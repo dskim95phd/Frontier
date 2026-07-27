@@ -57,6 +57,7 @@ LONG_PREFILL_TOKEN_THRESHOLD="${LONG_PREFILL_TOKEN_THRESHOLD:-64}"
 KV_TRANSFER_BANDWIDTH_GBPS="${KV_TRANSFER_BANDWIDTH_GBPS:-200.0}"
 KV_TRANSFER_LATENCY_MS="${KV_TRANSFER_LATENCY_MS:-0.5}"
 TRACE_FILE="${TRACE_FILE:-$REPO_ROOT/examples/fixtures/prefix_cache_shared_session_trace.csv}"
+PREFIX_CACHING_KEY_MODE="${PREFIX_CACHING_KEY_MODE:-block_hash}"
 MAX_TOKENS="${MAX_TOKENS:-128}"
 EXPECTED_TRACE_REQUESTS="${EXPECTED_TRACE_REQUESTS:-2}"
 BLOCK_SIZE="${BLOCK_SIZE:-16}"
@@ -105,6 +106,11 @@ fi
 
 if [ "$ENABLE_CHUNKED_PREFILL" = "false" ] && [ "$LONG_PREFILL_TOKEN_THRESHOLD" != "0" ]; then
   echo "ERROR: LONG_PREFILL_TOKEN_THRESHOLD must be 0 when ENABLE_CHUNKED_PREFILL=false" >&2
+  exit 2
+fi
+
+if [ "$PREFIX_CACHING_KEY_MODE" != "block_hash" ] && [ "$PREFIX_CACHING_KEY_MODE" != "session" ]; then
+  echo "ERROR: PREFIX_CACHING_KEY_MODE must be block_hash or session; got $PREFIX_CACHING_KEY_MODE" >&2
   exit 2
 fi
 
@@ -190,7 +196,10 @@ else
   CMD+=(--no-vllm_v1_scheduler_config_enable_chunked_prefill)
 fi
 
-CMD+=(--vllm_v1_scheduler_config_enable_prefix_caching)
+CMD+=(
+  --vllm_v1_scheduler_config_enable_prefix_caching
+  --vllm_v1_scheduler_config_prefix_caching_key_mode "$PREFIX_CACHING_KEY_MODE"
+)
 
 if [ "$ENABLE_DUMMY_MODE" = "true" ]; then
   CMD+=(
@@ -221,8 +230,8 @@ Decode parallelism: Attn_TP=$DECODE_ATTN_TP, MoE_TP=$DECODE_MOE_TP, MoE_EP=$DECO
 MoE: total_experts=$TOTAL_EXPERTS, router_topk=$ROUTER_TOPK, routing=$MOE_ROUTING_MODE, seed=$MOE_ROUTING_SEED
 Scheduler: $REPLICA_SCHEDULER
 Trace: $TRACE_FILE
-Expected Trace Shape: requests=$EXPECTED_TRACE_REQUESTS from TRACE_FILE, repeated block_hash_ids produce cache-hit blocks
-Prefix Caching: enabled, block_size=$BLOCK_SIZE, num_blocks=$NUM_BLOCKS
+Expected Trace Shape: requests=$EXPECTED_TRACE_REQUESTS from TRACE_FILE, key_mode=$PREFIX_CACHING_KEY_MODE
+Prefix Caching: enabled, key_mode=$PREFIX_CACHING_KEY_MODE, block_size=$BLOCK_SIZE, num_blocks=$NUM_BLOCKS
 Requests: $NUM_REQUESTS (prefill=$PREFILL_TOKENS, decode=$DECODE_TOKENS, qps=$QPS)
 Runtime Optimizations: decode_cuda_graph_mode=$DECODE_CUDA_GRAPH_MODE, chunked_prefill=$ENABLE_CHUNKED_PREFILL
 KV transfer: bandwidth_gbps=$KV_TRANSFER_BANDWIDTH_GBPS, latency_ms=$KV_TRANSFER_LATENCY_MS

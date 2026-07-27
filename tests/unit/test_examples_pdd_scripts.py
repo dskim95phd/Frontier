@@ -136,4 +136,8 @@ def test_pdd_prefix_cache_scripts_use_sticky_scheduler_and_no_spec_decode() -> N
         assert '--request_generator_config_type trace_replay' in text
         assert '--trace_request_generator_config_trace_file "$TRACE_FILE"' in text
         assert '--vllm_v1_scheduler_config_enable_prefix_caching' in text
+        assert (
+            '--vllm_v1_scheduler_config_prefix_caching_key_mode '
+            '"$PREFIX_CACHING_KEY_MODE"'
+        ) in text
         assert '--speculative_decoding_config_enabled' not in text

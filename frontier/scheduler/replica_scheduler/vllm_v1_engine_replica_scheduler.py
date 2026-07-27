@@ -258,6 +258,9 @@ class VLLMv1EngineReplicaScheduler(BaseReplicaScheduler):
                 caching_hash_algo=str(
                     getattr(self._config, "prefix_caching_hash_algo", "builtin")
                 ),
+                caching_key_mode=str(
+                    getattr(self._config, "prefix_caching_key_mode", "block_hash")
+                ),
                 num_preallocate_tokens=int(
                     getattr(self._config, "num_preallocate_tokens", 0)
                 ),
@@ -1177,24 +1180,40 @@ class VLLMv1EngineReplicaScheduler(BaseReplicaScheduler):
 
     def _prepare_prefix_cache_admission(
         self, request: Request
-    ) -> Tuple[List[object], int, int]:
+    ) -> Tuple[List[object], int, int, int, int]:
         if not self._is_prefix_caching_enabled():
-            return [], 0, self._get_request_next_num_tokens(request)
-        if request.block_hash_ids is None:
-            raise ValueError(
-                "block_hash_ids are required when enable_prefix_caching=True"
-            )
+            return [], 0, self._get_request_next_num_tokens(request), 0, 0
         assert self._kv_cache_manager is not None
-        computed_blocks, num_computed_tokens = self._kv_cache_manager.get_computed_blocks(
-            request
-        )
+        key_mode = self._kv_cache_manager.caching_key_mode
+        if key_mode == "block_hash" and request.block_hash_ids is None:
+            raise ValueError(
+                "block_hash_ids are required when enable_prefix_caching=True "
+                "and prefix_caching_key_mode='block_hash'"
+            )
+        if key_mode == "session" and request.session_id is None:
+            raise ValueError(
+                "session_id is required when enable_prefix_caching=True "
+                "and prefix_caching_key_mode='session'"
+            )
+        (
+            computed_blocks,
+            num_computed_tokens,
+            query_blocks,
+        ) = self._kv_cache_manager.get_computed_blocks(request)
+        hit_blocks = len(computed_blocks)
         num_new_tokens = int(request.num_prefill_tokens) - int(num_computed_tokens)
         if num_new_tokens == 0 and computed_blocks:
             num_computed_tokens -= int(self._config.block_size)
             num_new_tokens = int(self._config.block_size)
             computed_blocks = list(computed_blocks[:-1])
-            self._kv_cache_manager.prefix_cache_stats.hits -= 1
-        return computed_blocks, int(num_computed_tokens), int(num_new_tokens)
+            hit_blocks -= 1
+        return (
+            computed_blocks,
+            int(num_computed_tokens),
+            int(num_new_tokens),
+            int(query_blocks),
+            int(hit_blocks),
+        )
 
     def _build_decode_cuda_graph_metadata(
         self, batch: Batch
@@ -1755,10 +1774,14 @@ class VLLMv1EngineReplicaScheduler(BaseReplicaScheduler):
             prefix_cache_stats = self._kv_cache_manager.prefix_cache_stats
             payload.update(
                 {
-                    "prefix_cache_metric_semantics": "block_level",
+                    "prefix_cache_metric_semantics": (
+                        "successful_admission_block_level"
+                    ),
                     "prefix_cache_unit": "blocks",
                     "prefix_cache_block_size": int(self._config.block_size),
-                    "prefix_cache_requests": int(prefix_cache_stats.requests),
+                    "prefix_cache_admissions": int(
+                        prefix_cache_stats.admissions
+                    ),
                     "prefix_cache_queries": int(prefix_cache_stats.queries),
                     "prefix_cache_hits": int(prefix_cache_stats.hits),
                 }
@@ -1787,6 +1810,14 @@ class VLLMv1EngineReplicaScheduler(BaseReplicaScheduler):
             __name__, self._cluster_type.name if self._cluster_type else None
         )
         self._release_batch_requests_active(batch)
+
+        # Batch.on_batch_end() has already advanced each Request to the actual
+        # completed-token frontier. Only now may newly computed full blocks be
+        # exposed to later prefix-cache lookups.
+        if self._is_prefix_caching_enabled():
+            assert self._kv_cache_manager is not None
+            for request in batch.requests:
+                self._kv_cache_manager.mark_blocks_computed(request)
 
         for request in batch.requests:
             self._refresh_target_embedded_mtp_prefill_boundary_state(batch, request)
@@ -3070,13 +3101,19 @@ class VLLMv1EngineReplicaScheduler(BaseReplicaScheduler):
             )
             computed_blocks = None
             prefix_cached_tokens = 0
+            prefix_cache_query_blocks = 0
+            prefix_cache_hit_blocks = 0
+            prefix_cache_lookup_attempted = False
 
             # Calculate number of new tokens to process
             if self._is_prefix_caching_enabled() and not request.is_prefill_complete:
+                prefix_cache_lookup_attempted = True
                 (
                     computed_blocks,
                     prefix_cached_tokens,
                     num_new_tokens,
+                    prefix_cache_query_blocks,
+                    prefix_cache_hit_blocks,
                 ) = self._prepare_prefix_cache_admission(request)
                 max_allowed = self._max_model_len - prefix_cached_tokens
             else:
@@ -3181,8 +3218,18 @@ class VLLMv1EngineReplicaScheduler(BaseReplicaScheduler):
                 num_new_tokens,
                 new_computed_blocks=computed_blocks,
             )
-            if prefix_cached_tokens > 0:
-                request.on_cache_hit(prefix_cached_tokens)
+            if prefix_cache_lookup_attempted:
+                assert self._kv_cache_manager is not None
+                request.on_prefix_cache_lookup(
+                    query_blocks=prefix_cache_query_blocks,
+                    hit_blocks=prefix_cache_hit_blocks,
+                    num_tokens_cached=prefix_cached_tokens,
+                    key_mode=self._kv_cache_manager.caching_key_mode,
+                )
+                self._kv_cache_manager.record_prefix_cache_admission(
+                    query_blocks=prefix_cache_query_blocks,
+                    hit_blocks=prefix_cache_hit_blocks,
+                )
             self._advance_scheduler_num_computed_tokens(request, num_new_tokens)
 
             # Add to running requests

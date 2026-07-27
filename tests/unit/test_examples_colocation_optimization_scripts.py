@@ -229,3 +229,41 @@ def test_public_prefix_cache_trace_fixture_exists() -> None:
     text = fixture.read_text(encoding="utf-8")
     assert "block_hash_ids" in text
     assert text.count("\n") >= 2
+
+
+def test_public_session_prefix_trace_fixture_is_length_only() -> None:
+    fixture = (
+        REPO_ROOT
+        / "examples"
+        / "fixtures"
+        / "session_prefix_multi_turn_trace.csv"
+    )
+
+    assert fixture.exists()
+    header = fixture.read_text(encoding="utf-8").splitlines()[0]
+    assert header == (
+        "arrived_at,num_prefill_tokens,num_decode_tokens,session_id"
+    )
+    rows = fixture.read_text(encoding="utf-8").splitlines()[1:]
+    assert rows == [
+        "0.0,32,16,7",
+        "1.0,32,16,8",
+        "10.0,8,8,7",
+        "11.0,8,8,8",
+    ]
+
+
+def test_colocation_prefix_recipes_expose_session_key_mode() -> None:
+    for script in (
+        OFFLINE_DIR / "moe_prefix_caching.sh",
+        ONLINE_DIR / "moe_prefix_caching_online.sh",
+    ):
+        text = _read(script)
+        assert (
+            'PREFIX_CACHING_KEY_MODE="${PREFIX_CACHING_KEY_MODE:-block_hash}"'
+            in text
+        )
+        assert (
+            '--vllm_v1_scheduler_config_prefix_caching_key_mode '
+            '"$PREFIX_CACHING_KEY_MODE"'
+        ) in text

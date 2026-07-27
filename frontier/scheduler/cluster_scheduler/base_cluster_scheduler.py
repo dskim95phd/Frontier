@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Tuple, Optional, TYPE_CHECKING
 
 from frontier.config import ClusterConfig, BaseRequestGeneratorConfig
 from frontier.entities import Batch, EPBatchGroup, ExecutionTime, Replica, Request, Cluster
+from frontier.entities.request import RequestRoundPlan
 from frontier.config.config import DISAGGREGATED_ARCHITECTURE_RELEASE_ERROR
 # Phase 2.5: Removed deprecated MoECollectiveScheduleEvent import
 from frontier.execution_time_predictor import (
@@ -19,6 +20,12 @@ from frontier.model_architectures import (
 )
 from frontier.scheduler.replica_scheduler.replica_scheduler_registry import (
     ReplicaSchedulerRegistry,
+)
+from frontier.request_generator.trace_replay_request_generator import (
+    materialize_incremental_session_round_plans,
+    parse_thinking_round_plans,
+    scale_nonnegative_arrival_time,
+    scale_positive_token_count,
 )
 from frontier.types import (
     ClusterType,
@@ -74,24 +81,52 @@ class BaseClusterScheduler(ABC):
             return
 
         cluster_scheduler_type = self._config.cluster_scheduler_config.get_type()
-        if self._num_replicas > 1 and cluster_scheduler_type not in {
+        if (
+            self._cluster_type == ClusterType.PREFILL
+            and cluster_scheduler_type == ClusterSchedulerType.STICKY_LOR
+        ):
+            raise ValueError(
+                "sticky_lor prefix-cache affinity is only supported for "
+                "MONOLITHIC clusters in this release. Sequential "
+                "pd-disaggregation must use sticky_round_robin."
+            )
+
+        num_cache_targets = int(self._num_replicas) * int(self._replica_dp_size)
+        if num_cache_targets > 1 and cluster_scheduler_type not in {
             ClusterSchedulerType.STICKY_ROUND_ROBIN,
             ClusterSchedulerType.STICKY_LOR,
         }:
             raise ValueError(
-                "Multi-replica prefix caching requires a sticky cluster scheduler. "
-                f"Got {cluster_scheduler_type}."
+                "Prefix caching across multiple replica/DP cache targets requires "
+                "a sticky cluster scheduler. "
+                f"num_replicas={self._num_replicas}; "
+                f"data_parallel_size={self._replica_dp_size}; "
+                f"num_cache_targets={num_cache_targets}; "
+                f"got={cluster_scheduler_type}."
             )
 
         request_generator_config = getattr(self, "_request_generator_config", None)
         if request_generator_config is None:
             return
 
+        key_mode = str(
+            getattr(
+                replica_scheduler_config,
+                "prefix_caching_key_mode",
+                "block_hash",
+            )
+        )
+        required_metadata_description = (
+            "session_id"
+            if key_mode == "session"
+            else "session_id and block_hash_ids"
+        )
         request_generator_type = request_generator_config.get_type()
         if request_generator_type != RequestGeneratorType.TRACE_REPLAY:
             raise ValueError(
-                "Prefix caching requires a trace request source with session_id "
-                "and block_hash_ids metadata before scheduling. "
+                "Prefix caching requires a trace request source with "
+                f"{required_metadata_description} metadata "
+                f"for prefix_caching_key_mode={key_mode!r}. "
                 f"Got {request_generator_type}."
             )
 
@@ -99,21 +134,31 @@ class BaseClusterScheduler(ABC):
         if not trace_file.exists():
             raise ValueError(
                 "Prefix caching trace request source requires an existing trace file "
-                f"with session_id and block_hash_ids columns. Got {trace_file}."
+                f"with {required_metadata_description} "
+                f"for prefix_caching_key_mode={key_mode!r}. Got {trace_file}."
             )
 
         with trace_file.open("r", encoding="utf-8", newline="") as file:
             reader = csv.DictReader(file)
             header = reader.fieldnames
-            required_columns = {"session_id", "block_hash_ids"}
+            if key_mode == "session":
+                required_columns = {
+                    "arrived_at",
+                    "num_prefill_tokens",
+                    "num_decode_tokens",
+                    "session_id",
+                }
+            else:
+                required_columns = {"session_id", "block_hash_ids"}
             missing_columns = sorted(required_columns - set(header or []))
             if missing_columns:
                 raise ValueError(
-                    "Prefix caching trace request source requires session_id and "
-                    "block_hash_ids columns before scheduling. "
+                    "Prefix caching trace request source is missing columns for "
+                    f"prefix_caching_key_mode={key_mode!r}. "
                     f"Missing columns: {missing_columns}."
                 )
 
+            previous_turn_by_session: dict[int, tuple[float, int, int]] = {}
             for row_number, row in enumerate(reader, start=2):
                 missing_values = sorted(
                     column
@@ -123,10 +168,126 @@ class BaseClusterScheduler(ABC):
                 if missing_values:
                     raise ValueError(
                         "Prefix caching trace request source requires non-empty "
-                        "session_id and block_hash_ids values before scheduling. "
+                        f"values for prefix_caching_key_mode={key_mode!r}. "
                         f"Trace file: {trace_file}; row {row_number}; "
                         f"missing values: {missing_values}."
                     )
+
+                if key_mode != "session":
+                    continue
+
+                row_context = (
+                    f"Trace file: {trace_file}; row {row_number}"
+                )
+                try:
+                    session_id = int(row["session_id"])
+                    arrived_at = scale_nonnegative_arrival_time(
+                        row["arrived_at"],
+                        request_generator_config.time_scale_factor,
+                        context=row_context,
+                    )
+                    prefill_tokens = scale_positive_token_count(
+                        row["num_prefill_tokens"],
+                        request_generator_config.prefill_scale_factor,
+                        field_name="num_prefill_tokens",
+                        context=row_context,
+                    )
+                    decode_tokens = scale_positive_token_count(
+                        row["num_decode_tokens"],
+                        request_generator_config.decode_scale_factor,
+                        field_name="num_decode_tokens",
+                        context=row_context,
+                    )
+                except (KeyError, OverflowError, TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "Invalid session prefix-caching trace value. "
+                        f"{row_context}; reason={exc}"
+                    ) from exc
+
+                previous_turn = previous_turn_by_session.get(session_id)
+                if previous_turn is not None:
+                    (
+                        previous_arrived_at,
+                        previous_context_tokens,
+                        previous_row_number,
+                    ) = previous_turn
+                    if arrived_at < previous_arrived_at:
+                        raise ValueError(
+                            "Session prefix-caching turns must be ordered by "
+                            "nondecreasing arrived_at. "
+                            f"Trace file: {trace_file}; session_id={session_id}; "
+                            f"previous row={previous_row_number}; "
+                            f"current row={row_number}."
+                        )
+                else:
+                    previous_context_tokens = 0
+
+                incremental_round_plans = [
+                    RequestRoundPlan(prefill_tokens, decode_tokens)
+                ]
+                try:
+                    explicit_round_plans = parse_thinking_round_plans(
+                        row.get("thinking_round_plans_json"),
+                        prefill_scale_factor=(
+                            request_generator_config.prefill_scale_factor
+                        ),
+                        decode_scale_factor=(
+                            request_generator_config.decode_scale_factor
+                        ),
+                        context=row_context,
+                    )
+                    thinking_depth_value = row.get("thinking_depth")
+                    thinking_depth = (
+                        int(thinking_depth_value)
+                        if thinking_depth_value is not None
+                        and str(thinking_depth_value).strip()
+                        else (
+                            len(explicit_round_plans)
+                            if explicit_round_plans is not None
+                            else 1
+                        )
+                    )
+                    if explicit_round_plans is None and thinking_depth > 1:
+                        raise ValueError(
+                            "thinking_depth > 1 requires "
+                            "thinking_round_plans_json"
+                        )
+                    if explicit_round_plans is not None:
+                        if len(explicit_round_plans) != thinking_depth:
+                            raise ValueError(
+                                "thinking_round_plans length must match "
+                                f"thinking_depth={thinking_depth}"
+                            )
+                        if explicit_round_plans[-1] != incremental_round_plans[-1]:
+                            raise ValueError(
+                                "the final incremental thinking round plan must "
+                                "match the trace row lengths"
+                            )
+                        incremental_round_plans = explicit_round_plans
+
+                    _, resulting_context_tokens = (
+                        materialize_incremental_session_round_plans(
+                            initial_context_tokens=previous_context_tokens,
+                            incremental_round_plans=incremental_round_plans,
+                            max_tokens=int(request_generator_config.max_tokens),
+                            context=(
+                                f"Trace file: {trace_file}; row {row_number}; "
+                                f"session_id={session_id}"
+                            ),
+                        )
+                    )
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "Invalid session prefix incremental thinking-round "
+                        f"metadata. Trace file: {trace_file}; row {row_number}; "
+                        f"session_id={session_id}; reason={exc}."
+                    ) from exc
+
+                previous_turn_by_session[session_id] = (
+                    arrived_at,
+                    resulting_context_tokens,
+                    row_number,
+                )
 
     def _get_cluster_specific_replica_scheduler_config(self, config: ClusterConfig, cluster_type: ClusterType):
         """

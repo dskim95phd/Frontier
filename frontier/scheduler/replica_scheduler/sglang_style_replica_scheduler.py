@@ -78,10 +78,14 @@ class SGLangStyleReplicaScheduler(VLLMv1EngineReplicaScheduler):
             prefix_cache_stats = self._kv_cache_manager.prefix_cache_stats
             payload.update(
                 {
-                    "prefix_cache_metric_semantics": "block_level",
+                    "prefix_cache_metric_semantics": (
+                        "successful_admission_block_level"
+                    ),
                     "prefix_cache_unit": "blocks",
                     "prefix_cache_block_size": int(self._config.block_size),
-                    "prefix_cache_requests": int(prefix_cache_stats.requests),
+                    "prefix_cache_admissions": int(
+                        prefix_cache_stats.admissions
+                    ),
                     "prefix_cache_queries": int(prefix_cache_stats.queries),
                     "prefix_cache_hits": int(prefix_cache_stats.hits),
                 }

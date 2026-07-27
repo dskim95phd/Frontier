@@ -44,6 +44,37 @@ This directory contains one-click architecture entrypoints for Frontier's releas
 | `pdd/online/moe_spec_dec_online.sh` | Online MoE PDD Speculative Decoding / MTP | Mirrors Speculative Decoding offline settings with `--simulation_mode online` |
 | `pdd/online/moe_prefix_caching_online.sh` | Online MoE PDD Prefix Caching | Replays the same prefix-cache fixture with `--simulation_mode online` |
 
+All four Prefix Caching recipes accept
+`PREFIX_CACHING_KEY_MODE=session` together with
+`examples/fixtures/session_prefix_multi_turn_trace.csv`. Session mode derives
+cache identity from `session_id` and block position, so the trace does not need
+`block_hash_ids`:
+
+```bash
+TRACE_FILE=examples/fixtures/session_prefix_multi_turn_trace.csv \
+PREFIX_CACHING_KEY_MODE=session \
+EXPECTED_TRACE_REQUESTS=4 \
+bash examples/architecture/co-location/online/moe_prefix_caching_online.sh
+```
+
+The ISL column contains only the new input tokens added by each turn. Frontier
+accumulates those values with the prior session context to materialize the
+effective full prompt. `thinking_round_plans_json` uses the same incremental
+rule, scale factors, and integerization as the top-level CSV values for every
+round. Session arrivals and token lengths are validated as finite,
+nonnegative/positive values and are never silently clipped. Expanded context
+must remain within `max_tokens`. Context truncation and conversation branching
+under one session ID are not supported. Final request/system cache metrics sum
+hidden and final Thinking-round lookups without counting same-round
+preemption twice. Co-location may reuse full decode blocks from the prior
+turn; PDD only reuses blocks previously processed by its prefill cluster
+because decode KV is not returned automatically. Prefix Caching recipes use
+`sticky_round_robin` because every `(replica_id, dp_id)` owns an independent
+cache; affinity is required whenever replicas multiplied by DP lanes exceeds
+one. `sticky_lor` is supported for co-location only in this release;
+sequential PDD Prefix Caching rejects it during validation and requires
+`sticky_round_robin`.
+
 ## PDD Configuration Contract
 
 All PDD scripts use these release-supported defaults unless overridden from the shell:

@@ -15,6 +15,12 @@ organized into three horizons:
 Items within a horizon are not strictly ordered. Scope and timing may shift as
 the release stabilizes and community feedback arrives.
 
+Detailed implementation proposals:
+
+- [Session-scoped prefix caching](session-prefix-caching-plan.md) — add an
+  opt-in cache-key mode for incremental-ISL multi-turn traces identified by
+  `session_id`.
+
 ## Near-term
 
 We have released the initial version of Frontier, targeting the `co-location`

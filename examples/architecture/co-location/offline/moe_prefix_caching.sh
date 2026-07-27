@@ -33,6 +33,7 @@ MOE_ROUTING_MODE="${MOE_ROUTING_MODE:-simulation}"
 MOE_ROUTING_SEED="${MOE_ROUTING_SEED:-42}"
 REPLICA_SCHEDULER="${REPLICA_SCHEDULER:-vllm_v1}"
 TRACE_FILE="${TRACE_FILE:-$REPO_ROOT/examples/fixtures/prefix_cache_shared_session_trace.csv}"
+PREFIX_CACHING_KEY_MODE="${PREFIX_CACHING_KEY_MODE:-block_hash}"
 MAX_TOKENS="${MAX_TOKENS:-128}"
 EXPECTED_TRACE_REQUESTS="${EXPECTED_TRACE_REQUESTS:-2}"
 ENABLE_DUMMY_MODE="${ENABLE_DUMMY_MODE:-true}"
@@ -57,6 +58,11 @@ require_bool() {
 
 require_bool "ENABLE_DUMMY_MODE" "$ENABLE_DUMMY_MODE"
 require_bool "ENABLE_CHUNKED_PREFILL" "$ENABLE_CHUNKED_PREFILL"
+
+if [ "$PREFIX_CACHING_KEY_MODE" != "block_hash" ] && [ "$PREFIX_CACHING_KEY_MODE" != "session" ]; then
+  echo "ERROR: PREFIX_CACHING_KEY_MODE must be block_hash or session; got $PREFIX_CACHING_KEY_MODE" >&2
+  exit 2
+fi
 
 if [ "$SYS_ARCH" != "co-location" ]; then
   echo "ERROR: this example only supports SYS_ARCH=co-location; got SYS_ARCH=$SYS_ARCH" >&2
@@ -109,6 +115,7 @@ CMD=(
   --vllm_v1_scheduler_config_block_size "$BLOCK_SIZE"
   --vllm_v1_scheduler_config_num_blocks "$NUM_BLOCKS"
   --vllm_v1_scheduler_config_enable_prefix_caching
+  --vllm_v1_scheduler_config_prefix_caching_key_mode "$PREFIX_CACHING_KEY_MODE"
   --request_generator_config_type trace_replay
   --trace_request_generator_config_trace_file "$TRACE_FILE"
   --trace_request_generator_config_max_tokens "$MAX_TOKENS"
@@ -123,6 +130,10 @@ CMD=(
   --no-metrics_config_enable_chrome_trace
   --no-metrics_config_write_json_trace
 )
+
+if [ "$PREFIX_CACHING_KEY_MODE" = "session" ]; then
+  CMD+=(--offline_use_generated_request_arrivals)
+fi
 
 if [ "$ENABLE_CHUNKED_PREFILL" = "true" ]; then
   CMD+=(--vllm_v1_scheduler_config_enable_chunked_prefill)
@@ -151,9 +162,9 @@ cat <<EOF
 Model: $MODEL_NAME
 Trace: $TRACE_FILE
 Backend: $CC_BACKEND
-Expected Trace Shape: requests=$EXPECTED_TRACE_REQUESTS from TRACE_FILE, repeated block_hash_ids produce cache-hit blocks
+Expected Trace Shape: requests=$EXPECTED_TRACE_REQUESTS from TRACE_FILE, key_mode=$PREFIX_CACHING_KEY_MODE
 Parallelism: Attn_TP=$ATTN_TP, MoE_TP=$MOE_TP, MoE_EP=$MOE_EP, PP=$PP, DP=$DP
-Runtime Optimizations: decode_cuda_graph_mode=$DECODE_CUDA_GRAPH_MODE, chunked_prefill=$ENABLE_CHUNKED_PREFILL, prefix_caching=true
+Runtime Optimizations: decode_cuda_graph_mode=$DECODE_CUDA_GRAPH_MODE, chunked_prefill=$ENABLE_CHUNKED_PREFILL, prefix_caching=true, prefix_key_mode=$PREFIX_CACHING_KEY_MODE
 Metrics: output_dir=$METRICS_OUTPUT_DIR, run_id=$RUN_ID
 ============================================
 EOF

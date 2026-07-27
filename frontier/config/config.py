@@ -558,7 +558,18 @@ class VllmV1SchedulerConfig(BaseReplicaSchedulerConfig):
     enable_prefix_caching: bool = field(
         default=False,
         metadata={
-            "help": "Enable block-hash-based prefix matching and KV cache reuse."
+            "help": "Enable prefix matching and KV cache reuse."
+        },
+    )
+    prefix_caching_key_mode: str = field(
+        default="block_hash",
+        metadata={
+            "help": (
+                "Prefix identity source: 'block_hash' uses explicit request "
+                "block_hash_ids; 'session' derives replica-local block keys "
+                "from session_id and block position and interprets each trace "
+                "ISL as newly appended input tokens."
+            )
         },
     )
     prefix_caching_hash_algo: str = field(
@@ -698,6 +709,14 @@ class VllmV1SchedulerConfig(BaseReplicaSchedulerConfig):
             raise ValueError(
                 "VllmV1SchedulerConfig.prefix_caching_hash_algo must be one of "
                 f"{sorted(allowed_hash_algorithms)}, got={self.prefix_caching_hash_algo!r}"
+            )
+
+        allowed_prefix_key_modes = {"block_hash", "session"}
+        if self.prefix_caching_key_mode not in allowed_prefix_key_modes:
+            raise ValueError(
+                "VllmV1SchedulerConfig.prefix_caching_key_mode must be one of "
+                f"{sorted(allowed_prefix_key_modes)}, "
+                f"got={self.prefix_caching_key_mode!r}"
             )
 
         if self.num_preallocate_tokens < 0:

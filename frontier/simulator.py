@@ -137,6 +137,27 @@ class Simulator:
             self._config.request_generator_config.get_type(),
             self._config.request_generator_config,
         )
+        session_prefix_incremental_isl = any(
+            bool(
+                getattr(
+                    cluster_config.replica_scheduler_config,
+                    "enable_prefix_caching",
+                    False,
+                )
+            )
+            and str(
+                getattr(
+                    cluster_config.replica_scheduler_config,
+                    "prefix_caching_key_mode",
+                    "block_hash",
+                )
+            )
+            == "session"
+            for cluster_config in cluster_configs.values()
+        )
+        self._request_generator.configure_session_prefix_incremental_isl(
+            enabled=session_prefix_incremental_isl
+        )
         self._request_generator.configure_thinking_mode(
             enable_thinking_mode=self._config.enable_thinking_mode,
             thinking_depth=self._config.thinking_depth,

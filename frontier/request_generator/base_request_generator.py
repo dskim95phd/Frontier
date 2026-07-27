@@ -14,6 +14,11 @@ class BaseRequestGenerator(ABC):
         self._tool_call_latency = 0.001
         self._thinking_round_prefill_tokens: Optional[List[int]] = None
         self._thinking_round_decode_tokens: Optional[List[int]] = None
+        self._session_prefix_incremental_isl = False
+
+    def configure_session_prefix_incremental_isl(self, *, enabled: bool) -> None:
+        """Select incremental-ISL materialization for session prefix traces."""
+        self._session_prefix_incremental_isl = bool(enabled)
 
     def configure_thinking_mode(
         self,

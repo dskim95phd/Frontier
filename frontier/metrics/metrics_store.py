@@ -2547,15 +2547,46 @@ class MetricsStore:
                 return block_size
         return None
 
+    def _get_prefix_cache_key_mode(self) -> Optional[str]:
+        cluster_configs = getattr(self, "_cluster_configs", {})
+        for cluster_type, cluster_config in cluster_configs.items():
+            if cluster_type not in (ClusterType.MONOLITHIC, ClusterType.PREFILL):
+                continue
+            replica_scheduler_config = getattr(
+                cluster_config,
+                "replica_scheduler_config",
+                None,
+            )
+            if replica_scheduler_config is None:
+                continue
+            if not bool(
+                getattr(replica_scheduler_config, "enable_prefix_caching", False)
+            ):
+                continue
+            return str(
+                getattr(
+                    replica_scheduler_config,
+                    "prefix_caching_key_mode",
+                    "block_hash",
+                )
+            )
+        return None
+
     def _record_prefix_cache_request_metrics(self, request: Request) -> None:
         block_size = self._get_prefix_cache_block_size()
         if block_size is None or block_size <= 0:
             return
-        query_blocks = len(request.block_hash_ids or [])
-        hit_blocks = int(request.num_prefill_tokens_cached // block_size)
+        if request.prefix_cache_key_mode is None:
+            query_blocks = len(request.block_hash_ids or [])
+            hit_blocks = int(request.num_prefill_tokens_cached // block_size)
+            cached_tokens = int(request.num_prefill_tokens_cached)
+        else:
+            query_blocks = int(request.total_prefix_cache_query_blocks)
+            hit_blocks = int(request.total_prefix_cache_hit_blocks)
+            cached_tokens = int(request.total_num_prefill_tokens_cached)
         self._request_metrics_histogram[
             RequestMetricsHistogram.REQUEST_CACHED_PREFILL_TOKENS
-        ].put(request.id, int(request.num_prefill_tokens_cached))
+        ].put(request.id, cached_tokens)
         self._request_metrics_histogram[
             RequestMetricsHistogram.REQUEST_PREFIX_CACHE_QUERY_BLOCKS
         ].put(request.id, int(query_blocks))
@@ -2594,6 +2625,7 @@ class MetricsStore:
 
         return {
             "block_size_tokens": self._get_prefix_cache_block_size(),
+            "key_mode": self._get_prefix_cache_key_mode(),
             "requests": int(requests),
             "requests_with_hits": int(requests_with_hits),
             "total_cached_prefill_tokens": int(sum(cached_values)),
@@ -3211,10 +3243,19 @@ class MetricsStore:
         if not request.has_started_decode:
             return
 
+        # An intermediate Thinking Mode round enters tool-wait before batch
+        # metrics are emitted. That transition intentionally clears
+        # request._scheduled, while the just-completed iteration delay remains
+        # valid until the later requeue reset.
+        latest_iteration_scheduling_delay = (
+            request._latest_iteration_scheduling_delay
+            if request.pending_thinking_requeue
+            else request.latest_iteration_scheduling_delay
+        )
         self._token_metrics_time_distribution[
             TokenMetricsTimeDistribution.DECODE_TOKEN_EXECUTION_PLUS_PREMPTION_TIME
         ].put(
-            time - batch.scheduled_at + request.latest_iteration_scheduling_delay,
+            time - batch.scheduled_at + latest_iteration_scheduling_delay,
         )
 
         self._token_completion_metrics_time_series[

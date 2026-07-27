@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Hashable
 from dataclasses import dataclass
 from math import ceil
 from typing import Optional
@@ -13,9 +14,14 @@ from frontier.kv_cache.kv_cache_block_pool import BlockPool
 @dataclass
 class PrefixCacheStats:
     reset: bool = False
-    requests: int = 0
+    admissions: int = 0
     queries: int = 0
     hits: int = 0
+
+    @property
+    def requests(self) -> int:
+        """Backward-compatible alias for admission-scoped request counts."""
+        return self.admissions
 
 
 class KVCacheManager:
@@ -26,11 +32,18 @@ class KVCacheManager:
         enable_caching: bool,
         caching_hash_algo: str,
         num_preallocate_tokens: int,
+        caching_key_mode: str = "block_hash",
     ) -> None:
         self.block_size = int(block_size)
         self.num_gpu_blocks = int(num_gpu_blocks)
         self.enable_caching = bool(enable_caching)
         self.caching_hash_algo = str(caching_hash_algo)
+        self.caching_key_mode = str(caching_key_mode)
+        if self.caching_key_mode not in {"block_hash", "session"}:
+            raise ValueError(
+                "caching_key_mode must be 'block_hash' or 'session', "
+                f"got={self.caching_key_mode!r}"
+            )
         self.num_preallocate_tokens = int(num_preallocate_tokens)
         self.num_preallocate_blocks = (
             ceil(self.num_preallocate_tokens / self.block_size)
@@ -58,14 +71,73 @@ class KVCacheManager:
         self.prefix_cache_stats = PrefixCacheStats()
         return stats
 
-    def _get_request_block_hashes(self, request: Request) -> list[int]:
-        return list(request.block_hash_ids or [])
+    def _get_session_block_keys(
+        self,
+        request: Request,
+        num_blocks: int,
+        start_block_index: int = 0,
+    ) -> list[Hashable]:
+        if request.session_id is None:
+            raise ValueError(
+                "session_id is required when prefix caching key mode is 'session'"
+            )
+        session_id = int(request.session_id)
+        start_block_index = max(int(start_block_index), 0)
+        num_blocks = max(int(num_blocks), 0)
+        return [
+            ("session", session_id, block_index)
+            for block_index in range(
+                start_block_index,
+                start_block_index + num_blocks,
+            )
+        ]
 
-    def get_computed_blocks(self, request: Request) -> tuple[list[KVCacheBlock], int]:
+    def _get_request_lookup_block_keys(
+        self,
+        request: Request,
+    ) -> list[Hashable]:
+        if self.caching_key_mode == "block_hash":
+            return list(request.block_hash_ids or [])
+        num_prompt_blocks = int(request.num_prefill_tokens) // self.block_size
+        return self._get_session_block_keys(request, num_prompt_blocks)
+
+    def _get_num_request_storage_block_keys(
+        self,
+        request: Request,
+    ) -> int:
+        if self.caching_key_mode == "block_hash":
+            return len(request.block_hash_ids or [])
+        return int(request.total_tokens) // self.block_size
+
+    def _get_request_storage_block_keys(
+        self,
+        request: Request,
+        *,
+        start_block_index: int,
+        end_block_index: int,
+    ) -> list[Hashable]:
+        if end_block_index <= start_block_index:
+            return []
+        if self.caching_key_mode == "block_hash":
+            return list(
+                (request.block_hash_ids or [])[
+                    start_block_index:end_block_index
+                ]
+            )
+        return self._get_session_block_keys(
+            request,
+            end_block_index - start_block_index,
+            start_block_index=start_block_index,
+        )
+
+    def get_computed_blocks(
+        self,
+        request: Request,
+    ) -> tuple[list[KVCacheBlock], int, int]:
         if not self.enable_caching:
-            return [], 0
+            return [], 0, 0
 
-        block_hashes = self._get_request_block_hashes(request)
+        block_hashes = self._get_request_lookup_block_keys(request)
         computed_blocks: list[KVCacheBlock] = []
         for block_hash in block_hashes:
             cached_block = self.block_pool.get_cached_block(block_hash)
@@ -73,10 +145,30 @@ class KVCacheManager:
                 break
             computed_blocks.append(cached_block)
 
-        self.prefix_cache_stats.requests += 1
-        self.prefix_cache_stats.queries += len(block_hashes)
-        self.prefix_cache_stats.hits += len(computed_blocks)
-        return computed_blocks, len(computed_blocks) * self.block_size
+        return (
+            computed_blocks,
+            len(computed_blocks) * self.block_size,
+            len(block_hashes),
+        )
+
+    def record_prefix_cache_admission(
+        self,
+        *,
+        query_blocks: int,
+        hit_blocks: int,
+    ) -> None:
+        if query_blocks < 0:
+            raise ValueError(
+                f"query_blocks must be >= 0, got={query_blocks}"
+            )
+        if hit_blocks < 0 or hit_blocks > query_blocks:
+            raise ValueError(
+                "hit_blocks must be between 0 and query_blocks, "
+                f"got hits={hit_blocks}, queries={query_blocks}"
+            )
+        self.prefix_cache_stats.admissions += 1
+        self.prefix_cache_stats.queries += int(query_blocks)
+        self.prefix_cache_stats.hits += int(hit_blocks)
 
     def _get_num_new_blocks_required(
         self,
@@ -150,19 +242,42 @@ class KVCacheManager:
         if not self.enable_caching:
             return new_blocks
 
-        num_computed_tokens = int(request.num_processed_tokens) + len(
-            computed_blocks
-        ) * self.block_size
-        num_full_blocks = (num_computed_tokens + num_tokens) // self.block_size
-        num_cached_blocks = self.num_cached_blocks.get(request.id, len(computed_blocks))
-        self.block_pool.cache_full_blocks(
-            blocks=request_blocks,
-            block_hashes=self._get_request_block_hashes(request),
-            num_cached_blocks=num_cached_blocks,
-            num_full_blocks=num_full_blocks,
-        )
-        self.num_cached_blocks[request.id] = num_full_blocks
+        # Allocation only reserves space. Newly allocated blocks must not become
+        # prefix-cache hits until the batch that computes them has completed.
+        # Prefix blocks returned by get_computed_blocks() are already ready.
+        self.num_cached_blocks.setdefault(request.id, len(computed_blocks))
         return new_blocks
+
+    def mark_blocks_computed(self, request: Request) -> None:
+        """Publish full blocks up to the request's completed-token frontier."""
+        if not self.enable_caching:
+            return
+
+        request_blocks = self.req_to_blocks.get(request.id, [])
+        if not request_blocks:
+            return
+
+        num_ready_blocks = min(
+            int(request.num_processed_tokens) // self.block_size,
+            len(request_blocks),
+            self._get_num_request_storage_block_keys(request),
+        )
+        num_cached_blocks = self.num_cached_blocks.get(request.id, 0)
+        if num_ready_blocks <= num_cached_blocks:
+            return
+
+        new_block_keys = self._get_request_storage_block_keys(
+            request,
+            start_block_index=num_cached_blocks,
+            end_block_index=num_ready_blocks,
+        )
+        self.block_pool.cache_full_blocks(
+            blocks=request_blocks[num_cached_blocks:num_ready_blocks],
+            block_hashes=new_block_keys,
+            num_cached_blocks=0,
+            num_full_blocks=len(new_block_keys),
+        )
+        self.num_cached_blocks[request.id] = num_ready_blocks
 
     def free(self, request: Request) -> None:
         request_blocks = self.req_to_blocks.pop(request.id, [])

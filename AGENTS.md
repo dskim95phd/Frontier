@@ -84,6 +84,17 @@ The CLI/config parser still accepts the historical `sys_arch` choices so existin
 Important runtime constraints:
 
 - `sglang` is available only for `co-location` / `MONOLITHIC`.
+- Prefix-cache state is local to each `(replica_id, dp_id)` target. Affinity is
+  therefore required whenever `num_replicas * data_parallel_size > 1`.
+- Session-prefix traces reject nonfinite/negative arrivals and
+  nonfinite/nonpositive token counts instead of clipping. Explicit Thinking
+  rounds use the same trace scale factors and integerization as top-level
+  ISL/OSL values.
+- Prefix-cache request/system metrics accumulate hidden and final Thinking
+  rounds while avoiding same-round preemption double-counting.
+- `sticky_lor` Prefix Caching is supported only for `MONOLITHIC` in this
+  release. Sequential PDD Prefix Caching must use `sticky_round_robin` and
+  rejects `sticky_lor` during validation.
 - `decode_cuda_graph_mode` is intended for `co-location` and `pd-disaggregation`.
 - `use_cuda_graph=True` is not part of this release because the guarded PD+AF path previously owned that setting.
 - When speculative decoding is enabled, Frontier currently requires `decode_cuda_graph_mode='none'` unless the diagnostic opt-in is explicitly enabled.
@@ -375,7 +386,7 @@ PDD recipes:
 | `examples/architecture/pdd/offline/moe_model_basic.sh`        | Offline MoE PDD baseline                 | Sequential `pd-disaggregation`, shared-domain MoE invariant, Chunked Prefill enabled, CSV/JSON metrics enabled |
 | `examples/architecture/pdd/offline/thinking_mode_basic.sh`    | Offline Thinking Mode PDD smoke          | Thinking Mode enabled and records prefill-to-decode KV transfer handoffs                                       |
 | `examples/architecture/pdd/offline/moe_spec_dec.sh`           | Offline MoE PDD Speculative Decoding/MTP | Speculative Decoding / MTP enabled, `decode_cuda_graph_mode=none` to avoid the current runtime conflict        |
-| `examples/architecture/pdd/offline/moe_prefix_caching.sh`     | Offline MoE PDD Prefix Caching recipe    | Prefix Caching enabled against `examples/fixtures/prefix_cache_shared_session_trace.csv`                       |
+| `examples/architecture/pdd/offline/moe_prefix_caching.sh`     | Offline MoE PDD Prefix Caching recipe    | Prefix Caching with `sticky_round_robin` against `examples/fixtures/prefix_cache_shared_session_trace.csv`      |
 | `examples/architecture/pdd/online/dense_model_basic_online.sh` | Online dense PDD baseline                | Mirrors the dense offline case with `--simulation_mode online`                                                 |
 | `examples/architecture/pdd/online/moe_model_basic_online.sh`  | Online MoE PDD baseline                  | Mirrors the MoE offline case with `--simulation_mode online`                                                   |
 

@@ -155,6 +155,8 @@ Dummy predictor mode is useful for smoke tests. For latency studies, disable dum
 | `--decode_cuda_graph_mode none` | Disable decode CUDA Graph modeling. Required by the Speculative Decoding example. |
 | `--vllm_v1_scheduler_config_enable_chunked_prefill` | Enable Chunked Prefill on the `vllm_v1` scheduler. |
 | `--vllm_v1_scheduler_config_enable_prefix_caching` | Enable Prefix Caching on supported scheduler paths. |
+| `--vllm_v1_scheduler_config_prefix_caching_key_mode block_hash` | Use explicit `block_hash_ids` from the trace. This is the default. |
+| `--vllm_v1_scheduler_config_prefix_caching_key_mode session` | Derive replica-local prefix block keys from `session_id` and block position; trace ISLs are newly appended input tokens. |
 | `--speculative_decoding_config_enabled` | Enable Speculative Decoding / MTP modeling. |
 
 ### Workload generation
@@ -180,6 +182,79 @@ Trace replay workload:
 ```
 
 Use trace replay when you need shared-prefix or known-arrival behavior.
+
+Session-scoped prefix caching accepts a length-only, append-only multi-turn
+trace:
+
+```csv
+arrived_at,num_prefill_tokens,num_decode_tokens,session_id
+0.0,32,16,7
+10.0,8,8,7
+```
+
+In session mode, `num_prefill_tokens` is the number of new input tokens added
+by that turn. Frontier materializes the effective full-prompt length before
+creating each request:
+
+```text
+effective_ISL = prior_session_context + new_ISL
+next_session_context = effective_ISL + OSL
+```
+
+The example therefore materializes to effective prompt lengths 32 and 56.
+Entries in `thinking_round_plans_json` use the same incremental ISL rule and
+are accumulated round by round. Each round also uses
+`trace_request_generator_config_prefill_scale_factor` and
+`trace_request_generator_config_decode_scale_factor` with the same
+`int(raw * factor)` conversion as the top-level CSV values. Scaling happens
+before the final round is compared with the row and before contexts are
+accumulated.
+
+Session traces are strict: raw and scaled arrivals must be finite and
+nonnegative; raw and scaled token counts must be finite and positive; and
+integerized token counts must remain at least one. Invalid values fail with a
+row/field-specific `ValueError` and are not clipped to one. The expanded
+context must remain within `trace_request_generator_config_max_tokens`.
+Context truncation and branching under one session ID are not supported.
+Request and batch metrics continue to report the materialized effective prompt
+length, not the raw incremental ISL from the CSV.
+
+KV cache state is local to each `(replica_id, dp_id)` target. When
+`num_replicas * data_parallel_size > 1`, Prefix Caching therefore requires a
+sticky cluster scheduler even if there is only one physical replica.
+In this release, `sticky_lor` is supported only for co-location /
+`MONOLITHIC`. Sequential PDD Prefix Caching must use
+`--cluster_scheduler_config_type sticky_round_robin`; `sticky_lor` is rejected
+during configuration validation.
+
+Run the public session fixture in co-location mode:
+
+```bash
+TRACE_FILE=examples/fixtures/session_prefix_multi_turn_trace.csv \
+PREFIX_CACHING_KEY_MODE=session \
+EXPECTED_TRACE_REQUESTS=4 \
+bash examples/architecture/co-location/online/moe_prefix_caching_online.sh
+```
+
+For offline mode, the prefix-cache recipe automatically enables
+`--offline_use_generated_request_arrivals` when
+`PREFIX_CACHING_KEY_MODE=session`. This prevents all turns from being forced to
+arrive at `t=0`.
+
+In co-location, full decode blocks may remain available for a later turn. In
+PDD, the prefill cache does not automatically receive decode output KV, so the
+first follow-up turn can only hit the prefix previously processed by the
+prefill cluster.
+
+When cluster event logging is enabled, scheduler diagnostics report
+`prefix_cache_admissions`, `prefix_cache_queries`, and `prefix_cache_hits` with
+`prefix_cache_metric_semantics=successful_admission_block_level`. These
+counters are committed only after allocation succeeds, so repeated lookup
+attempts caused by token-budget or allocation checks do not inflate them.
+For Thinking Mode, request CSV and `prefix_cache_statistics` accumulate cached
+tokens, query blocks, and hit blocks across hidden and final rounds.
+Preemption/re-admission inside one round restores runtime state without
+double-counting that round.
 
 ### Execution-time predictor
 

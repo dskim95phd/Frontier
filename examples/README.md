@@ -147,6 +147,8 @@ Single monolithic cluster handles all prefill and decode work. These examples ar
 
 - `--request_generator_config_type synthetic`: Generate requests from configured length and interval generators.
 - `--request_generator_config_type trace_replay`: Replay a CSV trace, used by Prefix Caching examples.
+- `--vllm_v1_scheduler_config_prefix_caching_key_mode block_hash`: Use explicit trace `block_hash_ids` for prefix identity.
+- `--vllm_v1_scheduler_config_prefix_caching_key_mode session`: Use `session_id` plus block position for append-only multi-turn prefix identity and interpret each trace ISL as newly added input tokens.
 - `--interval_generator_config_type`: `poisson`, `gamma`, `static`, or `trace`.
 - `--length_generator_config_type`: `fixed`, `uniform`, `zipf`, or `trace`.
 
@@ -172,6 +174,32 @@ PDD Thinking Mode can produce multiple prefill-to-decode handoffs for one user r
 Co-location examples also use dummy mode for quick testing without profiling data. These examples validate CLI/runtime plumbing and metrics artifact generation, not profiling fidelity. Use non-dummy profiling data before drawing hardware accuracy conclusions.
 
 Baseline co-location scripts default to `decode_cuda_graph_mode=full_decode_only` and Chunked Prefill. The Speculative Decoding / MTP recipes use `decode_cuda_graph_mode=none` because speculative decoding currently conflicts with decode CUDA Graph modeling. The Prefix Caching recipes replay `examples/fixtures/prefix_cache_shared_session_trace.csv` to exercise cache-hit behavior.
+
+The same Prefix Caching recipes support length-only session traces. For
+example:
+
+```bash
+TRACE_FILE=examples/fixtures/session_prefix_multi_turn_trace.csv \
+PREFIX_CACHING_KEY_MODE=session \
+EXPECTED_TRACE_REQUESTS=4 \
+bash examples/architecture/co-location/online/moe_prefix_caching_online.sh
+```
+
+Session mode treats each `num_prefill_tokens` value as the new input added by
+that turn. Frontier accumulates prior effective ISL, prior OSL, and the new ISL
+before constructing the request. Thinking round plans follow the same
+round-by-round incremental rule and use the same prefill/decode scale factors
+and `int(raw * factor)` conversion as the top-level row. Session arrivals must
+be finite and nonnegative, and token counts must remain finite and positive
+before and after scaling; invalid values fail instead of being clipped to one.
+The expanded context must remain within `max_tokens`; context truncation and
+branching under one session ID remain unsupported. Output request metrics
+report the materialized effective prompt length and accumulate prefix-cache
+query/hit totals across every Thinking round. Offline Prefix Caching recipes
+preserve trace arrival times
+automatically when session mode is selected. Sequential PDD Prefix Caching
+must use `sticky_round_robin`; this release supports `sticky_lor` only for
+co-location and rejects that combination before PDD execution starts.
 
 For production simulations, remove the dummy mode flag and ensure profiling data is available in `data/profiling/compute/<device>/<model>/`.
 

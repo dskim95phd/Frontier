@@ -73,6 +73,14 @@ class Request(BaseEntity):
         self._session_id = session_id
         self._cohort = cohort
         self._num_prefill_tokens_cached = 0
+        self._prefix_cache_query_blocks = 0
+        self._prefix_cache_hit_blocks = 0
+        self._prefix_cache_key_mode: Optional[str] = None
+        self._prefix_cache_lookup_recorded = False
+        self._total_num_prefill_tokens_cached = 0
+        self._total_prefix_cache_query_blocks = 0
+        self._total_prefix_cache_hit_blocks = 0
+        self._prefix_cache_metric_rounds_recorded: set[int] = set()
 
         # Multi-round scheduling support for pingpong-pipeline mode
         # Each cluster can have multiple scheduling rounds (for different layers)
@@ -497,6 +505,30 @@ class Request(BaseEntity):
         return self._num_prefill_tokens_cached
 
     @property
+    def prefix_cache_query_blocks(self) -> int:
+        return self._prefix_cache_query_blocks
+
+    @property
+    def prefix_cache_hit_blocks(self) -> int:
+        return self._prefix_cache_hit_blocks
+
+    @property
+    def prefix_cache_key_mode(self) -> Optional[str]:
+        return self._prefix_cache_key_mode
+
+    @property
+    def total_num_prefill_tokens_cached(self) -> int:
+        return self._total_num_prefill_tokens_cached
+
+    @property
+    def total_prefix_cache_query_blocks(self) -> int:
+        return self._total_prefix_cache_query_blocks
+
+    @property
+    def total_prefix_cache_hit_blocks(self) -> int:
+        return self._total_prefix_cache_hit_blocks
+
+    @property
     def is_prefill_complete(self) -> bool:
         return self._is_prefill_complete
 
@@ -513,6 +545,66 @@ class Request(BaseEntity):
             )
         self._num_processed_tokens = int(num_tokens_cached)
         self._num_prefill_tokens_cached = int(num_tokens_cached)
+        if (
+            self._current_thinking_round_index
+            not in self._prefix_cache_metric_rounds_recorded
+        ):
+            self._total_num_prefill_tokens_cached += int(num_tokens_cached)
+            self._prefix_cache_metric_rounds_recorded.add(
+                self._current_thinking_round_index
+            )
+
+    def on_prefix_cache_lookup(
+        self,
+        *,
+        query_blocks: int,
+        hit_blocks: int,
+        num_tokens_cached: int,
+        key_mode: str,
+    ) -> None:
+        if query_blocks < 0:
+            raise ValueError(
+                f"Invalid prefix cache query block count: {query_blocks}"
+            )
+        if hit_blocks < 0 or hit_blocks > query_blocks:
+            raise ValueError(
+                "Invalid prefix cache hit block count: "
+                f"hits={hit_blocks}, queries={query_blocks}"
+            )
+
+        # Runtime restoration is admission-scoped and must happen again after
+        # preemption resets the request's processed-token frontier. Metrics,
+        # however, describe the request's first lookup and are recorded once.
+        if num_tokens_cached < 0 or num_tokens_cached > self._num_prefill_tokens:
+            raise ValueError(
+                f"Invalid cached token count for request {self._id}: "
+                f"{num_tokens_cached}"
+            )
+        if self._num_processed_tokens != 0:
+            raise ValueError(
+                f"Request {self._id} already has processed tokens: "
+                f"{self._num_processed_tokens}"
+            )
+        self._num_processed_tokens = int(num_tokens_cached)
+
+        if self._prefix_cache_lookup_recorded:
+            return
+
+        self._prefix_cache_query_blocks = int(query_blocks)
+        self._prefix_cache_hit_blocks = int(hit_blocks)
+        self._prefix_cache_key_mode = str(key_mode)
+        self._num_prefill_tokens_cached = int(num_tokens_cached)
+        self._prefix_cache_lookup_recorded = True
+        if (
+            self._current_thinking_round_index
+            not in self._prefix_cache_metric_rounds_recorded
+        ):
+            self._total_prefix_cache_query_blocks += int(query_blocks)
+            self._total_prefix_cache_hit_blocks += int(hit_blocks)
+            self._total_num_prefill_tokens_cached += int(num_tokens_cached)
+            self._prefix_cache_metric_rounds_recorded.add(
+                self._current_thinking_round_index
+            )
 
     # Preemption tracking accessor methods
     def get_preemption_count(self, cluster_type: ClusterType) -> int:
@@ -1754,6 +1846,18 @@ class Request(BaseEntity):
             "completed_thinking_rounds": self._completed_thinking_rounds,
             "num_processed_tokens": self._num_processed_tokens,
             "num_prefill_tokens_cached": self._num_prefill_tokens_cached,
+            "prefix_cache_query_blocks": self._prefix_cache_query_blocks,
+            "prefix_cache_hit_blocks": self._prefix_cache_hit_blocks,
+            "prefix_cache_key_mode": self._prefix_cache_key_mode,
+            "total_num_prefill_tokens_cached": (
+                self._total_num_prefill_tokens_cached
+            ),
+            "total_prefix_cache_query_blocks": (
+                self._total_prefix_cache_query_blocks
+            ),
+            "total_prefix_cache_hit_blocks": (
+                self._total_prefix_cache_hit_blocks
+            ),
             "block_hash_ids": self._block_hash_ids,
             "session_id": self._session_id,
             "cohort": self._cohort,
@@ -1842,6 +1946,10 @@ class Request(BaseEntity):
         self._kv_cache_transfer_start_time = None
         self._kv_cache_transfer_end_time = None
         self._num_prefill_tokens_cached = 0
+        self._prefix_cache_query_blocks = 0
+        self._prefix_cache_hit_blocks = 0
+        self._prefix_cache_key_mode = None
+        self._prefix_cache_lookup_recorded = False
 
         self._scheduled = False
         self._preempted = False
@@ -1932,6 +2040,10 @@ class Request(BaseEntity):
     def _reset_runtime_state_for_next_thinking_round(self) -> None:
         self._num_processed_tokens = 0
         self._num_prefill_tokens_cached = 0
+        self._prefix_cache_query_blocks = 0
+        self._prefix_cache_hit_blocks = 0
+        self._prefix_cache_key_mode = None
+        self._prefix_cache_lookup_recorded = False
         self._completed_at = 0
         self._prefill_completed_at = 0
         self._latest_stage_scheduled_at = 0
