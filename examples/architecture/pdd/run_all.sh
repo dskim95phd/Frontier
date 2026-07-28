@@ -18,11 +18,13 @@ CASES=(
   "offline/thinking_mode_basic.sh"
   "offline/moe_spec_dec.sh"
   "offline/moe_prefix_caching.sh"
+  "offline/cpu_kv_offloading.sh"
   "online/dense_model_basic_online.sh"
   "online/moe_model_basic_online.sh"
   "online/thinking_mode_basic_online.sh"
   "online/moe_spec_dec_online.sh"
   "online/moe_prefix_caching_online.sh"
+  "online/cpu_kv_offloading_online.sh"
 )
 
 EXTRA_ARGS=()

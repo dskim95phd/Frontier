@@ -81,6 +81,22 @@ class Request(BaseEntity):
         self._total_prefix_cache_query_blocks = 0
         self._total_prefix_cache_hit_blocks = 0
         self._prefix_cache_metric_rounds_recorded: set[int] = set()
+        self._gpu_prefix_cache_hit_blocks = 0
+        self._cpu_prefix_cache_query_blocks = 0
+        self._cpu_prefix_cache_hit_blocks = 0
+        self._cpu_prefix_cache_restored_blocks = 0
+        self._cpu_prefix_cache_restored_tokens = 0
+        self._total_gpu_prefix_cache_hit_blocks = 0
+        self._total_cpu_prefix_cache_query_blocks = 0
+        self._total_cpu_prefix_cache_hit_blocks = 0
+        self._total_cpu_prefix_cache_restored_blocks = 0
+        self._total_cpu_prefix_cache_restored_tokens = 0
+        self._cpu_kv_cache_restore_bytes = 0
+        self._cpu_kv_cache_restore_queue_time = 0.0
+        self._cpu_kv_cache_restore_transfer_time = 0.0
+        self._cpu_kv_cache_offload_bytes = 0
+        self._cpu_kv_cache_offload_queue_time = 0.0
+        self._cpu_kv_cache_offload_transfer_time = 0.0
 
         # Multi-round scheduling support for pingpong-pipeline mode
         # Each cluster can have multiple scheduling rounds (for different layers)
@@ -529,6 +545,77 @@ class Request(BaseEntity):
         return self._total_prefix_cache_hit_blocks
 
     @property
+    def gpu_prefix_cache_hit_blocks(self) -> int:
+        return self._gpu_prefix_cache_hit_blocks
+
+    @property
+    def cpu_prefix_cache_hit_blocks(self) -> int:
+        return self._cpu_prefix_cache_hit_blocks
+
+    @property
+    def cpu_prefix_cache_query_blocks(self) -> int:
+        return self._cpu_prefix_cache_query_blocks
+
+    @property
+    def cpu_prefix_cache_restored_blocks(self) -> int:
+        return self._cpu_prefix_cache_restored_blocks
+
+    @property
+    def cpu_prefix_cache_restored_tokens(self) -> int:
+        return self._cpu_prefix_cache_restored_tokens
+
+    @property
+    def total_gpu_prefix_cache_hit_blocks(self) -> int:
+        return self._total_gpu_prefix_cache_hit_blocks
+
+    @property
+    def total_cpu_prefix_cache_query_blocks(self) -> int:
+        return self._total_cpu_prefix_cache_query_blocks
+
+    @property
+    def total_cpu_prefix_cache_hit_blocks(self) -> int:
+        return self._total_cpu_prefix_cache_hit_blocks
+
+    @property
+    def total_cpu_prefix_cache_restored_blocks(self) -> int:
+        return self._total_cpu_prefix_cache_restored_blocks
+
+    @property
+    def total_cpu_prefix_cache_restored_tokens(self) -> int:
+        return self._total_cpu_prefix_cache_restored_tokens
+
+    @property
+    def cpu_kv_cache_restore_bytes(self) -> int:
+        return self._cpu_kv_cache_restore_bytes
+
+    @property
+    def cpu_kv_cache_restore_queue_time(self) -> float:
+        return self._cpu_kv_cache_restore_queue_time
+
+    @property
+    def cpu_kv_cache_restore_transfer_time(self) -> float:
+        return self._cpu_kv_cache_restore_transfer_time
+
+    @property
+    def cpu_kv_cache_offload_bytes(self) -> int:
+        return self._cpu_kv_cache_offload_bytes
+
+    @property
+    def cpu_kv_cache_offload_queue_time(self) -> float:
+        return self._cpu_kv_cache_offload_queue_time
+
+    @property
+    def cpu_kv_cache_offload_transfer_time(self) -> float:
+        return self._cpu_kv_cache_offload_transfer_time
+
+    @property
+    def prefix_cache_metrics_recorded_for_current_round(self) -> bool:
+        return (
+            self._current_thinking_round_index
+            in self._prefix_cache_metric_rounds_recorded
+        )
+
+    @property
     def is_prefill_complete(self) -> bool:
         return self._is_prefill_complete
 
@@ -592,6 +679,10 @@ class Request(BaseEntity):
 
         self._prefix_cache_query_blocks = int(query_blocks)
         self._prefix_cache_hit_blocks = int(hit_blocks)
+        # A non-tiered lookup is entirely GPU-resident. Tiered callers
+        # correct this provisional classification below after the common
+        # aggregate accounting has run.
+        self._gpu_prefix_cache_hit_blocks = int(hit_blocks)
         self._prefix_cache_key_mode = str(key_mode)
         self._num_prefill_tokens_cached = int(num_tokens_cached)
         self._prefix_cache_lookup_recorded = True
@@ -601,10 +692,86 @@ class Request(BaseEntity):
         ):
             self._total_prefix_cache_query_blocks += int(query_blocks)
             self._total_prefix_cache_hit_blocks += int(hit_blocks)
+            self._total_gpu_prefix_cache_hit_blocks += int(hit_blocks)
             self._total_num_prefill_tokens_cached += int(num_tokens_cached)
             self._prefix_cache_metric_rounds_recorded.add(
                 self._current_thinking_round_index
             )
+
+    def on_tiered_prefix_cache_lookup(
+        self,
+        *,
+        query_blocks: int,
+        gpu_hit_blocks: int,
+        cpu_query_blocks: int,
+        cpu_hit_blocks: int,
+        num_tokens_cached: int,
+        key_mode: str,
+    ) -> None:
+        total_hit_blocks = int(gpu_hit_blocks) + int(cpu_hit_blocks)
+        if gpu_hit_blocks < 0 or cpu_hit_blocks < 0 or cpu_query_blocks < 0:
+            raise ValueError("Tiered prefix-cache hit counts must be nonnegative")
+        if cpu_hit_blocks > cpu_query_blocks:
+            raise ValueError(
+                "CPU prefix-cache hits cannot exceed CPU queries: "
+                f"hits={cpu_hit_blocks}, queries={cpu_query_blocks}"
+            )
+        was_recorded = self._prefix_cache_lookup_recorded
+        round_index = self._current_thinking_round_index
+        round_was_recorded = round_index in self._prefix_cache_metric_rounds_recorded
+        self.on_prefix_cache_lookup(
+            query_blocks=int(query_blocks),
+            hit_blocks=total_hit_blocks,
+            num_tokens_cached=int(num_tokens_cached),
+            key_mode=key_mode,
+        )
+        if was_recorded:
+            return
+        self._gpu_prefix_cache_hit_blocks = int(gpu_hit_blocks)
+        self._cpu_prefix_cache_query_blocks = int(cpu_query_blocks)
+        self._cpu_prefix_cache_hit_blocks = int(cpu_hit_blocks)
+        if not round_was_recorded:
+            # on_prefix_cache_lookup provisionally counted every hit as GPU.
+            self._total_gpu_prefix_cache_hit_blocks += (
+                int(gpu_hit_blocks) - total_hit_blocks
+            )
+            self._total_cpu_prefix_cache_query_blocks += int(cpu_query_blocks)
+            self._total_cpu_prefix_cache_hit_blocks += int(cpu_hit_blocks)
+
+    def on_cpu_kv_cache_restore(
+        self,
+        *,
+        restored_blocks: int,
+        restored_tokens: int,
+        size_bytes: int,
+        queue_time_ms: float,
+        transfer_time_ms: float,
+    ) -> None:
+        self._cpu_prefix_cache_restored_blocks += int(restored_blocks)
+        self._cpu_prefix_cache_restored_tokens += int(restored_tokens)
+        self._total_cpu_prefix_cache_restored_blocks += int(restored_blocks)
+        self._total_cpu_prefix_cache_restored_tokens += int(restored_tokens)
+        self._cpu_kv_cache_restore_bytes += int(size_bytes)
+        # Request time metrics are held in seconds and converted to
+        # milliseconds together with the other request-latency columns when
+        # request_metrics.csv is written.
+        self._cpu_kv_cache_restore_queue_time += float(queue_time_ms) * 1e-3
+        self._cpu_kv_cache_restore_transfer_time += (
+            float(transfer_time_ms) * 1e-3
+        )
+
+    def on_cpu_kv_cache_offload(
+        self,
+        *,
+        size_bytes: int,
+        queue_time_ms: float,
+        transfer_time_ms: float,
+    ) -> None:
+        self._cpu_kv_cache_offload_bytes += int(size_bytes)
+        self._cpu_kv_cache_offload_queue_time += float(queue_time_ms) * 1e-3
+        self._cpu_kv_cache_offload_transfer_time += (
+            float(transfer_time_ms) * 1e-3
+        )
 
     # Preemption tracking accessor methods
     def get_preemption_count(self, cluster_type: ClusterType) -> int:
@@ -1858,6 +2025,44 @@ class Request(BaseEntity):
             "total_prefix_cache_hit_blocks": (
                 self._total_prefix_cache_hit_blocks
             ),
+            "gpu_prefix_cache_hit_blocks": self._gpu_prefix_cache_hit_blocks,
+            "cpu_prefix_cache_query_blocks": self._cpu_prefix_cache_query_blocks,
+            "cpu_prefix_cache_hit_blocks": self._cpu_prefix_cache_hit_blocks,
+            "cpu_prefix_cache_restored_blocks": (
+                self._cpu_prefix_cache_restored_blocks
+            ),
+            "cpu_prefix_cache_restored_tokens": (
+                self._cpu_prefix_cache_restored_tokens
+            ),
+            "total_gpu_prefix_cache_hit_blocks": (
+                self._total_gpu_prefix_cache_hit_blocks
+            ),
+            "total_cpu_prefix_cache_query_blocks": (
+                self._total_cpu_prefix_cache_query_blocks
+            ),
+            "total_cpu_prefix_cache_hit_blocks": (
+                self._total_cpu_prefix_cache_hit_blocks
+            ),
+            "total_cpu_prefix_cache_restored_blocks": (
+                self._total_cpu_prefix_cache_restored_blocks
+            ),
+            "total_cpu_prefix_cache_restored_tokens": (
+                self._total_cpu_prefix_cache_restored_tokens
+            ),
+            "cpu_kv_cache_restore_bytes": self._cpu_kv_cache_restore_bytes,
+            "cpu_kv_cache_restore_queue_time": (
+                self._cpu_kv_cache_restore_queue_time
+            ),
+            "cpu_kv_cache_restore_transfer_time": (
+                self._cpu_kv_cache_restore_transfer_time
+            ),
+            "cpu_kv_cache_offload_bytes": self._cpu_kv_cache_offload_bytes,
+            "cpu_kv_cache_offload_queue_time": (
+                self._cpu_kv_cache_offload_queue_time
+            ),
+            "cpu_kv_cache_offload_transfer_time": (
+                self._cpu_kv_cache_offload_transfer_time
+            ),
             "block_hash_ids": self._block_hash_ids,
             "session_id": self._session_id,
             "cohort": self._cohort,
@@ -1950,6 +2155,11 @@ class Request(BaseEntity):
         self._prefix_cache_hit_blocks = 0
         self._prefix_cache_key_mode = None
         self._prefix_cache_lookup_recorded = False
+        self._gpu_prefix_cache_hit_blocks = 0
+        self._cpu_prefix_cache_query_blocks = 0
+        self._cpu_prefix_cache_hit_blocks = 0
+        self._cpu_prefix_cache_restored_blocks = 0
+        self._cpu_prefix_cache_restored_tokens = 0
 
         self._scheduled = False
         self._preempted = False
@@ -2044,6 +2254,11 @@ class Request(BaseEntity):
         self._prefix_cache_hit_blocks = 0
         self._prefix_cache_key_mode = None
         self._prefix_cache_lookup_recorded = False
+        self._gpu_prefix_cache_hit_blocks = 0
+        self._cpu_prefix_cache_query_blocks = 0
+        self._cpu_prefix_cache_hit_blocks = 0
+        self._cpu_prefix_cache_restored_blocks = 0
+        self._cpu_prefix_cache_restored_tokens = 0
         self._completed_at = 0
         self._prefill_completed_at = 0
         self._latest_stage_scheduled_at = 0

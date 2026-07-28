@@ -15,6 +15,18 @@ from frontier.events.cluster_batch_end_event import ClusterBatchEndEvent
 from frontier.events.global_batch_end_event import GlobalBatchEndEvent
 from frontier.events.kv_cache_transfer_end_event import KVCacheTransferEndEvent
 from frontier.events.kv_cache_transfer_start_event import KVCacheTransferStartEvent
+from frontier.events.cpu_kv_cache_restore_start_event import (
+    CPUKVCacheRestoreStartEvent,
+)
+from frontier.events.cpu_kv_cache_restore_end_event import (
+    CPUKVCacheRestoreEndEvent,
+)
+from frontier.events.cpu_kv_cache_offload_start_event import (
+    CPUKVCacheOffloadStartEvent,
+)
+from frontier.events.cpu_kv_cache_offload_end_event import (
+    CPUKVCacheOffloadEndEvent,
+)
 from frontier.events.thinking_round_requeue_event import ThinkingRoundRequeueEvent
 
 
@@ -36,5 +48,9 @@ __all__ = [
     "GlobalBatchEndEvent",
     "KVCacheTransferEndEvent",
     "KVCacheTransferStartEvent",
+    "CPUKVCacheRestoreStartEvent",
+    "CPUKVCacheRestoreEndEvent",
+    "CPUKVCacheOffloadStartEvent",
+    "CPUKVCacheOffloadEndEvent",
     "ThinkingRoundRequeueEvent",
 ]

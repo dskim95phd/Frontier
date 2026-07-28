@@ -512,3 +512,19 @@ def test_session_prefix_cache_rejects_nonfinite_or_nonpositive_trace_values(
 def test_prefix_cache_key_mode_validation() -> None:
     with pytest.raises(ValueError, match="prefix_caching_key_mode"):
         VllmV1SchedulerConfig(prefix_caching_key_mode="unknown")
+
+
+@pytest.mark.parametrize(
+    "kv_cache_dtype",
+    ["auto", "fp32", "fp16", "bf16", "fp8", "int8", "fp4", "int4"],
+)
+def test_vllm_v1_accepts_supported_kv_cache_dtypes(
+    kv_cache_dtype: str,
+) -> None:
+    config = VllmV1SchedulerConfig(kv_cache_dtype=kv_cache_dtype)
+    assert config.kv_cache_dtype == kv_cache_dtype
+
+
+def test_vllm_v1_rejects_unknown_kv_cache_dtype() -> None:
+    with pytest.raises(ValueError, match="Unsupported precision type"):
+        VllmV1SchedulerConfig(kv_cache_dtype="fp3")

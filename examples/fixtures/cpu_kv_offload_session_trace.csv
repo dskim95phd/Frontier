@@ -1,0 +1,7 @@
+arrived_at,num_prefill_tokens,num_decode_tokens,session_id
+0.0,32,16,7
+1.0,32,16,8
+2.0,32,16,9
+100.0,16,8,7
+101.0,16,8,8
+102.0,16,8,9

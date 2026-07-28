@@ -246,6 +246,45 @@ PDD, the prefill cache does not automatically receive decode output KV, so the
 first follow-up turn can only hit the prefix previously processed by the
 prefill cluster.
 
+Prefill-side CPU KV-cache offloading extends that PDD behavior without
+changing the decode boundary:
+
+```bash
+bash examples/architecture/pdd/offline/cpu_kv_offloading.sh
+bash examples/architecture/pdd/online/cpu_kv_offloading_online.sh
+```
+
+The feature requires sequential `pd-disaggregation`, `vllm_v1`,
+`sticky_round_robin`, `enable_prefix_caching`, and
+`prefix_caching_key_mode=session`; Thinking Mode is rejected for this MVP.
+Full blocks produced by prefill are copied
+to the local CPU tier with direction-specific analytical bandwidth and
+latency. Decode-produced KV is not copied back; those tokens are recomputed
+by the next turn's prefill and only then can join a later CPU snapshot.
+
+`capacity_bytes` is the aggregate capacity of one prefill
+`(replica_id, dp_id)` target, not a per-GPU value. Its block accounting sums
+the physical KV shards of all attention TP workers in that target. The
+configured read/write bandwidths are likewise aggregate effective bandwidths
+for the target. `--vllm_v1_scheduler_config_kv_cache_dtype` controls the
+canonical GPU/CPU KV precision; `auto` follows the model `torch_dtype`.
+
+Relevant flat CLI fields are
+`--cpu_kv_cache_config_enable`,
+`--cpu_kv_cache_config_capacity_bytes`,
+`--cpu_kv_cache_config_write_bandwidth_gbps`,
+`--cpu_kv_cache_config_write_latency_ms`,
+`--cpu_kv_cache_config_read_bandwidth_gbps`,
+`--cpu_kv_cache_config_read_latency_ms`, and
+`--cpu_kv_cache_config_capacity_pressure_policy`. KV precision is selected
+with `--vllm_v1_scheduler_config_kv_cache_dtype` using `auto`, `fp32`,
+`fp16`, `bf16`, `fp8`, `int8`, `fp4`, or `int4`.
+
+Request metrics distinguish GPU hits, CPU queries/hits/restores, and
+D2H/H2D byte and time costs. `system_metrics.json` includes a separate
+`cpu_kv_cache_statistics` object for capacity, occupancy, eviction,
+offload/restore, and CPU hit information.
+
 When cluster event logging is enabled, scheduler diagnostics report
 `prefix_cache_admissions`, `prefix_cache_queries`, and `prefix_cache_hits` with
 `prefix_cache_metric_semantics=successful_admission_block_level`. These

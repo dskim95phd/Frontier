@@ -1,8 +1,10 @@
+from math import ceil
 from typing import Optional
 
 from frontier.attention.memory import get_attention_runtime_kv_layout
 from frontier.attention.model_binding import bind_attention_family
 from frontier.config import ReplicaConfig
+from frontier.config.precision_type import PrecisionType
 from frontier.errors import FrontierMemoryOOMError
 from frontier.entities.replica import Replica
 from frontier.spec_decode import method_uses_lookahead_slots
@@ -16,10 +18,16 @@ class MemoryPlanner:
         replica_config: ReplicaConfig,
         replica: Replica,
         cluster_type: ClusterType = None,
+        kv_cache_dtype: str = "auto",
     ) -> None:
         self._replica_config = replica_config
         self._replica = replica
         self._cluster_type = cluster_type
+        self._kv_cache_precision = (
+            replica_config.model_config.get_default_precision()
+            if str(kv_cache_dtype).lower() == "auto"
+            else PrecisionType.from_string(str(kv_cache_dtype))
+        )
 
         self._param_counter = ParamCounter(
             replica_config=replica_config,
@@ -84,11 +92,19 @@ class MemoryPlanner:
         if self._cluster_type == ClusterType.DECODE_FFN:
             return 0
 
-        return (
-            2  # 2 bytes per fp16/bf16 element
+        return ceil(
+            self._get_kv_cache_bytes_per_element()
             * self._get_kv_cache_elements_per_token_per_worker()
             * self._replica.max_request_tokens
         )
+
+    def _get_kv_cache_bytes_per_element(self) -> float:
+        precision = getattr(
+            self,
+            "_kv_cache_precision",
+            PrecisionType.FP16,
+        )
+        return float(precision.bytes_per_element)
 
     def _get_kv_cache_elements_per_token_per_worker(self) -> int:
         if self._cluster_type == ClusterType.DECODE_FFN:
@@ -101,6 +117,7 @@ class MemoryPlanner:
                 self._replica.kv_heads_per_tensor_parallel_worker
             ),
             runtime_head_size=self._replica.attention_head_dim,
+            bytes_per_element=self._get_kv_cache_bytes_per_element(),
         )
         return layout.elements_per_token_per_worker
 
@@ -109,10 +126,28 @@ class MemoryPlanner:
         if self._cluster_type == ClusterType.DECODE_FFN:
             return 0
 
-        return (
-            2  # 2 bytes per fp16/bf16 element
+        return ceil(
+            self._get_kv_cache_bytes_per_element()
             * block_size
             * self._get_kv_cache_elements_per_token_per_worker()
+        )
+
+    def get_kv_cache_memory_per_block_bytes(self, block_size: int) -> int:
+        """Return the canonical per-worker bytes for one logical KV block."""
+        page_size = self._get_kv_cache_memory_per_layer_per_block(block_size)
+        return int(page_size * self._replica.num_layers)
+
+    def get_cpu_kv_cache_memory_per_block_bytes(self, block_size: int) -> int:
+        """Return aggregate KV bytes for one (replica, DP) CPU cache target.
+
+        A CPU manager is shared by all attention TP workers in one DP lane.
+        The per-worker size already spans all model layers, including layers
+        distributed across PP stages, so only the attention TP width is
+        aggregated here.
+        """
+        return int(
+            self.get_kv_cache_memory_per_block_bytes(block_size)
+            * self._replica.num_attn_tensor_parallel_workers
         )
 
     def _get_parameter_memory_per_device(self) -> int:

@@ -14,6 +14,8 @@ from frontier.config.kv_cache_transfer_config import (
     BaseKVCacheTransferConfig,
     AnalyticalKVCacheTransferConfig,
 )
+from frontier.config.cpu_kv_cache_config import CPUKVCacheConfig
+from frontier.config.precision_type import PrecisionType
 from frontier.config.m2n_transfer_config import (
     BaseM2NTransferConfig,
     AnalyticalM2NTransferConfig,
@@ -561,6 +563,25 @@ class VllmV1SchedulerConfig(BaseReplicaSchedulerConfig):
             "help": "Enable prefix matching and KV cache reuse."
         },
     )
+    kv_cache_dtype: str = field(
+        default="auto",
+        metadata={
+            "help": (
+                "Runtime KV-cache dtype used for GPU capacity and CPU "
+                "offload sizing. 'auto' follows the model torch_dtype."
+            ),
+            "choices": [
+                "auto",
+                "fp32",
+                "fp16",
+                "bf16",
+                "fp8",
+                "int8",
+                "fp4",
+                "int4",
+            ],
+        },
+    )
     prefix_caching_key_mode: str = field(
         default="block_hash",
         metadata={
@@ -684,6 +705,8 @@ class VllmV1SchedulerConfig(BaseReplicaSchedulerConfig):
     )
 
     def __post_init__(self) -> None:
+        if self.kv_cache_dtype != "auto":
+            PrecisionType.from_string(self.kv_cache_dtype)
         allowed_modes = {"memory_planner", "memory_planner_profiled", "explicit"}
         if self.num_blocks_mode not in allowed_modes:
             raise ValueError(
@@ -5801,6 +5824,12 @@ class SimulationConfig(ABC):
         default_factory=AnalyticalKVCacheTransferConfig,
         metadata={"help": "KV cache transfer predictor config."},
     )
+    cpu_kv_cache_config: CPUKVCacheConfig = field(
+        default_factory=CPUKVCacheConfig,
+        metadata={
+            "help": "Prefill-side CPU KV-cache offloading configuration."
+        },
+    )
     m2n_transfer_config: BaseM2NTransferConfig = field(
         default_factory=AnalyticalM2NTransferConfig,
         metadata={
@@ -5931,6 +5960,7 @@ class SimulationConfig(ABC):
             )
 
         self._validate_simulation_mode_arch_compatibility()
+        self._validate_cpu_kv_cache_config()
         self._validate_thinking_mode_config()
         self._validate_sequential_checkpoint_observer_config()
         self._validate_monolithic_moe_stage_aggregation_config()
@@ -6057,6 +6087,71 @@ class SimulationConfig(ABC):
                 "supported only for 'co-location' and 'pd-disaggregation'. "
                 "Please use simulation_mode='offline' for "
                 "'pd-af-disaggregation'."
+            )
+
+    def _validate_cpu_kv_cache_config(self) -> None:
+        config = self.cpu_kv_cache_config
+        if not config.enable:
+            return
+        if self.sys_arch != "pd-disaggregation":
+            raise ValueError(
+                "CPU KV-cache offloading MVP requires "
+                "sys_arch='pd-disaggregation'."
+            )
+        if self.enable_parallel_clusters:
+            raise ValueError(
+                "CPU KV-cache offloading MVP requires sequential PDD with "
+                "enable_parallel_clusters=False."
+            )
+        if self.enable_thinking_mode:
+            raise ValueError(
+                "CPU KV-cache offloading MVP does not support Thinking Mode. "
+                "Overlapping prefill export generations for one Request require "
+                "an epoch-scoped export barrier."
+            )
+
+        cluster_scheduler_type = self.cluster_config.cluster_scheduler_config.get_type()
+        if cluster_scheduler_type != ClusterSchedulerType.STICKY_ROUND_ROBIN:
+            raise ValueError(
+                "CPU KV-cache offloading requires "
+                "cluster_scheduler_config_type=sticky_round_robin."
+            )
+
+        replica_scheduler_config = self.cluster_config.replica_scheduler_config
+        prefill_override = (
+            self.cluster_config.prefill_replica_scheduler_config_type
+        )
+        if prefill_override is not None:
+            is_vllm_v1 = str(prefill_override).lower() == "vllm_v1"
+        else:
+            is_vllm_v1 = (
+                replica_scheduler_config.get_type()
+                == ReplicaSchedulerType.VLLM_V1
+            )
+        if not is_vllm_v1:
+            raise ValueError(
+                "CPU KV-cache offloading MVP requires the vllm_v1 prefill "
+                "replica scheduler."
+            )
+        if not bool(
+            getattr(replica_scheduler_config, "enable_prefix_caching", False)
+        ):
+            raise ValueError(
+                "CPU KV-cache offloading requires enable_prefix_caching=True."
+            )
+        if (
+            str(
+                getattr(
+                    replica_scheduler_config,
+                    "prefix_caching_key_mode",
+                    "block_hash",
+                )
+            )
+            != "session"
+        ):
+            raise ValueError(
+                "CPU KV-cache offloading requires "
+                "prefix_caching_key_mode='session'."
             )
 
     def _validate_monolithic_moe_stage_aggregation_config(self) -> None:

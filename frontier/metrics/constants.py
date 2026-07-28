@@ -213,6 +213,20 @@ class RequestMetricsTimeDistributions(enum.Enum):
     CLUSTER_DECODE_FFN_E2E_TIME = "cluster_decode_ffn_e2e_time"  # DECODE_FFN request residence: (A→F end) to (F→A start)
 
 
+    REQUEST_CPU_KV_CACHE_RESTORE_QUEUE_TIME = (
+        "request_cpu_kv_cache_restore_queue_time"
+    )
+    REQUEST_CPU_KV_CACHE_RESTORE_TRANSFER_TIME = (
+        "request_cpu_kv_cache_restore_transfer_time"
+    )
+    REQUEST_CPU_KV_CACHE_OFFLOAD_QUEUE_TIME = (
+        "request_cpu_kv_cache_offload_queue_time"
+    )
+    REQUEST_CPU_KV_CACHE_OFFLOAD_TRANSFER_TIME = (
+        "request_cpu_kv_cache_offload_transfer_time"
+    )
+
+
 class TokenMetricsTimeDistribution(enum.Enum):
     DECODE_TOKEN_EXECUTION_PLUS_PREMPTION_TIME = (
         "decode_token_execution_plus_preemption_time"
@@ -228,6 +242,17 @@ class RequestMetricsHistogram(enum.Enum):
     REQUEST_CACHED_PREFILL_TOKENS = "request_cached_prefill_tokens"
     REQUEST_PREFIX_CACHE_QUERY_BLOCKS = "request_prefix_cache_query_blocks"
     REQUEST_PREFIX_CACHE_HIT_BLOCKS = "request_prefix_cache_hit_blocks"
+    REQUEST_GPU_PREFIX_CACHE_HIT_BLOCKS = "request_gpu_prefix_cache_hit_blocks"
+    REQUEST_CPU_PREFIX_CACHE_QUERY_BLOCKS = "request_cpu_prefix_cache_query_blocks"
+    REQUEST_CPU_PREFIX_CACHE_HIT_BLOCKS = "request_cpu_prefix_cache_hit_blocks"
+    REQUEST_CPU_PREFIX_CACHE_RESTORED_BLOCKS = (
+        "request_cpu_prefix_cache_restored_blocks"
+    )
+    REQUEST_CPU_PREFIX_CACHE_RESTORED_TOKENS = (
+        "request_cpu_prefix_cache_restored_tokens"
+    )
+    REQUEST_CPU_KV_CACHE_RESTORE_BYTES = "request_cpu_kv_cache_restore_bytes"
+    REQUEST_CPU_KV_CACHE_OFFLOAD_BYTES = "request_cpu_kv_cache_offload_bytes"
     REQUEST_NUM_RESTARTS = "request_num_restarts"
     REQUEST_THINKING_ROUND_COUNT = "request_thinking_round_count"
     REQUEST_SESSION_ID = "request_session_id"

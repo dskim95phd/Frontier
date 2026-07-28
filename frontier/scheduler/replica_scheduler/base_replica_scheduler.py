@@ -6,6 +6,7 @@ from frontier.config import (
     BaseRequestGeneratorConfig,
     ReplicaConfig,
 )
+from frontier.config.cpu_kv_cache_config import CPUKVCacheConfig
 from frontier.config.config import DISAGGREGATED_ARCHITECTURE_RELEASE_ERROR
 from frontier.errors import FrontierMemoryOOMError
 from frontier.entities import Batch, Replica, Request
@@ -33,7 +34,8 @@ class BaseReplicaScheduler(ABC):
         cluster_type: ClusterType = None,
         dp_id: int = None,
         af_pipeline_num_micro_batch: int = -1,
-        cluster_scheduler = None
+        cluster_scheduler=None,
+        cpu_kv_cache_config: CPUKVCacheConfig | None = None,
     ) -> None:
         self._config = replica_scheduler_config
         self._replica_config = replica_config
@@ -47,6 +49,7 @@ class BaseReplicaScheduler(ABC):
         self._dp_id = dp_id
         self._af_pipeline_num_micro_batch = af_pipeline_num_micro_batch
         self._cluster_scheduler = cluster_scheduler
+        self._cpu_kv_cache_config = cpu_kv_cache_config
 
         self._max_blocks_per_sequence = (
             self._request_generator_config.max_tokens // self._config.block_size
@@ -56,6 +59,19 @@ class BaseReplicaScheduler(ABC):
             replica_config=self._replica_config,
             replica=replica,
             cluster_type=self._cluster_type,
+            kv_cache_dtype=str(
+                getattr(self._config, "kv_cache_dtype", "auto")
+            ),
+        )
+        self._kv_cache_bytes_per_block = (
+            memory_planner.get_kv_cache_memory_per_block_bytes(
+                int(self._config.block_size)
+            )
+        )
+        self._cpu_kv_cache_bytes_per_block = (
+            memory_planner.get_cpu_kv_cache_memory_per_block_bytes(
+                int(self._config.block_size)
+            )
         )
 
         num_blocks_mode = getattr(self._config, "num_blocks_mode", "memory_planner")

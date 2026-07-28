@@ -101,6 +101,19 @@ class KVCacheManager:
         num_prompt_blocks = int(request.num_prefill_tokens) // self.block_size
         return self._get_session_block_keys(request, num_prompt_blocks)
 
+    def get_request_lookup_block_keys(
+        self, request: Request
+    ) -> list[Hashable]:
+        """Return the full prompt lookup-key sequence for tiered planning."""
+        return self._get_request_lookup_block_keys(request)
+
+    def get_cached_block_for_key(
+        self, block_key: Hashable
+    ) -> Optional[KVCacheBlock]:
+        if not self.enable_caching:
+            return None
+        return self.block_pool.get_cached_block(block_key)
+
     def _get_num_request_storage_block_keys(
         self,
         request: Request,
@@ -247,6 +260,108 @@ class KVCacheManager:
         # Prefix blocks returned by get_computed_blocks() are already ready.
         self.num_cached_blocks.setdefault(request.id, len(computed_blocks))
         return new_blocks
+
+    def can_reserve_tiered_prefix(
+        self,
+        *,
+        gpu_blocks_by_index: dict[int, KVCacheBlock],
+        cpu_restore_count: int,
+        suffix_reservation_count: int = 0,
+        minimum_free_blocks_after_reservation: int = 0,
+    ) -> bool:
+        """Return whether a mixed GPU/CPU prefix can be pinned and reserved."""
+        if cpu_restore_count < 0:
+            raise ValueError("cpu_restore_count must be >= 0")
+        if suffix_reservation_count < 0:
+            raise ValueError("suffix_reservation_count must be >= 0")
+        if minimum_free_blocks_after_reservation < 0:
+            raise ValueError(
+                "minimum_free_blocks_after_reservation must be >= 0"
+            )
+        evictable_gpu_hits = sum(
+            1
+            for block in gpu_blocks_by_index.values()
+            if block.ref_cnt == 0
+        )
+        return int(cpu_restore_count) + int(suffix_reservation_count) <= (
+            self.block_pool.get_num_free_blocks()
+            - evictable_gpu_hits
+            - int(minimum_free_blocks_after_reservation)
+        )
+
+    def reserve_tiered_prefix(
+        self,
+        request: Request,
+        *,
+        hit_frontier_blocks: int,
+        gpu_blocks_by_index: dict[int, KVCacheBlock],
+        cpu_restore_indices: list[int],
+        suffix_reservation_count: int = 0,
+    ) -> dict[int, KVCacheBlock]:
+        """Attach a mixed prefix and reserve unpublished GPU restore pages."""
+        hit_frontier_blocks = int(hit_frontier_blocks)
+        cpu_restore_indices = [int(index) for index in cpu_restore_indices]
+        if request.id in self.req_to_blocks and self.req_to_blocks[request.id]:
+            raise ValueError(
+                f"Request {request.id} already owns KV blocks before tiered restore"
+            )
+        expected_indices = set(range(hit_frontier_blocks))
+        actual_indices = set(gpu_blocks_by_index) | set(cpu_restore_indices)
+        if actual_indices != expected_indices:
+            raise ValueError(
+                "Tiered prefix sources must cover the full hit frontier: "
+                f"expected={sorted(expected_indices)}, actual={sorted(actual_indices)}"
+            )
+        if set(gpu_blocks_by_index) & set(cpu_restore_indices):
+            raise ValueError("GPU and CPU prefix sources overlap")
+        if not self.can_reserve_tiered_prefix(
+            gpu_blocks_by_index=gpu_blocks_by_index,
+            cpu_restore_count=len(cpu_restore_indices),
+            suffix_reservation_count=suffix_reservation_count,
+        ):
+            raise ValueError(
+                f"Insufficient GPU blocks to reserve CPU restore for request {request.id}"
+            )
+
+        self.block_pool.touch(list(gpu_blocks_by_index.values()))
+        restore_blocks = self.block_pool.get_new_blocks(len(cpu_restore_indices))
+        restore_by_index = dict(zip(cpu_restore_indices, restore_blocks))
+        ordered_blocks = [
+            gpu_blocks_by_index.get(index, restore_by_index.get(index))
+            for index in range(hit_frontier_blocks)
+        ]
+        if any(block is None for block in ordered_blocks):
+            raise AssertionError("Tiered prefix reservation produced a missing block")
+        self.req_to_blocks[request.id].extend(ordered_blocks)
+        if suffix_reservation_count:
+            self.req_to_blocks[request.id].extend(
+                self.block_pool.get_new_blocks(
+                    int(suffix_reservation_count)
+                )
+            )
+        self.num_cached_blocks[request.id] = len(gpu_blocks_by_index)
+        return restore_by_index
+
+    def publish_restored_prefix(
+        self,
+        request: Request,
+        *,
+        restore_blocks_by_index: dict[int, KVCacheBlock],
+        block_keys: list[Hashable],
+        hit_frontier_blocks: int,
+    ) -> None:
+        """Publish restored CPU blocks as ready GPU prefix-cache entries."""
+        for block_index, block in sorted(restore_blocks_by_index.items()):
+            if block_index >= len(block_keys):
+                raise ValueError(
+                    f"Missing block key for restored block index {block_index}"
+                )
+            if block.block_hash is None:
+                block.block_hash = block_keys[block_index]
+                self.block_pool.cached_block_hash_to_block[
+                    block.block_hash
+                ][block.block_id] = block
+        self.num_cached_blocks[request.id] = int(hit_frontier_blocks)
 
     def mark_blocks_computed(self, request: Request) -> None:
         """Publish full blocks up to the request's completed-token frontier."""

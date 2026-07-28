@@ -32,17 +32,19 @@ This directory contains one-click architecture entrypoints for Frontier's releas
 | `co-location/online/thinking_mode_basic_online.sh` | Online Thinking Mode v1 co-location | Mirrors Thinking Mode offline settings with `--simulation_mode online` |
 | `co-location/online/moe_spec_dec_online.sh` | Online MoE Speculative Decoding / MTP | Mirrors Speculative Decoding offline settings with `--simulation_mode online` |
 | `co-location/online/moe_prefix_caching_online.sh` | Online MoE Prefix Caching | Replays the same prefix-cache fixture with `--simulation_mode online` |
-| `pdd/run_all.sh` | Full PDD suite | Runs all five offline PDD cases and all five online PDD cases; pass extra Frontier CLI flags after `--` |
+| `pdd/run_all.sh` | Full PDD suite | Runs all six offline PDD cases and all six online PDD cases; pass extra Frontier CLI flags after `--` |
 | `pdd/offline/dense_model_basic.sh` | Offline dense PDD baseline | Sequential `pd-disaggregation`, analytical backend, dummy execution time, Chunked Prefill, CSV/JSON metrics |
 | `pdd/offline/moe_model_basic.sh` | Offline MoE PDD baseline | Sequential `pd-disaggregation`, reference-runnable shared-domain MoE topology, Chunked Prefill, CSV/JSON metrics |
 | `pdd/offline/thinking_mode_basic.sh` | Offline Thinking Mode v1 PDD | Thinking Mode with two KV transfer handoffs for the one-request smoke configuration |
 | `pdd/offline/moe_spec_dec.sh` | Offline MoE PDD Speculative Decoding / MTP | Speculative Decoding enabled; Prefix Caching intentionally disabled; `DECODE_CUDA_GRAPH_MODE=none` |
 | `pdd/offline/moe_prefix_caching.sh` | Offline MoE PDD Prefix Caching | Sticky scheduler with `examples/fixtures/prefix_cache_shared_session_trace.csv` |
+| `pdd/offline/cpu_kv_offloading.sh` | Offline prefill CPU KV offloading | Session-affine PDD with a finite five-block prefill GPU cache and analytical D2H/H2D copies |
 | `pdd/online/dense_model_basic_online.sh` | Online dense PDD baseline | Mirrors dense offline settings with `--simulation_mode online` |
 | `pdd/online/moe_model_basic_online.sh` | Online MoE PDD baseline | Mirrors MoE offline settings with `--simulation_mode online` |
 | `pdd/online/thinking_mode_basic_online.sh` | Online Thinking Mode v1 PDD | Mirrors Thinking Mode offline settings with `--simulation_mode online` |
 | `pdd/online/moe_spec_dec_online.sh` | Online MoE PDD Speculative Decoding / MTP | Mirrors Speculative Decoding offline settings with `--simulation_mode online` |
 | `pdd/online/moe_prefix_caching_online.sh` | Online MoE PDD Prefix Caching | Replays the same prefix-cache fixture with `--simulation_mode online` |
+| `pdd/online/cpu_kv_offloading_online.sh` | Online prefill CPU KV offloading | Online counterpart using `examples/fixtures/cpu_kv_offload_session_trace.csv` |
 
 All four Prefix Caching recipes accept
 `PREFIX_CACHING_KEY_MODE=session` together with
@@ -74,6 +76,42 @@ cache; affinity is required whenever replicas multiplied by DP lanes exceeds
 one. `sticky_lor` is supported for co-location only in this release;
 sequential PDD Prefix Caching rejects it during validation and requires
 `sticky_round_robin`.
+
+### Prefill-side CPU KV offloading
+
+The CPU examples add a DRAM tier local to every prefill
+`(replica_id, dp_id)` cache target. After prefill finishes, full reusable
+blocks are copied to CPU while the normal prefill-to-decode transfer proceeds
+independently. Decode can begin as soon as its transfer finishes, but the
+prefill GPU allocation remains pinned until both exports are terminal.
+
+Only prefill-created KV is copied. If turn 1 has prompt `A` and produces
+decode output `B`, turn 2 restores `A` from prefill GPU or CPU and recomputes
+`B` plus the new input. Once that expanded prompt passes through prefill, its
+full blocks become eligible for the next CPU snapshot.
+
+The main controls are:
+
+- `--cpu_kv_cache_config_enable`
+- `--cpu_kv_cache_config_capacity_bytes`
+- `--cpu_kv_cache_config_write_bandwidth_gbps` and
+  `--cpu_kv_cache_config_write_latency_ms`
+- `--cpu_kv_cache_config_read_bandwidth_gbps` and
+  `--cpu_kv_cache_config_read_latency_ms`
+- `--cpu_kv_cache_config_capacity_pressure_policy prefix_fit|skip_offload`
+- `--vllm_v1_scheduler_config_kv_cache_dtype` with `auto`, `fp32`, `fp16`,
+  `bf16`, `fp8`, `int8`, `fp4`, or `int4`
+
+The capacity and direction-specific bandwidth values apply to one aggregate
+prefill `(replica_id, dp_id)` CPU cache target. All attention TP workers in
+that DP lane contribute their physical KV shard bytes to each CPU block.
+
+The MVP requires sequential `pd-disaggregation`, `vllm_v1`, session prefix
+caching, and `sticky_round_robin`; Thinking Mode is not supported in this
+MVP because its overlapping rounds require epoch-scoped export ownership.
+CPU eviction chooses the least-recently used unpinned session and removes the
+required highest-index suffix in one bulk operation, preserving the longest
+useful prefix.
 
 ## PDD Configuration Contract
 
@@ -119,6 +157,7 @@ bash examples/architecture/pdd/offline/moe_model_basic.sh
 bash examples/architecture/pdd/offline/thinking_mode_basic.sh
 bash examples/architecture/pdd/offline/moe_spec_dec.sh
 bash examples/architecture/pdd/offline/moe_prefix_caching.sh
+bash examples/architecture/pdd/offline/cpu_kv_offloading.sh
 
 # PDD online cases.
 bash examples/architecture/pdd/online/dense_model_basic_online.sh
@@ -126,6 +165,7 @@ bash examples/architecture/pdd/online/moe_model_basic_online.sh
 bash examples/architecture/pdd/online/thinking_mode_basic_online.sh
 bash examples/architecture/pdd/online/moe_spec_dec_online.sh
 bash examples/architecture/pdd/online/moe_prefix_caching_online.sh
+bash examples/architecture/pdd/online/cpu_kv_offloading_online.sh
 
 # Full co-location comparison suite.
 bash examples/architecture/co-location/run_all.sh

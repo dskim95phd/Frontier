@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
+
+import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -23,6 +26,10 @@ ONLINE_SCRIPTS = (
 )
 ALL_SCRIPTS = (*OFFLINE_SCRIPTS, *ONLINE_SCRIPTS)
 COMPATIBILITY_SCRIPTS = (PDD_DIR / "dense_model_basic.sh",)
+CPU_OFFLOAD_SCRIPTS = (
+    PDD_DIR / "offline" / "cpu_kv_offloading.sh",
+    PDD_DIR / "online" / "cpu_kv_offloading_online.sh",
+)
 
 
 def _read(path: Path) -> str:
@@ -42,15 +49,22 @@ def test_pdd_examples_include_expected_offline_online_script_set() -> None:
 
 
 def test_pdd_examples_are_shell_syntax_valid() -> None:
-    for script in (*ALL_SCRIPTS, *COMPATIBILITY_SCRIPTS, PDD_DIR / "run_all.sh"):
+    for script in (
+        *ALL_SCRIPTS,
+        *CPU_OFFLOAD_SCRIPTS,
+        *COMPATIBILITY_SCRIPTS,
+        PDD_DIR / "run_all.sh",
+    ):
         result = subprocess.run(
-            ["bash", "-n", str(script)],
-            text=True,
+            ["bash", "-n"],
+            cwd=REPO_ROOT,
+            input=_read(script).replace("\r\n", "\n").encode("utf-8"),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
         )
-        assert result.returncode == 0, f"{script}: {result.stderr}"
+        stderr = result.stderr.decode("utf-8", errors="replace")
+        assert result.returncode == 0, f"{script}: {stderr}"
 
 
 def test_pdd_dense_compatibility_entrypoint_forwards_to_offline_script() -> None:
@@ -92,6 +106,10 @@ def test_pdd_scripts_configure_prefill_decode_clusters_explicitly() -> None:
         assert '--cc_backend_config_type analytical' in text, script
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="The WSL bash launcher does not preserve the synthetic PATH environment.",
+)
 def test_pdd_moe_scripts_fail_fast_on_invalid_shared_domain_parallelism() -> None:
     moe_scripts = [script for script in ALL_SCRIPTS if "moe" in script.name]
     env = {
@@ -105,16 +123,17 @@ def test_pdd_moe_scripts_fail_fast_on_invalid_shared_domain_parallelism() -> Non
 
     for script in moe_scripts:
         result = subprocess.run(
-            ["bash", str(script)],
+            ["bash", "-s"],
             cwd=REPO_ROOT,
             env=env,
-            text=True,
+            input=_read(script).replace("\r\n", "\n").encode("utf-8"),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
         )
+        stderr = result.stderr.decode("utf-8", errors="replace")
         assert result.returncode == 2, script
-        assert "PREFILL_ATTN_TP * PREFILL_ATTN_DP == PREFILL_MOE_TP * PREFILL_MOE_EP" in result.stderr, script
+        assert "PREFILL_ATTN_TP * PREFILL_ATTN_DP == PREFILL_MOE_TP * PREFILL_MOE_EP" in stderr, script
 
 
 def test_pdd_spec_decode_scripts_use_spec_controls_without_prefix_cache_conflict() -> None:
@@ -141,3 +160,21 @@ def test_pdd_prefix_cache_scripts_use_sticky_scheduler_and_no_spec_decode() -> N
             '"$PREFIX_CACHING_KEY_MODE"'
         ) in text
         assert '--speculative_decoding_config_enabled' not in text
+
+
+def test_pdd_cpu_offload_examples_expose_supported_contract() -> None:
+    run_all_text = _read(PDD_DIR / "run_all.sh")
+    for script in CPU_OFFLOAD_SCRIPTS:
+        assert script.exists()
+        relative = script.relative_to(PDD_DIR).as_posix()
+        assert f'"{relative}"' in run_all_text
+        text = _read(script)
+        assert "cpu_kv_offload_session_trace.csv" in text
+        assert "PREFIX_CACHING_KEY_MODE=session" in text
+        assert "--cpu_kv_cache_config_enable" in text
+        assert 'NUM_BLOCKS="${NUM_BLOCKS:-5}"' in text
+        assert "--cpu_kv_cache_config_capacity_bytes" in text
+        assert "--cpu_kv_cache_config_write_bandwidth_gbps" in text
+        assert "--cpu_kv_cache_config_read_bandwidth_gbps" in text
+        assert "--cpu_kv_cache_config_capacity_pressure_policy" in text
+        assert "--vllm_v1_scheduler_config_kv_cache_dtype" in text

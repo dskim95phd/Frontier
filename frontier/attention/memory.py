@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import ceil
 
 from frontier.attention.ops import AttentionFamilySpec
 
@@ -13,7 +14,7 @@ class AttentionRuntimeKVLayout:
     kv_factor: int
     runtime_num_kv_heads_per_worker: int
     runtime_head_size: int
-    bytes_per_element: int = 2
+    bytes_per_element: float = 2.0
 
     def __post_init__(self) -> None:
         if self.kv_factor <= 0:
@@ -43,8 +44,8 @@ class AttentionRuntimeKVLayout:
     def page_bytes(self, block_size: int) -> int:
         if block_size <= 0:
             raise ValueError(f"block_size must be positive, got={block_size!r}")
-        return (
-            self.bytes_per_element
+        return ceil(
+            float(self.bytes_per_element)
             * int(block_size)
             * self.elements_per_token_per_worker
         )
@@ -55,7 +56,7 @@ def get_attention_runtime_kv_layout(
     *,
     runtime_num_kv_heads_per_worker: int,
     runtime_head_size: int,
-    bytes_per_element: int = 2,
+    bytes_per_element: float = 2.0,
 ) -> AttentionRuntimeKVLayout:
     family.require_enabled_for_execution()
 
@@ -70,5 +71,5 @@ def get_attention_runtime_kv_layout(
         kv_factor=family.kv_factor,
         runtime_num_kv_heads_per_worker=int(runtime_num_kv_heads_per_worker),
         runtime_head_size=int(runtime_head_size),
-        bytes_per_element=int(bytes_per_element),
+        bytes_per_element=float(bytes_per_element),
     )

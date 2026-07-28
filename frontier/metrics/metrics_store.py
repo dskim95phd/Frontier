@@ -353,6 +353,24 @@ class MetricsStore:
                 self._config.store_plots,
             ),
         }
+        self._cpu_kv_cache_metrics = {
+            "restore_count": 0,
+            "restore_blocks": 0,
+            "restore_bytes": 0,
+            "restore_queue_time_ms": 0.0,
+            "restore_transfer_time_ms": 0.0,
+            "offload_count": 0,
+            "offload_blocks": 0,
+            "offload_bytes": 0,
+            "offload_queue_time_ms": 0.0,
+            "offload_transfer_time_ms": 0.0,
+            "cpu_query_blocks": 0,
+            "cpu_hit_blocks": 0,
+            "source_gpu_hold_time_ms": 0.0,
+        }
+        self._cpu_kv_cache_store_statistics: dict[
+            tuple[int, int], dict[str, int | float]
+        ] = {}
 
         # Initialize preemption statistics collector for system-level metrics
         # NOTE: Separation of Concerns - Request-Level vs. System-Level Metrics
@@ -2121,6 +2139,83 @@ class MetricsStore:
         if prefix_cache_statistics is not None:
             system_metrics["prefix_cache_statistics"] = prefix_cache_statistics
 
+        cpu_metrics = self._cpu_kv_cache_metrics
+        cpu_store_snapshots = self._cpu_kv_cache_store_statistics
+        if (
+            cpu_metrics["restore_count"] > 0
+            or cpu_metrics["offload_count"] > 0
+            or cpu_store_snapshots
+        ):
+            summed_store_fields = {
+                field: sum(
+                    int(snapshot.get(field, 0))
+                    for snapshot in cpu_store_snapshots.values()
+                )
+                for field in (
+                    "capacity_bytes",
+                    "capacity_blocks",
+                    "resident_bytes",
+                    "resident_blocks",
+                    "reserved_bytes",
+                    "reserved_blocks",
+                    "free_blocks",
+                    "peak_resident_bytes",
+                    "peak_resident_blocks",
+                    "peak_reserved_bytes",
+                    "peak_reserved_blocks",
+                    "resident_sessions",
+                    "evicted_sessions",
+                    "evicted_blocks",
+                    "evicted_bytes",
+                    "skipped_offloads",
+                    "truncated_offloads",
+                    "stale_generation_completions",
+                    "cpu_query_blocks",
+                    "cpu_hit_blocks",
+                    "sessions_with_cpu_hits",
+                )
+            }
+            cpu_query_blocks = int(
+                summed_store_fields["cpu_query_blocks"]
+                if cpu_store_snapshots
+                else cpu_metrics["cpu_query_blocks"]
+            )
+            cpu_hit_blocks = int(
+                summed_store_fields["cpu_hit_blocks"]
+                if cpu_store_snapshots
+                else cpu_metrics["cpu_hit_blocks"]
+            )
+            bytes_per_block_values = {
+                int(snapshot.get("bytes_per_block", 0))
+                for snapshot in cpu_store_snapshots.values()
+            }
+            bytes_per_block_values.discard(0)
+            if len(bytes_per_block_values) > 1:
+                raise ValueError(
+                    "CPU KV cache targets reported inconsistent block sizes: "
+                    f"{sorted(bytes_per_block_values)}"
+                )
+            system_metrics["cpu_kv_cache_statistics"] = {
+                **cpu_metrics,
+                **summed_store_fields,
+                "bytes_per_block": (
+                    next(iter(bytes_per_block_values))
+                    if bytes_per_block_values
+                    else 0
+                ),
+                "cache_target_count": len(cpu_store_snapshots),
+                "offload_operations": int(cpu_metrics["offload_count"]),
+                "restore_operations": int(cpu_metrics["restore_count"]),
+                "current_resident_sessions": int(
+                    summed_store_fields["resident_sessions"]
+                ),
+                "cpu_hit_ratio": (
+                    float(cpu_hit_blocks / cpu_query_blocks)
+                    if cpu_query_blocks > 0
+                    else 0.0
+                ),
+            }
+
         # 7. KV Cache Transfer statistics (for disaggregated mode)
         if self._kv_cache_transfer_metrics["transfer_count"] > 0:
             transfer_times = self._kv_cache_transfer_metrics["transfer_times"]
@@ -2593,6 +2688,39 @@ class MetricsStore:
         self._request_metrics_histogram[
             RequestMetricsHistogram.REQUEST_PREFIX_CACHE_HIT_BLOCKS
         ].put(request.id, int(hit_blocks))
+        self._request_metrics_histogram[
+            RequestMetricsHistogram.REQUEST_GPU_PREFIX_CACHE_HIT_BLOCKS
+        ].put(request.id, int(request.total_gpu_prefix_cache_hit_blocks))
+        self._request_metrics_histogram[
+            RequestMetricsHistogram.REQUEST_CPU_PREFIX_CACHE_QUERY_BLOCKS
+        ].put(request.id, int(request.total_cpu_prefix_cache_query_blocks))
+        self._request_metrics_histogram[
+            RequestMetricsHistogram.REQUEST_CPU_PREFIX_CACHE_HIT_BLOCKS
+        ].put(request.id, int(request.total_cpu_prefix_cache_hit_blocks))
+        self._request_metrics_histogram[
+            RequestMetricsHistogram.REQUEST_CPU_PREFIX_CACHE_RESTORED_BLOCKS
+        ].put(request.id, int(request.total_cpu_prefix_cache_restored_blocks))
+        self._request_metrics_histogram[
+            RequestMetricsHistogram.REQUEST_CPU_PREFIX_CACHE_RESTORED_TOKENS
+        ].put(request.id, int(request.total_cpu_prefix_cache_restored_tokens))
+        self._request_metrics_histogram[
+            RequestMetricsHistogram.REQUEST_CPU_KV_CACHE_RESTORE_BYTES
+        ].put(request.id, int(request.cpu_kv_cache_restore_bytes))
+        self._request_metrics_time_distributions[
+            RequestMetricsTimeDistributions.REQUEST_CPU_KV_CACHE_RESTORE_QUEUE_TIME
+        ].put(request.id, float(request.cpu_kv_cache_restore_queue_time))
+        self._request_metrics_time_distributions[
+            RequestMetricsTimeDistributions.REQUEST_CPU_KV_CACHE_RESTORE_TRANSFER_TIME
+        ].put(request.id, float(request.cpu_kv_cache_restore_transfer_time))
+        self._request_metrics_histogram[
+            RequestMetricsHistogram.REQUEST_CPU_KV_CACHE_OFFLOAD_BYTES
+        ].put(request.id, int(request.cpu_kv_cache_offload_bytes))
+        self._request_metrics_time_distributions[
+            RequestMetricsTimeDistributions.REQUEST_CPU_KV_CACHE_OFFLOAD_QUEUE_TIME
+        ].put(request.id, float(request.cpu_kv_cache_offload_queue_time))
+        self._request_metrics_time_distributions[
+            RequestMetricsTimeDistributions.REQUEST_CPU_KV_CACHE_OFFLOAD_TRANSFER_TIME
+        ].put(request.id, float(request.cpu_kv_cache_offload_transfer_time))
 
     def _compute_prefix_cache_statistics(self) -> Optional[Dict[str, Any]]:
         cached_tokens_data = self._request_metrics_histogram.get(
@@ -4393,6 +4521,114 @@ class MetricsStore:
             return
 
         self._kv_cache_transfer_metrics["transfer_count"] += 1
+
+    def on_cpu_kv_cache_restore_start(self, time: float, restore_info: Any) -> None:
+        if self._trace_store and self._config.enable_op_level_tracing:
+            from frontier.metrics.trace_store import TraceEvent
+
+            self._trace_store.log_event(
+                TraceEvent(
+                    type="TRANSFER",
+                    name="cpu_kv_cache_restore",
+                    ts_start=time,
+                    duration_ms=restore_info.timing.service_time_ms,
+                    cluster=ClusterType.PREFILL.name,
+                    replica_id=restore_info.replica_id,
+                    request_id=str(restore_info.request.id),
+                    target_cluster="PREFILL_CPU_DRAM_TO_GPU",
+                    meta={
+                        "dp_id": restore_info.dp_id,
+                        "size_bytes": restore_info.timing.size_bytes,
+                        "queue_time_ms": restore_info.timing.queue_time_ms,
+                        "blocks": restore_info.plan.cpu_hit_blocks,
+                    },
+                )
+            )
+        if not self._config.write_metrics:
+            return
+        self._cpu_kv_cache_metrics["restore_count"] += 1
+
+    def on_cpu_kv_cache_restore_end(self, time: float, restore_info: Any) -> None:
+        del time
+        if not self._config.write_metrics:
+            return
+        plan = restore_info.plan
+        timing = restore_info.timing
+        self._cpu_kv_cache_metrics["restore_blocks"] += int(
+            plan.cpu_hit_blocks
+        )
+        self._cpu_kv_cache_metrics["restore_bytes"] += int(
+            timing.size_bytes
+        )
+        self._cpu_kv_cache_metrics["restore_queue_time_ms"] += float(
+            timing.queue_time_ms
+        )
+        self._cpu_kv_cache_metrics["restore_transfer_time_ms"] += float(
+            timing.service_time_ms
+        )
+        self._cpu_kv_cache_metrics["cpu_query_blocks"] += int(
+            plan.cpu_query_blocks
+        )
+        self._cpu_kv_cache_metrics["cpu_hit_blocks"] += int(
+            plan.cpu_hit_blocks
+        )
+
+    def on_cpu_kv_cache_offload_start(self, time: float, offload_info: Any) -> None:
+        if self._trace_store and self._config.enable_op_level_tracing:
+            from frontier.metrics.trace_store import TraceEvent
+
+            self._trace_store.log_event(
+                TraceEvent(
+                    type="TRANSFER",
+                    name="cpu_kv_cache_offload",
+                    ts_start=time,
+                    duration_ms=offload_info.timing.service_time_ms,
+                    cluster=ClusterType.PREFILL.name,
+                    replica_id=offload_info.replica_id,
+                    request_id=str(offload_info.request.id),
+                    target_cluster="PREFILL_CPU_DRAM",
+                    meta={
+                        "dp_id": offload_info.dp_id,
+                        "size_bytes": offload_info.timing.size_bytes,
+                        "queue_time_ms": offload_info.timing.queue_time_ms,
+                        "blocks": offload_info.reservation.num_blocks,
+                    },
+                )
+            )
+        if not self._config.write_metrics:
+            return
+        self._cpu_kv_cache_metrics["offload_count"] += 1
+
+    def on_cpu_kv_cache_offload_end(self, time: float, offload_info: Any) -> None:
+        del time
+        if not self._config.write_metrics:
+            return
+        timing = offload_info.timing
+        reservation = offload_info.reservation
+        self._cpu_kv_cache_metrics["offload_blocks"] += int(
+            reservation.num_blocks
+        )
+        self._cpu_kv_cache_metrics["offload_bytes"] += int(
+            timing.size_bytes
+        )
+        self._cpu_kv_cache_metrics["offload_queue_time_ms"] += float(
+            timing.queue_time_ms
+        )
+        self._cpu_kv_cache_metrics["offload_transfer_time_ms"] += float(
+            timing.service_time_ms
+        )
+        self._cpu_kv_cache_metrics["source_gpu_hold_time_ms"] += float(
+            offload_info.source_gpu_hold_time_ms
+        )
+
+    def set_cpu_kv_cache_store_statistics(
+        self,
+        statistics_by_target: dict[tuple[int, int], dict[str, int | float]],
+    ) -> None:
+        self._cpu_kv_cache_store_statistics = {
+            (int(replica_id), int(dp_id)): dict(statistics)
+            for (replica_id, dp_id), statistics in statistics_by_target.items()
+        }
 
     def on_kv_cache_transfer_end(
         self,

@@ -12,6 +12,7 @@ from frontier.execution_time_predictor import BaseExecutionTimePredictor
 from frontier.logger import init_logger
 
 if TYPE_CHECKING:
+    from frontier.config.cpu_kv_cache_config import CPUKVCacheConfig
     from frontier.kv_cache_transfer import BaseKVCacheTransferPredictor
     from frontier.m2n_transfer import BaseM2NTransferPredictor
     from frontier.events import BaseEvent
@@ -27,6 +28,7 @@ class BaseGlobalScheduler(ABC):
         predictors: Dict[ClusterType, BaseExecutionTimePredictor] = None,
         kv_cache_transfer_predictor: Optional["BaseKVCacheTransferPredictor"] = None,
         m2n_transfer_predictor: Optional["BaseM2NTransferPredictor"] = None,
+        cpu_kv_cache_config: Optional["CPUKVCacheConfig"] = None,
         enable_parallel_mode: bool = False,
         max_inter_cluster_queue_size: int = 1000,
     ):
@@ -34,6 +36,7 @@ class BaseGlobalScheduler(ABC):
         self._cluster_schedulers = {}
         self._kv_cache_transfer_predictor = kv_cache_transfer_predictor
         self._m2n_transfer_predictor = m2n_transfer_predictor
+        self._cpu_kv_cache_config = cpu_kv_cache_config
         self._enable_parallel_mode = enable_parallel_mode
 
         assert predictors is not None, "Predictors are required for scheduler initialization"
@@ -50,6 +53,7 @@ class BaseGlobalScheduler(ABC):
                 predictor=predictor,
                 kv_cache_transfer_predictor=kv_cache_transfer_predictor,
                 m2n_transfer_predictor=m2n_transfer_predictor,
+                cpu_kv_cache_config=cpu_kv_cache_config,
                 available_clusters=set(clusters.keys()),  # Pass available cluster types
             )
         self._request_queue = []  # List[Tuple[Request, ClusterType]]
@@ -132,6 +136,19 @@ class BaseGlobalScheduler(ABC):
     def get_cluster_scheduler(self, cluster_type: ClusterType):
         # Each cluster has a unique scheduler.
         return self._cluster_schedulers[cluster_type]
+
+    def get_cpu_kv_cache_statistics_by_target(
+        self,
+    ) -> dict[tuple[int, int], dict[str, int | float]]:
+        prefill_scheduler = self._cluster_schedulers.get(ClusterType.PREFILL)
+        if prefill_scheduler is None:
+            return {}
+        getter = getattr(
+            prefill_scheduler,
+            "get_cpu_kv_cache_statistics_by_target",
+            None,
+        )
+        return getter() if getter is not None else {}
 
     def clear_queues(self):
         self._request_queue = []

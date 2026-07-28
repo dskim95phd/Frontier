@@ -35,6 +35,7 @@ from frontier.types import (
 )
 
 if TYPE_CHECKING:
+    from frontier.config.cpu_kv_cache_config import CPUKVCacheConfig
     from frontier.kv_cache_transfer import BaseKVCacheTransferPredictor
     from frontier.m2n_transfer import BaseM2NTransferPredictor
 
@@ -400,6 +401,7 @@ class BaseClusterScheduler(ABC):
         predictor: BaseExecutionTimePredictor = None,
         kv_cache_transfer_predictor: Optional["BaseKVCacheTransferPredictor"] = None,
         m2n_transfer_predictor: Optional["BaseM2NTransferPredictor"] = None,
+        cpu_kv_cache_config: Optional["CPUKVCacheConfig"] = None,
         available_clusters: Optional[set] = None,
     ):
         self._config = config
@@ -409,6 +411,7 @@ class BaseClusterScheduler(ABC):
         self._predictor = predictor
         self._kv_cache_transfer_predictor = kv_cache_transfer_predictor
         self._m2n_transfer_predictor = m2n_transfer_predictor
+        self._cpu_kv_cache_config = cpu_kv_cache_config
         self._replica_dp_size = self._config.replica_config.data_parallel_size
         self._available_clusters = available_clusters or set()
         self._request_generator_config = request_generator_config
@@ -463,6 +466,7 @@ class BaseClusterScheduler(ABC):
                         dp_id=ep_id,  # Use ep_id as dp_id for compatibility
                         af_pipeline_num_micro_batch=getattr(self._config, 'af_pipeline_num_micro_batch', -1),
                         cluster_scheduler=self,
+                        cpu_kv_cache_config=cpu_kv_cache_config,
                     )
         else:
             # For other clusters: use traditional DP concept
@@ -480,6 +484,7 @@ class BaseClusterScheduler(ABC):
                         dp_id=dp_id,
                         af_pipeline_num_micro_batch=getattr(self._config, 'af_pipeline_num_micro_batch', -1),
                         cluster_scheduler=self,
+                        cpu_kv_cache_config=cpu_kv_cache_config,
                     )
         self._request_queue = []
 
@@ -726,6 +731,21 @@ class BaseClusterScheduler(ABC):
 
     def get_dp_replica_scheduler(self, replica_id: int, dp_id: int):
         return self._dp_replica_schedulers[(replica_id, dp_id)]
+
+    def get_cpu_kv_cache_statistics_by_target(
+        self,
+    ) -> dict[tuple[int, int], dict[str, int | float]]:
+        statistics = {}
+        for target, replica_scheduler in self._dp_replica_schedulers.items():
+            getter = getattr(
+                replica_scheduler, "get_cpu_kv_cache_statistics", None
+            )
+            if getter is None:
+                continue
+            target_statistics = getter()
+            if target_statistics is not None:
+                statistics[target] = target_statistics
+        return statistics
 
     def get_dp_replica_stage_scheduler(self, replica_id: int, dp_id: int, stage_id: int):
         return self._dp_replica_schedulers[(replica_id, dp_id)].get_replica_stage_scheduler(

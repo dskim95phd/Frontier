@@ -15,6 +15,9 @@ TRACE_FILE = REPO_ROOT / "examples" / "fixtures" / "session_prefix_multi_turn_tr
 BLOCK_HASH_TRACE_FILE = (
     REPO_ROOT / "examples" / "fixtures" / "prefix_cache_shared_session_trace.csv"
 )
+CPU_KV_TRACE_FILE = (
+    REPO_ROOT / "examples" / "fixtures" / "cpu_kv_offload_session_trace.csv"
+)
 
 
 def _common_args(
@@ -112,7 +115,7 @@ def _colocation_args(*, dp_size: int = 1) -> list[str]:
     ]
 
 
-def _pdd_args() -> list[str]:
+def _pdd_args(*, prefill_attn_tp: int = 1) -> list[str]:
     args = [
         "--sys_arch",
         "pd-disaggregation",
@@ -128,18 +131,20 @@ def _pdd_args() -> list[str]:
     ]
     for cluster_name in ("prefill", "decode"):
         prefix = f"--cluster_config_{cluster_name}_replica_config_"
+        attn_tp = prefill_attn_tp if cluster_name == "prefill" else 1
+        moe_ep = prefill_attn_tp if cluster_name == "prefill" else 1
         args.extend(
             [
                 f"{prefix}num_pipeline_stages",
                 "1",
                 f"{prefix}attn_tensor_parallel_size",
-                "1",
+                str(attn_tp),
                 f"{prefix}attn_data_parallel_size",
                 "1",
                 f"{prefix}moe_tensor_parallel_size",
                 "1",
                 f"{prefix}moe_expert_parallel_size",
-                "1",
+                str(moe_ep),
                 f"{prefix}total_expert_num",
                 "8",
                 f"{prefix}router_topk",
@@ -147,6 +152,24 @@ def _pdd_args() -> list[str]:
             ]
         )
     return args
+
+
+def _cpu_offload_args(*, read_latency_ms: float = 0.01) -> list[str]:
+    return [
+        "--vllm_v1_scheduler_config_num_blocks",
+        "5",
+        "--cpu_kv_cache_config_enable",
+        "--cpu_kv_cache_config_capacity_bytes",
+        str(1024**3),
+        "--cpu_kv_cache_config_write_bandwidth_gbps",
+        "64",
+        "--cpu_kv_cache_config_write_latency_ms",
+        "0.01",
+        "--cpu_kv_cache_config_read_bandwidth_gbps",
+        "64",
+        "--cpu_kv_cache_config_read_latency_ms",
+        str(read_latency_ms),
+    ]
 
 
 def _run_simulation(
@@ -237,6 +260,15 @@ def test_session_prefix_cache_runtime_metrics(
     assert request_metrics["request_prefix_cache_hit_blocks"].tolist() == [
         value // 16 for value in expected_cached_tokens
     ]
+    assert request_metrics["request_gpu_prefix_cache_hit_blocks"].tolist() == [
+        value // 16 for value in expected_cached_tokens
+    ]
+    assert request_metrics["request_cpu_prefix_cache_hit_blocks"].tolist() == [
+        0,
+        0,
+        0,
+        0,
+    ]
     assert system_metrics["prefix_cache_statistics"]["key_mode"] == "session"
 
 
@@ -276,6 +308,221 @@ def test_pdd_session_prefix_cache_rejects_sticky_lor_before_runtime(
     assert completed.returncode != 0
     assert "only supported for MONOLITHIC clusters" in completed.stdout
     assert "must use sticky_round_robin" in completed.stdout
+
+
+def test_pdd_prefill_cpu_kv_offload_runtime_metrics(tmp_path: Path) -> None:
+    output_root = tmp_path / "metrics"
+    run_id = "pdd_cpu_kv_offload"
+    command = [
+        sys.executable,
+        *_common_args(
+            output_root,
+            run_id,
+            trace_file=CPU_KV_TRACE_FILE,
+            key_mode="session",
+        ),
+        *_pdd_args(),
+        *_cpu_offload_args(),
+    ]
+    env = os.environ.copy()
+    env.update(
+        {
+            "PYTHONPATH": str(REPO_ROOT),
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "WANDB_DISABLED": "true",
+            "VIDUR_DISABLE_WANDB": "1",
+            "FRONTIER_LOG_LEVEL": "ERROR",
+        }
+    )
+
+    completed = subprocess.run(
+        command,
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+        timeout=60,
+    )
+    assert completed.returncode == 0, completed.stdout[-10000:]
+
+    run_dir = (
+        output_root
+        / "phi_tiny_moe_instruct"
+        / "online_serving"
+        / run_id
+    )
+    request_metrics = pd.read_csv(run_dir / "request_metrics.csv")
+    system_metrics = json.loads(
+        (run_dir / "system_metrics.json").read_text(encoding="utf-8")
+    )
+
+    assert request_metrics["request_session_id"].tolist() == [7, 8, 9, 7, 8, 9]
+    assert request_metrics["request_cpu_prefix_cache_hit_blocks"].tolist()[:3] == [
+        0,
+        0,
+        0,
+    ]
+    assert request_metrics["request_cpu_prefix_cache_hit_blocks"].tolist()[3:] == [
+        1,
+        2,
+        2,
+    ]
+    assert request_metrics["request_cached_prefill_tokens"].tolist()[3:] == [
+        32,
+        32,
+        32,
+    ]
+    assert (
+        request_metrics["request_num_prefill_tokens"].tolist()[3:]
+        == [64, 64, 64]
+    )
+    assert [
+        prompt - cached
+        for prompt, cached in zip(
+            request_metrics["request_num_prefill_tokens"].tolist()[3:],
+            request_metrics["request_cached_prefill_tokens"].tolist()[3:],
+        )
+    ] == [32, 32, 32]
+    assert (
+        request_metrics["request_cpu_kv_cache_offload_bytes"] > 0
+    ).all()
+    assert request_metrics[
+        "request_cpu_kv_cache_restore_bytes"
+    ].tolist()[:3] == [0, 0, 0]
+    assert all(
+        value > 0
+        for value in request_metrics[
+            "request_cpu_kv_cache_restore_bytes"
+        ].tolist()[3:]
+    )
+    cpu_statistics = system_metrics["cpu_kv_cache_statistics"]
+    assert cpu_statistics["offload_operations"] == 6
+    assert cpu_statistics["offload_blocks"] == 12
+    assert cpu_statistics["restore_operations"] == 3
+    assert cpu_statistics["restore_blocks"] == 5
+    assert cpu_statistics["cpu_hit_blocks"] >= 5
+    assert request_metrics[
+        "request_cpu_kv_cache_restore_transfer_time"
+    ].sum() == pytest.approx(
+        cpu_statistics["restore_transfer_time_ms"],
+        rel=1e-6,
+    )
+    assert system_metrics["kv_cache_transfer_statistics"]["total_transfers"] == 6
+
+
+def test_cpu_restore_latency_contributes_to_followup_ttft(tmp_path: Path) -> None:
+    results = {}
+    for label, read_latency_ms in (("fast", 0.01), ("slow", 75.0)):
+        output_root = tmp_path / label
+        run_id = f"pdd_cpu_kv_ttft_{label}"
+        command = [
+            sys.executable,
+            *_common_args(
+                output_root,
+                run_id,
+                trace_file=CPU_KV_TRACE_FILE,
+                key_mode="session",
+            ),
+            *_pdd_args(),
+            *_cpu_offload_args(read_latency_ms=read_latency_ms),
+        ]
+        env = os.environ.copy()
+        env.update(
+            {
+                "PYTHONPATH": str(REPO_ROOT),
+                "PYTHONDONTWRITEBYTECODE": "1",
+                "WANDB_DISABLED": "true",
+                "VIDUR_DISABLE_WANDB": "1",
+                "FRONTIER_LOG_LEVEL": "ERROR",
+            }
+        )
+        completed = subprocess.run(
+            command,
+            cwd=REPO_ROOT,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+            timeout=60,
+        )
+        assert completed.returncode == 0, completed.stdout[-10000:]
+        run_dir = (
+            output_root
+            / "phi_tiny_moe_instruct"
+            / "online_serving"
+            / run_id
+        )
+        results[label] = pd.read_csv(run_dir / "request_metrics.csv")
+
+    fast_followups = results["fast"].iloc[3:]
+    slow_followups = results["slow"].iloc[3:]
+    assert (
+        fast_followups["request_cpu_prefix_cache_hit_blocks"].tolist()
+        == slow_followups["request_cpu_prefix_cache_hit_blocks"].tolist()
+    )
+    assert (
+        slow_followups["ttft"].mean() - fast_followups["ttft"].mean()
+        >= 70.0
+    )
+
+
+def test_cpu_kv_bytes_aggregate_tp_workers_and_follow_runtime_precision(
+    tmp_path: Path,
+) -> None:
+    results = {}
+    for prefill_tp, kv_cache_dtype in (
+        (1, "auto"),
+        (2, "auto"),
+        (2, "fp8"),
+    ):
+        request_metrics, system_metrics = _run_simulation(
+            output_root=tmp_path / f"tp{prefill_tp}_{kv_cache_dtype}",
+            run_id=f"pdd_cpu_kv_tp{prefill_tp}_{kv_cache_dtype}",
+            architecture_args=[
+                *_pdd_args(prefill_attn_tp=prefill_tp),
+                *_cpu_offload_args(),
+                "--vllm_v1_scheduler_config_kv_cache_dtype",
+                kv_cache_dtype,
+            ],
+            trace_file=CPU_KV_TRACE_FILE,
+            key_mode="session",
+        )
+        results[(prefill_tp, kv_cache_dtype)] = (
+            request_metrics,
+            system_metrics,
+        )
+
+    tp1_requests, tp1_system = results[(1, "auto")]
+    tp2_requests, tp2_system = results[(2, "auto")]
+    fp8_requests, fp8_system = results[(2, "fp8")]
+    tp1_cpu = tp1_system["cpu_kv_cache_statistics"]
+    tp2_cpu = tp2_system["cpu_kv_cache_statistics"]
+    fp8_cpu = fp8_system["cpu_kv_cache_statistics"]
+
+    # Phi-tiny partitions its runtime KV heads evenly across TP workers, so
+    # the aggregate physical snapshot is TP-invariant. The old per-worker
+    # accounting incorrectly made TP=2 half of TP=1.
+    assert tp2_cpu["bytes_per_block"] == tp1_cpu["bytes_per_block"]
+    assert tp1_cpu["capacity_blocks"] == (
+        tp1_cpu["capacity_bytes"] // tp1_cpu["bytes_per_block"]
+    )
+    assert tp2_cpu["capacity_blocks"] == (
+        tp2_cpu["capacity_bytes"] // tp2_cpu["bytes_per_block"]
+    )
+    assert tp2_cpu["offload_bytes"] == tp1_cpu["offload_bytes"]
+    assert tp2_cpu["restore_bytes"] == tp1_cpu["restore_bytes"]
+    assert tp2_requests[
+        "request_cpu_kv_cache_offload_bytes"
+    ].sum() == tp1_requests["request_cpu_kv_cache_offload_bytes"].sum()
+    assert fp8_cpu["bytes_per_block"] * 2 == tp2_cpu["bytes_per_block"]
+    assert fp8_cpu["offload_bytes"] * 2 == tp2_cpu["offload_bytes"]
+    assert fp8_cpu["restore_bytes"] * 2 == tp2_cpu["restore_bytes"]
+    assert fp8_requests[
+        "request_cpu_kv_cache_offload_bytes"
+    ].sum() * 2 == tp2_requests["request_cpu_kv_cache_offload_bytes"].sum()
 
 
 def test_invalid_session_arrival_fails_before_simulation_events(

@@ -103,6 +103,9 @@ class VLLMv1EngineReplicaScheduler(BaseReplicaScheduler):
         self._waiting_requests: List[Request] = []
         # Requests waiting for prefill-side KV transfer completion.
         self._pending_kv_transfer_requests: set[int] = set()
+        self._pending_prefill_export_kinds: dict[int, set[str]] = {}
+        self._pending_cpu_offload_operations: dict[int, object] = {}
+        self._cpu_offload_generation_by_session: dict[int, int] = {}
         self._scheduled_num_computed_tokens_by_request: Dict[int, int] = {}
         self._monolithic_pp_pending_terminal_release_iters: Dict[int, int] = {}
         self._monolithic_pp_waiting_sensitive_release_extensions: set[int] = set()
@@ -264,6 +267,38 @@ class VLLMv1EngineReplicaScheduler(BaseReplicaScheduler):
                 num_preallocate_tokens=int(
                     getattr(self._config, "num_preallocate_tokens", 0)
                 ),
+            )
+        self._cpu_kv_cache_manager = None
+        self._cpu_kv_cache_transfer_engine = None
+        self._cpu_restore_waiting_requests: dict[int, object] = {}
+        self._pending_cpu_restore_operations: dict[int, object] = {}
+        self._cpu_restore_ready_plans: dict[int, object] = {}
+        self._pending_auxiliary_events: list[object] = []
+        if (
+            self._cpu_kv_cache_config is not None
+            and self._cpu_kv_cache_config.enable
+            and self._cluster_type == ClusterType.PREFILL
+        ):
+            if self._kv_cache_manager is None:
+                raise ValueError(
+                    "CPU KV-cache offloading requires the prefill GPU prefix cache."
+                )
+            from frontier.cpu_kv_cache_transfer import (
+                AnalyticalCPUKVCacheTransferEngine,
+            )
+            from frontier.kv_cache import CPUKVCacheManager
+
+            self._cpu_kv_cache_manager = CPUKVCacheManager(
+                capacity_bytes=self._cpu_kv_cache_config.capacity_bytes,
+                bytes_per_block=self._cpu_kv_cache_bytes_per_block,
+                capacity_pressure_policy=(
+                    self._cpu_kv_cache_config.capacity_pressure_policy
+                ),
+            )
+            self._cpu_kv_cache_transfer_engine = (
+                AnalyticalCPUKVCacheTransferEngine(
+                    self._cpu_kv_cache_config
+                )
             )
 
     def _create_batch(self, requests: List[Request], num_tokens: List[int]) -> Batch:
@@ -1139,9 +1174,151 @@ class VLLMv1EngineReplicaScheduler(BaseReplicaScheduler):
                     f"source_dp={self._dp_id}"
                 )
 
+            self._pending_kv_transfer_requests.discard(request.id)
+            pending_exports = getattr(
+                self, "_pending_prefill_export_kinds", None
+            )
+            if pending_exports is None:
+                pending_exports = {}
+                self._pending_prefill_export_kinds = pending_exports
+            pending_kinds = pending_exports.setdefault(request.id, set())
+            pending_kinds.discard("decode_transfer")
+            if not pending_kinds:
+                pending_exports.pop(request.id, None)
+                if request.id in self._allocation_map:
+                    self._free_request_resources(request)
+
+    def record_decode_kv_transfer_completion(
+        self, time: float, requests: Sequence[Request]
+    ) -> None:
+        """Record the competing P-to-D export endpoint for barrier metrics."""
+        for request in requests:
+            offload_info = self._pending_cpu_offload_operations.get(request.id)
+            if offload_info is not None:
+                offload_info.decode_transfer_completed_at = float(time)
+
+    def start_cpu_kv_cache_offload(
+        self, *, time: float, request: Request
+    ):
+        if not self._is_cpu_kv_cache_enabled():
+            return None
+        assert self._cpu_kv_cache_manager is not None
+        assert self._cpu_kv_cache_transfer_engine is not None
+        desired_frontier = (
+            int(request.num_prefill_tokens) // int(self._config.block_size)
+        )
+        session_id = int(request.session_id)
+        generations = getattr(
+            self, "_cpu_offload_generation_by_session", None
+        )
+        if generations is None:
+            generations = {}
+            self._cpu_offload_generation_by_session = generations
+        generation = generations.get(session_id, 0) + 1
+        generations[session_id] = generation
+        reservation = self._cpu_kv_cache_manager.reserve_offload(
+            session_id=request.session_id,
+            desired_frontier_blocks=desired_frontier,
+            generation=generation,
+            time=time,
+        )
+        if reservation.terminal or reservation.num_blocks == 0:
+            return None
+
+        from frontier.entities.cpu_kv_cache_transfer_info import (
+            CPUKVCacheOffloadInfo,
+        )
+        from frontier.events.cpu_kv_cache_offload_start_event import (
+            CPUKVCacheOffloadStartEvent,
+        )
+
+        try:
+            timing = self._cpu_kv_cache_transfer_engine.schedule(
+                direction="d2h",
+                size_bytes=reservation.num_blocks
+                * self._cpu_kv_cache_manager.bytes_per_block,
+                submitted_at=time,
+            )
+        except Exception:
+            self._cpu_kv_cache_manager.abort_offload(reservation)
+            raise
+        offload_info = CPUKVCacheOffloadInfo(
+            request=request,
+            replica_id=self._replica_id,
+            dp_id=self._dp_id,
+            reservation=reservation,
+            timing=timing,
+            desired_frontier_blocks=desired_frontier,
+        )
+        if request.id in self._pending_cpu_offload_operations:
+            raise ValueError(
+                "CPU KV-cache offload already pending for request: "
+                f"request_id={request.id}"
+            )
+        self._pending_cpu_offload_operations[request.id] = offload_info
+        # Record the scheduled transfer cost immediately. Decode is allowed to
+        # finish before this independent D2H copy, so request metrics cannot
+        # depend on the later offload-completion event.
+        request.on_cpu_kv_cache_offload(
+            size_bytes=timing.size_bytes,
+            queue_time_ms=timing.queue_time_ms,
+            transfer_time_ms=timing.service_time_ms,
+        )
+        self._pending_prefill_export_kinds.setdefault(
+            request.id, set()
+        ).add("cpu_offload")
+        return CPUKVCacheOffloadStartEvent(offload_info)
+
+    def abort_cpu_kv_cache_offload(self, offload_info) -> bool:
+        """Rollback an in-flight D2H snapshot and close its barrier branch."""
+        request = offload_info.request
+        pending = self._pending_cpu_offload_operations.get(request.id)
+        if pending is None:
+            return False
+        if pending is not offload_info:
+            raise ValueError(
+                "CPU KV-cache offload abort does not match pending operation: "
+                f"request_id={request.id}"
+            )
+        assert self._cpu_kv_cache_manager is not None
+        self._cpu_kv_cache_manager.abort_offload(offload_info.reservation)
+        self._pending_cpu_offload_operations.pop(request.id, None)
+        pending_kinds = self._pending_prefill_export_kinds.get(request.id)
+        if pending_kinds is not None:
+            pending_kinds.discard("cpu_offload")
+            if not pending_kinds:
+                self._pending_prefill_export_kinds.pop(request.id, None)
+                if request.id in self._allocation_map:
+                    self._free_request_resources(request)
+        return True
+
+    def complete_cpu_kv_cache_offload(
+        self, time: float, offload_info
+    ) -> None:
+        request = offload_info.request
+        pending_kinds = self._pending_prefill_export_kinds.get(request.id)
+        if pending_kinds is None or "cpu_offload" not in pending_kinds:
+            raise ValueError(
+                "CPU KV-cache offload completion without pending export: "
+                f"request_id={request.id}"
+            )
+        assert self._cpu_kv_cache_manager is not None
+        pending_offload = self._pending_cpu_offload_operations.get(request.id)
+        if pending_offload is not offload_info:
+            raise ValueError(
+                "CPU KV-cache offload completion does not match pending operation: "
+                f"request_id={request.id}"
+            )
+        self._cpu_kv_cache_manager.commit_offload(
+            offload_info.reservation,
+            time=time,
+        )
+        pending_kinds.discard("cpu_offload")
+        self._pending_cpu_offload_operations.pop(request.id, None)
+        if not pending_kinds:
+            self._pending_prefill_export_kinds.pop(request.id, None)
             if request.id in self._allocation_map:
                 self._free_request_resources(request)
-            self._pending_kv_transfer_requests.discard(request.id)
 
     def _free_request_resources(self, request: Request) -> None:
         self._get_monolithic_pp_mtp_near_full_prefill_request_ids().discard(
@@ -1214,6 +1391,251 @@ class VLLMv1EngineReplicaScheduler(BaseReplicaScheduler):
             int(query_blocks),
             int(hit_blocks),
         )
+
+    def _is_cpu_kv_cache_enabled(self) -> bool:
+        return (
+            self._cpu_kv_cache_manager is not None
+            and self._cpu_kv_cache_transfer_engine is not None
+            and self._cluster_type == ClusterType.PREFILL
+        )
+
+    def _build_tiered_prefix_plan(self, request: Request):
+        from frontier.kv_cache import TieredPrefixPlan
+
+        if not self._is_cpu_kv_cache_enabled():
+            raise ValueError("CPU KV-cache tier is not enabled")
+        assert self._kv_cache_manager is not None
+        assert self._cpu_kv_cache_manager is not None
+        if request.session_id is None:
+            raise ValueError("CPU KV-cache lookup requires request.session_id")
+
+        block_keys = self._kv_cache_manager.get_request_lookup_block_keys(
+            request
+        )
+        gpu_blocks_by_index = {}
+        cpu_block_indices = []
+        cpu_query_blocks = 0
+        hit_frontier = 0
+        for block_index, block_key in enumerate(block_keys):
+            gpu_block = self._kv_cache_manager.get_cached_block_for_key(
+                block_key
+            )
+            if gpu_block is not None:
+                gpu_blocks_by_index[block_index] = gpu_block
+            else:
+                cpu_query_blocks += 1
+                if self._cpu_kv_cache_manager.probe_committed_block(
+                    request.session_id, block_index
+                ):
+                    cpu_block_indices.append(block_index)
+                else:
+                    break
+            hit_frontier += 1
+
+        block_size = int(self._config.block_size)
+        if (
+            hit_frontier > 0
+            and int(request.num_prefill_tokens)
+            - hit_frontier * block_size
+            == 0
+        ):
+            demoted_index = hit_frontier - 1
+            gpu_blocks_by_index.pop(demoted_index, None)
+            if demoted_index in cpu_block_indices:
+                cpu_block_indices.remove(demoted_index)
+            hit_frontier -= 1
+
+        return TieredPrefixPlan(
+            query_blocks=len(block_keys),
+            cpu_query_blocks=cpu_query_blocks,
+            hit_frontier_blocks=hit_frontier,
+            gpu_blocks_by_index=gpu_blocks_by_index,
+            cpu_block_indices=cpu_block_indices,
+            block_keys=block_keys,
+            block_size=block_size,
+            prompt_tokens=int(request.num_prefill_tokens),
+        )
+
+    def _begin_cpu_kv_cache_restore(
+        self,
+        *,
+        request: Request,
+        plan,
+        time: float,
+    ) -> bool:
+        if not plan.needs_restore:
+            return False
+        if request.id in self._pending_cpu_restore_operations:
+            return True
+        if request.id in self._cpu_restore_ready_plans:
+            return False
+        assert self._kv_cache_manager is not None
+        assert self._cpu_kv_cache_manager is not None
+        assert self._cpu_kv_cache_transfer_engine is not None
+        prompt_blocks = ceil(
+            int(request.num_prefill_tokens) / int(self._config.block_size)
+        )
+        suffix_reservation_count = max(
+            prompt_blocks - int(plan.hit_frontier_blocks),
+            0,
+        )
+        if not self._kv_cache_manager.can_reserve_tiered_prefix(
+            gpu_blocks_by_index=plan.gpu_blocks_by_index,
+            cpu_restore_count=plan.cpu_hit_blocks,
+            suffix_reservation_count=suffix_reservation_count,
+            minimum_free_blocks_after_reservation=self._watermark_blocks,
+        ):
+            return False
+
+        restore_blocks_by_index = (
+            self._kv_cache_manager.reserve_tiered_prefix(
+                request,
+                hit_frontier_blocks=plan.hit_frontier_blocks,
+                gpu_blocks_by_index=plan.gpu_blocks_by_index,
+                cpu_restore_indices=plan.cpu_block_indices,
+                suffix_reservation_count=suffix_reservation_count,
+            )
+        )
+        try:
+            cpu_lease = self._cpu_kv_cache_manager.pin_restore_blocks(
+                session_id=request.session_id,
+                block_indices=plan.cpu_block_indices,
+                time=time,
+            )
+        except Exception:
+            self._kv_cache_manager.free(request)
+            self._sync_prefix_cache_allocation_state()
+            raise
+
+        from frontier.entities.cpu_kv_cache_transfer_info import (
+            CPUKVCacheRestoreInfo,
+        )
+        from frontier.events.cpu_kv_cache_restore_start_event import (
+            CPUKVCacheRestoreStartEvent,
+        )
+
+        try:
+            timing = self._cpu_kv_cache_transfer_engine.schedule(
+                direction="h2d",
+                size_bytes=plan.cpu_hit_blocks
+                * self._cpu_kv_cache_manager.bytes_per_block,
+                submitted_at=time,
+            )
+        except Exception:
+            self._cpu_kv_cache_manager.release_restore_lease(
+                cpu_lease, time=time, used=False
+            )
+            self._kv_cache_manager.free(request)
+            self._sync_prefix_cache_allocation_state()
+            raise
+        restore_info = CPUKVCacheRestoreInfo(
+            request=request,
+            replica_id=self._replica_id,
+            dp_id=self._dp_id,
+            plan=plan,
+            restore_blocks_by_index=restore_blocks_by_index,
+            cpu_lease=cpu_lease,
+            timing=timing,
+        )
+        self._pending_cpu_restore_operations[request.id] = restore_info
+        self._cpu_restore_waiting_requests[request.id] = request
+        self._sync_prefix_cache_allocation_state(request)
+        self._pending_auxiliary_events.append(
+            CPUKVCacheRestoreStartEvent(restore_info)
+        )
+        return True
+
+    def cancel_cpu_kv_cache_restore(self, request_id: int, *, time: float) -> bool:
+        """Rollback an in-flight H2D restore exactly once."""
+        request_id = int(request_id)
+        restore_info = self._pending_cpu_restore_operations.pop(
+            request_id, None
+        )
+        if restore_info is None:
+            return False
+        assert self._kv_cache_manager is not None
+        assert self._cpu_kv_cache_manager is not None
+        self._cpu_kv_cache_manager.release_restore_lease(
+            restore_info.cpu_lease,
+            time=time,
+            used=False,
+        )
+        self._kv_cache_manager.free(restore_info.request)
+        self._cpu_restore_waiting_requests.pop(request_id, None)
+        self._cpu_restore_ready_plans.pop(request_id, None)
+        self._pending_auxiliary_events = [
+            event
+            for event in self._pending_auxiliary_events
+            if getattr(event, "_restore_info", None) is not restore_info
+        ]
+        self._sync_prefix_cache_allocation_state()
+        return True
+
+    def complete_cpu_kv_cache_restore(
+        self, time: float, restore_info
+    ) -> None:
+        request = restore_info.request
+        pending = self._pending_cpu_restore_operations.get(request.id)
+        if pending is not restore_info:
+            raise ValueError(
+                "CPU KV-cache restore completion does not match pending "
+                f"operation for request {request.id}"
+            )
+        assert self._kv_cache_manager is not None
+        assert self._cpu_kv_cache_manager is not None
+        self._kv_cache_manager.publish_restored_prefix(
+            request,
+            restore_blocks_by_index=restore_info.restore_blocks_by_index,
+            block_keys=restore_info.plan.block_keys,
+            hit_frontier_blocks=restore_info.plan.hit_frontier_blocks,
+        )
+        self._cpu_kv_cache_manager.release_restore_lease(
+            restore_info.cpu_lease,
+            time=time,
+            used=True,
+        )
+        should_record_cpu_lookup = (
+            not request.prefix_cache_metrics_recorded_for_current_round
+        )
+        request.on_tiered_prefix_cache_lookup(
+            query_blocks=restore_info.plan.query_blocks,
+            gpu_hit_blocks=restore_info.plan.gpu_hit_blocks,
+            cpu_query_blocks=restore_info.plan.cpu_query_blocks,
+            cpu_hit_blocks=restore_info.plan.cpu_hit_blocks,
+            num_tokens_cached=restore_info.plan.hit_tokens,
+            key_mode="session",
+        )
+        if should_record_cpu_lookup:
+            self._cpu_kv_cache_manager.record_lookup(
+                session_id=request.session_id,
+                query_blocks=restore_info.plan.cpu_query_blocks,
+                hit_blocks=restore_info.plan.cpu_hit_blocks,
+                lookup_id=request.id,
+            )
+        request.on_cpu_kv_cache_restore(
+            restored_blocks=restore_info.plan.cpu_hit_blocks,
+            restored_tokens=(
+                restore_info.plan.cpu_hit_blocks
+                * restore_info.plan.block_size
+            ),
+            size_bytes=restore_info.timing.size_bytes,
+            queue_time_ms=restore_info.timing.queue_time_ms,
+            transfer_time_ms=restore_info.timing.service_time_ms,
+        )
+        self._pending_cpu_restore_operations.pop(request.id)
+        self._cpu_restore_waiting_requests.pop(request.id, None)
+        self._cpu_restore_ready_plans[request.id] = restore_info.plan
+        self._sync_prefix_cache_allocation_state(request)
+
+    def drain_pending_auxiliary_events(self) -> list:
+        events = self._pending_auxiliary_events
+        self._pending_auxiliary_events = []
+        return events
+
+    def get_cpu_kv_cache_statistics(self) -> dict[str, int | float] | None:
+        if self._cpu_kv_cache_manager is None:
+            return None
+        return self._cpu_kv_cache_manager.get_statistics()
 
     def _build_decode_cuda_graph_metadata(
         self, batch: Batch
@@ -1864,6 +2286,9 @@ class VLLMv1EngineReplicaScheduler(BaseReplicaScheduler):
 
                     # Track that this request's KV cache is pending transfer.
                     self._pending_kv_transfer_requests.add(request.id)
+                    self._pending_prefill_export_kinds.setdefault(
+                        request.id, set()
+                    ).add("decode_transfer")
 
                     logger.info(
                         f"[VLLMv1Engine] Request {request.id} prefill complete, "
@@ -3104,9 +3529,55 @@ class VLLMv1EngineReplicaScheduler(BaseReplicaScheduler):
             prefix_cache_query_blocks = 0
             prefix_cache_hit_blocks = 0
             prefix_cache_lookup_attempted = False
+            prefix_cache_lookup_already_applied = False
+            tiered_lookup_plan = None
+
+            if request.id in self._pending_cpu_restore_operations:
+                waiting_queue.popleft()
+                skipped_waiting_requests.append(request)
+                continue
 
             # Calculate number of new tokens to process
-            if self._is_prefix_caching_enabled() and not request.is_prefill_complete:
+            ready_tiered_plan = self._cpu_restore_ready_plans.get(request.id)
+            if ready_tiered_plan is not None and not request.is_prefill_complete:
+                prefix_cache_lookup_attempted = True
+                prefix_cache_lookup_already_applied = True
+                computed_blocks = None
+                prefix_cached_tokens = ready_tiered_plan.hit_tokens
+                prefix_cache_query_blocks = ready_tiered_plan.query_blocks
+                prefix_cache_hit_blocks = ready_tiered_plan.total_hit_blocks
+                num_new_tokens = self._get_request_next_num_tokens(request)
+                max_allowed = (
+                    self._max_model_len
+                    - self._get_scheduler_num_computed_tokens(request)
+                )
+            elif (
+                self._is_cpu_kv_cache_enabled()
+                and not request.is_prefill_complete
+            ):
+                tiered_plan = self._build_tiered_prefix_plan(request)
+                if tiered_plan.needs_restore:
+                    if self._begin_cpu_kv_cache_restore(
+                        request=request,
+                        plan=tiered_plan,
+                        time=self._current_schedule_time,
+                    ):
+                        waiting_queue.popleft()
+                        skipped_waiting_requests.append(request)
+                        continue
+                    break
+                prefix_cache_lookup_attempted = True
+                tiered_lookup_plan = tiered_plan
+                computed_blocks = [
+                    tiered_plan.gpu_blocks_by_index[index]
+                    for index in range(tiered_plan.hit_frontier_blocks)
+                ]
+                prefix_cached_tokens = tiered_plan.hit_tokens
+                prefix_cache_query_blocks = tiered_plan.query_blocks
+                prefix_cache_hit_blocks = tiered_plan.total_hit_blocks
+                num_new_tokens = tiered_plan.num_new_tokens
+                max_allowed = self._max_model_len - prefix_cached_tokens
+            elif self._is_prefix_caching_enabled() and not request.is_prefill_complete:
                 prefix_cache_lookup_attempted = True
                 (
                     computed_blocks,
@@ -3220,16 +3691,43 @@ class VLLMv1EngineReplicaScheduler(BaseReplicaScheduler):
             )
             if prefix_cache_lookup_attempted:
                 assert self._kv_cache_manager is not None
-                request.on_prefix_cache_lookup(
-                    query_blocks=prefix_cache_query_blocks,
-                    hit_blocks=prefix_cache_hit_blocks,
-                    num_tokens_cached=prefix_cached_tokens,
-                    key_mode=self._kv_cache_manager.caching_key_mode,
+                should_record_cpu_lookup = (
+                    tiered_lookup_plan is not None
+                    and not request.prefix_cache_metrics_recorded_for_current_round
                 )
+                if not prefix_cache_lookup_already_applied:
+                    if tiered_lookup_plan is not None:
+                        request.on_tiered_prefix_cache_lookup(
+                            query_blocks=prefix_cache_query_blocks,
+                            gpu_hit_blocks=tiered_lookup_plan.gpu_hit_blocks,
+                            cpu_query_blocks=(
+                                tiered_lookup_plan.cpu_query_blocks
+                            ),
+                            cpu_hit_blocks=tiered_lookup_plan.cpu_hit_blocks,
+                            num_tokens_cached=prefix_cached_tokens,
+                            key_mode=self._kv_cache_manager.caching_key_mode,
+                        )
+                    else:
+                        request.on_prefix_cache_lookup(
+                            query_blocks=prefix_cache_query_blocks,
+                            hit_blocks=prefix_cache_hit_blocks,
+                            num_tokens_cached=prefix_cached_tokens,
+                            key_mode=self._kv_cache_manager.caching_key_mode,
+                        )
                 self._kv_cache_manager.record_prefix_cache_admission(
                     query_blocks=prefix_cache_query_blocks,
                     hit_blocks=prefix_cache_hit_blocks,
                 )
+                if should_record_cpu_lookup:
+                    assert self._cpu_kv_cache_manager is not None
+                    self._cpu_kv_cache_manager.record_lookup(
+                        session_id=request.session_id,
+                        query_blocks=tiered_lookup_plan.cpu_query_blocks,
+                        hit_blocks=tiered_lookup_plan.cpu_hit_blocks,
+                        lookup_id=request.id,
+                    )
+                if prefix_cache_lookup_already_applied:
+                    self._cpu_restore_ready_plans.pop(request.id, None)
             self._advance_scheduler_num_computed_tokens(request, num_new_tokens)
 
             # Add to running requests

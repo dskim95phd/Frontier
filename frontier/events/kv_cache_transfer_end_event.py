@@ -59,6 +59,13 @@ class KVCacheTransferEndEvent(BaseEvent):
                 self._transfer_info.source_replica_id,
                 self._transfer_info.source_dp_id,
             )
+            record_completion = getattr(
+                source_replica_scheduler,
+                "record_decode_kv_transfer_completion",
+                None,
+            )
+            if record_completion is not None:
+                record_completion(self.time, batch.requests)
             source_replica_scheduler.complete_kv_transfer_for_requests(batch.requests)
 
             memory_usage_percent = source_replica_scheduler.memory_usage_percent

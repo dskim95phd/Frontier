@@ -114,6 +114,19 @@ class ClusterBatchEndEvent(BaseEvent):
 
             for request in self._batch.requests:
                 if request.is_prefill_complete and request.num_decode_tokens > 0:
+                    cpu_offload_event = (
+                        replica_scheduler.start_cpu_kv_cache_offload(
+                            time=self.time,
+                            request=request,
+                        )
+                        if hasattr(
+                            replica_scheduler,
+                            "start_cpu_kv_cache_offload",
+                        )
+                        else None
+                    )
+                    if cpu_offload_event is not None:
+                        next_events.append(cpu_offload_event)
                     kv_cache_size_bytes, transfer_time_ms = (
                         kv_pred.get_transfer_info_for_request(
                             source_cluster_type=self._cluster_type,

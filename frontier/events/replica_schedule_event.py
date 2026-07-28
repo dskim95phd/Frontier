@@ -85,6 +85,11 @@ class ReplicaScheduleEvent(BaseEvent):
         # bachting operation based on the replica scheduler (internal engine like orca/vllm/..., )
         # also consider current running batch in pipeline stage
         self._batches = replica_scheduler.on_schedule(self.time)
+        auxiliary_events = []
+        if hasattr(replica_scheduler, "drain_pending_auxiliary_events"):
+            auxiliary_events = list(
+                replica_scheduler.drain_pending_auxiliary_events()
+            )
 
         # if there are no batches, we return an empty list
         if not self._batches:
@@ -127,7 +132,7 @@ class ReplicaScheduleEvent(BaseEvent):
                         self._dp_id,
                     )
                 ]
-            return []
+            return auxiliary_events
 
         # Log batching results
         total_requests = sum(len(batch.requests) for batch in self._batches)
@@ -163,7 +168,7 @@ class ReplicaScheduleEvent(BaseEvent):
                             f"requests={[req.id for req in batch.requests]}")
             raise
 
-        return [
+        return auxiliary_events + [
             BatchStageArrivalEvent(
                 self.time,
                 self._replica_id,

@@ -15,11 +15,21 @@ organized into three horizons:
 Items within a horizon are not strictly ordered. Scope and timing may shift as
 the release stabilizes and community feedback arrives.
 
-Detailed implementation proposals:
+Detailed implementation plans and records:
 
 - [Session-scoped prefix caching](session-prefix-caching-plan.md) — add an
   opt-in cache-key mode for incremental-ISL multi-turn traces identified by
   `session_id`.
+
+- [Prefill-side CPU KV-cache offloading](prefill-cpu-kv-offloading-plan.md) -
+  implemented and validated finite, session-aware CPU DRAM tier below each
+  sequential-PDD prefill GPU cache target, preserving the current
+  decode-output recomputation contract.
+
+- [CPU KV-cache restore head-of-line deadlock](cpu-kv-offload-restore-hol-deadlock.md) -
+  open P1 investigation record covering the small-GPU multi-session restore
+  deadlock, minimal reproduction, root cause, churn results, and regression
+  acceptance criteria.
 
 ## Near-term
 

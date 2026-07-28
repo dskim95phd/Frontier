@@ -253,6 +253,7 @@ class Simulator:
             predictors=self._predictors,
             kv_cache_transfer_predictor=kv_cache_transfer_predictor,
             m2n_transfer_predictor=m2n_transfer_predictor,
+            cpu_kv_cache_config=self._config.cpu_kv_cache_config,
             enable_parallel_mode=enable_parallel,
             max_inter_cluster_queue_size=self._config.max_inter_cluster_queue_size,
         )
@@ -1211,6 +1212,9 @@ class Simulator:
         if self._config.metrics_config.write_metrics:
             try:
                 with self._profiler.profile("metrics_output"):
+                    self._metric_store.set_cpu_kv_cache_store_statistics(
+                        self._global_scheduler.get_cpu_kv_cache_statistics_by_target()
+                    )
                     if self._config.metrics_config.store_plots:
                         logger.info("Writing metrics (CSV + plots)...")
                     else:
