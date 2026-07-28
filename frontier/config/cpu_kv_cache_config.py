@@ -26,7 +26,8 @@ class CpuKVCacheConfig:
         metadata={
             "help": (
                 "Derive one CPU KV-cache target from a fixed per-GPU capacity "
-                "and bandwidth slice. The target is aggregated over attention TP."
+                "and bandwidth slice. The target is aggregated over attention "
+                "TP and pipeline parallel stages."
             )
         },
     )
@@ -34,13 +35,23 @@ class CpuKVCacheConfig:
         default=750_000_000_000,
         metadata={"help": "Static CPU DRAM capacity assigned to one GPU in bytes."},
     )
-    read_bandwidth_gbps_per_gpu: float = field(
+    dram_bandwidth_gbps_per_gpu: float = field(
         default=4_800.0,
-        metadata={"help": "Static CPU-to-GPU bandwidth assigned to one GPU in Gbps."},
+        metadata={
+            "help": (
+                "Static per-direction CPU DRAM bandwidth assigned to one GPU "
+                "in Gbps."
+            )
+        },
     )
-    write_bandwidth_gbps_per_gpu: float = field(
-        default=4_800.0,
-        metadata={"help": "Static GPU-to-CPU bandwidth assigned to one GPU in Gbps."},
+    c2c_bandwidth_gbps_per_gpu: float = field(
+        default=3_600.0,
+        metadata={
+            "help": (
+                "Static per-direction NVLink-C2C bandwidth assigned to one GPU "
+                "in Gbps."
+            )
+        },
     )
     write_bandwidth_gbps: float = field(
         default=64.0,
@@ -110,8 +121,8 @@ class CpuKVCacheConfig:
                 f"got={self.capacity_bytes_per_gpu}"
             )
         for field_name in (
-            "read_bandwidth_gbps_per_gpu",
-            "write_bandwidth_gbps_per_gpu",
+            "dram_bandwidth_gbps_per_gpu",
+            "c2c_bandwidth_gbps_per_gpu",
         ):
             value = float(getattr(self, field_name))
             if not math.isfinite(value) or value <= 0:
@@ -172,17 +183,43 @@ class CpuKVCacheConfig:
             )
         if not self.static_slice_per_gpu:
             return self
+        effective_bandwidth_gbps_per_gpu = min(
+            float(self.dram_bandwidth_gbps_per_gpu),
+            float(self.c2c_bandwidth_gbps_per_gpu),
+        )
         return replace(
             self,
             static_slice_per_gpu=False,
             capacity_bytes=self.capacity_bytes_per_gpu * resolved_num_gpus,
             read_bandwidth_gbps=(
-                self.read_bandwidth_gbps_per_gpu * resolved_num_gpus
+                effective_bandwidth_gbps_per_gpu * resolved_num_gpus
             ),
             write_bandwidth_gbps=(
-                self.write_bandwidth_gbps_per_gpu * resolved_num_gpus
+                effective_bandwidth_gbps_per_gpu * resolved_num_gpus
             ),
         )
+
+    def resolve_for_replica_target(
+        self,
+        *,
+        attn_tensor_parallel_size: int,
+        num_pipeline_stages: int,
+    ) -> "CpuKVCacheConfig":
+        """Resolve the physical GPU slices owned by one replica/DP target."""
+
+        attn_tp = int(attn_tensor_parallel_size)
+        pp = int(num_pipeline_stages)
+        if attn_tp <= 0:
+            raise ValueError(
+                "CPU KV-cache attention TP size must be > 0, "
+                f"got={attn_tensor_parallel_size}"
+            )
+        if pp <= 0:
+            raise ValueError(
+                "CPU KV-cache pipeline parallel size must be > 0, "
+                f"got={num_pipeline_stages}"
+            )
+        return self.resolve_for_target(attn_tp * pp)
 
 
 # Compatibility alias. FlatDataclass uses the underlying class name, whose

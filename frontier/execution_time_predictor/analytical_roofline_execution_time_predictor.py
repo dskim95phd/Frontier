@@ -12,6 +12,8 @@ from dataclasses import asdict, dataclass
 import math
 from typing import Dict, Optional
 
+import numpy as np
+
 from frontier.config import (
     AnalyticalRooflineExecutionTimePredictorConfig,
     BaseReplicaSchedulerConfig,
@@ -77,6 +79,45 @@ class AnalyticalRooflineExecutionTimePredictor(BaseExecutionTimePredictor):
             replica_scheduler_config,
             metrics_config,
         )
+        self._moe_routing_mode = str(
+            getattr(replica_config, "moe_routing_mode", "simulation")
+        ).strip()
+        self._moe_routing_seed = int(
+            getattr(replica_config, "moe_routing_seed", 42)
+        )
+        self._moe_routing_distribution_type = str(
+            getattr(
+                replica_config,
+                "moe_routing_distribution_type",
+                "balanced",
+            )
+        ).strip().lower()
+        if self._moe_routing_mode not in {
+            "simulation",
+            "uniform_legacy",
+            "uniform_random",
+        }:
+            raise ValueError(
+                "moe_routing_mode must be one of "
+                "['simulation', 'uniform_legacy', 'uniform_random'], "
+                f"got {self._moe_routing_mode!r}"
+            )
+        if self._moe_routing_seed < 0:
+            raise ValueError(
+                "moe_routing_seed must be non-negative, "
+                f"got {self._moe_routing_seed}"
+            )
+        if self._moe_routing_distribution_type not in {
+            "balanced",
+            "random",
+            "skewed",
+            "zipf",
+        }:
+            raise ValueError(
+                "moe_routing_distribution_type must be one of "
+                "['balanced', 'random', 'skewed', 'zipf'], "
+                f"got {self._moe_routing_distribution_type!r}"
+            )
         if self._model_config.uses_mla():
             raise NotImplementedError(
                 "analytical_roofline MVP supports dense-KV attention; MLA needs "
@@ -111,16 +152,11 @@ class AnalyticalRooflineExecutionTimePredictor(BaseExecutionTimePredictor):
         if precision in (PrecisionType.FP16, PrecisionType.BF16):
             peak = float(device.fp16_tflops)
         elif precision is PrecisionType.FP32:
-            peak = float(device.fp16_tflops) / 2.0
+            peak = float(getattr(device, "fp32_tflops", 0.0))
         elif precision in (PrecisionType.FP8, PrecisionType.INT8):
             peak = float(getattr(device, "fp8_tflops", 0.0))
         elif precision in (PrecisionType.FP4, PrecisionType.INT4):
-            if not self._config.enable_nvfp4_inference_peak:
-                raise ValueError(
-                    "FP4/INT4 requested but enable_nvfp4_inference_peak=False. "
-                    "The published NVFP4 peak is not a generic dense ceiling."
-                )
-            peak = float(getattr(device, "nvfp4_tflops", 0.0))
+            peak = float(getattr(device, "fp4_tflops", 0.0))
         else:  # pragma: no cover - future enum member
             peak = 0.0
         if peak <= 0.0:
@@ -481,7 +517,187 @@ class AnalyticalRooflineExecutionTimePredictor(BaseExecutionTimePredictor):
             mlp_norm_time=norm,
         )
 
+    @staticmethod
+    def _discretize_expert_ratios(
+        total_routed_tokens: int,
+        allocation_ratios: Dict[int, float],
+    ) -> Dict[int, int]:
+        """Convert expert ratios to integer counts with strict conservation."""
+
+        resolved_total = int(total_routed_tokens)
+        if resolved_total < 0:
+            raise ValueError("total_routed_tokens must be non-negative")
+        if not allocation_ratios:
+            if resolved_total == 0:
+                return {}
+            raise ValueError(
+                "allocation_ratios must be non-empty when routed tokens exist"
+            )
+        if any(float(value) < 0.0 for value in allocation_ratios.values()):
+            raise ValueError("allocation_ratios must be non-negative")
+
+        ratio_sum = sum(float(value) for value in allocation_ratios.values())
+        if ratio_sum <= 0.0:
+            if resolved_total == 0:
+                return {int(expert_id): 0 for expert_id in allocation_ratios}
+            raise ValueError(
+                "allocation_ratios must sum to a positive value"
+            )
+
+        base: Dict[int, int] = {}
+        fractional: Dict[int, float] = {}
+        normalized: Dict[int, float] = {}
+        for expert_id in sorted(allocation_ratios):
+            ratio = float(allocation_ratios[expert_id]) / ratio_sum
+            exact = resolved_total * ratio
+            base[int(expert_id)] = int(math.floor(exact))
+            fractional[int(expert_id)] = exact - math.floor(exact)
+            normalized[int(expert_id)] = ratio
+
+        remainder = resolved_total - sum(base.values())
+        ranked_experts = sorted(
+            base,
+            key=lambda expert_id: (
+                -fractional[expert_id],
+                -normalized[expert_id],
+                expert_id,
+            ),
+        )
+        for index in range(remainder):
+            base[ranked_experts[index % len(ranked_experts)]] += 1
+
+        if sum(base.values()) != resolved_total:
+            raise ValueError(
+                "MoE token conservation failed after ratio discretization"
+            )
+        return base
+
+    def _get_global_per_expert_tokens(
+        self,
+        total_routed_tokens: int,
+        layer_id: int,
+    ) -> Dict[int, int]:
+        """Apply the configured routing policy across all global experts."""
+
+        resolved_total = int(total_routed_tokens)
+        total_experts = int(self._replica_config.total_expert_num)
+        if total_experts <= 0:
+            raise ValueError(
+                f"MoE routing requires num_experts > 0, got {total_experts}"
+            )
+        if resolved_total < 0:
+            raise ValueError("total_routed_tokens must be non-negative")
+        if resolved_total == 0:
+            return {expert_id: 0 for expert_id in range(total_experts)}
+
+        if self._moe_routing_mode == "uniform_random":
+            rng = np.random.default_rng(
+                self._moe_routing_seed + int(layer_id)
+            )
+            sampled_expert_ids = rng.integers(
+                low=0,
+                high=total_experts,
+                size=resolved_total,
+            )
+            expert_counts = np.bincount(
+                sampled_expert_ids,
+                minlength=total_experts,
+            )
+            return {
+                expert_id: int(expert_counts[expert_id])
+                for expert_id in range(total_experts)
+            }
+
+        if self._moe_routing_mode == "uniform_legacy":
+            ratios = {
+                expert_id: 1.0 for expert_id in range(total_experts)
+            }
+            return self._discretize_expert_ratios(
+                resolved_total,
+                ratios,
+            )
+
+        distribution = self._moe_routing_distribution_type
+        if distribution == "balanced":
+            weights = np.ones(total_experts, dtype=float)
+        elif distribution == "random":
+            rng = np.random.default_rng(
+                self._moe_routing_seed + int(layer_id)
+            )
+            weights = rng.uniform(0.1, 1.0, total_experts)
+        elif distribution == "skewed":
+            ranks = np.arange(1, total_experts + 1, dtype=float)
+            weights = 1.0 / np.power(ranks, 0.35)
+        elif distribution == "zipf":
+            ranks = np.arange(1, total_experts + 1, dtype=float)
+            weights = 1.0 / ranks
+        else:  # pragma: no cover - guarded in __init__
+            raise ValueError(
+                f"Unsupported MoE routing distribution {distribution!r}"
+            )
+
+        return self._discretize_expert_ratios(
+            resolved_total,
+            {
+                expert_id: float(weights[expert_id])
+                for expert_id in range(total_experts)
+            },
+        )
+
+    def _get_ep_lane_per_expert_tokens(
+        self,
+        batch: Batch,
+        layer_id: int,
+        cluster_type: ClusterType,
+    ) -> Dict[int, Dict[int, int]]:
+        """Partition global routed tokens by contiguous EP expert ownership."""
+
+        ep_size = max(
+            1,
+            int(self._replica_config.moe_expert_parallel_size),
+        )
+        total_experts = int(self._replica_config.total_expert_num)
+        if total_experts <= 0 or total_experts % ep_size != 0:
+            raise ValueError(
+                "MoE expert ownership requires num_experts to be positive and "
+                "divisible by moe_expert_parallel_size; "
+                f"got num_experts={total_experts}, ep_size={ep_size}"
+            )
+
+        topk = max(
+            1,
+            int(
+                self._replica_config.router_topk
+                or self._model_config.num_experts_per_tok
+            ),
+        )
+        total_routed_tokens = self._tokens(batch, cluster_type) * topk
+        global_allocation = self._get_global_per_expert_tokens(
+            total_routed_tokens,
+            layer_id,
+        )
+        experts_per_lane = total_experts // ep_size
+        lane_allocations: Dict[int, Dict[int, int]] = {
+            ep_id: {} for ep_id in range(ep_size)
+        }
+        for global_expert_id, token_count in global_allocation.items():
+            ep_id = global_expert_id // experts_per_lane
+            local_expert_id = global_expert_id % experts_per_lane
+            lane_allocations[ep_id][local_expert_id] = int(token_count)
+
+        if sum(
+            token_count
+            for allocation in lane_allocations.values()
+            for token_count in allocation.values()
+        ) != total_routed_tokens:
+            raise ValueError(
+                "MoE token conservation failed while partitioning EP lanes"
+            )
+        return lane_allocations
+
     def _uniform_local_expert_tokens(self, batch: Batch) -> Dict[int, int]:
+        """Legacy uniform allocation for callers that explicitly request it."""
+
         topk = max(
             1,
             int(
@@ -521,8 +737,107 @@ class AnalyticalRooflineExecutionTimePredictor(BaseExecutionTimePredictor):
     def _get_moe_tokens_input(
         self, batch: Batch, layer_id: int = 0
     ) -> Dict[int, int]:
-        del layer_id
-        return self._uniform_local_expert_tokens(batch)
+        lane_allocations = self._get_ep_lane_per_expert_tokens(
+            batch,
+            layer_id,
+            self._cluster_type,
+        )
+        return lane_allocations[0]
+
+    def _predict_grouped_moe_projection_time(
+        self,
+        *,
+        batch: Batch,
+        allocation: Dict[int, int],
+        k: int,
+        n: int,
+        cluster_type: ClusterType,
+        projection: str,
+        weight_multiplier: int = 1,
+    ) -> float:
+        """Predict one grouped projection over all active local experts."""
+
+        active_allocation = {
+            int(expert_id): int(token_count)
+            for expert_id, token_count in allocation.items()
+            if int(token_count) > 0
+        }
+        if not active_allocation:
+            return 0.0
+
+        precision = self._precision("moe_grouped_gemm", cluster_type)
+        element_bytes = precision.bytes_per_element
+        flops = 0.0
+        hbm_bytes = 0.0
+        for token_count in active_allocation.values():
+            flops += (
+                2.0
+                * token_count
+                * k
+                * n
+                * weight_multiplier
+            )
+            hbm_bytes += element_bytes * (
+                token_count * k
+                + weight_multiplier * k * n
+                + weight_multiplier * token_count * n
+            )
+
+        token_shape = ",".join(
+            f"e{expert_id}:{active_allocation[expert_id]}"
+            for expert_id in sorted(active_allocation)
+        )
+        return self.predict_roofline_kernel(
+            operator_name="moe_grouped_gemm",
+            phase=self._phase(batch),
+            local_shape=(
+                f"projection={projection},groups={len(active_allocation)},"
+                f"K={k},N={n},multiplicity={weight_multiplier},"
+                f"tokens=[{token_shape}]"
+            ),
+            flops=flops,
+            hbm_bytes=hbm_bytes,
+            precision=precision,
+            compute_efficiency=self._config.moe_compute_efficiency,
+            memory_efficiency=self._config.moe_memory_efficiency,
+            overlap_penalty=self._config.moe_overlap_penalty,
+        )
+
+    def predict_ep_lane_moe_times_ms(
+        self,
+        batch: Batch,
+        layer_id: int,
+        cluster_type: ClusterType,
+    ) -> Dict[int, float]:
+        """Predict local MoE compute time for every EP lane."""
+
+        lane_allocations = self._get_ep_lane_per_expert_tokens(
+            batch,
+            layer_id,
+            cluster_type,
+        )
+        return {
+            ep_id: self.predict_moe_layer_time(
+                batch,
+                layer_id,
+                cluster_type,
+                per_expert_tokens=local_allocation,
+            ).total_time()
+            for ep_id, local_allocation in lane_allocations.items()
+        }
+
+    def predict_monolithic_decode_shared_domain_lane_moe_times_ms(
+        self,
+        batch: Batch,
+        layer_id: int,
+    ) -> Dict[int, float]:
+        """Compatibility entry point for monolithic EP synchronization."""
+
+        return self.predict_ep_lane_moe_times_ms(
+            batch,
+            layer_id,
+            ClusterType.MONOLITHIC,
+        )
 
     def predict_moe_layer_time(
         self,
@@ -531,7 +846,6 @@ class AnalyticalRooflineExecutionTimePredictor(BaseExecutionTimePredictor):
         cluster_type: ClusterType,
         per_expert_tokens: Optional[Dict[int, int]] = None,
     ) -> MoETime:
-        del layer_id
         if not self._model_config.is_moe:
             raise ValueError("MoE prediction requested for a dense model")
         if cluster_type == ClusterType.DECODE_ATTN:
@@ -565,35 +879,27 @@ class AnalyticalRooflineExecutionTimePredictor(BaseExecutionTimePredictor):
             else dict(getattr(batch, "per_expert_tokens", {}) or {})
         )
         if not allocation:
-            allocation = self._uniform_local_expert_tokens(batch)
+            allocation = self._get_moe_tokens_input(batch, layer_id)
         if any(int(value) < 0 for value in allocation.values()):
             raise ValueError("per_expert_tokens values must be non-negative")
 
-        grouped_gemm = 0.0
-        for expert_id, expert_tokens in allocation.items():
-            expert_tokens = int(expert_tokens)
-            if expert_tokens <= 0:
-                continue
-            up = self._gemm(
-                "moe_grouped_gemm",
-                batch,
-                expert_tokens,
-                hidden,
-                local_intermediate,
-                cluster_type,
-                operator_class="moe",
-                weight_multiplier=gated,
-            )
-            down = self._gemm(
-                "moe_grouped_gemm",
-                batch,
-                expert_tokens,
-                local_intermediate,
-                hidden,
-                cluster_type,
-                operator_class="moe",
-            )
-            grouped_gemm += up + down
+        grouped_gemm = self._predict_grouped_moe_projection_time(
+            batch=batch,
+            allocation=allocation,
+            k=hidden,
+            n=local_intermediate,
+            cluster_type=cluster_type,
+            projection="up",
+            weight_multiplier=gated,
+        )
+        grouped_gemm += self._predict_grouped_moe_projection_time(
+            batch=batch,
+            allocation=allocation,
+            k=local_intermediate,
+            n=hidden,
+            cluster_type=cluster_type,
+            projection="down",
+        )
 
         routed_tokens = sum(int(value) for value in allocation.values())
         shuffling = self._streaming(
@@ -954,8 +1260,9 @@ class AnalyticalRooflineExecutionTimePredictor(BaseExecutionTimePredictor):
             "hbm_bandwidth_tbps": float(
                 self._replica_config.device_config.hbm_bandwidth_tbps
             ),
+            "fp32_tflops": float(self._replica_config.device_config.fp32_tflops),
             "fp16_tflops": float(self._replica_config.device_config.fp16_tflops),
             "fp8_tflops": float(self._replica_config.device_config.fp8_tflops),
-            "nvfp4_tflops": float(self._replica_config.device_config.nvfp4_tflops),
+            "fp4_tflops": float(self._replica_config.device_config.fp4_tflops),
             "diagnostic_count": len(self._diagnostics),
         }

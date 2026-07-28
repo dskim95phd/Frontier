@@ -97,9 +97,10 @@ The main controls are:
 - `--cpu_kv_cache_config_enable`
 - `--cpu_kv_cache_config_capacity_bytes`
 - `--cpu_kv_cache_config_static_slice_per_gpu` derives the target capacity and
-  bandwidth from the attention-TP GPU count; use it with
-  `capacity_bytes_per_gpu`, `read_bandwidth_gbps_per_gpu`, and
-  `write_bandwidth_gbps_per_gpu`
+  bandwidth from `attention TP × pipeline parallel size`; use it with
+  `capacity_bytes_per_gpu`, `dram_bandwidth_gbps_per_gpu`, and
+  `c2c_bandwidth_gbps_per_gpu`. The slower of DRAM and C2C determines each
+  GPU slice's effective per-direction transfer bandwidth.
 - `--cpu_kv_cache_config_write_bandwidth_gbps` and
   `--cpu_kv_cache_config_write_latency_ms`
 - `--cpu_kv_cache_config_read_bandwidth_gbps` and
@@ -110,7 +111,10 @@ The main controls are:
 
 The capacity and direction-specific bandwidth values apply to one aggregate
 prefill `(replica_id, dp_id)` CPU cache target. All attention TP workers in
-that DP lane contribute their physical KV shard bytes to each CPU block.
+that DP lane contribute their physical KV shard bytes to each CPU block. A
+pipeline-parallel target owns physical GPU slices in every stage, even though
+the aggregate CPU block already represents the full model and therefore is
+not multiplied by PP a second time.
 
 The MVP requires sequential `pd-disaggregation`, `vllm_v1`, session prefix
 caching, and `sticky_round_robin`; Thinking Mode is not supported in this

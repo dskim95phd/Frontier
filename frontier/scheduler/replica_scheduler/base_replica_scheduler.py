@@ -50,8 +50,11 @@ class BaseReplicaScheduler(ABC):
         self._af_pipeline_num_micro_batch = af_pipeline_num_micro_batch
         self._cluster_scheduler = cluster_scheduler
         self._cpu_kv_cache_config = (
-            cpu_kv_cache_config.resolve_for_target(
-                replica_config.attn_tensor_parallel_size
+            cpu_kv_cache_config.resolve_for_replica_target(
+                attn_tensor_parallel_size=(
+                    replica_config.attn_tensor_parallel_size
+                ),
+                num_pipeline_stages=replica_config.num_pipeline_stages,
             )
             if cpu_kv_cache_config is not None
             else None

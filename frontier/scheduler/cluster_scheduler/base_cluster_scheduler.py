@@ -58,6 +58,48 @@ def resolve_ep_collective_kind(
 
 
 class BaseClusterScheduler(ABC):
+    @staticmethod
+    def _predict_ep_lane_moe_times_ms(
+        execution_time_predictor,
+        batch: Batch,
+        layer_id: int,
+        cluster_type: ClusterType,
+    ) -> Optional[Dict[int, float]]:
+        """Return validated per-EP-lane MoE times when a predictor supports it."""
+
+        prediction_method = getattr(
+            execution_time_predictor,
+            "predict_ep_lane_moe_times_ms",
+            None,
+        )
+        if not callable(prediction_method):
+            return None
+
+        raw_lane_times = prediction_method(
+            batch,
+            layer_id,
+            cluster_type,
+        )
+        if not isinstance(raw_lane_times, dict) or not raw_lane_times:
+            raise ValueError(
+                "predict_ep_lane_moe_times_ms must return a non-empty dict"
+            )
+
+        lane_times: Dict[int, float] = {}
+        for lane_id, lane_time_ms in raw_lane_times.items():
+            resolved_lane_id = int(lane_id)
+            resolved_lane_time_ms = float(lane_time_ms)
+            if (
+                not math.isfinite(resolved_lane_time_ms)
+                or resolved_lane_time_ms < 0.0
+            ):
+                raise ValueError(
+                    "predict_ep_lane_moe_times_ms returned invalid time "
+                    f"for lane={resolved_lane_id}: {resolved_lane_time_ms}"
+                )
+            lane_times[resolved_lane_id] = resolved_lane_time_ms
+        return lane_times
+
     def _validate_prefix_cache_cluster_config(self, replica_scheduler_config) -> None:
         prefix_enabled = bool(
             getattr(replica_scheduler_config, "enable_prefix_caching", False)
@@ -1900,7 +1942,37 @@ class BaseClusterScheduler(ABC):
                 num_layers=1,
                 layer_id=layer_id,
             )
-            moe_stage_time = execution_time.get_single_layer_post_attention_time() * 1e-3
+            moe_stage_time_ms = (
+                execution_time.get_single_layer_post_attention_time()
+            )
+            lane_times_ms = self._predict_ep_lane_moe_times_ms(
+                execution_time_predictor,
+                sample_batch,
+                layer_id,
+                self._cluster_type,
+            )
+            if lane_times_ms is not None:
+                representative_moe_time_ms = (
+                    execution_time_predictor.predict_moe_layer_time(
+                        sample_batch,
+                        layer_id,
+                        self._cluster_type,
+                    ).total_time()
+                )
+                critical_lane_time_ms = max(lane_times_ms.values())
+                moe_stage_time_ms += (
+                    critical_lane_time_ms - representative_moe_time_ms
+                )
+                if moe_stage_time_ms < 0.0:
+                    raise ValueError(
+                        "Replacing representative MoE time with the critical "
+                        "EP lane produced a negative prefill stage time"
+                    )
+                logger.info(
+                    f"[PREFILL_SYNC][EP_LANES] lane_times_ms={lane_times_ms}, "
+                    f"critical_lane_time_ms={critical_lane_time_ms:.6f}"
+                )
+            moe_stage_time = moe_stage_time_ms * 1e-3
             dp_input_allreduce_time = (
                 execution_time.get_single_layer_dp_input_allreduce_time() * 1e-3
             )
@@ -2912,48 +2984,61 @@ class BaseClusterScheduler(ABC):
                 participant_count,
             )
 
-            per_expert_tokens = None
-            if hasattr(global_batch, "per_expert_tokens") and global_batch.per_expert_tokens:
-                per_expert_tokens = global_batch.per_expert_tokens
-            elif hasattr(execution_time_predictor, "_calculate_expert_token_allocation"):
-                per_expert_tokens = execution_time_predictor._calculate_expert_token_allocation(
-                    batch=global_batch,
-                    cluster_type=self._cluster_type,
-                    layer_id=layer_id,
-                )
-            elif hasattr(execution_time_predictor, "_get_moe_tokens_input"):
-                moe_tokens_input = execution_time_predictor._get_moe_tokens_input(
-                    global_batch,
-                    layer_id=layer_id,
-                )
-                if isinstance(moe_tokens_input, dict):
-                    per_expert_tokens = moe_tokens_input
-                elif hasattr(execution_time_predictor, "_build_uniform_per_expert_tokens"):
-                    per_expert_tokens = execution_time_predictor._build_uniform_per_expert_tokens(
-                        int(moe_tokens_input)
-                    )
-                else:
-                    raise ValueError(
-                        "predictor returned scalar moe_tokens_input but does not expose "
-                        "_build_uniform_per_expert_tokens for decode sync collective"
-                    )
-            else:
-                raise AttributeError(
-                    f"{type(execution_time_predictor).__name__} does not expose a supported "
-                    "MoE token-allocation API for decode sync collective"
-                )
-
-            moe_time = execution_time_predictor.predict_moe_layer_time(
+            lane_times_ms = self._predict_ep_lane_moe_times_ms(
+                execution_time_predictor,
                 global_batch,
                 layer_id,
                 self._cluster_type,
-                per_expert_tokens=per_expert_tokens,
             )
+            if lane_times_ms is not None:
+                moe_compute_time = max(lane_times_ms.values()) * 1e-3
+                logger.info(
+                    f"[DECODE_SYNC][EP_LANES] lane_times_ms={lane_times_ms}, "
+                    f"critical_lane_time_ms={max(lane_times_ms.values()):.6f}"
+                )
+            else:
+                per_expert_tokens = None
+                if hasattr(global_batch, "per_expert_tokens") and global_batch.per_expert_tokens:
+                    per_expert_tokens = global_batch.per_expert_tokens
+                elif hasattr(execution_time_predictor, "_calculate_expert_token_allocation"):
+                    per_expert_tokens = execution_time_predictor._calculate_expert_token_allocation(
+                        batch=global_batch,
+                        cluster_type=self._cluster_type,
+                        layer_id=layer_id,
+                    )
+                elif hasattr(execution_time_predictor, "_get_moe_tokens_input"):
+                    moe_tokens_input = execution_time_predictor._get_moe_tokens_input(
+                        global_batch,
+                        layer_id=layer_id,
+                    )
+                    if isinstance(moe_tokens_input, dict):
+                        per_expert_tokens = moe_tokens_input
+                    elif hasattr(execution_time_predictor, "_build_uniform_per_expert_tokens"):
+                        per_expert_tokens = execution_time_predictor._build_uniform_per_expert_tokens(
+                            int(moe_tokens_input)
+                        )
+                    else:
+                        raise ValueError(
+                            "predictor returned scalar moe_tokens_input but does not expose "
+                            "_build_uniform_per_expert_tokens for decode sync collective"
+                        )
+                else:
+                    raise AttributeError(
+                        f"{type(execution_time_predictor).__name__} does not expose a supported "
+                        "MoE token-allocation API for decode sync collective"
+                    )
+
+                moe_time = execution_time_predictor.predict_moe_layer_time(
+                    global_batch,
+                    layer_id,
+                    self._cluster_type,
+                    per_expert_tokens=per_expert_tokens,
+                )
+                moe_compute_time = moe_time.total_time() * 1e-3
             dp_scatter_time = execution_time_predictor.predict_dp_scatter_time(
                 total_global_tokens,
                 participant_count,
             )
-            moe_compute_time = moe_time.total_time() * 1e-3
             moe_stage_time = dp_gather_time + moe_compute_time + dp_scatter_time
 
             logger.info(

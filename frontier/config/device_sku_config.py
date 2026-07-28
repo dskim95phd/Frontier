@@ -15,8 +15,9 @@ class BaseDeviceSKUConfig(BaseFixedConfig):
     # the ceiling and an analytical predictor must reject or conservatively
     # fall back rather than inventing a hardware value.
     hbm_bandwidth_tbps: float = 0.0
+    fp32_tflops: float = 0.0
     fp8_tflops: float = 0.0
-    nvfp4_tflops: float = 0.0
+    fp4_tflops: float = 0.0
 
 
 @dataclass
@@ -109,8 +110,9 @@ class RubinDeviceSKUConfig(BaseDeviceSKUConfig):
     fp16_tflops: int = 4_000
     total_memory_gb: int = 288
     hbm_bandwidth_tbps: float = 22.0
+    fp32_tflops: float = 400.0
     fp8_tflops: float = 17_500.0
-    nvfp4_tflops: float = 50_000.0
+    fp4_tflops: float = 35_000.0
 
     @staticmethod
     def get_type():

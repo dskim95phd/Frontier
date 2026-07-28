@@ -34,6 +34,6 @@ exec bash "$SCRIPT_DIR/moe_prefix_caching.sh" -- \
   --cpu_kv_cache_config_enable \
   --cpu_kv_cache_config_static_slice_per_gpu \
   --cpu_kv_cache_config_capacity_bytes_per_gpu 750000000000 \
-  --cpu_kv_cache_config_read_bandwidth_gbps_per_gpu 4800 \
-  --cpu_kv_cache_config_write_bandwidth_gbps_per_gpu 4800 \
+  --cpu_kv_cache_config_dram_bandwidth_gbps_per_gpu 4800 \
+  --cpu_kv_cache_config_c2c_bandwidth_gbps_per_gpu 3600 \
   "$@"

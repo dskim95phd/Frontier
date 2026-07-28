@@ -2955,7 +2955,6 @@ class AnalyticalRooflineExecutionTimePredictorConfig(
     routing_overlap_penalty: float = 0.75
     kernel_launch_latency_us: float = 5.0
     small_gemm_token_threshold: int = 128
-    enable_nvfp4_inference_peak: bool = False
     keep_diagnostics: bool = True
     max_diagnostic_records: int = 10_000
 
