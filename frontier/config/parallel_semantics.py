@@ -55,11 +55,85 @@ class CollectiveSimPhysicalTopology:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class RackLocalReplicaPlacement:
+    num_racks: int
+    gpus_per_rack: int
+    replica_gpus: int
+    num_replicas: int
+    replicas_per_rack: int
+    active_gpus: int
+    idle_gpus: int
+
+    def to_dict(self) -> dict[str, int]:
+        return asdict(self)
+
+
 def _validate_positive(name: str, value: int) -> int:
     resolved_value = int(value)
     if resolved_value <= 0:
         raise ValueError(f"{name} must be positive, got {value!r}")
     return resolved_value
+
+
+def build_rack_local_replica_placement(
+    *,
+    num_replicas: int,
+    replica_gpus: int,
+    gpus_per_rack: int,
+    configured_num_racks: int | None = None,
+) -> RackLocalReplicaPlacement:
+    """Pack whole replicas into cluster-exclusive racks.
+
+    A replica, and therefore every DP lane and model-parallel group inside it,
+    remains within one rack. Unused GPUs in the final or fragmented rack stay
+    idle and cannot be assigned to another cluster.
+    """
+
+    resolved_num_replicas = _validate_positive("num_replicas", num_replicas)
+    resolved_replica_gpus = _validate_positive("replica_gpus", replica_gpus)
+    resolved_gpus_per_rack = _validate_positive(
+        "gpus_per_rack",
+        gpus_per_rack,
+    )
+    if resolved_replica_gpus > resolved_gpus_per_rack:
+        raise ValueError(
+            "Rack-local placement requires one replica to fit in one rack: "
+            f"replica_gpus={resolved_replica_gpus}, "
+            f"gpus_per_rack={resolved_gpus_per_rack}"
+        )
+
+    replicas_per_rack = resolved_gpus_per_rack // resolved_replica_gpus
+    required_num_racks = (
+        resolved_num_replicas + replicas_per_rack - 1
+    ) // replicas_per_rack
+    if configured_num_racks is None:
+        resolved_num_racks = required_num_racks
+    else:
+        resolved_num_racks = _validate_positive(
+            "configured_num_racks",
+            configured_num_racks,
+        )
+        if resolved_num_racks < required_num_racks:
+            raise ValueError(
+                "Configured rack count cannot hold all rack-local replicas: "
+                f"configured_num_racks={resolved_num_racks}, "
+                f"required_num_racks={required_num_racks}, "
+                f"num_replicas={resolved_num_replicas}, "
+                f"replica_gpus={resolved_replica_gpus}, "
+                f"replicas_per_rack={replicas_per_rack}"
+            )
+
+    active_gpus = resolved_num_replicas * resolved_replica_gpus
+    return RackLocalReplicaPlacement(
+        num_racks=resolved_num_racks,
+        gpus_per_rack=resolved_gpus_per_rack,
+        replica_gpus=resolved_replica_gpus,
+        num_replicas=resolved_num_replicas,
+        replicas_per_rack=replicas_per_rack,
+        active_gpus=active_gpus,
+        idle_gpus=(resolved_num_racks * resolved_gpus_per_rack) - active_gpus,
+    )
 
 
 def validate_frontier_shared_parallel_domains(

@@ -23,7 +23,7 @@ This directory contains one-click architecture entrypoints for Frontier's releas
 | `run_dummy_smoke_matrix.sh` | Profiling-independent dummy smoke matrix | Runs dense/MoE across co-location/PDD and offline/online; does not consume profiling CSV datasets |
 | `co-location/run_all.sh` | Full co-location suite | Runs all five offline cases and all five online cases; pass extra Frontier CLI flags after `--` |
 | `co-location/offline/dense_model_basic.sh` | Offline dense co-location baseline | Analytical backend by default, dummy execution time, `decode_cuda_graph_mode=full_decode_only`, Chunked Prefill, CSV/JSON metrics |
-| `co-location/offline/vera_rubin_nvl72_analytical.sh` | Rubin NVL72 analytical co-location | Nine TP=8 replicas, profile-free roofline timing, one logical 72-GPU ASTRA switch domain |
+| `co-location/offline/vera_rubin_nvl72_analytical.sh` | Rubin NVL72 analytical co-location | Configurable cluster-exclusive racks, whole-replica packing, and profile-free roofline timing |
 | `co-location/offline/moe_model_basic.sh` | Offline MoE co-location baseline | Analytical backend by default, dummy execution time, shared-domain MoE invariant, Chunked Prefill, CSV/JSON metrics |
 | `co-location/offline/thinking_mode_basic.sh` | Offline Thinking Mode v1 co-location | Analytical backend; one hidden round plus one final round; CSV/JSON metrics |
 | `co-location/offline/moe_spec_dec.sh` | Offline MoE Speculative Decoding / MTP | Speculative Decoding / MTP enabled; uses `decode_cuda_graph_mode=none` to avoid the current conflict |
@@ -40,7 +40,7 @@ This directory contains one-click architecture entrypoints for Frontier's releas
 | `pdd/offline/moe_spec_dec.sh` | Offline MoE PDD Speculative Decoding / MTP | Speculative Decoding enabled; Prefix Caching intentionally disabled; `DECODE_CUDA_GRAPH_MODE=none` |
 | `pdd/offline/moe_prefix_caching.sh` | Offline MoE PDD Prefix Caching | Sticky scheduler with `examples/fixtures/prefix_cache_shared_session_trace.csv` |
 | `pdd/offline/cpu_kv_offloading.sh` | Offline prefill CPU KV offloading | Session-affine PDD with a finite five-block prefill GPU cache and analytical D2H/H2D copies |
-| `pdd/offline/vera_rubin_nvl72_cpu_offload_analytical.sh` | Rubin NVL72 analytical PDD | Sequential 36/36-GPU split with profile-free roofline timing and static per-GPU Vera CPU slices |
+| `pdd/offline/vera_rubin_nvl72_cpu_offload_analytical.sh` | Rubin NVL72 analytical PDD | Cluster-exclusive prefill/decode racks with configurable rack counts, profile-free roofline timing, and static per-GPU Vera CPU slices |
 | `pdd/online/dense_model_basic_online.sh` | Online dense PDD baseline | Mirrors dense offline settings with `--simulation_mode online` |
 | `pdd/online/moe_model_basic_online.sh` | Online MoE PDD baseline | Mirrors MoE offline settings with `--simulation_mode online` |
 | `pdd/online/thinking_mode_basic_online.sh` | Online Thinking Mode v1 PDD | Mirrors Thinking Mode offline settings with `--simulation_mode online` |

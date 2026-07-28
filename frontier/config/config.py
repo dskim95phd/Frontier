@@ -41,6 +41,7 @@ from frontier.config.model_config import BaseModelConfig
 from frontier.config.node_sku_config import BaseNodeSKUConfig
 from frontier.config.parallel_semantics import (
     FrontierParallelismMapping,
+    build_rack_local_replica_placement,
     resolve_collective_sim_physical_topology,
     validate_frontier_shared_parallel_domains,
 )
@@ -3063,6 +3064,16 @@ class ClusterConfig:
             "help": "Number of replicas",
         },
     )
+    num_racks: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Number of cluster-exclusive racks. For Vera Rubin NVL72, "
+                "replicas never span racks and unused GPUs remain idle. None "
+                "selects the minimum required rack count."
+            ),
+        },
+    )
     replica_config: Optional[ReplicaConfig] = field(
         default_factory=lambda: ReplicaConfig(model_name="meta-llama/Llama-2-7b-hf"),
         metadata={
@@ -3078,10 +3089,24 @@ class ClusterConfig:
             "mode_dependency": "pd-af-disaggregation",
         },
     )
+    prefill_cluster_num_racks: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": "Number of cluster-exclusive prefill racks.",
+            "mode_dependency": "pd-af-disaggregation,pd-disaggregation",
+        },
+    )
     decode_attn_cluster_num_replicas: Optional[int] = field(
         default=None,
         metadata={
             "help": "Number of replicas for decode attention cluster. Used only in pd-af-disaggregation mode.",
+            "mode_dependency": "pd-af-disaggregation",
+        },
+    )
+    decode_attn_cluster_num_racks: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": "Number of cluster-exclusive decode-attention racks.",
             "mode_dependency": "pd-af-disaggregation",
         },
     )
@@ -3091,6 +3116,13 @@ class ClusterConfig:
             "help": "Number of replicas for decode FFN cluster (must be 1). "
             "DP for the FFN cluster is not supported because it causes expert redundancy. "
             "Use EP within a single replica instead. Used only in pd-af-disaggregation mode.",
+            "mode_dependency": "pd-af-disaggregation",
+        },
+    )
+    decode_ffn_cluster_num_racks: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": "Number of cluster-exclusive decode-FFN racks.",
             "mode_dependency": "pd-af-disaggregation",
         },
     )
@@ -3106,6 +3138,13 @@ class ClusterConfig:
         default=None,
         metadata={
             "help": "Number of replicas for unified decode cluster. Used only in pd-disaggregation mode.",
+            "mode_dependency": "pd-disaggregation",
+        },
+    )
+    decode_cluster_num_racks: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": "Number of cluster-exclusive unified decode racks.",
             "mode_dependency": "pd-disaggregation",
         },
     )
@@ -4524,6 +4563,18 @@ class ClusterConfig:
         self._validate_open_source_release_cluster_type_guard()
         self._validate_open_source_release_disaggregation_fields_guard()
         self._validate_open_source_release_cc_backend_guard()
+        for rack_field_name in (
+            "num_racks",
+            "prefill_cluster_num_racks",
+            "decode_attn_cluster_num_racks",
+            "decode_ffn_cluster_num_racks",
+            "decode_cluster_num_racks",
+        ):
+            rack_count = getattr(self, rack_field_name)
+            if rack_count is not None and int(rack_count) <= 0:
+                raise ValueError(
+                    f"{rack_field_name} must be positive, got {rack_count}"
+                )
 
         # check and set args only in first init (not in Cluster())
         if self.cluster_type is None:
@@ -4753,8 +4804,12 @@ class ClusterConfig:
         self.decode_attn_replica_config = None
         self.decode_ffn_replica_config = None
         self.prefill_cluster_num_replicas = None
+        self.prefill_cluster_num_racks = None
         self.decode_attn_cluster_num_replicas = None
+        self.decode_attn_cluster_num_racks = None
         self.decode_ffn_cluster_num_replicas = None
+        self.decode_ffn_cluster_num_racks = None
+        self.decode_cluster_num_racks = None
 
         # if self.replica_config.extend_ep_across_dp:
         #     assert self.replica_config.expert_parallel_size == self.replica_config.data_parallel_size * \
@@ -4767,6 +4822,7 @@ class ClusterConfig:
         # Clear monolithic fields since they're not used
         # self.replica_config = None
         self.num_replicas = None
+        self.num_racks = None
 
         # Determine disaggregation mode
         is_pd_af_mode = (
@@ -5157,6 +5213,13 @@ class ClusterConfig:
             "DECODE_FFN": "decode_ffn",
             "DECODE": "decode",
         }
+        rack_count_by_cluster = {
+            "MONOLITHIC": self.num_racks,
+            "PREFILL": self.prefill_cluster_num_racks,
+            "DECODE_ATTN": self.decode_attn_cluster_num_racks,
+            "DECODE_FFN": self.decode_ffn_cluster_num_racks,
+            "DECODE": self.decode_cluster_num_racks,
+        }
 
         for cluster_name, num_replicas, replica_config in clusters_info:
             cluster_total_devices = int(num_replicas) * int(replica_config.world_size)
@@ -5171,6 +5234,20 @@ class ClusterConfig:
                     "num_devices_per_node must be positive when computing "
                     f"server-count metadata, got {num_devices_per_node}"
                 )
+            if (
+                str(replica_config.network_device).strip().lower()
+                == "vera_rubin_nvl72_domain"
+            ):
+                rack_placement = build_rack_local_replica_placement(
+                    num_replicas=int(num_replicas),
+                    replica_gpus=int(replica_config.world_size),
+                    gpus_per_rack=num_devices_per_node,
+                    configured_num_racks=rack_count_by_cluster[cluster_name],
+                )
+                server_counts_by_cluster[cluster_name] = (
+                    rack_placement.num_racks
+                )
+                continue
             if cluster_name == "MONOLITHIC":
                 cc_backend_config = self.cc_backend_config
             else:
@@ -5313,6 +5390,7 @@ class ClusterConfig:
             prefill_config = ClusterConfig(
                 cluster_type=ClusterType.PREFILL,
                 num_replicas=self.prefill_cluster_num_replicas,
+                num_racks=self.prefill_cluster_num_racks,
                 replica_config=self.prefill_replica_config
                 or self._create_replica_config_copy(),
                 cluster_scheduler_config=self.cluster_scheduler_config,
@@ -5341,6 +5419,7 @@ class ClusterConfig:
             decode_attn_config = ClusterConfig(
                 cluster_type=ClusterType.DECODE_ATTN,
                 num_replicas=self.decode_attn_cluster_num_replicas,
+                num_racks=self.decode_attn_cluster_num_racks,
                 replica_config=self.decode_attn_replica_config
                 or self._create_replica_config_copy(),
                 cluster_scheduler_config=self.cluster_scheduler_config,
@@ -5371,6 +5450,7 @@ class ClusterConfig:
             decode_ffn_config = ClusterConfig(
                 cluster_type=ClusterType.DECODE_FFN,
                 num_replicas=self.decode_ffn_cluster_num_replicas,
+                num_racks=self.decode_ffn_cluster_num_racks,
                 replica_config=self.decode_ffn_replica_config
                 or self._create_replica_config_copy(),
                 cluster_scheduler_config=self.cluster_scheduler_config,
@@ -5418,6 +5498,7 @@ class ClusterConfig:
             decode_config = ClusterConfig(
                 cluster_type=ClusterType.DECODE,
                 num_replicas=self.decode_cluster_num_replicas,
+                num_racks=self.decode_cluster_num_racks,
                 replica_config=self.decode_replica_config
                 or self._create_replica_config_copy(),
                 cluster_scheduler_config=self.cluster_scheduler_config,

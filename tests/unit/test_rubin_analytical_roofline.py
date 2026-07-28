@@ -10,17 +10,25 @@ from frontier.cc_backend.cc_backend_config import (
 )
 from frontier.config import (
     AnalyticalRooflineExecutionTimePredictorConfig,
+    ClusterConfig,
     MetricsConfig,
     PrecisionType,
     ReplicaConfig,
+    SyntheticRequestGeneratorConfig,
     VllmV1SchedulerConfig,
 )
 from frontier.config.cpu_kv_cache_config import CPUKVCacheConfig
 from frontier.config.device_sku_config import BaseDeviceSKUConfig
 from frontier.config.node_sku_config import BaseNodeSKUConfig
+from frontier.config.parallel_semantics import (
+    build_rack_local_replica_placement,
+)
 from frontier.entities.cluster import Cluster
 from frontier.execution_time_predictor.analytical_roofline_execution_time_predictor import (
     AnalyticalRooflineExecutionTimePredictor,
+)
+from frontier.scheduler.cluster_scheduler.base_cluster_scheduler import (
+    BaseClusterScheduler,
 )
 from frontier.types import ClusterType
 
@@ -73,6 +81,36 @@ def _predictor(**config_overrides):
     )
 
 
+def _moe_predictor(
+    *,
+    routing_mode="simulation",
+    distribution_type="balanced",
+    routing_seed=42,
+    **config_overrides,
+):
+    replica_config = ReplicaConfig(
+        model_name="Phi-tiny-MoE-instruct",
+        device="rubin",
+        network_device="vera_rubin_nvl72_domain",
+        attn_tensor_parallel_size=2,
+        moe_tensor_parallel_size=1,
+        moe_expert_parallel_size=2,
+        total_expert_num=8,
+        router_topk=2,
+        moe_routing_mode=routing_mode,
+        moe_routing_seed=routing_seed,
+        moe_routing_distribution_type=distribution_type,
+    )
+    return AnalyticalRooflineExecutionTimePredictor(
+        AnalyticalRooflineExecutionTimePredictorConfig(**config_overrides),
+        replica_config,
+        VllmV1SchedulerConfig(),
+        MetricsConfig(),
+        cluster_type=ClusterType.PREFILL,
+        cc_backend=_NoCommunicationBackend(),
+    )
+
+
 def test_rubin_and_nvl72_logical_skus_publish_analytical_ceilings():
     device = BaseDeviceSKUConfig.create_from_type_string("rubin")
     node = BaseNodeSKUConfig.create_from_type_string(
@@ -81,10 +119,32 @@ def test_rubin_and_nvl72_logical_skus_publish_analytical_ceilings():
 
     assert device.total_memory_gb == 288
     assert device.hbm_bandwidth_tbps == pytest.approx(22.0)
+    assert device.fp32_tflops == pytest.approx(400.0)
     assert device.fp16_tflops == 4_000
     assert device.fp8_tflops == pytest.approx(17_500.0)
-    assert device.nvfp4_tflops == pytest.approx(50_000.0)
+    assert device.fp4_tflops == pytest.approx(35_000.0)
     assert node.num_devices_per_node == 72
+
+
+@pytest.mark.parametrize(
+    ("precision", "expected_tflops"),
+    [
+        (PrecisionType.FP4, 35_000.0),
+        (PrecisionType.INT4, 35_000.0),
+        (PrecisionType.FP8, 17_500.0),
+        (PrecisionType.INT8, 17_500.0),
+        (PrecisionType.FP16, 4_000.0),
+        (PrecisionType.BF16, 4_000.0),
+        (PrecisionType.FP32, 400.0),
+    ],
+)
+def test_rubin_analytical_ceiling_is_selected_by_bit_width(
+    precision,
+    expected_tflops,
+):
+    assert _predictor()._peak_tflops(precision) == pytest.approx(
+        expected_tflops
+    )
 
 
 def test_roofline_formula_preserves_partial_overlap_and_diagnostics():
@@ -149,18 +209,47 @@ def test_stage_prediction_is_profile_free_and_scales_layers_once():
     )
 
 
-def test_cpu_static_slice_aggregates_over_attention_tp_target():
+def test_cpu_static_slice_uses_c2c_bottleneck_and_aggregates_over_gpu_target():
     config = CPUKVCacheConfig(enable=True, static_slice_per_gpu=True)
 
     one_gpu = config.resolve_for_target(1)
     eight_gpus = config.resolve_for_target(8)
 
     assert one_gpu.capacity_bytes == 750_000_000_000
-    assert one_gpu.read_bandwidth_gbps == pytest.approx(4_800.0)
-    assert one_gpu.write_bandwidth_gbps == pytest.approx(4_800.0)
+    assert config.dram_bandwidth_gbps_per_gpu == pytest.approx(4_800.0)
+    assert config.c2c_bandwidth_gbps_per_gpu == pytest.approx(3_600.0)
+    assert one_gpu.read_bandwidth_gbps == pytest.approx(3_600.0)
+    assert one_gpu.write_bandwidth_gbps == pytest.approx(3_600.0)
     assert eight_gpus.capacity_bytes == 6_000_000_000_000
-    assert eight_gpus.read_bandwidth_gbps == pytest.approx(38_400.0)
-    assert eight_gpus.write_bandwidth_gbps == pytest.approx(38_400.0)
+    assert eight_gpus.read_bandwidth_gbps == pytest.approx(28_800.0)
+    assert eight_gpus.write_bandwidth_gbps == pytest.approx(28_800.0)
+
+
+def test_cpu_static_slice_uses_dram_when_it_is_the_slower_path():
+    config = CPUKVCacheConfig(
+        enable=True,
+        static_slice_per_gpu=True,
+        dram_bandwidth_gbps_per_gpu=2_400.0,
+        c2c_bandwidth_gbps_per_gpu=3_600.0,
+    )
+
+    target = config.resolve_for_target(2)
+
+    assert target.read_bandwidth_gbps == pytest.approx(4_800.0)
+    assert target.write_bandwidth_gbps == pytest.approx(4_800.0)
+
+
+def test_cpu_static_slice_counts_attention_tp_across_pipeline_stages():
+    config = CPUKVCacheConfig(enable=True, static_slice_per_gpu=True)
+
+    target = config.resolve_for_replica_target(
+        attn_tensor_parallel_size=8,
+        num_pipeline_stages=2,
+    )
+
+    assert target.capacity_bytes == 12_000_000_000_000
+    assert target.read_bandwidth_gbps == pytest.approx(57_600.0)
+    assert target.write_bandwidth_gbps == pytest.approx(57_600.0)
 
 
 def test_nvl72_materializes_as_one_astra_switch_domain():
@@ -177,6 +266,12 @@ def test_nvl72_materializes_as_one_astra_switch_domain():
     cluster = Cluster.__new__(Cluster)
     cluster._config = SimpleNamespace(num_replicas=1)
     cluster._cluster_type = ClusterType.MONOLITHIC
+    cluster._rack_placement = build_rack_local_replica_placement(
+        num_replicas=1,
+        replica_gpus=72,
+        gpus_per_rack=72,
+        configured_num_racks=1,
+    )
 
     resolved = cluster._materialize_astra_sim_analytical_cc_config(
         config, replica_config, num_devices=replica_config.world_size
@@ -191,6 +286,8 @@ def test_nvl72_materializes_as_one_astra_switch_domain():
 
     assert resolved.cluster_servers == 1
     assert resolved.cluster_gpus_per_server == 72
+    assert resolved.runtime_num_racks == 1
+    assert resolved.runtime_num_replicas == 1
     assert resolved.intra_server_topology == "Switch"
     assert resolved.intra_server_bandwidth_gbps == pytest.approx(14_400.0)
     assert (
@@ -199,3 +296,289 @@ def test_nvl72_materializes_as_one_astra_switch_domain():
         )
         > 0.0
     )
+
+
+def test_nvl72_multi_rack_keeps_collectives_replica_local():
+    replica_config = ReplicaConfig(
+        device="rubin",
+        network_device="vera_rubin_nvl72_domain",
+        attn_tensor_parallel_size=2,
+    )
+    config = AstraSimAnalyticalCCBackendConfig(
+        intra_server_topology="Switch",
+        intra_server_bandwidth_gbps=14_400.0,
+        intra_server_latency_us=1.0,
+    )
+    cluster = Cluster.__new__(Cluster)
+    cluster._config = SimpleNamespace(num_replicas=72)
+    cluster._cluster_type = ClusterType.MONOLITHIC
+    cluster._rack_placement = build_rack_local_replica_placement(
+        num_replicas=72,
+        replica_gpus=2,
+        gpus_per_rack=72,
+        configured_num_racks=2,
+    )
+
+    resolved = cluster._materialize_astra_sim_analytical_cc_config(
+        config,
+        replica_config,
+        num_devices=replica_config.world_size,
+    )
+    backend = AstraSimAnalyticalCCBackend(
+        resolved,
+        ClusterType.MONOLITHIC,
+        "rubin",
+        "vera_rubin_nvl72_domain",
+        2,
+    )
+
+    assert resolved.runtime_num_racks == 2
+    assert resolved.runtime_gpus_per_rack == 72
+    assert resolved.runtime_replicas_per_rack == 36
+    assert resolved.runtime_idle_gpus == 0
+    assert resolved.runtime_num_replicas == 1
+    assert resolved.cluster_servers == 1
+    assert resolved.cluster_gpus_per_server == 2
+    assert backend.predict_allreduce(
+        1_000_000,
+        2,
+        comm_domain="ATTN_TP",
+    ) > 0.0
+    with pytest.raises(ValueError, match="exceeds domain_size"):
+        backend.predict_allreduce(
+            1_000_000,
+            4,
+            comm_domain="ATTN_TP",
+        )
+
+
+def test_nvl72_rack_packing_keeps_fragmented_capacity_idle():
+    placement = build_rack_local_replica_placement(
+        num_replicas=3,
+        replica_gpus=40,
+        gpus_per_rack=72,
+    )
+
+    assert placement.num_racks == 3
+    assert placement.replicas_per_rack == 1
+    assert placement.active_gpus == 120
+    assert placement.idle_gpus == 96
+
+
+def test_nvl72_rack_packing_rejects_cross_rack_replica_or_insufficient_racks():
+    with pytest.raises(ValueError, match="one replica to fit in one rack"):
+        build_rack_local_replica_placement(
+            num_replicas=1,
+            replica_gpus=73,
+            gpus_per_rack=72,
+        )
+
+    with pytest.raises(ValueError, match="cannot hold all rack-local replicas"):
+        build_rack_local_replica_placement(
+            num_replicas=72,
+            replica_gpus=2,
+            gpus_per_rack=72,
+            configured_num_racks=1,
+        )
+
+
+def test_nvl72_cluster_config_exposes_explicit_multi_rack_capacity():
+    cluster_config = ClusterConfig(
+        num_replicas=72,
+        num_racks=2,
+        replica_config=ReplicaConfig(
+            device="rubin",
+            network_device="vera_rubin_nvl72_domain",
+            attn_tensor_parallel_size=2,
+        ),
+    )
+
+    assert cluster_config.get_server_count_metadata("co-location") == {
+        "server_count": 2
+    }
+
+
+def test_nvl72_cluster_assigns_each_whole_replica_to_one_rack():
+    cluster = Cluster(
+        ClusterConfig(
+            num_replicas=10,
+            num_racks=2,
+            replica_config=ReplicaConfig(
+                device="rubin",
+                network_device="vera_rubin_nvl72_domain",
+                attn_tensor_parallel_size=8,
+            ),
+        ),
+        MetricsConfig(write_json_trace=False),
+        SyntheticRequestGeneratorConfig(),
+    )
+    rack_ids = [
+        cluster.get_replica_rack_id(replica_id)
+        for replica_id in cluster.replicas
+    ]
+
+    assert rack_ids == ([0] * 9) + [1]
+    assert cluster.rack_placement.num_racks == 2
+    assert cluster.rack_placement.replicas_per_rack == 9
+    assert cluster.rack_placement.idle_gpus == 64
+
+
+def test_nvl72_pdd_propagates_cluster_exclusive_rack_counts():
+    root_config = ClusterConfig(
+        num_replicas=None,
+        prefill_cluster_num_replicas=18,
+        decode_cluster_num_replicas=18,
+        prefill_cluster_num_racks=1,
+        decode_cluster_num_racks=1,
+        prefill_replica_config_device="rubin",
+        decode_replica_config_device="rubin",
+        prefill_replica_config_network_device="vera_rubin_nvl72_domain",
+        decode_replica_config_network_device="vera_rubin_nvl72_domain",
+        prefill_replica_config_attn_tensor_parallel_size=2,
+        decode_replica_config_attn_tensor_parallel_size=2,
+    )
+
+    clusters = root_config.get_cluster_configs_for_disaggregation()
+
+    assert clusters[ClusterType.PREFILL].num_racks == 1
+    assert clusters[ClusterType.DECODE].num_racks == 1
+    assert root_config.get_server_count_metadata("pd-disaggregation") == {
+        "prefill_server_count": 1,
+        "decode_server_count": 1,
+    }
+
+
+def test_analytical_moe_routing_is_selectable_and_conserves_tokens():
+    batch = _Batch(scheduled_tokens=32, processed_tokens=0, prefill=True)
+
+    balanced = _moe_predictor(distribution_type="balanced")
+    balanced_lanes = balanced._get_ep_lane_per_expert_tokens(
+        batch,
+        layer_id=0,
+        cluster_type=ClusterType.PREFILL,
+    )
+    assert [sum(tokens.values()) for tokens in balanced_lanes.values()] == [
+        32,
+        32,
+    ]
+
+    zipf = _moe_predictor(distribution_type="zipf")
+    zipf_lanes = zipf._get_ep_lane_per_expert_tokens(
+        batch,
+        layer_id=0,
+        cluster_type=ClusterType.PREFILL,
+    )
+    assert sum(
+        token_count
+        for allocation in zipf_lanes.values()
+        for token_count in allocation.values()
+    ) == 64
+    assert sum(zipf_lanes[0].values()) > sum(zipf_lanes[1].values())
+
+    random_a = _moe_predictor(
+        distribution_type="random",
+        routing_seed=7,
+    )
+    random_b = _moe_predictor(
+        distribution_type="random",
+        routing_seed=7,
+    )
+    assert random_a._get_ep_lane_per_expert_tokens(
+        batch,
+        layer_id=3,
+        cluster_type=ClusterType.PREFILL,
+    ) == random_b._get_ep_lane_per_expert_tokens(
+        batch,
+        layer_id=3,
+        cluster_type=ClusterType.PREFILL,
+    )
+
+    uniform_random = _moe_predictor(
+        routing_mode="uniform_random",
+        distribution_type="zipf",
+    )
+    uniform_random_lanes = uniform_random._get_ep_lane_per_expert_tokens(
+        batch,
+        layer_id=0,
+        cluster_type=ClusterType.PREFILL,
+    )
+    assert sum(
+        token_count
+        for allocation in uniform_random_lanes.values()
+        for token_count in allocation.values()
+    ) == 64
+
+
+def test_analytical_moe_predicts_each_ep_lane_from_local_expert_tokens():
+    predictor = _moe_predictor(distribution_type="zipf")
+    batch = _Batch(scheduled_tokens=32, processed_tokens=0, prefill=True)
+
+    lane_allocations = predictor._get_ep_lane_per_expert_tokens(
+        batch,
+        layer_id=0,
+        cluster_type=ClusterType.PREFILL,
+    )
+    lane_times_ms = predictor.predict_ep_lane_moe_times_ms(
+        batch,
+        layer_id=0,
+        cluster_type=ClusterType.PREFILL,
+    )
+
+    assert set(lane_times_ms) == {0, 1}
+    assert sum(lane_allocations[0].values()) > sum(
+        lane_allocations[1].values()
+    )
+    assert lane_times_ms[0] > lane_times_ms[1]
+    assert (
+        predictor.predict_monolithic_decode_shared_domain_lane_moe_times_ms(
+            batch,
+            layer_id=0,
+        )
+        == predictor.predict_ep_lane_moe_times_ms(
+            batch,
+            layer_id=0,
+            cluster_type=ClusterType.MONOLITHIC,
+        )
+    )
+
+
+def test_analytical_moe_models_grouped_projection_once_per_gpu():
+    predictor = _moe_predictor()
+    batch = _Batch(scheduled_tokens=16, processed_tokens=0, prefill=True)
+    predictor.clear_diagnostics()
+
+    predictor.predict_moe_layer_time(
+        batch,
+        layer_id=0,
+        cluster_type=ClusterType.PREFILL,
+        per_expert_tokens={0: 24, 1: 8, 2: 0, 3: 0},
+    )
+
+    grouped_records = [
+        record
+        for record in predictor.get_diagnostics()
+        if record["operator_name"] == "moe_grouped_gemm"
+    ]
+    assert len(grouped_records) == 2
+    assert "projection=up,groups=2" in grouped_records[0]["local_shape"]
+    assert "projection=down,groups=2" in grouped_records[1]["local_shape"]
+
+
+def test_cluster_scheduler_validates_predictor_ep_lane_times():
+    class _LanePredictor:
+        def predict_ep_lane_moe_times_ms(
+            self,
+            _batch,
+            _layer_id,
+            _cluster_type,
+        ):
+            return {0: 1.25, 1: 2.5}
+
+    lane_times = BaseClusterScheduler._predict_ep_lane_moe_times_ms(
+        _LanePredictor(),
+        object(),
+        0,
+        ClusterType.DECODE,
+    )
+    assert lane_times == {0: 1.25, 1: 2.5}
+    assert max(lane_times.values()) == pytest.approx(2.5)

@@ -272,6 +272,10 @@ canonical GPU/CPU KV precision; `auto` follows the model `torch_dtype`.
 Relevant flat CLI fields are
 `--cpu_kv_cache_config_enable`,
 `--cpu_kv_cache_config_capacity_bytes`,
+`--cpu_kv_cache_config_static_slice_per_gpu`,
+`--cpu_kv_cache_config_capacity_bytes_per_gpu`,
+`--cpu_kv_cache_config_dram_bandwidth_gbps_per_gpu`,
+`--cpu_kv_cache_config_c2c_bandwidth_gbps_per_gpu`,
 `--cpu_kv_cache_config_write_bandwidth_gbps`,
 `--cpu_kv_cache_config_write_latency_ms`,
 `--cpu_kv_cache_config_read_bandwidth_gbps`,
@@ -279,6 +283,19 @@ Relevant flat CLI fields are
 `--cpu_kv_cache_config_capacity_pressure_policy`. KV precision is selected
 with `--vllm_v1_scheduler_config_kv_cache_dtype` using `auto`, `fp32`,
 `fp16`, `bf16`, `fp8`, `int8`, `fp4`, or `int4`.
+
+With `static_slice_per_gpu`, the number of physical slices for one target is
+`attention TP × pipeline parallel size`. The effective per-direction transfer
+bandwidth of each GPU slice is
+`min(dram_bandwidth_gbps_per_gpu, c2c_bandwidth_gbps_per_gpu)`.
+
+For `network_device=vera_rubin_nvl72_domain`, rack-local placement can be
+configured with `--cluster_config_num_racks` in co-location mode or
+`--cluster_config_prefill_cluster_num_racks` and
+`--cluster_config_decode_cluster_num_racks` in sequential PDD. Each rack is
+owned by one cluster, replicas never span racks, and unused rack GPUs remain
+idle. Omitting a rack count selects the minimum number required to pack all
+whole replicas.
 
 Request metrics distinguish GPU hits, CPU queries/hits/restores, and
 D2H/H2D byte and time costs. `system_metrics.json` includes a separate

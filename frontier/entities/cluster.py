@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Optional
 from frontier.config import BaseRequestGeneratorConfig, ClusterConfig, MetricsConfig
 from frontier.config.parallel_semantics import (
     FrontierParallelismMapping,
+    build_rack_local_replica_placement,
     build_collective_sim_layout,
     resolve_collective_sim_physical_topology,
 )
@@ -52,9 +53,36 @@ class Cluster(BaseEntity):
             replica_config is not None
         ), f"Replica config not found for cluster type {self.cluster_type}"
 
-        for _ in range(num_replicas):
+        is_vera_rubin_rack_domain = (
+            str(replica_config.network_device).strip().lower()
+            == "vera_rubin_nvl72_domain"
+        )
+        if self._config.num_racks is not None and not is_vera_rubin_rack_domain:
+            raise ValueError(
+                "cluster_config.num_racks is currently supported only with "
+                "network_device='vera_rubin_nvl72_domain'"
+            )
+        self._rack_placement = (
+            build_rack_local_replica_placement(
+                num_replicas=int(num_replicas),
+                replica_gpus=int(replica_config.world_size),
+                gpus_per_rack=int(
+                    replica_config.node_config.num_devices_per_node
+                ),
+                configured_num_racks=self._config.num_racks,
+            )
+            if is_vera_rubin_rack_domain
+            else None
+        )
+        self._replica_rack_ids: dict[int, int] = {}
+
+        for replica_index in range(num_replicas):
             replica = Replica(replica_config, generator_config, self.cluster_type)
             self._replicas[replica.id] = replica
+            if self._rack_placement is not None:
+                self._replica_rack_ids[replica.id] = (
+                    replica_index // self._rack_placement.replicas_per_rack
+                )
 
         if metrics_config.write_json_trace:
             self._write_cluster_info_to_file()
@@ -66,6 +94,13 @@ class Cluster(BaseEntity):
     @property
     def cluster_type(self) -> ClusterType:
         return self._cluster_type
+
+    @property
+    def rack_placement(self):
+        return self._rack_placement
+
+    def get_replica_rack_id(self, replica_id: int) -> int | None:
+        return self._replica_rack_ids.get(int(replica_id))
 
     @property
     def cc_backend(self) -> "BaseCCBackend":
@@ -260,6 +295,39 @@ class Cluster(BaseEntity):
     ):
         """Materialize cluster-specific runtime dims for astra-sim analytical config."""
         num_replicas = max(1, int(self._config.num_replicas or 1))
+        rack_placement = getattr(self, "_rack_placement", None)
+        if rack_placement is not None:
+            # NVL72 replicas are independent rack-local collective domains.
+            # Multiple racks increase serving capacity through more replicas;
+            # they never enlarge a single model-execution collective.
+            return replace(
+                cc_config,
+                cluster_servers=1,
+                cluster_gpus_per_server=int(num_devices),
+                runtime_num_replicas=1,
+                runtime_num_pipeline_stages=max(
+                    1, int(replica_config.num_pipeline_stages)
+                ),
+                runtime_attn_tensor_parallel_size=max(
+                    1, int(replica_config.attn_tensor_parallel_size)
+                ),
+                runtime_attn_data_parallel_size=max(
+                    1, int(replica_config.attn_data_parallel_size)
+                ),
+                runtime_moe_tensor_parallel_size=max(
+                    1, int(replica_config.moe_tensor_parallel_size)
+                ),
+                runtime_moe_expert_parallel_size=max(
+                    1, int(replica_config.moe_expert_parallel_size)
+                ),
+                runtime_num_racks=int(rack_placement.num_racks),
+                runtime_gpus_per_rack=int(rack_placement.gpus_per_rack),
+                runtime_replicas_per_rack=int(
+                    rack_placement.replicas_per_rack
+                ),
+                runtime_idle_gpus=int(rack_placement.idle_gpus),
+            )
+
         physical_topology = resolve_collective_sim_physical_topology(
             cluster_total_devices=num_replicas * int(num_devices),
             num_devices_per_node=int(replica_config.node_config.num_devices_per_node),
@@ -287,15 +355,27 @@ class Cluster(BaseEntity):
         )
 
     def to_dict(self) -> dict:
-        return {
+        result = {
             "id": self._id,
             "cluster_type": str(self.cluster_type),
             "num_replicas": len(self._replicas),
         }
+        if self._rack_placement is not None:
+            result["rack_placement"] = self._rack_placement.to_dict()
+            result["replica_rack_ids"] = dict(self._replica_rack_ids)
+        return result
 
     def _write_cluster_info_to_file(self) -> None:
-        replica_dicts = [replica.to_dict() for replica in self._replicas.values()]
+        replica_dicts = []
+        for replica in self._replicas.values():
+            replica_dict = replica.to_dict()
+            rack_id = self.get_replica_rack_id(replica.id)
+            if rack_id is not None:
+                replica_dict["rack_id"] = rack_id
+            replica_dicts.append(replica_dict)
         cluster_info = {"replicas": replica_dicts}
+        if self._rack_placement is not None:
+            cluster_info["rack_placement"] = self._rack_placement.to_dict()
 
         cluster_file = f"{self._output_dir}/cluster.json"
         with open(cluster_file, "w") as f:

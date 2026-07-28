@@ -70,7 +70,7 @@ Engine ceiling from workloads that do not satisfy its assumptions.
 
 ## MVP Decisions
 
-### 1. CPU DRAM Is Statically Partitioned Per GPU
+### 1. CPU DRAM and C2C Are Statically Partitioned Per GPU
 
 One Vera CPU is paired with two Rubin GPUs. The MVP assigns half of the Vera
 CPU memory and half of its memory bandwidth to each GPU:
@@ -86,28 +86,47 @@ Frontier's CPU KV-cache transfer configuration uses gigabits per second:
 600 GB/s * 8 = 4,800 Gbps
 ```
 
+The public 1.8-TB/s NVLink-C2C figure is bidirectional for one Vera Rubin
+Superchip. The MVP conservatively divides that aggregate equally across two
+GPUs and two directions:
+
+```text
+C2C bandwidth per GPU per direction
+  = 1.8 TB/s / 2 GPUs / 2 directions
+  = 450 GB/s
+  = 3,600 Gbps
+```
+
 The default physical slice for one Rubin GPU is therefore:
 
 ```text
-capacity_bytes       = 750_000_000_000
-read_bandwidth_gbps  = 4_800
-write_bandwidth_gbps = 4_800
+capacity_bytes                  = 750_000_000_000
+dram_bandwidth_gbps             = 4_800
+c2c_bandwidth_gbps              = 3_600
+effective_read_bandwidth_gbps   = min(4_800, 3_600) = 3_600
+effective_write_bandwidth_gbps  = min(4_800, 3_600) = 3_600
 ```
 
 The existing CPU KV-cache target is one `(replica_id, dp_id)` and accounts for
-the physical KV shards of all attention-TP workers in that target. If a target
-contains `N` Rubin GPUs, its aggregate settings must be derived as:
+the physical KV shards of all attention-TP workers in that target. Its
+physical slice count includes every pipeline stage:
+
+```text
+N = attention_tensor_parallel_size * num_pipeline_stages
+```
+
+If a target contains `N` Rubin GPUs, its aggregate settings are:
 
 ```text
 target_capacity_bytes = 750_000_000_000 * N
-target_read_bw_gbps   = 4_800 * N
-target_write_bw_gbps  = 4_800 * N
+target_read_bw_gbps   = min(4_800, 3_600) * N
+target_write_bw_gbps  = min(4_800, 3_600) * N
 ```
 
-The published NVLink-C2C value is bidirectional. Interpreting it as roughly
-900 GB/s per direction leaves the statically assigned 600 GB/s LPDDR slice as
-the MVP bottleneck. The first implementation therefore does not need a
-separate C2C limiter.
+The CPU block size already represents the full model across the layers
+distributed over PP stages, so the block size itself remains aggregated over
+attention TP only. PP changes the physical capacity and bandwidth slices, not
+the logical bytes in one CPU block.
 
 The following effects are deferred:
 
@@ -118,18 +137,51 @@ The following effects are deferred:
 - contention between CPU offload and GPU HBM traffic; and
 - capacity borrowing between the two static GPU slices.
 
-### 2. NVL72 Is One Logical 72-GPU Switch Domain
+### 2. Each NVL72 Rack Is One Rack-Local Switch Domain
 
-The MVP uses the existing `astra_sim_analytical` backend. All 72 GPUs are
-placed in one logical server and connected through one `Switch` topology:
+The MVP uses the existing `astra_sim_analytical` backend. Each physical NVL72
+rack is owned by exactly one Frontier cluster. A replica, including all of its
+TP, PP, EP, and DP lanes, must fit entirely inside one rack. Multiple replicas
+may share a rack, but no model-execution collective crosses a rack boundary.
+
+Rack allocation is configured independently for each cluster:
+
+```text
+co-location:
+  cluster_config_num_racks
+
+sequential PDD:
+  cluster_config_prefill_cluster_num_racks
+  cluster_config_decode_cluster_num_racks
+```
+
+If a rack count is omitted, Frontier chooses the minimum count needed for
+whole-replica packing:
+
+```text
+replica_gpus      = PP * ATTN_TP * ATTN_DP
+replicas_per_rack = floor(72 / replica_gpus)
+required_racks    = ceil(num_replicas / replicas_per_rack)
+```
+
+Unused GPUs remain idle and cannot be assigned to a different cluster. A
+replica larger than 72 GPUs, or an explicit rack count that cannot hold all
+replicas, fails fast.
+
+The ASTRA analytical backend receives one replica-local switch domain:
 
 ```text
 cluster_servers             = 1
-cluster_gpus_per_server     = 72
+cluster_gpus_per_server     = replica_gpus
 intra_server_topology       = Switch
 intra_server_bandwidth_gbps = 14_400
 intra_server_latency_us     = 1.0
 ```
+
+The allocated rack count, 72 GPUs per rack, replicas per rack, and idle GPU
+count are retained as runtime placement metadata. Rack count increases serving
+capacity through independent replicas; it does not increase a single
+collective domain.
 
 The bandwidth conversion is:
 
@@ -161,7 +213,8 @@ This SKU describes the scale-up communication domain, not the mechanical
 compute-tray boundary.
 
 The MVP continues to use the backend's existing ring-style collective
-formulas. It does not model:
+formulas. PDD KV transfer between cluster-exclusive prefill and decode racks
+remains a separate scale-out transfer model. It does not model:
 
 - the 36 individual NVLink 6 switch chips;
 - the nine physical switch trays;
@@ -170,7 +223,7 @@ formulas. It does not model:
 - NCCL channel and algorithm selection;
 - link or switch failures;
 - compute/communication overlap; or
-- scale-out traffic between NVL72 racks.
+- model-execution collectives spanning NVL72 racks.
 
 ### 3. Layer Runtime Uses an Analytical Roofline Predictor
 
@@ -371,13 +424,18 @@ Add a Rubin device SKU with at least:
 device = rubin
 total_memory_gb = 288
 hbm_bandwidth_tbps = 22
-fp16_bf16_dense_tflops = 4_000
-fp8_fp6_dense_tflops = 17_500
-nvfp4_inference_tflops = 50_000
+fp32_tflops = 400
+fp16_tflops = 4_000
+fp8_tflops = 17_500
+fp4_tflops = 35_000
 ```
 
-The existing `fp16_tflops` field may remain for compatibility, but the
-analytical predictor must select a precision-specific peak.
+The MVP intentionally uses one representative ceiling per bit width rather
+than distinguishing floating-point and integer formats. FP4 and INT4 use the
+same 35-PFLOPS ceiling, FP8 and INT8 use 17.5 PFLOPS, FP16 and BF16 use
+4 PFLOPS, and FP32 uses the 400-TFLOPS SGEMM ceiling. The 35-PFLOPS four-bit
+value is the conservative published NVFP4 training ceiling rather than the
+50-PFLOPS inference peak.
 
 ### Logical Node SKU
 
@@ -388,8 +446,9 @@ network_device = vera_rubin_nvl72_domain
 num_devices_per_node = 72
 ```
 
-This is required so ASTRA analytical topology materialization produces one
-72-GPU switch domain.
+This identifies the physical rack capacity used by whole-replica packing.
+ASTRA analytical topology materialization then creates one replica-local
+switch domain inside the allocated rack.
 
 ### Predictor Type
 
@@ -412,6 +471,7 @@ intended configuration is:
 ```text
 --device rubin
 --network_device vera_rubin_nvl72_domain
+--cluster_config_num_racks 2
 --execution_time_predictor_config_type analytical_roofline
 --cc_backend_config_type astra_sim_analytical
 --astra_sim_analytical_cc_backend_config_intra_server_topology Switch
@@ -437,7 +497,9 @@ The expected implementation touches:
 - `frontier/types/node_sku_type.py`
 - `frontier/config/device_sku_config.py`
 - `frontier/config/node_sku_config.py`
+- `frontier/config/parallel_semantics.py`
 - `frontier/config/config.py`
+- `frontier/entities/cluster.py`
 - `frontier/execution_time_predictor/execution_time_predictor_registry.py`
 - a new analytical predictor module under
   `frontier/execution_time_predictor/`
@@ -450,8 +512,8 @@ the canonical operator families so operation-level traces remain compatible
 with the current metrics and comparison tools.
 
 No new communication backend is required for the MVP. The existing
-ASTRA-Sim-inspired analytical backend is configured to represent the logical
-NVL72 switch domain.
+ASTRA-Sim-inspired analytical backend is configured once per replica-local
+NVL72 switch domain; rack allocation remains cluster placement metadata.
 
 ## Implementation Phases
 
@@ -460,7 +522,9 @@ NVL72 switch domain.
 1. Add Rubin device and logical NVL72 node SKUs.
 2. Add precision-specific hardware ceilings and HBM bandwidth.
 3. Add the analytical predictor configuration and registry entry.
-4. Validate that a 72-GPU cluster materializes as one ASTRA switch domain.
+4. Add cluster-exclusive rack counts and whole-replica packing validation.
+5. Validate that each replica materializes as one rack-local ASTRA switch
+   domain even when its cluster owns multiple racks.
 
 ### Phase 2: Dense Analytical Predictor
 
@@ -526,8 +590,11 @@ unseen shapes.
 
 Tests must verify:
 
-- all 72 GPUs resolve inside one logical switch domain;
-- participant groups do not use `inter_server` parameters;
+- a 72-GPU replica resolves inside one logical switch domain;
+- multi-rack clusters pack whole replicas without crossing rack boundaries;
+- explicit insufficient rack counts fail fast;
+- fragmented and final-rack capacity remains idle;
+- participant groups never use `inter_server` parameters;
 - collective latency increases with payload and participant count;
 - one-device collectives return zero; and
 - the configured 14,400-Gbps directional bandwidth is used.
@@ -536,8 +603,10 @@ Tests must verify:
 
 Tests must verify:
 
-- one GPU resolves to 750 GB and 4,800 Gbps;
+- one GPU resolves to 750 GB, with 4,800-Gbps DRAM and 3,600-Gbps C2C inputs;
+- effective transfer bandwidth uses the slower DRAM/C2C path;
 - an `N`-GPU target resolves to `N` times those values;
+- the target GPU count is `attention TP × PP`;
 - capacity accounting still uses aggregate physical TP KV shards;
 - existing CPU offload/restore event ordering is unchanged; and
 - disabling CPU offload preserves existing simulation behavior.
@@ -557,7 +626,9 @@ The examples must complete with:
 The MVP is complete when:
 
 1. A Rubin NVL72 simulation runs without target-hardware profiling data.
-2. All 72 GPUs are represented as one logical ASTRA `Switch` domain.
+2. Every replica is represented as one rack-local ASTRA `Switch` domain, and
+   multiple cluster-exclusive racks can be configured without cross-rack
+   model collectives.
 3. Layer timing is calculated from FLOPs, bytes, hardware ceilings, and
    explicit efficiency/overlap parameters.
 4. The predictor supports dense prefill and decode; MoE support may land as a
@@ -582,7 +653,7 @@ The MVP does not include:
 - detailed NCCL algorithm/channel selection;
 - communication contention between concurrent replicas;
 - switch-chip-level routing;
-- scale-out networking between racks;
+- model-execution scale-out collectives between racks;
 - dynamic CPU bandwidth or capacity sharing;
 - C2C/LPDDR/HBM resource contention;
 - general weight or expert offloading; or

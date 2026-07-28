@@ -524,6 +524,34 @@ class AstraSimAnalyticalCCBackendConfig(BaseCCBackendConfig):
             "include_in_cli": False,
         },
     )
+    runtime_num_racks: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": "Allocated rack count for rack-local replica placement.",
+            "include_in_cli": False,
+        },
+    )
+    runtime_gpus_per_rack: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": "Physical GPUs in each allocated rack.",
+            "include_in_cli": False,
+        },
+    )
+    runtime_replicas_per_rack: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": "Maximum whole replicas packed into each rack.",
+            "include_in_cli": False,
+        },
+    )
+    runtime_idle_gpus: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": "Allocated rack GPUs left idle by whole-replica packing.",
+            "include_in_cli": False,
+        },
+    )
     intra_server_topology: str = field(
         default="FullyConnected",
         metadata={"help": "Intra-server topology primitive: FullyConnected|Switch|Ring."},
