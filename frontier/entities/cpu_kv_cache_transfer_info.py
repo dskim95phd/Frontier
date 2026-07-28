@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Hashable
 
 from frontier.cpu_kv_cache_transfer import CPUKVCacheTransferTiming
 
@@ -12,7 +12,6 @@ if TYPE_CHECKING:
         CPURestoreLease,
         TieredPrefixPlan,
     )
-    from frontier.kv_cache.kv_cache_block import KVCacheBlock
 
 
 @dataclass
@@ -21,13 +20,59 @@ class CPUKVCacheRestoreInfo:
     replica_id: int
     dp_id: int
     plan: "TieredPrefixPlan"
-    restore_blocks_by_index: dict[int, "KVCacheBlock"]
     cpu_lease: "CPURestoreLease"
     timing: CPUKVCacheTransferTiming
 
     @property
     def size_bytes(self) -> int:
         return self.timing.size_bytes
+
+
+@dataclass(frozen=True)
+class StagedCPUKVCacheRestore:
+    """CPU restore payload that has arrived but does not own GPU KV pages."""
+
+    request: "Request"
+    replica_id: int
+    dp_id: int
+    session_id: int
+    block_keys: tuple[Hashable, ...]
+    transferred_cpu_block_indices: tuple[int, ...]
+    query_blocks: int
+    cpu_query_blocks: int
+    lookup_gpu_hit_blocks: int
+    lookup_hit_frontier_blocks: int
+    block_size: int
+    prompt_tokens: int
+    timing: CPUKVCacheTransferTiming
+
+    @classmethod
+    def from_restore_info(
+        cls, restore_info: CPUKVCacheRestoreInfo
+    ) -> "StagedCPUKVCacheRestore":
+        request = restore_info.request
+        if request.session_id is None:
+            raise ValueError("A staged CPU restore requires request.session_id")
+        plan = restore_info.plan
+        return cls(
+            request=request,
+            replica_id=int(restore_info.replica_id),
+            dp_id=int(restore_info.dp_id),
+            session_id=int(request.session_id),
+            block_keys=tuple(plan.block_keys),
+            transferred_cpu_block_indices=tuple(plan.cpu_block_indices),
+            query_blocks=int(plan.query_blocks),
+            cpu_query_blocks=int(plan.cpu_query_blocks),
+            lookup_gpu_hit_blocks=int(plan.gpu_hit_blocks),
+            lookup_hit_frontier_blocks=int(plan.hit_frontier_blocks),
+            block_size=int(plan.block_size),
+            prompt_tokens=int(plan.prompt_tokens),
+            timing=restore_info.timing,
+        )
+
+    @property
+    def transferred_cpu_blocks(self) -> int:
+        return len(self.transferred_cpu_block_indices)
 
 
 @dataclass

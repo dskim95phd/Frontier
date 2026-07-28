@@ -261,7 +261,7 @@ class KVCacheManager:
         self.num_cached_blocks.setdefault(request.id, len(computed_blocks))
         return new_blocks
 
-    def can_reserve_tiered_prefix(
+    def can_allocate_tiered_prefix_for_admission(
         self,
         *,
         gpu_blocks_by_index: dict[int, KVCacheBlock],
@@ -269,7 +269,7 @@ class KVCacheManager:
         suffix_reservation_count: int = 0,
         minimum_free_blocks_after_reservation: int = 0,
     ) -> bool:
-        """Return whether a mixed GPU/CPU prefix can be pinned and reserved."""
+        """Return whether a staged mixed prefix can be admitted atomically."""
         if cpu_restore_count < 0:
             raise ValueError("cpu_restore_count must be >= 0")
         if suffix_reservation_count < 0:
@@ -289,7 +289,7 @@ class KVCacheManager:
             - int(minimum_free_blocks_after_reservation)
         )
 
-    def reserve_tiered_prefix(
+    def allocate_tiered_prefix_for_admission(
         self,
         request: Request,
         *,
@@ -298,7 +298,7 @@ class KVCacheManager:
         cpu_restore_indices: list[int],
         suffix_reservation_count: int = 0,
     ) -> dict[int, KVCacheBlock]:
-        """Attach a mixed prefix and reserve unpublished GPU restore pages."""
+        """Materialize a staged mixed prefix during scheduler admission."""
         hit_frontier_blocks = int(hit_frontier_blocks)
         cpu_restore_indices = [int(index) for index in cpu_restore_indices]
         if request.id in self.req_to_blocks and self.req_to_blocks[request.id]:
@@ -314,7 +314,7 @@ class KVCacheManager:
             )
         if set(gpu_blocks_by_index) & set(cpu_restore_indices):
             raise ValueError("GPU and CPU prefix sources overlap")
-        if not self.can_reserve_tiered_prefix(
+        if not self.can_allocate_tiered_prefix_for_admission(
             gpu_blocks_by_index=gpu_blocks_by_index,
             cpu_restore_count=len(cpu_restore_indices),
             suffix_reservation_count=suffix_reservation_count,

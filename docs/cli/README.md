@@ -285,6 +285,21 @@ D2H/H2D byte and time costs. `system_metrics.json` includes a separate
 `cpu_kv_cache_statistics` object for capacity, occupancy, eviction,
 offload/restore, and CPU hit information.
 
+CPU restore uses the same deferred target-allocation abstraction as the PDD
+prefill-to-decode transfer. H2D completion places the transferred block
+contents in a logical staging state; it does not reserve scheduler-managed
+prefill GPU KV pages. The prefill scheduler revalidates current GPU hits and
+materializes the usable staged prefix only when the request is admitted.
+
+This abstraction preserves normal waiting-request scheduling semantics, but it
+does not model a finite receiver staging buffer, destination-GPU transfer
+backpressure, or an additional materialization latency at admission. An H2D
+operation can therefore complete while the prefill GPU KV pool is full, and
+cache churn can make some transferred blocks unusable before admission.
+`restore_blocks` and restore-byte metrics describe transferred traffic;
+request cached-token and CPU-hit metrics describe the prefix actually consumed
+at admission.
+
 When cluster event logging is enabled, scheduler diagnostics report
 `prefix_cache_admissions`, `prefix_cache_queries`, and `prefix_cache_hits` with
 `prefix_cache_metric_semantics=successful_admission_block_level`. These

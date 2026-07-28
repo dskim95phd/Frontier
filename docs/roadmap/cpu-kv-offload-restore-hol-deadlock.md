@@ -2,7 +2,8 @@
 
 ## Status
 
-- **State:** Open
+- **State:** Resolved by deferred GPU allocation; targeted and supported-path
+  validation complete
 - **Severity:** P1
 - **Discovered:** 2026-07-28
 - **Affected architecture:** Sequential `pd-disaggregation`
@@ -462,29 +463,25 @@ capacity is large enough to avoid the open restore-admission deadlock.
 
 ## Proposed Fix Direction
 
-The fix must guarantee that a request holding a completed restore reservation
-cannot be blocked behind a request that needs additional restore capacity.
+The selected implementation direction is now documented in
+[`cpu-kv-restore-deferred-allocation-plan.md`](cpu-kv-restore-deferred-allocation-plan.md).
+It removes restore-start GPU reservation and materializes the staged restore
+payload only during normal prefill admission, matching Frontier's current PDD
+target-allocation abstraction.
 
-The preferred scheduling contract is:
+The selected contract is:
 
-1. Process `_cpu_restore_ready_plans` before starting new restores on the same
-   cache target.
-2. Preserve the original scheduler order among restore-ready requests.
-3. If a non-ready request cannot reserve restore space, continue scanning for
-   restore-ready work instead of unconditionally breaking.
-4. Start no additional restore whose reservation would prevent already-ready
-   work from being admitted.
-5. Keep restore lease, GPU block, request allocation, and metric finalization
-   exactly-once under success, cancellation, and stale events.
-
-Possible implementations include:
-
-- reinserting skipped restore requests at the front rather than the tail;
-- explicitly partitioning the queue into restore-ready, restore-pending, and
-  not-started requests;
-- adding a ready-request fast lane before normal FCFS admission; or
-- limiting in-flight GPU restore reservations and waking admission when the
-  current ready request is consumed.
+1. Pending and completed restores own no scheduler-managed prefill GPU pages.
+2. Restore completion produces a logical staged payload and requeues the
+   request exactly once.
+3. Admission revalidates current GPU hits because the transfer-start snapshot
+   can become stale while waiting.
+4. GPU allocation, restored-prefix publication, staged-payload consumption,
+   and transition to `RUNNING` occur atomically.
+5. Temporary admission failure leaves the staged request in ordinary waiting
+   with zero request-owned GPU blocks.
+6. Restore leases, staged payloads, GPU blocks, and metrics remain exactly-once
+   under success, cancellation, and stale events.
 
 Simply increasing GPU capacity is not a fix. It only moves the failure
 boundary.
@@ -599,7 +596,17 @@ Recommended targeted suite:
 
 ## Notes
 
-- No production fix is included in this document.
+- The implementation follows
+  [`cpu-kv-restore-deferred-allocation-plan.md`](cpu-kv-restore-deferred-allocation-plan.md):
+  restore completion creates a logical staged payload and GPU pages are
+  allocated only during successful prefill admission.
+- The resolving implementation is currently in the worktree after baseline
+  checkpoint `8db430f`; record its commit ID here when it is committed.
+- The targeted CPU KV-cache, transfer-completion, tiered-cache, and session
+  prefix-cache suites pass with 106 tests.
+- The E2E stress matrix covers the original five-block GPU reproducer, an
+  eight-block CPU tier with repeated eviction, 16-session churn, and prefill
+  `DP=2` with two independent cache targets.
 - Stress artifacts were generated under the operating system temporary
   directory and are not repository fixtures.
 - The numerical queue-time totals above are cumulative simulator metrics, not

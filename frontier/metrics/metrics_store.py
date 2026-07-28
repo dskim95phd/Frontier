@@ -2173,6 +2173,8 @@ class MetricsStore:
                     "cpu_query_blocks",
                     "cpu_hit_blocks",
                     "sessions_with_cpu_hits",
+                    "pending_restore_operations",
+                    "staged_restore_payloads",
                 )
             }
             cpu_query_blocks = int(
@@ -4566,12 +4568,9 @@ class MetricsStore:
         self._cpu_kv_cache_metrics["restore_transfer_time_ms"] += float(
             timing.service_time_ms
         )
-        self._cpu_kv_cache_metrics["cpu_query_blocks"] += int(
-            plan.cpu_query_blocks
-        )
-        self._cpu_kv_cache_metrics["cpu_hit_blocks"] += int(
-            plan.cpu_hit_blocks
-        )
+        # CPU query/hit counters come from the cache-manager admission
+        # snapshots. The restore plan describes transferred traffic and can
+        # overstate the prefix actually consumed after admission revalidation.
 
     def on_cpu_kv_cache_offload_start(self, time: float, offload_info: Any) -> None:
         if self._trace_store and self._config.enable_op_level_tracing:

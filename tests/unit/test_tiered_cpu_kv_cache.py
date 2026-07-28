@@ -121,10 +121,14 @@ def _scheduler(
     )
     scheduler._pending_cpu_restore_operations = {}
     scheduler._cpu_restore_waiting_requests = {}
-    scheduler._cpu_restore_ready_plans = {}
+    scheduler._staged_cpu_restore_payloads = {}
     scheduler._pending_auxiliary_events = []
     scheduler._allocation_map = {}
     scheduler._num_allocated_blocks = 0
+    scheduler._request_queue = []
+    scheduler._preempted_requests = []
+    scheduler._waiting_requests = []
+    scheduler._running_requests = []
     scheduler._pending_kv_transfer_requests = set()
     scheduler._pending_prefill_export_kinds = {}
     scheduler._pending_cpu_offload_operations = {}
@@ -323,7 +327,7 @@ def test_fully_cached_prompt_demotes_final_block_before_restore() -> None:
     assert plan.num_new_tokens == BLOCK_SIZE
 
 
-def test_restore_reserves_gpu_pages_and_publishes_only_on_completion() -> None:
+def test_restore_stages_payload_without_allocating_gpu_pages() -> None:
     cpu = _cpu_manager()
     _seed_cpu(cpu, session_id=7, blocks=2)
     scheduler = _scheduler(cpu_manager=cpu)
@@ -334,30 +338,77 @@ def test_restore_reserves_gpu_pages_and_publishes_only_on_completion() -> None:
         request=request, plan=plan, time=2.0
     )
     restore_info = scheduler._pending_cpu_restore_operations[request.id]
-    assert scheduler._kv_cache_manager.get_num_blocks_for_request(request) == 3
-    assert all(
-        block.block_hash is None
-        for block in restore_info.restore_blocks_by_index.values()
-    )
+    assert scheduler._kv_cache_manager.get_num_blocks_for_request(request) == 0
     assert all(block.pin_count == 1 for block in restore_info.cpu_lease.blocks)
 
     scheduler.complete_cpu_kv_cache_restore(
         restore_info.timing.end_time, restore_info
     )
 
-    assert all(
-        block.block_hash == ("session", 7, index)
-        for index, block in restore_info.restore_blocks_by_index.items()
-    )
+    assert scheduler._kv_cache_manager.get_num_blocks_for_request(request) == 0
     assert all(block.pin_count == 0 for block in restore_info.cpu_lease.blocks)
-    assert request.cpu_prefix_cache_hit_blocks == 2
+    assert request.cpu_prefix_cache_hit_blocks == 0
     assert request.cpu_prefix_cache_restored_blocks == 2
     assert request.cpu_prefix_cache_restored_tokens == 32
-    assert request.num_prefill_tokens_cached == 32
-    assert request.id in scheduler._cpu_restore_ready_plans
+    assert request.num_prefill_tokens_cached == 0
+    assert request.id in scheduler._staged_cpu_restore_payloads
+    assert scheduler._request_queue == [request]
 
 
-def test_restore_allocation_failure_does_not_pin_or_attach_blocks() -> None:
+def test_staged_restore_revalidates_gpu_frontier_before_admission() -> None:
+    gpu = _gpu_manager()
+    cpu = _cpu_manager()
+    _seed_gpu(gpu, session_id=7, blocks=2)
+    _seed_cpu(cpu, session_id=7, blocks=4)
+    scheduler = _scheduler(gpu_manager=gpu, cpu_manager=cpu)
+    request = _request(prefill_tokens=5 * BLOCK_SIZE)
+    transfer_plan = scheduler._build_tiered_prefix_plan(request)
+    assert transfer_plan.cpu_block_indices == [2, 3]
+
+    assert scheduler._begin_cpu_kv_cache_restore(
+        request=request,
+        plan=transfer_plan,
+        time=2.0,
+    )
+    restore_info = scheduler._pending_cpu_restore_operations[request.id]
+    scheduler.complete_cpu_kv_cache_restore(
+        restore_info.timing.end_time,
+        restore_info,
+    )
+    staged = scheduler._staged_cpu_restore_payloads[request.id]
+    assert cpu.cpu_query_blocks == 0
+    assert cpu.cpu_hit_blocks == 0
+
+    unchanged_plan = scheduler._build_staged_restore_admission_plan(
+        request, staged
+    )
+    assert sorted(unchanged_plan.gpu_blocks_by_index) == [0, 1]
+    assert unchanged_plan.cpu_block_indices == [2, 3]
+    assert unchanged_plan.hit_frontier_blocks == 4
+
+    block_zero = gpu.get_cached_block_for_key(("session", 7, 0))
+    assert block_zero is not None
+    cached = gpu.block_pool.cached_block_hash_to_block[block_zero.block_hash]
+    del cached[block_zero.block_id]
+    del gpu.block_pool.cached_block_hash_to_block[block_zero.block_hash]
+    block_zero.reset_hash()
+
+    churned_plan = scheduler._build_staged_restore_admission_plan(
+        request, staged
+    )
+    assert churned_plan.hit_frontier_blocks == 0
+    assert churned_plan.gpu_blocks_by_index == {}
+    assert churned_plan.cpu_block_indices == []
+    assert churned_plan.num_new_tokens == 5 * BLOCK_SIZE
+
+    scheduler._record_cpu_kv_cache_admission(request, churned_plan)
+
+    assert cpu.cpu_query_blocks == transfer_plan.cpu_query_blocks
+    assert cpu.cpu_hit_blocks == 0
+    assert cpu.get_statistics()["sessions_with_cpu_hits"] == 0
+
+
+def test_restore_start_is_independent_of_gpu_capacity() -> None:
     cpu = _cpu_manager()
     _seed_cpu(cpu, session_id=7, blocks=2)
     gpu = _gpu_manager(num_blocks=1)
@@ -365,17 +416,16 @@ def test_restore_allocation_failure_does_not_pin_or_attach_blocks() -> None:
     request = _request()
     plan = scheduler._build_tiered_prefix_plan(request)
 
-    assert not scheduler._begin_cpu_kv_cache_restore(
+    assert scheduler._begin_cpu_kv_cache_restore(
         request=request, plan=plan, time=2.0
     )
     assert gpu.get_num_blocks_for_request(request) == 0
-    assert cpu.reserved_blocks == 0
-    assert all(block.pin_count == 0 for block in cpu._blocks.values())
+    assert all(block.pin_count == 1 for block in cpu._blocks.values())
     assert cpu.cpu_query_blocks == 0
     assert cpu.cpu_hit_blocks == 0
 
 
-def test_restore_atomically_reserves_prompt_suffix_against_competing_request() -> None:
+def test_pending_restore_does_not_block_competing_gpu_admission() -> None:
     cpu = _cpu_manager()
     _seed_cpu(cpu, session_id=7, blocks=2)
     gpu = _gpu_manager(num_blocks=4)
@@ -386,11 +436,11 @@ def test_restore_atomically_reserves_prompt_suffix_against_competing_request() -
     assert scheduler._begin_cpu_kv_cache_restore(
         request=restoring, plan=plan, time=2.0
     )
-    assert gpu.get_num_blocks_for_request(restoring) == 3
+    assert gpu.get_num_blocks_for_request(restoring) == 0
 
     competing = _request(session_id=8, prefill_tokens=32)
-    assert not gpu.can_allocate_slots(competing, 32)
-    assert gpu.get_num_blocks_for_request(restoring) == 3
+    assert gpu.can_allocate_slots(competing, 32)
+    assert gpu.get_num_blocks_for_request(restoring) == 0
 
 
 @pytest.mark.parametrize("decode_first", [True, False])
@@ -498,7 +548,7 @@ def test_cpu_offload_generation_is_monotonic_across_session_requests() -> None:
     assert cpu.stale_generation_completions == 1
 
 
-def test_restore_reservation_preserves_scheduler_watermark() -> None:
+def test_restore_start_does_not_consume_scheduler_watermark() -> None:
     cpu = _cpu_manager(num_blocks=10)
     _seed_cpu(cpu, session_id=7, blocks=8)
     scheduler = _scheduler(
@@ -509,18 +559,18 @@ def test_restore_reservation_preserves_scheduler_watermark() -> None:
     request = _request(session_id=7, prefill_tokens=10 * BLOCK_SIZE)
     plan = scheduler._build_tiered_prefix_plan(request)
 
-    assert not scheduler._begin_cpu_kv_cache_restore(
+    assert scheduler._begin_cpu_kv_cache_restore(
         request=request,
         plan=plan,
         time=2.0,
     )
     assert scheduler._kv_cache_manager.num_used_blocks == 0
-    assert scheduler._pending_cpu_restore_operations == {}
-    assert scheduler._pending_auxiliary_events == []
-    assert all(block.pin_count == 0 for block in cpu._blocks.values())
+    assert request.id in scheduler._pending_cpu_restore_operations
+    assert len(scheduler._pending_auxiliary_events) == 1
+    assert all(block.pin_count == 1 for block in cpu._blocks.values())
 
 
-def test_restore_reservation_succeeds_at_watermark_boundary() -> None:
+def test_restore_start_leaves_all_gpu_blocks_free_at_watermark_boundary() -> None:
     cpu = _cpu_manager(num_blocks=10)
     _seed_cpu(cpu, session_id=7, blocks=6)
     scheduler = _scheduler(
@@ -536,8 +586,8 @@ def test_restore_reservation_succeeds_at_watermark_boundary() -> None:
         plan=plan,
         time=2.0,
     )
-    assert scheduler._kv_cache_manager.num_used_blocks == 8
-    assert scheduler._kv_cache_manager.block_pool.get_num_free_blocks() == 2
+    assert scheduler._kv_cache_manager.num_used_blocks == 0
+    assert scheduler._kv_cache_manager.block_pool.get_num_free_blocks() == 10
 
 
 def test_restore_schedule_failure_rolls_back_gpu_and_cpu_state() -> None:

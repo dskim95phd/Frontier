@@ -31,6 +31,11 @@ Detailed implementation plans and records:
   deadlock, minimal reproduction, root cause, churn results, and regression
   acceptance criteria.
 
+- [CPU KV-cache restore deferred GPU allocation](cpu-kv-restore-deferred-allocation-plan.md) -
+  selected remediation plan that aligns CPU restore with PDD's deferred target
+  allocation model, including scheduler invariants, admission-time prefix
+  revalidation, metrics, tests, rationale, and fidelity limitations.
+
 ## Near-term
 
 We have released the initial version of Frontier, targeting the `co-location`

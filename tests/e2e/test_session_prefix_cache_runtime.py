@@ -402,7 +402,9 @@ def test_pdd_prefill_cpu_kv_offload_runtime_metrics(tmp_path: Path) -> None:
     assert cpu_statistics["offload_blocks"] == 12
     assert cpu_statistics["restore_operations"] == 3
     assert cpu_statistics["restore_blocks"] == 5
-    assert cpu_statistics["cpu_hit_blocks"] >= 5
+    assert cpu_statistics["cpu_hit_blocks"] == request_metrics[
+        "request_cpu_prefix_cache_hit_blocks"
+    ].sum()
     assert request_metrics[
         "request_cpu_kv_cache_restore_transfer_time"
     ].sum() == pytest.approx(
@@ -410,6 +412,75 @@ def test_pdd_prefill_cpu_kv_offload_runtime_metrics(tmp_path: Path) -> None:
         rel=1e-6,
     )
     assert system_metrics["kv_cache_transfer_statistics"]["total_transfers"] == 6
+
+
+@pytest.mark.parametrize(
+    ("num_sessions", "cpu_capacity_blocks", "prefill_dp_size"),
+    [(4, 1024, 1), (4, 8, 1), (16, 8, 1), (8, 8, 2)],
+)
+def test_cpu_restore_deferred_gpu_allocation_avoids_small_gpu_deadlock(
+    tmp_path: Path,
+    num_sessions: int,
+    cpu_capacity_blocks: int,
+    prefill_dp_size: int,
+) -> None:
+    trace_file = tmp_path / "restore_hol_trace.csv"
+    rows = []
+    round_orders = (
+        tuple(range(num_sessions)),
+        tuple(reversed(range(num_sessions))),
+        tuple(range(num_sessions)),
+    )
+    for round_id, order in enumerate(round_orders):
+        for position, session_index in enumerate(order):
+            rows.append(
+                {
+                    "arrived_at": round_id * 100 + position * 0.1,
+                    "num_prefill_tokens": 16,
+                    "num_decode_tokens": 1,
+                    "session_id": 1000 + session_index,
+                }
+            )
+    pd.DataFrame(rows).to_csv(trace_file, index=False)
+
+    cpu_args = _cpu_offload_args()
+    capacity_flag = "--cpu_kv_cache_config_capacity_bytes"
+    cpu_args[cpu_args.index(capacity_flag) + 1] = str(
+        cpu_capacity_blocks * 1024**2
+    )
+    pdd_args = _pdd_args()
+    for field in (
+        "attn_data_parallel_size",
+        "moe_expert_parallel_size",
+    ):
+        flag = f"--cluster_config_prefill_replica_config_{field}"
+        pdd_args[pdd_args.index(flag) + 1] = str(prefill_dp_size)
+    request_metrics, system_metrics = _run_simulation(
+        output_root=tmp_path
+        / f"cpu_{num_sessions}_{cpu_capacity_blocks}_dp{prefill_dp_size}",
+        run_id=(
+            f"cpu_restore_deferred_{num_sessions}_"
+            f"{cpu_capacity_blocks}_dp{prefill_dp_size}"
+        ),
+        architecture_args=[*pdd_args, *cpu_args],
+        trace_file=trace_file,
+        key_mode="session",
+    )
+
+    assert len(request_metrics) == num_sessions * 3
+    cpu_statistics = system_metrics["cpu_kv_cache_statistics"]
+    assert cpu_statistics["restore_operations"] > 0
+    assert cpu_statistics["restore_blocks"] > 0
+    assert cpu_statistics["reserved_blocks"] == 0
+    assert cpu_statistics["pending_restore_operations"] == 0
+    assert cpu_statistics["staged_restore_payloads"] == 0
+    assert cpu_statistics["cache_target_count"] == prefill_dp_size
+    assert cpu_statistics["resident_blocks"] <= (
+        cpu_capacity_blocks * prefill_dp_size
+    )
+    if cpu_capacity_blocks == 8:
+        assert cpu_statistics["evicted_sessions"] > 0
+        assert cpu_statistics["evicted_blocks"] > 0
 
 
 def test_cpu_restore_latency_contributes_to_followup_ttft(tmp_path: Path) -> None:

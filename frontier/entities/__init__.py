@@ -6,6 +6,7 @@ from frontier.entities.kv_cache_transfer_info import KVCacheTransferInfo
 from frontier.entities.cpu_kv_cache_transfer_info import (
     CPUKVCacheOffloadInfo,
     CPUKVCacheRestoreInfo,
+    StagedCPUKVCacheRestore,
 )
 from frontier.entities.m2n_transfer_info import M2NTransferInfo
 from frontier.entities.replica import Replica
@@ -24,5 +25,6 @@ __all__ = [
     KVCacheTransferInfo,
     CPUKVCacheOffloadInfo,
     CPUKVCacheRestoreInfo,
+    StagedCPUKVCacheRestore,
     M2NTransferInfo,
 ]

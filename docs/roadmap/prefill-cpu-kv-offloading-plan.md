@@ -48,6 +48,23 @@ Decode-to-CPU offload, decode-to-prefill KV return, and a shared remote CPU
 cache are follow-up features and require separate topology and transfer-cost
 contracts.
 
+## Restore Target-Allocation Decision
+
+CPU restore follows Frontier's existing PDD deferred target-allocation
+abstraction. Restore start pins CPU source blocks and schedules H2D latency but
+does not reserve prefill GPU KV pages. Restore completion creates a logical
+staged payload and returns the request to the runnable prefill waiting queue.
+The scheduler revalidates current GPU hits and atomically allocates/publishes
+the usable restored prefix only when admission succeeds.
+
+This decision preserves the vLLM invariant that waiting requests do not own
+scarce GPU KV pages and removes the restore head-of-line deadlock caused by a
+GPU-owning restore-ready request. It intentionally does not model a finite
+receiver staging area, destination-GPU backpressure, or admission-time
+materialization latency. The complete rationale, implementation sequence,
+alternatives, and acceptance criteria are recorded in
+[`cpu-kv-restore-deferred-allocation-plan.md`](cpu-kv-restore-deferred-allocation-plan.md).
+
 ## Motivation
 
 The current session prefix cache is local to a GPU cache target. When a
@@ -376,32 +393,30 @@ immediately recompute.
 ## Restore Admission Flow
 
 A CPU hit is not immediately equivalent to a computed GPU block. The request
-must wait for capacity reservation and transfer completion.
+must wait for transfer completion and then pass normal GPU admission.
 
-Recommended flow:
+Implemented flow:
 
 1. Route the request to its sticky prefill cache target.
 2. Build a `TieredPrefixPlan`.
-3. Pin all GPU-hit blocks participating in the plan.
-4. Reserve physical GPU pages for CPU restore blocks.
-5. Verify that restored pages plus the planned prefill suffix satisfy normal
-   allocation and watermark rules.
-6. If reservation succeeds, remove the request from normal admission and put
-   it in `WAITING_FOR_CPU_RESTORE`.
-7. Pin the source CPU blocks.
-8. Emit a CPU restore start event.
-9. On restore completion:
-   - attach the restored physical GPU blocks to the request;
-   - publish their existing logical session keys on GPU;
+3. Pin the source CPU blocks.
+4. Remove the request from runnable admission and emit a CPU restore event.
+5. On restore completion:
    - release the CPU restore lease;
-   - apply the combined cached-token frontier to the request;
-   - return the request to schedulable prefill work; and
+   - retain the transferred block identities in a logical staged payload;
+   - return the request to schedulable prefill work without GPU ownership; and
    - emit a replica schedule event.
-10. Prefill computes only `num_new_tokens`.
+6. At admission, revalidate current GPU hits and the contiguous usable staged
+   prefix.
+7. Check restored-prefix, recompute/suffix, and watermark capacity together.
+8. Allocate and publish the usable staged prefix in the same iteration that
+   moves the request to `RUNNING`.
+9. Prefill computes only the resulting `num_new_tokens`.
 
-GPU pages must be reserved before the transfer starts. Deferring allocation
-until transfer completion would allow unrelated work to consume the space and
-leave a completed restore without a valid destination.
+No scheduler-managed GPU page is reserved during the H2D interval or while the
+completed payload waits for admission. This is the deliberate PDD-aligned
+logical-staging model described in the restore target-allocation decision
+above.
 
 A request waiting for restore should not block unrelated requests at the head
 of the normal waiting queue. Track restore-waiting requests separately and
@@ -873,9 +888,9 @@ Changes:
 
 - add non-breaking GPU key probes needed by the tiered planner;
 - build one contiguous GPU+CPU prefix plan;
-- reserve restore pages before emitting a transfer;
+- keep pending and staged restores free of scheduler-managed GPU allocations;
 - maintain a restore-waiting request collection;
-- publish restored GPU block keys only after transfer completion;
+- revalidate, allocate, and publish restored GPU block keys at admission;
 - apply existing cached-token and fully-cached-prompt semantics;
 - avoid lookup metric double counting across failed admission retries.
 

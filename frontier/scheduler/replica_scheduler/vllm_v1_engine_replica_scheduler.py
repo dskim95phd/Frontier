@@ -272,7 +272,7 @@ class VLLMv1EngineReplicaScheduler(BaseReplicaScheduler):
         self._cpu_kv_cache_transfer_engine = None
         self._cpu_restore_waiting_requests: dict[int, object] = {}
         self._pending_cpu_restore_operations: dict[int, object] = {}
-        self._cpu_restore_ready_plans: dict[int, object] = {}
+        self._staged_cpu_restore_payloads: dict[int, object] = {}
         self._pending_auxiliary_events: list[object] = []
         if (
             self._cpu_kv_cache_config is not None
@@ -1467,45 +1467,15 @@ class VLLMv1EngineReplicaScheduler(BaseReplicaScheduler):
             return False
         if request.id in self._pending_cpu_restore_operations:
             return True
-        if request.id in self._cpu_restore_ready_plans:
+        if request.id in self._staged_cpu_restore_payloads:
             return False
-        assert self._kv_cache_manager is not None
         assert self._cpu_kv_cache_manager is not None
         assert self._cpu_kv_cache_transfer_engine is not None
-        prompt_blocks = ceil(
-            int(request.num_prefill_tokens) / int(self._config.block_size)
+        cpu_lease = self._cpu_kv_cache_manager.pin_restore_blocks(
+            session_id=request.session_id,
+            block_indices=plan.cpu_block_indices,
+            time=time,
         )
-        suffix_reservation_count = max(
-            prompt_blocks - int(plan.hit_frontier_blocks),
-            0,
-        )
-        if not self._kv_cache_manager.can_reserve_tiered_prefix(
-            gpu_blocks_by_index=plan.gpu_blocks_by_index,
-            cpu_restore_count=plan.cpu_hit_blocks,
-            suffix_reservation_count=suffix_reservation_count,
-            minimum_free_blocks_after_reservation=self._watermark_blocks,
-        ):
-            return False
-
-        restore_blocks_by_index = (
-            self._kv_cache_manager.reserve_tiered_prefix(
-                request,
-                hit_frontier_blocks=plan.hit_frontier_blocks,
-                gpu_blocks_by_index=plan.gpu_blocks_by_index,
-                cpu_restore_indices=plan.cpu_block_indices,
-                suffix_reservation_count=suffix_reservation_count,
-            )
-        )
-        try:
-            cpu_lease = self._cpu_kv_cache_manager.pin_restore_blocks(
-                session_id=request.session_id,
-                block_indices=plan.cpu_block_indices,
-                time=time,
-            )
-        except Exception:
-            self._kv_cache_manager.free(request)
-            self._sync_prefix_cache_allocation_state()
-            raise
 
         from frontier.entities.cpu_kv_cache_transfer_info import (
             CPUKVCacheRestoreInfo,
@@ -1525,50 +1495,56 @@ class VLLMv1EngineReplicaScheduler(BaseReplicaScheduler):
             self._cpu_kv_cache_manager.release_restore_lease(
                 cpu_lease, time=time, used=False
             )
-            self._kv_cache_manager.free(request)
-            self._sync_prefix_cache_allocation_state()
             raise
         restore_info = CPUKVCacheRestoreInfo(
             request=request,
             replica_id=self._replica_id,
             dp_id=self._dp_id,
             plan=plan,
-            restore_blocks_by_index=restore_blocks_by_index,
             cpu_lease=cpu_lease,
             timing=timing,
         )
         self._pending_cpu_restore_operations[request.id] = restore_info
         self._cpu_restore_waiting_requests[request.id] = request
-        self._sync_prefix_cache_allocation_state(request)
         self._pending_auxiliary_events.append(
             CPUKVCacheRestoreStartEvent(restore_info)
         )
         return True
 
     def cancel_cpu_kv_cache_restore(self, request_id: int, *, time: float) -> bool:
-        """Rollback an in-flight H2D restore exactly once."""
+        """Cancel an in-flight or staged H2D restore exactly once."""
         request_id = int(request_id)
         restore_info = self._pending_cpu_restore_operations.pop(
             request_id, None
         )
         if restore_info is None:
-            return False
-        assert self._kv_cache_manager is not None
+            staged = self._staged_cpu_restore_payloads.pop(request_id, None)
+            if staged is None:
+                return False
+            self._cpu_restore_waiting_requests.pop(request_id, None)
+            self._request_queue = [
+                request
+                for request in self._request_queue
+                if request.id != request_id
+            ]
+            self._preempted_requests = [
+                request
+                for request in self._preempted_requests
+                if request.id != request_id
+            ]
+            return True
         assert self._cpu_kv_cache_manager is not None
         self._cpu_kv_cache_manager.release_restore_lease(
             restore_info.cpu_lease,
             time=time,
             used=False,
         )
-        self._kv_cache_manager.free(restore_info.request)
         self._cpu_restore_waiting_requests.pop(request_id, None)
-        self._cpu_restore_ready_plans.pop(request_id, None)
         self._pending_auxiliary_events = [
             event
             for event in self._pending_auxiliary_events
             if getattr(event, "_restore_info", None) is not restore_info
         ]
-        self._sync_prefix_cache_allocation_state()
         return True
 
     def complete_cpu_kv_cache_restore(
@@ -1581,37 +1557,28 @@ class VLLMv1EngineReplicaScheduler(BaseReplicaScheduler):
                 "CPU KV-cache restore completion does not match pending "
                 f"operation for request {request.id}"
             )
-        assert self._kv_cache_manager is not None
         assert self._cpu_kv_cache_manager is not None
-        self._kv_cache_manager.publish_restored_prefix(
-            request,
-            restore_blocks_by_index=restore_info.restore_blocks_by_index,
-            block_keys=restore_info.plan.block_keys,
-            hit_frontier_blocks=restore_info.plan.hit_frontier_blocks,
+        from frontier.entities.cpu_kv_cache_transfer_info import (
+            StagedCPUKVCacheRestore,
         )
+        staged_restore = StagedCPUKVCacheRestore.from_restore_info(restore_info)
+        if request.id in self._staged_cpu_restore_payloads:
+            raise ValueError(
+                f"CPU KV-cache restore payload already staged for request {request.id}"
+            )
         self._cpu_kv_cache_manager.release_restore_lease(
             restore_info.cpu_lease,
             time=time,
             used=True,
         )
-        should_record_cpu_lookup = (
-            not request.prefix_cache_metrics_recorded_for_current_round
-        )
-        request.on_tiered_prefix_cache_lookup(
-            query_blocks=restore_info.plan.query_blocks,
-            gpu_hit_blocks=restore_info.plan.gpu_hit_blocks,
-            cpu_query_blocks=restore_info.plan.cpu_query_blocks,
-            cpu_hit_blocks=restore_info.plan.cpu_hit_blocks,
-            num_tokens_cached=restore_info.plan.hit_tokens,
-            key_mode="session",
-        )
-        if should_record_cpu_lookup:
-            self._cpu_kv_cache_manager.record_lookup(
-                session_id=request.session_id,
-                query_blocks=restore_info.plan.cpu_query_blocks,
-                hit_blocks=restore_info.plan.cpu_hit_blocks,
-                lookup_id=request.id,
-            )
+        self._pending_cpu_restore_operations.pop(request.id)
+        self._cpu_restore_waiting_requests.pop(request.id, None)
+        self._staged_cpu_restore_payloads[request.id] = staged_restore
+        self._enqueue_staged_cpu_restore_request(request)
+
+        # Move ownership to staged state before recording transfer metrics. CPU
+        # lookup hits are recorded only after admission revalidates how much of
+        # this payload is actually consumed.
         request.on_cpu_kv_cache_restore(
             restored_blocks=restore_info.plan.cpu_hit_blocks,
             restored_tokens=(
@@ -1622,10 +1589,92 @@ class VLLMv1EngineReplicaScheduler(BaseReplicaScheduler):
             queue_time_ms=restore_info.timing.queue_time_ms,
             transfer_time_ms=restore_info.timing.service_time_ms,
         )
-        self._pending_cpu_restore_operations.pop(request.id)
-        self._cpu_restore_waiting_requests.pop(request.id, None)
-        self._cpu_restore_ready_plans[request.id] = restore_info.plan
-        self._sync_prefix_cache_allocation_state(request)
+
+    def _enqueue_staged_cpu_restore_request(self, request: Request) -> None:
+        """Return one completed restore to the runnable prefill waiting queue."""
+        queues = (
+            self._preempted_requests,
+            self._request_queue,
+            self._waiting_requests,
+            self._running_requests,
+        )
+        if any(
+            queued_request.id == request.id
+            for queue in queues
+            for queued_request in queue
+        ):
+            raise ValueError(
+                f"CPU KV-cache restore request {request.id} is already queued"
+            )
+        if getattr(request, "_preempted", False):
+            self._preempted_requests.append(request)
+        else:
+            self._request_queue.append(request)
+
+    def _build_staged_restore_admission_plan(self, request: Request, staged_restore):
+        """Revalidate GPU hits and staged CPU contents without mutating storage."""
+        from frontier.kv_cache import TieredPrefixPlan
+
+        assert self._kv_cache_manager is not None
+        if staged_restore.request is not request:
+            raise ValueError(
+                "Staged CPU restore request identity mismatch: "
+                f"expected={request.id}, got={staged_restore.request.id}"
+            )
+        if request.session_id is None or int(request.session_id) != int(
+            staged_restore.session_id
+        ):
+            raise ValueError(
+                f"Staged CPU restore session mismatch for request {request.id}"
+            )
+
+        staged_indices = set(staged_restore.transferred_cpu_block_indices)
+        gpu_blocks_by_index = {}
+        cpu_block_indices = []
+        hit_frontier = 0
+        for block_index, block_key in enumerate(staged_restore.block_keys):
+            gpu_block = self._kv_cache_manager.get_cached_block_for_key(block_key)
+            if gpu_block is not None:
+                gpu_blocks_by_index[block_index] = gpu_block
+            elif block_index in staged_indices:
+                cpu_block_indices.append(block_index)
+            else:
+                break
+            hit_frontier += 1
+
+        block_size = int(staged_restore.block_size)
+        if (
+            hit_frontier > 0
+            and int(staged_restore.prompt_tokens) - hit_frontier * block_size == 0
+        ):
+            demoted_index = hit_frontier - 1
+            gpu_blocks_by_index.pop(demoted_index, None)
+            if demoted_index in cpu_block_indices:
+                cpu_block_indices.remove(demoted_index)
+            hit_frontier -= 1
+
+        return TieredPrefixPlan(
+            query_blocks=int(staged_restore.query_blocks),
+            cpu_query_blocks=int(staged_restore.cpu_query_blocks),
+            hit_frontier_blocks=hit_frontier,
+            gpu_blocks_by_index=gpu_blocks_by_index,
+            cpu_block_indices=cpu_block_indices,
+            block_keys=list(staged_restore.block_keys),
+            block_size=block_size,
+            prompt_tokens=int(staged_restore.prompt_tokens),
+        )
+
+    def _record_cpu_kv_cache_admission(self, request: Request, plan) -> None:
+        """Record CPU lookup results using the admission-revalidated prefix."""
+        if request.session_id is None:
+            raise ValueError("CPU KV-cache admission requires request.session_id")
+        assert self._cpu_kv_cache_manager is not None
+        self._cpu_kv_cache_manager.record_lookup(
+            session_id=request.session_id,
+            query_blocks=plan.cpu_query_blocks,
+            hit_blocks=plan.cpu_hit_blocks,
+            lookup_id=request.id,
+        )
 
     def drain_pending_auxiliary_events(self) -> list:
         events = self._pending_auxiliary_events
@@ -1635,7 +1684,14 @@ class VLLMv1EngineReplicaScheduler(BaseReplicaScheduler):
     def get_cpu_kv_cache_statistics(self) -> dict[str, int | float] | None:
         if self._cpu_kv_cache_manager is None:
             return None
-        return self._cpu_kv_cache_manager.get_statistics()
+        statistics = dict(self._cpu_kv_cache_manager.get_statistics())
+        statistics["pending_restore_operations"] = len(
+            self._pending_cpu_restore_operations
+        )
+        statistics["staged_restore_payloads"] = len(
+            self._staged_cpu_restore_payloads
+        )
+        return statistics
 
     def _build_decode_cuda_graph_metadata(
         self, batch: Batch
@@ -3529,28 +3585,27 @@ class VLLMv1EngineReplicaScheduler(BaseReplicaScheduler):
             prefix_cache_query_blocks = 0
             prefix_cache_hit_blocks = 0
             prefix_cache_lookup_attempted = False
-            prefix_cache_lookup_already_applied = False
             tiered_lookup_plan = None
+            staged_restore = None
 
             if request.id in self._pending_cpu_restore_operations:
                 waiting_queue.popleft()
-                skipped_waiting_requests.append(request)
                 continue
 
             # Calculate number of new tokens to process
-            ready_tiered_plan = self._cpu_restore_ready_plans.get(request.id)
-            if ready_tiered_plan is not None and not request.is_prefill_complete:
+            staged_restore = self._staged_cpu_restore_payloads.get(request.id)
+            if staged_restore is not None and not request.is_prefill_complete:
+                ready_tiered_plan = self._build_staged_restore_admission_plan(
+                    request, staged_restore
+                )
                 prefix_cache_lookup_attempted = True
-                prefix_cache_lookup_already_applied = True
                 computed_blocks = None
+                tiered_lookup_plan = ready_tiered_plan
                 prefix_cached_tokens = ready_tiered_plan.hit_tokens
                 prefix_cache_query_blocks = ready_tiered_plan.query_blocks
                 prefix_cache_hit_blocks = ready_tiered_plan.total_hit_blocks
-                num_new_tokens = self._get_request_next_num_tokens(request)
-                max_allowed = (
-                    self._max_model_len
-                    - self._get_scheduler_num_computed_tokens(request)
-                )
+                num_new_tokens = ready_tiered_plan.num_new_tokens
+                max_allowed = self._max_model_len - prefix_cached_tokens
             elif (
                 self._is_cpu_kv_cache_enabled()
                 and not request.is_prefill_complete
@@ -3563,7 +3618,6 @@ class VLLMv1EngineReplicaScheduler(BaseReplicaScheduler):
                         time=self._current_schedule_time,
                     ):
                         waiting_queue.popleft()
-                        skipped_waiting_requests.append(request)
                         continue
                     break
                 prefix_cache_lookup_attempted = True
@@ -3649,12 +3703,34 @@ class VLLMv1EngineReplicaScheduler(BaseReplicaScheduler):
                 waiting_queue.popleft()
                 continue
 
-            # Try to allocate (no preemption for waiting requests in Phase 2)
-            if not self._can_allocate_request(
-                request,
-                num_new_tokens,
-                new_computed_blocks=computed_blocks,
-            ):
+            # Try to allocate (no preemption for waiting requests in Phase 2).
+            # A completed CPU restore owns no GPU pages. Its full prompt
+            # reservation is checked and materialized only at admission.
+            if staged_restore is not None:
+                assert self._kv_cache_manager is not None
+                assert tiered_lookup_plan is not None
+                prompt_blocks = ceil(
+                    int(request.num_prefill_tokens) / int(self._config.block_size)
+                )
+                suffix_reservation_count = max(
+                    prompt_blocks - int(tiered_lookup_plan.hit_frontier_blocks),
+                    0,
+                )
+                can_allocate_waiting_request = (
+                    self._kv_cache_manager.can_allocate_tiered_prefix_for_admission(
+                        gpu_blocks_by_index=tiered_lookup_plan.gpu_blocks_by_index,
+                        cpu_restore_count=tiered_lookup_plan.cpu_hit_blocks,
+                        suffix_reservation_count=suffix_reservation_count,
+                        minimum_free_blocks_after_reservation=self._watermark_blocks,
+                    )
+                )
+            else:
+                can_allocate_waiting_request = self._can_allocate_request(
+                    request,
+                    num_new_tokens,
+                    new_computed_blocks=computed_blocks,
+                )
+            if not can_allocate_waiting_request:
                 # Flow validation: log memory pressure for waiting queue admission
                 available_blocks = int(self._config.num_blocks - self._num_allocated_blocks)
                 logger.info(
@@ -3667,6 +3743,31 @@ class VLLMv1EngineReplicaScheduler(BaseReplicaScheduler):
                 )
                 # Cannot allocate - stop scheduling new requests
                 break
+
+            if staged_restore is not None:
+                assert self._kv_cache_manager is not None
+                assert tiered_lookup_plan is not None
+                staged_restore_blocks_by_index = (
+                    self._kv_cache_manager.allocate_tiered_prefix_for_admission(
+                        request,
+                        hit_frontier_blocks=tiered_lookup_plan.hit_frontier_blocks,
+                        gpu_blocks_by_index=tiered_lookup_plan.gpu_blocks_by_index,
+                        cpu_restore_indices=tiered_lookup_plan.cpu_block_indices,
+                        suffix_reservation_count=suffix_reservation_count,
+                    )
+                )
+                try:
+                    self._kv_cache_manager.publish_restored_prefix(
+                        request,
+                        restore_blocks_by_index=staged_restore_blocks_by_index,
+                        block_keys=tiered_lookup_plan.block_keys,
+                        hit_frontier_blocks=tiered_lookup_plan.hit_frontier_blocks,
+                    )
+                except Exception:
+                    self._kv_cache_manager.free(request)
+                    self._sync_prefix_cache_allocation_state()
+                    raise
+                self._sync_prefix_cache_allocation_state(request)
 
             # Remove from waiting queues and allocate
             waiting_queue.popleft()
@@ -3684,50 +3785,47 @@ class VLLMv1EngineReplicaScheduler(BaseReplicaScheduler):
                 self._current_schedule_time, self._cluster_type
             )
 
-            self._allocate_request(
-                request,
-                num_new_tokens,
-                new_computed_blocks=computed_blocks,
-            )
+            if staged_restore is None:
+                self._allocate_request(
+                    request,
+                    num_new_tokens,
+                    new_computed_blocks=computed_blocks,
+                )
             if prefix_cache_lookup_attempted:
                 assert self._kv_cache_manager is not None
                 should_record_cpu_lookup = (
                     tiered_lookup_plan is not None
                     and not request.prefix_cache_metrics_recorded_for_current_round
                 )
-                if not prefix_cache_lookup_already_applied:
-                    if tiered_lookup_plan is not None:
-                        request.on_tiered_prefix_cache_lookup(
-                            query_blocks=prefix_cache_query_blocks,
-                            gpu_hit_blocks=tiered_lookup_plan.gpu_hit_blocks,
-                            cpu_query_blocks=(
-                                tiered_lookup_plan.cpu_query_blocks
-                            ),
-                            cpu_hit_blocks=tiered_lookup_plan.cpu_hit_blocks,
-                            num_tokens_cached=prefix_cached_tokens,
-                            key_mode=self._kv_cache_manager.caching_key_mode,
-                        )
-                    else:
-                        request.on_prefix_cache_lookup(
-                            query_blocks=prefix_cache_query_blocks,
-                            hit_blocks=prefix_cache_hit_blocks,
-                            num_tokens_cached=prefix_cached_tokens,
-                            key_mode=self._kv_cache_manager.caching_key_mode,
-                        )
+                if tiered_lookup_plan is not None:
+                    request.on_tiered_prefix_cache_lookup(
+                        query_blocks=prefix_cache_query_blocks,
+                        gpu_hit_blocks=tiered_lookup_plan.gpu_hit_blocks,
+                        cpu_query_blocks=(
+                            tiered_lookup_plan.cpu_query_blocks
+                        ),
+                        cpu_hit_blocks=tiered_lookup_plan.cpu_hit_blocks,
+                        num_tokens_cached=prefix_cached_tokens,
+                        key_mode=self._kv_cache_manager.caching_key_mode,
+                    )
+                else:
+                    request.on_prefix_cache_lookup(
+                        query_blocks=prefix_cache_query_blocks,
+                        hit_blocks=prefix_cache_hit_blocks,
+                        num_tokens_cached=prefix_cached_tokens,
+                        key_mode=self._kv_cache_manager.caching_key_mode,
+                    )
                 self._kv_cache_manager.record_prefix_cache_admission(
                     query_blocks=prefix_cache_query_blocks,
                     hit_blocks=prefix_cache_hit_blocks,
                 )
                 if should_record_cpu_lookup:
-                    assert self._cpu_kv_cache_manager is not None
-                    self._cpu_kv_cache_manager.record_lookup(
-                        session_id=request.session_id,
-                        query_blocks=tiered_lookup_plan.cpu_query_blocks,
-                        hit_blocks=tiered_lookup_plan.cpu_hit_blocks,
-                        lookup_id=request.id,
+                    self._record_cpu_kv_cache_admission(
+                        request,
+                        tiered_lookup_plan,
                     )
-                if prefix_cache_lookup_already_applied:
-                    self._cpu_restore_ready_plans.pop(request.id, None)
+                if staged_restore is not None:
+                    self._staged_cpu_restore_payloads.pop(request.id, None)
             self._advance_scheduler_num_computed_tokens(request, num_new_tokens)
 
             # Add to running requests
@@ -4868,7 +4966,16 @@ class VLLMv1EngineReplicaScheduler(BaseReplicaScheduler):
         """
         if self._cluster_type in (ClusterType.DECODE, ClusterType.DECODE_ATTN):
             return len(self._request_queue) + len(self._waiting_requests)
-        return len(self._request_queue) + len(self._preempted_requests)
+        pending_restore_count = (
+            len(getattr(self, "_cpu_restore_waiting_requests", {}))
+            if self._cluster_type == ClusterType.PREFILL
+            else 0
+        )
+        return (
+            len(self._request_queue)
+            + len(self._preempted_requests)
+            + pending_restore_count
+        )
 
     def peek_waiting_requests(self) -> List[Request]:
         requests: List[Request] = []
@@ -4920,6 +5027,8 @@ class VLLMv1EngineReplicaScheduler(BaseReplicaScheduler):
             and waiting_len == 0
             and running_len == 0
             and len(self._allocation_map) == 0
+            and len(getattr(self, "_pending_cpu_restore_operations", {})) == 0
+            and len(getattr(self, "_staged_cpu_restore_payloads", {})) == 0
             and self._num_running_batches == 0
             and stages_empty
         )
