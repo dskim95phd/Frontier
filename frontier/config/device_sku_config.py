@@ -11,6 +11,12 @@ logger = init_logger(__name__)
 class BaseDeviceSKUConfig(BaseFixedConfig):
     fp16_tflops: int
     total_memory_gb: int
+    # Optional analytical ceilings. Zero means that the SKU has not declared
+    # the ceiling and an analytical predictor must reject or conservatively
+    # fall back rather than inventing a hardware value.
+    hbm_bandwidth_tbps: float = 0.0
+    fp8_tflops: float = 0.0
+    nvfp4_tflops: float = 0.0
 
 
 @dataclass
@@ -94,3 +100,18 @@ class RtxPro6000DeviceSKUConfig(BaseDeviceSKUConfig):
     @staticmethod
     def get_type():
         return DeviceSKUType.RTX_PRO_6000
+
+
+@dataclass
+class RubinDeviceSKUConfig(BaseDeviceSKUConfig):
+    """Preliminary NVIDIA Rubin GPU ceilings used by analytical models."""
+
+    fp16_tflops: int = 4_000
+    total_memory_gb: int = 288
+    hbm_bandwidth_tbps: float = 22.0
+    fp8_tflops: float = 17_500.0
+    nvfp4_tflops: float = 50_000.0
+
+    @staticmethod
+    def get_type():
+        return DeviceSKUType.RUBIN

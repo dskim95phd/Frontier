@@ -49,7 +49,13 @@ class BaseReplicaScheduler(ABC):
         self._dp_id = dp_id
         self._af_pipeline_num_micro_batch = af_pipeline_num_micro_batch
         self._cluster_scheduler = cluster_scheduler
-        self._cpu_kv_cache_config = cpu_kv_cache_config
+        self._cpu_kv_cache_config = (
+            cpu_kv_cache_config.resolve_for_target(
+                replica_config.attn_tensor_parallel_size
+            )
+            if cpu_kv_cache_config is not None
+            else None
+        )
 
         self._max_blocks_per_sequence = (
             self._request_generator_config.max_tokens // self._config.block_size

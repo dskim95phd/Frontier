@@ -26,7 +26,7 @@ from frontier.request_generator import RequestGeneratorRegistry
 from frontier.scheduler.global_scheduler.base_global_scheduler import (
     BaseGlobalScheduler,
 )
-from frontier.types import ClusterType
+from frontier.types import ClusterType, ExecutionTimePredictorType
 from frontier.execution_time_predictor import ExecutionTimePredictorRegistry
 from frontier.execution_time_predictor.shared_prediction_model_manager import (
     ExecutionTimePredictionModelManager,
@@ -169,11 +169,21 @@ class Simulator:
         # Initialize shared execution time prediction model manager and predictors for each cluster
         self._predictors = {}
         if self._config.is_disaggregated_mode():
-            # Create shared model manager that trains prediction models once for all clusters
+            # Analytical clusters must not trigger profiling-file discovery or
+            # estimator training. Mixed configurations still share one manager
+            # across only the profile-backed clusters.
+            profile_backed_cluster_configs = {
+                cluster_type: cluster_config
+                for cluster_type, cluster_config in cluster_configs.items()
+                if cluster_config.execution_time_predictor_config.get_type()
+                != ExecutionTimePredictorType.ANALYTICAL_ROOFLINE
+            }
             self._execution_time_prediction_model_manager = (
                 ExecutionTimePredictionModelManager(
-                    cluster_configs, self._config.metrics_config
+                    profile_backed_cluster_configs, self._config.metrics_config
                 )
+                if profile_backed_cluster_configs
+                else None
             )
 
             # Create individual predictors for each cluster
@@ -191,8 +201,12 @@ class Simulator:
                     cluster_config=self._config.cluster_config,
                     model_manager=self._execution_time_prediction_model_manager,
                     cluster_type=cluster_type,
-                    training_file_paths=self._execution_time_prediction_model_manager.get_training_file_paths(
-                        cluster_type
+                    training_file_paths=(
+                        self._execution_time_prediction_model_manager.get_training_file_paths(
+                            cluster_type
+                        )
+                        if cluster_type in profile_backed_cluster_configs
+                        else None
                     ),
                     actual_replica_ids=list(
                         self._clusters[cluster_type].replicas.keys()

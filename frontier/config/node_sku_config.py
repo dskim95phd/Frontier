@@ -100,3 +100,15 @@ class H20DgxNodeSKUConfig(BaseNodeSKUConfig):
     @staticmethod
     def get_type():
         return NodeSKUType.H20_DGX
+
+
+@dataclass
+class VeraRubinNVL72DomainNodeSKUConfig(BaseNodeSKUConfig):
+    """One logical rack-scale NVLink switch domain, not a physical tray."""
+
+    device_sku_type: DeviceSKUType = DeviceSKUType.RUBIN
+    num_devices_per_node: int = 72
+
+    @staticmethod
+    def get_type():
+        return NodeSKUType.VERA_RUBIN_NVL72_DOMAIN

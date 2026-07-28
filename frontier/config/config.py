@@ -2927,6 +2927,92 @@ class RandomForrestExecutionTimePredictorConfig(BaseExecutionTimePredictorConfig
 
 
 @dataclass
+class AnalyticalRooflineExecutionTimePredictorConfig(
+    BaseExecutionTimePredictorConfig
+):
+    """Transparent FLOP/byte execution-time model for unprofiled devices."""
+
+    large_gemm_compute_efficiency: float = 0.65
+    large_gemm_memory_efficiency: float = 0.75
+    large_gemm_overlap_penalty: float = 0.10
+    small_gemm_compute_efficiency: float = 0.25
+    small_gemm_memory_efficiency: float = 0.60
+    small_gemm_overlap_penalty: float = 0.50
+    prefill_attention_compute_efficiency: float = 0.55
+    prefill_attention_memory_efficiency: float = 0.65
+    prefill_attention_overlap_penalty: float = 0.20
+    decode_attention_compute_efficiency: float = 0.20
+    decode_attention_memory_efficiency: float = 0.60
+    decode_attention_overlap_penalty: float = 0.50
+    streaming_compute_efficiency: float = 0.20
+    streaming_memory_efficiency: float = 0.75
+    streaming_overlap_penalty: float = 0.0
+    moe_compute_efficiency: float = 0.45
+    moe_memory_efficiency: float = 0.65
+    moe_overlap_penalty: float = 0.30
+    routing_compute_efficiency: float = 0.15
+    routing_memory_efficiency: float = 0.55
+    routing_overlap_penalty: float = 0.75
+    kernel_launch_latency_us: float = 5.0
+    small_gemm_token_threshold: int = 128
+    enable_nvfp4_inference_peak: bool = False
+    keep_diagnostics: bool = True
+    max_diagnostic_records: int = 10_000
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        efficiency_fields = (
+            "large_gemm_compute_efficiency",
+            "large_gemm_memory_efficiency",
+            "small_gemm_compute_efficiency",
+            "small_gemm_memory_efficiency",
+            "prefill_attention_compute_efficiency",
+            "prefill_attention_memory_efficiency",
+            "decode_attention_compute_efficiency",
+            "decode_attention_memory_efficiency",
+            "streaming_compute_efficiency",
+            "streaming_memory_efficiency",
+            "moe_compute_efficiency",
+            "moe_memory_efficiency",
+            "routing_compute_efficiency",
+            "routing_memory_efficiency",
+        )
+        for field_name in efficiency_fields:
+            value = float(getattr(self, field_name))
+            if value <= 0.0 or value > 1.0:
+                raise ValueError(
+                    f"{self.__class__.__name__}.{field_name} must satisfy "
+                    f"0 < value <= 1, got={value}"
+                )
+        overlap_fields = (
+            "large_gemm_overlap_penalty",
+            "small_gemm_overlap_penalty",
+            "prefill_attention_overlap_penalty",
+            "decode_attention_overlap_penalty",
+            "streaming_overlap_penalty",
+            "moe_overlap_penalty",
+            "routing_overlap_penalty",
+        )
+        for field_name in overlap_fields:
+            value = float(getattr(self, field_name))
+            if value < 0.0 or value > 1.0:
+                raise ValueError(
+                    f"{self.__class__.__name__}.{field_name} must satisfy "
+                    f"0 <= value <= 1, got={value}"
+                )
+        if self.kernel_launch_latency_us < 0.0:
+            raise ValueError("kernel_launch_latency_us must be >= 0")
+        if self.small_gemm_token_threshold <= 0:
+            raise ValueError("small_gemm_token_threshold must be > 0")
+        if self.max_diagnostic_records <= 0:
+            raise ValueError("max_diagnostic_records must be > 0")
+
+    @staticmethod
+    def get_type():
+        return ExecutionTimePredictorType.ANALYTICAL_ROOFLINE
+
+
+@dataclass
 class ClusterConfig:
     # === Common fields for all modes ===
     cluster_scheduler_config: BaseClusterSchedulerConfig = field(

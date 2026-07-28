@@ -19,6 +19,9 @@ from frontier.execution_time_predictor.linear_regression_execution_time_predicto
 from frontier.execution_time_predictor.random_forrest_execution_time_predictor import (
     RandomForrestExecutionTimePredictor,
 )
+from frontier.execution_time_predictor.analytical_roofline_execution_time_predictor import (
+    AnalyticalRooflineExecutionTimePredictor,
+)
 from frontier.types import ClusterType, ExecutionTimePredictorType
 from frontier.utils.base_registry import BaseRegistry
 
@@ -99,4 +102,8 @@ ExecutionTimePredictorRegistry.register(
 )
 ExecutionTimePredictorRegistry.register(
     ExecutionTimePredictorType.LINEAR_REGRESSION, LinearRegressionExecutionTimePredictor
+)
+ExecutionTimePredictorRegistry.register(
+    ExecutionTimePredictorType.ANALYTICAL_ROOFLINE,
+    AnalyticalRooflineExecutionTimePredictor,
 )

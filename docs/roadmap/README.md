@@ -17,6 +17,11 @@ the release stabilizes and community feedback arrives.
 
 Detailed implementation plans and records:
 
+- [NVIDIA Vera Rubin NVL72 analytical modeling](vera-rubin-nvl72-analytical-modeling-plan.md) -
+  proposed profile-free MVP covering roofline-based operator timing, a logical
+  72-GPU ASTRA analytical switch domain, and statically partitioned Vera CPU
+  KV-cache capacity and bandwidth.
+
 - [Session-scoped prefix caching](session-prefix-caching-plan.md) — add an
   opt-in cache-key mode for incremental-ISL multi-turn traces identified by
   `session_id`.
