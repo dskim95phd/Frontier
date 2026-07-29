@@ -27,6 +27,16 @@ class SimTime {
 enum class EventType : std::uint8_t {
   kRequestArrival,
   kFoundationCompletion,
+  kSchedulerPoll,
+  kBatchCompletion,
+  kGlobalSchedule,
+  kClusterSchedule,
+  kReplicaSchedule,
+  kBatchStageArrival,
+  kReplicaStageSchedule,
+  kBatchStageEnd,
+  kClusterBatchEnd,
+  kGlobalBatchEnd,
 };
 
 struct EventPayload {
@@ -34,6 +44,7 @@ struct EventPayload {
   std::optional<BatchId> batch_id;
   std::optional<ReplicaId> replica_id;
   std::optional<DataParallelId> dp_id;
+  std::optional<StageId> stage_id;
   std::optional<Generation> generation;
 };
 

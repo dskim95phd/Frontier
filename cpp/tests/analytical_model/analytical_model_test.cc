@@ -1,6 +1,10 @@
 #include "frontier/cc_backend/analytical_model.h"
+#include "frontier/entities/batch.h"
+#include "frontier/entities/request.h"
+#include "frontier/execution_time_predictor/batch_execution_model.h"
 #include "frontier/execution_time_predictor/analytical_model.h"
 #include "frontier/kv_cache_transfer/analytical_transfer.h"
+#include "frontier/request_generator/workload.h"
 #include "tests/test_support.h"
 
 #include <algorithm>
@@ -8,7 +12,9 @@
 #include <cstdint>
 #include <filesystem>
 #include <limits>
+#include <optional>
 #include <string>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
@@ -22,6 +28,15 @@ namespace analytical = frontier::execution_time_predictor;
 namespace communication = frontier::cc_backend;
 namespace kv_transfer = frontier::kv_cache_transfer;
 
+using frontier::BatchId;
+using frontier::Generation;
+using frontier::IterationId;
+using frontier::RequestId;
+using frontier::SimTime;
+using frontier::entities::Batch;
+using frontier::entities::Request;
+using frontier::entities::RequestBatchSnapshot;
+using frontier::request_generator::WorkloadRequest;
 using frontier::test::expect;
 using frontier::test::expect_throws;
 using frontier::test::read_text_file;
@@ -54,6 +69,13 @@ Json load_golden() {
   const std::filesystem::path path =
       std::filesystem::path{FRONTIER_TEST_FIXTURE_DIR} /
       "analytical/analytical_v1.json";
+  return Json::parse(read_text_file(path));
+}
+
+Json load_step2_batch_golden() {
+  const std::filesystem::path path =
+      std::filesystem::path{FRONTIER_TEST_FIXTURE_DIR} /
+      "analytical/step2_batch_v1.json";
   return Json::parse(read_text_file(path));
 }
 
@@ -209,6 +231,93 @@ void test_long_context_decode_cost_increases() {
       predict(4'096).decode_attention_ms >
           predict(128).decode_attention_ms,
       "long-context decode attention must cost more");
+}
+
+double diagnostic_value(
+    const analytical::BatchExecutionPrediction& prediction,
+    std::string_view name) {
+  const auto iterator = std::find_if(
+      prediction.diagnostics.begin(),
+      prediction.diagnostics.end(),
+      [name](const auto& item) { return item.first == name; });
+  if (iterator == prediction.diagnostics.end()) {
+    throw std::runtime_error(
+        "missing analytical batch diagnostic: " + std::string{name});
+  }
+  return iterator->second;
+}
+
+void test_step2_batch_model_matches_python_golden() {
+  const Json golden = load_step2_batch_golden();
+  expect(
+      golden.at("schema_version").get<int>() == 1,
+      "Step 2 analytical batch golden schema must be version 1");
+  const analytical::AnalyticalBatchExecutionModel model{
+      frontier::config::AnalyticalExecutionModelConfig{}};
+
+  for (const Json& test_case : golden.at("cases")) {
+    std::vector<Request> requests;
+    std::vector<RequestBatchSnapshot> snapshots;
+    std::uint64_t request_index = 0;
+    for (const Json& slice :
+         test_case.at("input").at("slices")) {
+      const std::string phase = slice.at("phase").get<std::string>();
+      const std::uint64_t past_context =
+          slice.at("past_context").get<std::uint64_t>();
+      const std::uint64_t scheduled_tokens =
+          slice.at("scheduled_tokens").get<std::uint64_t>();
+      const std::uint64_t prefill_tokens =
+          phase == "decode"
+          ? past_context
+          : past_context + scheduled_tokens + 1;
+      requests.emplace_back(WorkloadRequest{
+          .request_id = RequestId{request_index},
+          .arrived_at = SimTime::from_seconds(0.0),
+          .num_prefill_tokens = prefill_tokens,
+          .num_decode_tokens = 2,
+          .session_id = std::nullopt,
+          .session_turn_index = std::nullopt,
+      });
+      snapshots.push_back(RequestBatchSnapshot{
+          .request_id = RequestId{request_index},
+          .scheduled_tokens = scheduled_tokens,
+          .runtime_epoch = 0,
+          .execution_epoch = 0,
+          .processed_tokens = past_context,
+          .scheduler_frontier = past_context + scheduled_tokens,
+      });
+      ++request_index;
+    }
+    const Batch batch{
+        BatchId{0},
+        IterationId{0},
+        std::move(snapshots),
+        SimTime::from_seconds(0.0),
+        Generation{0},
+    };
+    const analytical::BatchExecutionPrediction prediction =
+        model.predict(batch, requests, frontier::StageId{0});
+    const Json& expected = test_case.at("expected");
+    expect_approximately_equal(
+        prediction.duration_ms,
+        expected.at("batch_duration_ms").get<double>(),
+        "batch_duration_ms");
+    for (const std::string_view field : {
+             "total_tokens",
+             "prefill_request_count",
+             "decode_request_count",
+             "dense_layer_compute_ms",
+             "tp_allreduce_ms",
+             "dense_layer_total_ms",
+             "num_layers",
+             "batch_duration_ms",
+         }) {
+      expect_approximately_equal(
+          diagnostic_value(prediction, field),
+          expected.at(field).get<double>(),
+          field);
+    }
+  }
 }
 
 void test_communication_matches_python_golden() {
@@ -369,6 +478,9 @@ int main() {
   failures += frontier::test::run(
       "long-context decode cost increases",
       test_long_context_decode_cost_increases);
+  failures += frontier::test::run(
+      "Step 2 batch model matches Python golden",
+      test_step2_batch_model_matches_python_golden);
   failures += frontier::test::run(
       "communication matches Python golden",
       test_communication_matches_python_golden);

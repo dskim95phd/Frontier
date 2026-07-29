@@ -495,6 +495,7 @@ def test_preemption_reentry_restores_runtime_cache_without_rewriting_metrics() -
 
     assert preempted_requests == [request]
     assert request.num_processed_tokens == 0
+    assert request.is_prefill_complete is False
 
     computed_blocks, cached_tokens, query_blocks = manager.get_computed_blocks(
         request
@@ -511,6 +512,34 @@ def test_preemption_reentry_restores_runtime_cache_without_rewriting_metrics() -
     assert request.num_prefill_tokens_cached == 0
     assert request.prefix_cache_query_blocks == 3
     assert request.prefix_cache_hit_blocks == 0
+
+
+def test_monolithic_recompute_reset_does_not_change_decode_preemption_state() -> None:
+    request = _request(session_id=7, prefill_tokens=32, decode_tokens=8)
+    request._is_prefill_complete = True
+    request._num_processed_tokens = 34
+
+    scheduler = object.__new__(VLLMv1EngineReplicaScheduler)
+    scheduler._cluster_type = ClusterType.DECODE
+    scheduler._allocation_map = {}
+    scheduler._running_requests = [request]
+    scheduler._scheduled_num_computed_tokens_by_request = {request.id: 34}
+    scheduler._current_schedule_time = 1.0
+    scheduler._waiting_requests = []
+    scheduler._request_queue = []
+    scheduler._scheduling_policy = "fcfs"
+    scheduler._config = SimpleNamespace(num_blocks=16)
+    scheduler._num_allocated_blocks = 0
+    scheduler._current_iteration_token_budget = 128
+    scheduler._emit_schedule_decision_event = lambda **_: None
+
+    preempted_requests: list[Request] = []
+    scheduler._preempt_request(request, preempted_requests)
+
+    assert preempted_requests == [request]
+    assert scheduler._waiting_requests == [request]
+    assert request.num_processed_tokens == 0
+    assert request.is_prefill_complete is True
 
 
 @pytest.mark.parametrize(

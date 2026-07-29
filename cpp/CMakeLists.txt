@@ -72,10 +72,25 @@ add_library(
   frontier/config/config.cc
   frontier/cc_backend/analytical_model.cc
   frontier/core/event_queue.cc
+  frontier/entities/request.cc
+  frontier/entities/batch.cc
+  frontier/entities/batch_stage.cc
+  frontier/entities/cluster.cc
+  frontier/entities/replica.cc
+  frontier/events/co_location_events.cc
   frontier/execution_time_predictor/analytical_model.cc
+  frontier/execution_time_predictor/batch_execution_model.cc
   frontier/kv_cache_transfer/analytical_transfer.cc
   frontier/metrics/output_contract.cc
   frontier/request_generator/workload.cc
+  frontier/scheduler/cluster_scheduler/co_location_cluster_scheduler.cc
+  frontier/scheduler/global_scheduler/co_location_global_scheduler.cc
+  frontier/scheduler/kv_block_accounting.cc
+  frontier/scheduler/replica_scheduler/base_replica_scheduler.cc
+  frontier/scheduler/replica_scheduler/vllm_v1_engine_replica_scheduler.cc
+  frontier/scheduler/replica_stage_scheduler/replica_stage_scheduler.cc
+  frontier/simulator/co_location_simulator.cc
+  frontier/simulator/simulation_context.cc
   frontier/simulator/simulator.cc
 )
 target_include_directories(frontier_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
@@ -192,6 +207,22 @@ if(BUILD_TESTING)
   )
 
   add_executable(
+    frontier_output_v2_contract_test
+    tests/metrics/output_v2_test.cc
+  )
+  target_link_libraries(
+    frontier_output_v2_contract_test
+    PRIVATE
+      frontier_core
+      nlohmann_json::nlohmann_json
+  )
+  frontier_enable_warnings(frontier_output_v2_contract_test)
+  add_test(
+    NAME frontier_contract.output_v2
+    COMMAND $<TARGET_FILE:frontier_output_v2_contract_test>
+  )
+
+  add_executable(
     frontier_analytical_model_test
     tests/analytical_model/analytical_model_test.cc
   )
@@ -231,5 +262,111 @@ if(BUILD_TESTING)
   add_test(
     NAME frontier_simulator.foundation_lifecycle
     COMMAND $<TARGET_FILE:frontier_foundation_simulator_test>
+  )
+
+  add_executable(
+    frontier_request_entity_test
+    tests/entities/request_test.cc
+  )
+  target_link_libraries(frontier_request_entity_test PRIVATE frontier_core)
+  frontier_enable_warnings(frontier_request_entity_test)
+  add_test(
+    NAME frontier_entities.request
+    COMMAND $<TARGET_FILE:frontier_request_entity_test>
+  )
+
+  add_executable(
+    frontier_batch_entity_test
+    tests/entities/batch_test.cc
+  )
+  target_link_libraries(frontier_batch_entity_test PRIVATE frontier_core)
+  frontier_enable_warnings(frontier_batch_entity_test)
+  add_test(
+    NAME frontier_entities.batch
+    COMMAND $<TARGET_FILE:frontier_batch_entity_test>
+  )
+
+  add_executable(
+    frontier_kv_block_accounting_test
+    tests/scheduler/kv_block_accounting_test.cc
+  )
+  target_link_libraries(
+    frontier_kv_block_accounting_test
+    PRIVATE frontier_core
+  )
+  frontier_enable_warnings(frontier_kv_block_accounting_test)
+  add_test(
+    NAME frontier_scheduler.kv_block_accounting
+    COMMAND $<TARGET_FILE:frontier_kv_block_accounting_test>
+  )
+
+  add_executable(
+    frontier_vllm_v1_scheduler_test
+    tests/scheduler/vllm_v1_scheduler_test.cc
+  )
+  target_link_libraries(
+    frontier_vllm_v1_scheduler_test
+    PRIVATE frontier_core
+  )
+  frontier_enable_warnings(frontier_vllm_v1_scheduler_test)
+  add_test(
+    NAME frontier_scheduler.vllm_v1
+    COMMAND $<TARGET_FILE:frontier_vllm_v1_scheduler_test>
+  )
+
+  add_executable(
+    frontier_scheduler_hierarchy_test
+    tests/scheduler/scheduler_hierarchy_test.cc
+  )
+  target_link_libraries(
+    frontier_scheduler_hierarchy_test
+    PRIVATE frontier_core
+  )
+  frontier_enable_warnings(frontier_scheduler_hierarchy_test)
+  add_test(
+    NAME frontier_scheduler.hierarchy
+    COMMAND $<TARGET_FILE:frontier_scheduler_hierarchy_test>
+  )
+
+  add_executable(
+    frontier_colocation_simulator_test
+    tests/simulator/co_location_simulator_test.cc
+  )
+  target_compile_definitions(
+    frontier_colocation_simulator_test
+    PRIVATE
+      FRONTIER_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures"
+  )
+  target_link_libraries(
+    frontier_colocation_simulator_test
+    PRIVATE
+      frontier_core
+      nlohmann_json::nlohmann_json
+  )
+  frontier_enable_warnings(frontier_colocation_simulator_test)
+  add_test(
+    NAME frontier_simulator.colocation
+    COMMAND $<TARGET_FILE:frontier_colocation_simulator_test>
+  )
+
+  add_executable(
+    frontier_parallel_colocation_test
+    tests/simulator/parallel_colocation_test.cc
+  )
+  target_compile_definitions(
+    frontier_parallel_colocation_test
+    PRIVATE
+      FRONTIER_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures"
+  )
+  target_link_libraries(
+    frontier_parallel_colocation_test
+    PRIVATE
+      frontier_core
+      nlohmann_json::nlohmann_json
+  )
+  frontier_enable_warnings(frontier_parallel_colocation_test)
+  add_test(
+    NAME frontier_simulator.parallel_colocation
+    COMMAND $<TARGET_FILE:frontier_parallel_colocation_test>
   )
 endif()

@@ -34,15 +34,19 @@ struct RequestIdTag;
 struct BatchIdTag;
 struct ReplicaIdTag;
 struct DataParallelIdTag;
+struct StageIdTag;
 struct SessionIdTag;
 struct GenerationTag;
+struct IterationIdTag;
 
 using EventSequence = StrongId<EventSequenceTag>;
 using RequestId = StrongId<RequestIdTag>;
 using BatchId = StrongId<BatchIdTag>;
 using ReplicaId = StrongId<ReplicaIdTag>;
 using DataParallelId = StrongId<DataParallelIdTag>;
+using StageId = StrongId<StageIdTag>;
 using SessionId = StrongId<SessionIdTag>;
 using Generation = StrongId<GenerationTag>;
+using IterationId = StrongId<IterationIdTag>;
 
 }  // namespace frontier

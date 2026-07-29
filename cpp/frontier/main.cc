@@ -127,7 +127,7 @@ int main(int argc, char* argv[]) {
         frontier::request_generator::parse_workload_csv(
             read_text_file(input_paths->workload));
     const frontier::metrics::SimulationOutput output =
-        frontier::simulator::run_foundation_lifecycle(
+        frontier::simulator::run_simulation(
             config,
             workload);
     std::cout

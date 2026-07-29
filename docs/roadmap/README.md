@@ -23,6 +23,13 @@ Detailed implementation plans and records:
   - [Step 1: contracts, parity, and simulator foundation](cpp-porting-step1-foundation.md) -
     WSL build setup, deterministic event core, versioned schemas, analytical
     model validation, and the initial Python/C++ differential harness.
+  - [Step 2: co-location vLLM V1 scheduler](cpp-porting-step2-colocation-scheduler.md) -
+    completed canonical request/batch lifecycle, continuous batching, token
+    and KV-block admission, decode iterations, chunked prefill, preemption,
+    and analytical timing parity.
+  - [Step 2.5: dense co-location event and parallelism parity](cpp-porting-step2-5-colocation-parallelism-events.md) -
+    completed event/scheduler hierarchy, multi-replica routing, dense
+    TP/PP/DP execution, and expanded PP4/PP8 terminal-drain parity.
 
 - [NVIDIA Vera Rubin NVL72 analytical modeling](vera-rubin-nvl72-analytical-modeling-plan.md) -
   proposed profile-free MVP covering roofline-based operator timing, a logical

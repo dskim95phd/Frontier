@@ -7,6 +7,7 @@
 #include <utility>
 
 #include "frontier/core/event_queue.h"
+#include "frontier/simulator/co_location_simulator.h"
 
 namespace frontier::simulator {
 namespace {
@@ -93,6 +94,7 @@ metrics::SimulationOutput run_foundation_lifecycle(
   request_generator::validate_workload_for_config(workload, config);
 
   metrics::SimulationOutput output{
+      .schema_version = config::kFoundationSchemaVersion,
       .run = metrics::RunMetadata{
           .run_id = config.run_id,
           .simulation_mode = config.simulation_mode,
@@ -101,6 +103,9 @@ metrics::SimulationOutput run_foundation_lifecycle(
               metrics::MetricsSemantics::kFoundationPlaceholder,
       },
       .requests = {},
+      .batches = {},
+      .batch_stages = {},
+      .scheduler_trace = {},
       .event_trace = {},
       .analytical_diagnostics = {},
   };
@@ -183,8 +188,25 @@ metrics::SimulationOutput run_foundation_lifecycle(
             .arrived_at = request.arrived_at,
             .prefill_completed_at = event.time,
             .completed_at = event.time,
+            .first_scheduled_at = std::nullopt,
+            .first_token_completed_at = std::nullopt,
+            .num_processed_tokens = 0,
+            .preemption_count = 0,
+            .tokens_at_preemption = {},
         });
         break;
+      case EventType::kSchedulerPoll:
+      case EventType::kBatchCompletion:
+      case EventType::kGlobalSchedule:
+      case EventType::kClusterSchedule:
+      case EventType::kReplicaSchedule:
+      case EventType::kBatchStageArrival:
+      case EventType::kReplicaStageSchedule:
+      case EventType::kBatchStageEnd:
+      case EventType::kClusterBatchEnd:
+      case EventType::kGlobalBatchEnd:
+        throw FoundationSimulationError(
+            "scheduler event leaked into foundation lifecycle");
     }
   }
 
@@ -200,6 +222,21 @@ metrics::SimulationOutput run_foundation_lifecycle(
     }
   }
   return output;
+}
+
+metrics::SimulationOutput run_simulation(
+    const config::SimulationConfig& config,
+    const std::vector<request_generator::WorkloadRequest>& workload) {
+  if (config.schema_version == config::kFoundationSchemaVersion) {
+    return run_foundation_lifecycle(config, workload);
+  }
+  if (config.schema_version == config::kSchedulerSchemaVersion ||
+      config.schema_version == config::kParallelSchemaVersion) {
+    return run_co_location_simulation(config, workload);
+  }
+  throw FoundationSimulationError(
+      "unsupported simulation config schema_version=" +
+      std::to_string(config.schema_version));
 }
 
 }  // namespace frontier::simulator

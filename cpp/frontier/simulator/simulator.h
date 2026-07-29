@@ -24,4 +24,8 @@ class FoundationSimulationError : public std::runtime_error {
     const std::vector<request_generator::WorkloadRequest>& workload,
     const FoundationLifecycleOptions& options = {});
 
+[[nodiscard]] metrics::SimulationOutput run_simulation(
+    const config::SimulationConfig& config,
+    const std::vector<request_generator::WorkloadRequest>& workload);
+
 }  // namespace frontier::simulator

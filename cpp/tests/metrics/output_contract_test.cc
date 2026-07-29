@@ -2,6 +2,7 @@
 #include "tests/test_support.h"
 
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -29,6 +30,7 @@ SimulationOutput make_output() {
   payload.request_id = RequestId{0};
 
   return SimulationOutput{
+      .schema_version = 1,
       .run = RunMetadata{
           .run_id = "output-contract",
           .simulation_mode = SimulationMode::kOffline,
@@ -40,8 +42,16 @@ SimulationOutput make_output() {
               .arrived_at = SimTime::from_seconds(0.0),
               .prefill_completed_at = SimTime::from_seconds(0.25),
               .completed_at = SimTime::from_seconds(1.0),
+              .first_scheduled_at = std::nullopt,
+              .first_token_completed_at = std::nullopt,
+              .num_processed_tokens = 0,
+              .preemption_count = 0,
+              .tokens_at_preemption = {},
           },
       },
+      .batches = {},
+      .batch_stages = {},
+      .scheduler_trace = {},
       .event_trace = {
           Event{
               .time = SimTime::from_seconds(0.0),

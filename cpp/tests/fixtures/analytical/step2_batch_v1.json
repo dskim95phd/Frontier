@@ -1,0 +1,99 @@
+{
+  "cases": [
+    {
+      "expected": {
+        "batch_duration_ms": 1.8640443114668657,
+        "decode_request_count": 0,
+        "dense_layer_compute_ms": 0.05421248695556177,
+        "dense_layer_total_ms": 0.05825138473333955,
+        "num_layers": 32,
+        "prefill_request_count": 1,
+        "total_tokens": 128,
+        "tp_allreduce_ms": 0.002019448888888889
+      },
+      "input": {
+        "slices": [
+          {
+            "past_context": 0,
+            "phase": "prefill",
+            "scheduled_tokens": 128
+          }
+        ]
+      },
+      "name": "single_prefill"
+    },
+    {
+      "expected": {
+        "batch_duration_ms": 1.788858162289778,
+        "decode_request_count": 1,
+        "dense_layer_compute_ms": 0.053885888682666666,
+        "dense_layer_total_ms": 0.05590181757155555,
+        "num_layers": 32,
+        "prefill_request_count": 0,
+        "total_tokens": 1,
+        "tp_allreduce_ms": 0.0010079644444444444
+      },
+      "input": {
+        "slices": [
+          {
+            "past_context": 128,
+            "phase": "decode",
+            "scheduled_tokens": 1
+          }
+        ]
+      },
+      "name": "single_decode_short_context"
+    },
+    {
+      "expected": {
+        "batch_duration_ms": 1.8087212103576564,
+        "decode_request_count": 1,
+        "dense_layer_compute_ms": 0.05450660893478788,
+        "dense_layer_total_ms": 0.05652253782367676,
+        "num_layers": 32,
+        "prefill_request_count": 0,
+        "total_tokens": 1,
+        "tp_allreduce_ms": 0.0010079644444444444
+      },
+      "input": {
+        "slices": [
+          {
+            "past_context": 4096,
+            "phase": "decode",
+            "scheduled_tokens": 1
+          }
+        ]
+      },
+      "name": "single_decode_long_context"
+    },
+    {
+      "expected": {
+        "batch_duration_ms": 2.053674425826959,
+        "decode_request_count": 1,
+        "dense_layer_compute_ms": 0.06114194802931469,
+        "dense_layer_total_ms": 0.06417732580709247,
+        "num_layers": 32,
+        "prefill_request_count": 1,
+        "total_tokens": 65,
+        "tp_allreduce_ms": 0.0015176888888888888
+      },
+      "input": {
+        "slices": [
+          {
+            "past_context": 32,
+            "phase": "prefill",
+            "scheduled_tokens": 64
+          },
+          {
+            "past_context": 1024,
+            "phase": "decode",
+            "scheduled_tokens": 1
+          }
+        ]
+      },
+      "name": "mixed_prefill_decode"
+    }
+  ],
+  "oracle": "production AnalyticalRooflineExecutionTimePredictor with AnalyticalCCBackend",
+  "schema_version": 1
+}

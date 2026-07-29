@@ -1,12 +1,19 @@
 #pragma once
 
+#include <cstdint>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace frontier::config {
 
-inline constexpr int kSchemaVersion = 1;
+inline constexpr int kFoundationSchemaVersion = 1;
+inline constexpr int kSchedulerSchemaVersion = 2;
+inline constexpr int kParallelSchemaVersion = 3;
+// Kept for Step 1 callers that use the original constant.
+inline constexpr int kSchemaVersion = kFoundationSchemaVersion;
 
 enum class SimulationMode {
   kOffline,
@@ -31,6 +38,94 @@ struct PrefixCacheConfig {
       const PrefixCacheConfig&) = default;
 };
 
+enum class SchedulerType {
+  kVllmV1,
+};
+
+enum class SchedulingPolicy {
+  kFcfs,
+};
+
+enum class ClusterSchedulerType {
+  kRoundRobin,
+};
+
+struct ParallelismConfig {
+  std::uint64_t num_replicas = 1;
+  std::uint64_t tensor_parallel_size = 1;
+  std::uint64_t pipeline_parallel_size = 1;
+  std::uint64_t data_parallel_size = 1;
+
+  friend bool operator==(
+      const ParallelismConfig&,
+      const ParallelismConfig&) = default;
+};
+
+struct ClusterSchedulerConfig {
+  ClusterSchedulerType type = ClusterSchedulerType::kRoundRobin;
+
+  friend bool operator==(
+      const ClusterSchedulerConfig&,
+      const ClusterSchedulerConfig&) = default;
+};
+
+struct SchedulerConfig {
+  SchedulerType type = SchedulerType::kVllmV1;
+  SchedulingPolicy scheduling_policy = SchedulingPolicy::kFcfs;
+  std::uint64_t batch_size_cap = 1;
+  std::uint64_t max_tokens_in_batch = 1;
+  bool enable_preemption = false;
+  bool enable_chunked_prefill = false;
+  std::uint64_t long_prefill_token_threshold = 0;
+  std::uint64_t block_size = 16;
+  std::uint64_t num_blocks = 1;
+  double watermark_blocks_fraction = 0.0;
+  std::uint64_t num_preallocate_tokens = 0;
+
+  friend bool operator==(
+      const SchedulerConfig&,
+      const SchedulerConfig&) = default;
+};
+
+enum class ExecutionModelType {
+  kFixed,
+  kAnalytical,
+};
+
+struct FixedExecutionModelConfig {
+  double batch_latency_ms = 1.0;
+  std::vector<double> stage_latencies_ms;
+
+  friend bool operator==(
+      const FixedExecutionModelConfig&,
+      const FixedExecutionModelConfig&) = default;
+};
+
+struct AnalyticalExecutionModelConfig {
+  std::string device = "rubin";
+  std::string model = "llama2-7b";
+  std::string precision = "fp16";
+  std::uint64_t tensor_parallel_size = 8;
+  std::uint64_t num_layers = 32;
+  double network_bandwidth_gbps = 400.0;
+  double network_latency_us = 1.0;
+  double intra_node_bandwidth_gbps = 14'400.0;
+
+  friend bool operator==(
+      const AnalyticalExecutionModelConfig&,
+      const AnalyticalExecutionModelConfig&) = default;
+};
+
+struct ExecutionModelConfig {
+  ExecutionModelType type = ExecutionModelType::kFixed;
+  FixedExecutionModelConfig fixed;
+  AnalyticalExecutionModelConfig analytical;
+
+  friend bool operator==(
+      const ExecutionModelConfig&,
+      const ExecutionModelConfig&) = default;
+};
+
 struct SimulationConfig {
   int schema_version;
   std::string run_id;
@@ -38,6 +133,10 @@ struct SimulationConfig {
   SystemArchitecture system_architecture;
   bool enable_parallel_clusters;
   PrefixCacheConfig prefix_cache;
+  std::optional<ParallelismConfig> parallelism;
+  std::optional<ClusterSchedulerConfig> cluster_scheduler;
+  std::optional<SchedulerConfig> scheduler;
+  std::optional<ExecutionModelConfig> execution_model;
 
   friend bool operator==(
       const SimulationConfig&,
@@ -54,6 +153,13 @@ class ConfigError : public std::runtime_error {
     SystemArchitecture architecture) noexcept;
 [[nodiscard]] std::string_view to_string(
     PrefixCachingKeyMode key_mode) noexcept;
+[[nodiscard]] std::string_view to_string(SchedulerType type) noexcept;
+[[nodiscard]] std::string_view to_string(
+    SchedulingPolicy policy) noexcept;
+[[nodiscard]] std::string_view to_string(
+    ClusterSchedulerType type) noexcept;
+[[nodiscard]] std::string_view to_string(
+    ExecutionModelType type) noexcept;
 
 [[nodiscard]] SimulationConfig parse_simulation_config_json(
     std::string_view json_text);

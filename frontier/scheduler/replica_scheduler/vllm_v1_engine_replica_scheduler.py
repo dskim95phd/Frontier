@@ -2229,6 +2229,8 @@ class VLLMv1EngineReplicaScheduler(BaseReplicaScheduler):
             "source": "frontier",
             "scheduler": "vllm_v1",
             "cluster_type": cluster_name,
+            "replica_id": int(getattr(self, "_replica_id", -1)),
+            "dp_id": int(getattr(self, "_dp_id", -1)),
             "iteration_id": int(self._active_schedule_iteration_id),
             "decision_result": decision_result,
             "request_id": None if request_id is None else str(request_id),
@@ -3097,6 +3099,14 @@ class VLLMv1EngineReplicaScheduler(BaseReplicaScheduler):
         # Mark as preempted and reset computed tokens
         victim._preempted = True
         victim._num_processed_tokens = 0  # Reset computed tokens as in vLLM v1
+        # MONOLITHIC recompute preemption discards the request's KV state.
+        # Keeping the prefill-complete flag set while resetting both token
+        # frontiers makes _get_request_next_num_tokens() return zero forever,
+        # so the request can never be readmitted. Restore prefill state
+        # together with the frontiers; disaggregated decode semantics remain
+        # unchanged and first-observation metric timestamps stay write-once.
+        if self._cluster_type == ClusterType.MONOLITHIC:
+            victim._is_prefill_complete = False
         self._scheduled_num_computed_tokens_by_request.pop(victim.id, None)
 
         # Record re-entry to waiting queue for waiting time tracking

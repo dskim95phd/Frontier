@@ -1,5 +1,6 @@
 #include "frontier/metrics/output_contract.h"
 
+#include <algorithm>
 #include <cmath>
 #include <iomanip>
 #include <limits>
@@ -15,6 +16,11 @@ namespace frontier::metrics {
 namespace {
 
 using OrderedJson = nlohmann::ordered_json;
+
+bool has_scheduler_contract(int schema_version) {
+  return schema_version == config::kSchedulerSchemaVersion ||
+      schema_version == config::kParallelSchemaVersion;
+}
 
 void require_valid_time(SimTime time, std::string_view field) {
   if (!std::isfinite(time.seconds()) || time.seconds() < 0.0) {
@@ -37,7 +43,8 @@ double milliseconds_between(
 }
 
 void validate_request_metrics(
-    const std::vector<RequestMetricsRecord>& requests) {
+    const std::vector<RequestMetricsRecord>& requests,
+    int schema_version) {
   std::unordered_set<std::uint64_t> request_ids;
   request_ids.reserve(requests.size());
   for (const RequestMetricsRecord& request : requests) {
@@ -59,16 +66,53 @@ void validate_request_metrics(
       throw std::invalid_argument(
           "completed_at must not precede prefill_completed_at");
     }
+    if (has_scheduler_contract(schema_version)) {
+      if (!request.first_scheduled_at.has_value() ||
+          !request.first_token_completed_at.has_value()) {
+        throw std::invalid_argument(
+            "schema v2 request metrics require canonical scheduling and "
+            "first-token timestamps");
+      }
+      static_cast<void>(milliseconds_between(
+          request.first_scheduled_at.value(),
+          request.arrived_at,
+          "first_scheduled_at"));
+      static_cast<void>(milliseconds_between(
+          request.first_token_completed_at.value(),
+          request.arrived_at,
+          "first_token_completed_at"));
+      if (request.first_token_completed_at->seconds() <
+          request.prefill_completed_at.seconds()) {
+        throw std::invalid_argument(
+            "first token completion must not precede prefill completion");
+      }
+    }
   }
 }
 
-OrderedJson serialize_request(const RequestMetricsRecord& request) {
+OrderedJson serialize_request(
+    const RequestMetricsRecord& request,
+    int schema_version) {
   OrderedJson json = OrderedJson::object();
   json["request_id"] = request.request_id.value();
   json["arrived_at_s"] = request.arrived_at.seconds();
+  if (has_scheduler_contract(schema_version)) {
+    json["first_scheduled_at_s"] =
+        request.first_scheduled_at->seconds();
+  }
   json["prefill_completed_at_s"] =
       request.prefill_completed_at.seconds();
+  if (has_scheduler_contract(schema_version)) {
+    json["first_token_completed_at_s"] =
+        request.first_token_completed_at->seconds();
+  }
   json["completed_at_s"] = request.completed_at.seconds();
+  if (has_scheduler_contract(schema_version)) {
+    json["scheduling_delay_ms"] = milliseconds_between(
+        request.first_scheduled_at.value(),
+        request.arrived_at,
+        "first_scheduled_at");
+  }
   json["ttft_ms"] = milliseconds_between(
       request.prefill_completed_at,
       request.arrived_at,
@@ -77,6 +121,15 @@ OrderedJson serialize_request(const RequestMetricsRecord& request) {
       request.completed_at,
       request.arrived_at,
       "completed_at");
+  if (has_scheduler_contract(schema_version)) {
+    json["num_processed_tokens"] = request.num_processed_tokens;
+    json["preemption_count"] = request.preemption_count;
+    json["tokens_at_preemption"] = request.tokens_at_preemption;
+  }
+  if (schema_version == config::kParallelSchemaVersion) {
+    json["replica_id"] = request.replica_id.value();
+    json["dp_id"] = request.dp_id.value();
+  }
   return json;
 }
 
@@ -99,8 +152,150 @@ OrderedJson serialize_event(const Event& event) {
   if (event.payload.dp_id.has_value()) {
     json["dp_id"] = event.payload.dp_id->value();
   }
+  if (event.payload.stage_id.has_value()) {
+    json["stage_id"] = event.payload.stage_id->value();
+  }
   if (event.payload.generation.has_value()) {
     json["generation"] = event.payload.generation->value();
+  }
+  return json;
+}
+
+OrderedJson serialize_batch(
+    const BatchMetricsRecord& batch,
+    int schema_version) {
+  require_valid_time(batch.scheduled_at, "batch.scheduled_at");
+  require_valid_time(batch.completed_at, "batch.completed_at");
+  if (batch.completed_at.seconds() < batch.scheduled_at.seconds()) {
+    throw std::invalid_argument(
+        "batch completion must not precede scheduling");
+  }
+  if (batch.request_ids.empty() ||
+      batch.request_ids.size() != batch.scheduled_tokens.size()) {
+    throw std::invalid_argument(
+        "batch request IDs and token counts must be nonempty and aligned");
+  }
+  std::uint64_t total = 0;
+  for (const std::uint64_t tokens : batch.scheduled_tokens) {
+    if (tokens == 0) {
+      throw std::invalid_argument(
+          "batch scheduled token counts must be positive");
+    }
+    total += tokens;
+  }
+  if (total != batch.total_scheduled_tokens ||
+      batch.num_prefill_tokens + batch.num_decode_tokens != total) {
+    throw std::invalid_argument(
+        "batch token totals are inconsistent");
+  }
+  if (!std::isfinite(batch.predicted_execution_ms) ||
+      batch.predicted_execution_ms < 0.0) {
+    throw std::invalid_argument(
+        "batch predicted execution time must be finite and nonnegative");
+  }
+
+  OrderedJson json = OrderedJson::object();
+  json["batch_id"] = batch.batch_id.value();
+  json["iteration_id"] = batch.iteration_id.value();
+  json["scheduled_at_s"] = batch.scheduled_at.seconds();
+  json["completed_at_s"] = batch.completed_at.seconds();
+  json["request_ids"] = OrderedJson::array();
+  for (const RequestId request_id : batch.request_ids) {
+    json["request_ids"].push_back(request_id.value());
+  }
+  json["scheduled_tokens"] = batch.scheduled_tokens;
+  json["total_scheduled_tokens"] = batch.total_scheduled_tokens;
+  json["num_prefill_tokens"] = batch.num_prefill_tokens;
+  json["num_decode_tokens"] = batch.num_decode_tokens;
+  json["predicted_execution_ms"] = batch.predicted_execution_ms;
+  if (schema_version == config::kParallelSchemaVersion) {
+    json["replica_id"] = batch.replica_id.value();
+    json["dp_id"] = batch.dp_id.value();
+    json["num_pipeline_stages"] =
+        batch.num_pipeline_stages;
+  }
+  return json;
+}
+
+OrderedJson serialize_batch_stage(
+    const BatchStageMetricsRecord& stage) {
+  require_valid_time(stage.arrived_at, "batch_stage.arrived_at");
+  require_valid_time(stage.started_at, "batch_stage.started_at");
+  require_valid_time(stage.completed_at, "batch_stage.completed_at");
+  if (stage.started_at.seconds() < stage.arrived_at.seconds() ||
+      stage.completed_at.seconds() < stage.started_at.seconds()) {
+    throw std::invalid_argument(
+        "batch stage timestamps are out of order");
+  }
+  const entities::ExecutionTime& execution =
+      stage.execution_time;
+  if (!std::isfinite(execution.dense_compute_ms) ||
+      !std::isfinite(execution.tp_communication_ms) ||
+      !std::isfinite(execution.pp_communication_ms) ||
+      execution.dense_compute_ms < 0.0 ||
+      execution.tp_communication_ms < 0.0 ||
+      execution.pp_communication_ms < 0.0) {
+    throw std::invalid_argument(
+        "batch stage execution time is invalid");
+  }
+  return OrderedJson::object({
+      {"batch_id", stage.batch_id.value()},
+      {"replica_id", stage.replica_id.value()},
+      {"dp_id", stage.dp_id.value()},
+      {"stage_id", stage.stage_id.value()},
+      {"arrived_at_s", stage.arrived_at.seconds()},
+      {"started_at_s", stage.started_at.seconds()},
+      {"completed_at_s", stage.completed_at.seconds()},
+      {"dense_compute_ms", execution.dense_compute_ms},
+      {"tp_communication_ms", execution.tp_communication_ms},
+      {"pp_communication_ms", execution.pp_communication_ms},
+      {"duration_ms", execution.total_ms()},
+  });
+}
+
+OrderedJson serialize_scheduler_trace(
+    const SchedulerTraceRecord& trace,
+    int schema_version) {
+  require_valid_time(trace.simulation_time, "scheduler simulation_time");
+  if (trace.token_budget_after > trace.token_budget_before) {
+    throw std::invalid_argument("invalid scheduler trace counters");
+  }
+  if (trace.batch_request_ids.size() !=
+      trace.request_num_tokens.size()) {
+    throw std::invalid_argument(
+        "scheduler trace batch IDs and tokens are misaligned");
+  }
+
+  OrderedJson json = OrderedJson::object();
+  json["iteration_id"] = trace.iteration_id.value();
+  json["simulation_time_s"] = trace.simulation_time.seconds();
+  json["decisions"] = OrderedJson::array();
+  for (const SchedulerDecisionRecord& decision : trace.decisions) {
+    json["decisions"].push_back(OrderedJson::object({
+        {"decision_result", decision.decision_result},
+        {"request_id", decision.request_id.value()},
+        {"num_tokens", decision.num_tokens},
+        {"token_budget_after", decision.token_budget_after},
+        {"available_blocks_after", decision.available_blocks_after},
+    }));
+  }
+  json["token_budget_before"] = trace.token_budget_before;
+  json["token_budget_after"] = trace.token_budget_after;
+  json["available_blocks_before"] = trace.available_blocks_before;
+  json["available_blocks_after"] = trace.available_blocks_after;
+  json["waiting_count_before"] = trace.waiting_count_before;
+  json["waiting_count_after"] = trace.waiting_count_after;
+  json["running_count_before"] = trace.running_count_before;
+  json["running_count_after"] = trace.running_count_after;
+  json["preempted_count"] = trace.preempted_count;
+  json["batch_request_ids"] = OrderedJson::array();
+  for (const RequestId request_id : trace.batch_request_ids) {
+    json["batch_request_ids"].push_back(request_id.value());
+  }
+  json["request_num_tokens"] = trace.request_num_tokens;
+  if (schema_version == config::kParallelSchemaVersion) {
+    json["replica_id"] = trace.replica_id.value();
+    json["dp_id"] = trace.dp_id.value();
   }
   return json;
 }
@@ -143,6 +338,26 @@ std::string_view to_string(EventType event_type) noexcept {
       return "request_arrival";
     case EventType::kFoundationCompletion:
       return "foundation_completion";
+    case EventType::kSchedulerPoll:
+      return "scheduler_poll";
+    case EventType::kBatchCompletion:
+      return "batch_completion";
+    case EventType::kGlobalSchedule:
+      return "global_schedule";
+    case EventType::kClusterSchedule:
+      return "cluster_schedule";
+    case EventType::kReplicaSchedule:
+      return "replica_schedule";
+    case EventType::kBatchStageArrival:
+      return "batch_stage_arrival";
+    case EventType::kReplicaStageSchedule:
+      return "replica_stage_schedule";
+    case EventType::kBatchStageEnd:
+      return "batch_stage_end";
+    case EventType::kClusterBatchEnd:
+      return "cluster_batch_end";
+    case EventType::kGlobalBatchEnd:
+      return "global_batch_end";
   }
   return "unknown";
 }
@@ -159,13 +374,24 @@ std::string_view to_string(MetricsSemantics semantics) noexcept {
 
 std::string serialize_simulation_output_json(
     const SimulationOutput& output) {
+  if (output.schema_version != config::kFoundationSchemaVersion &&
+      output.schema_version != config::kSchedulerSchemaVersion &&
+      output.schema_version != config::kParallelSchemaVersion) {
+    throw std::invalid_argument(
+        "output schema_version must be 1, 2, or 3");
+  }
   if (output.run.run_id.empty()) {
     throw std::invalid_argument("output run_id must not be empty");
   }
-  validate_request_metrics(output.requests);
+  validate_request_metrics(output.requests, output.schema_version);
+  if (output.schema_version == config::kFoundationSchemaVersion &&
+      (!output.batches.empty() || !output.scheduler_trace.empty())) {
+    throw std::invalid_argument(
+        "output schema v1 cannot contain scheduler records");
+  }
 
   OrderedJson root = OrderedJson::object();
-  root["schema_version"] = kOutputSchemaVersion;
+  root["schema_version"] = output.schema_version;
   root["run"] = OrderedJson::object({
       {"run_id", output.run.run_id},
       {
@@ -189,7 +415,30 @@ std::string serialize_simulation_output_json(
   root["requests"] = OrderedJson::array();
   for (const RequestMetricsRecord& request : output.requests) {
     root["completed_request_ids"].push_back(request.request_id.value());
-    root["requests"].push_back(serialize_request(request));
+    root["requests"].push_back(
+        serialize_request(request, output.schema_version));
+  }
+
+  if (has_scheduler_contract(output.schema_version)) {
+    root["batches"] = OrderedJson::array();
+    for (const BatchMetricsRecord& batch : output.batches) {
+      root["batches"].push_back(
+          serialize_batch(batch, output.schema_version));
+    }
+    root["scheduler_trace"] = OrderedJson::array();
+    for (const SchedulerTraceRecord& trace : output.scheduler_trace) {
+      root["scheduler_trace"].push_back(
+          serialize_scheduler_trace(
+              trace, output.schema_version));
+    }
+  }
+  if (output.schema_version == config::kParallelSchemaVersion) {
+    root["batch_stages"] = OrderedJson::array();
+    for (const BatchStageMetricsRecord& stage :
+         output.batch_stages) {
+      root["batch_stages"].push_back(
+          serialize_batch_stage(stage));
+    }
   }
 
   root["event_trace"] = OrderedJson::array();
@@ -208,21 +457,53 @@ std::string serialize_simulation_output_json(
 }
 
 std::string serialize_request_metrics_csv(
-    const std::vector<RequestMetricsRecord>& requests) {
-  validate_request_metrics(requests);
+    const std::vector<RequestMetricsRecord>& requests,
+    int schema_version) {
+  validate_request_metrics(requests, schema_version);
 
   std::ostringstream output;
   output.imbue(std::locale::classic());
   output << std::setprecision(std::numeric_limits<double>::max_digits10);
-  output
-      << "request_id,arrived_at_s,prefill_completed_at_s,completed_at_s,"
-         "ttft_ms,e2e_ms\n";
+  if (schema_version == config::kFoundationSchemaVersion) {
+    output
+        << "request_id,arrived_at_s,prefill_completed_at_s,completed_at_s,"
+           "ttft_ms,e2e_ms\n";
+  } else if (schema_version == config::kSchedulerSchemaVersion) {
+    output
+        << "request_id,arrived_at_s,first_scheduled_at_s,"
+           "prefill_completed_at_s,first_token_completed_at_s,"
+           "completed_at_s,scheduling_delay_ms,ttft_ms,e2e_ms,"
+           "num_processed_tokens,preemption_count\n";
+  } else if (schema_version == config::kParallelSchemaVersion) {
+    output
+        << "request_id,arrived_at_s,first_scheduled_at_s,"
+           "prefill_completed_at_s,first_token_completed_at_s,"
+           "completed_at_s,scheduling_delay_ms,ttft_ms,e2e_ms,"
+           "num_processed_tokens,preemption_count,replica_id,dp_id\n";
+  } else {
+    throw std::invalid_argument(
+        "request CSV schema_version must be 1, 2, or 3");
+  }
+
   for (const RequestMetricsRecord& request : requests) {
     output << request.request_id.value() << ','
-           << request.arrived_at.seconds() << ','
-           << request.prefill_completed_at.seconds() << ','
-           << request.completed_at.seconds() << ','
-           << milliseconds_between(
+           << request.arrived_at.seconds() << ',';
+    if (has_scheduler_contract(schema_version)) {
+      output << request.first_scheduled_at->seconds() << ',';
+    }
+    output << request.prefill_completed_at.seconds() << ',';
+    if (has_scheduler_contract(schema_version)) {
+      output << request.first_token_completed_at->seconds() << ',';
+    }
+    output << request.completed_at.seconds() << ',';
+    if (has_scheduler_contract(schema_version)) {
+      output << milliseconds_between(
+                    request.first_scheduled_at.value(),
+                    request.arrived_at,
+                    "first_scheduled_at")
+             << ',';
+    }
+    output << milliseconds_between(
                   request.prefill_completed_at,
                   request.arrived_at,
                   "prefill_completed_at")
@@ -230,8 +511,16 @@ std::string serialize_request_metrics_csv(
            << milliseconds_between(
                   request.completed_at,
                   request.arrived_at,
-                  "completed_at")
-           << '\n';
+                  "completed_at");
+    if (has_scheduler_contract(schema_version)) {
+      output << ',' << request.num_processed_tokens << ','
+             << request.preemption_count;
+      if (schema_version == config::kParallelSchemaVersion) {
+        output << ',' << request.replica_id.value() << ','
+               << request.dp_id.value();
+      }
+    }
+    output << '\n';
   }
   return output.str();
 }

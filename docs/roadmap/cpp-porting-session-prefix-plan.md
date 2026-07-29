@@ -251,7 +251,7 @@ queue both matches the release contract and removes synchronization overhead.
    - Follow the detailed
      [Step 1 foundation plan](cpp-porting-step1-foundation.md).
 
-2. **Co-location scheduler**
+2. **Co-location scheduler (complete)**
    - Implement and validate in small vertical slices:
      1. one fixed-latency request;
      2. multiple requests and continuous batching;
@@ -261,6 +261,21 @@ queue both matches the release contract and removes synchronization overhead.
      6. memory-pressure preemption.
    - Require request completion count, TTFT, E2E latency, queue state, and block
      accounting parity at each slice before proceeding.
+   - Follow the detailed
+     [Step 2 co-location scheduler plan](cpp-porting-step2-colocation-scheduler.md).
+
+2.5. **Dense co-location event and parallelism parity (complete)**
+   - Replace the flattened Step 2 event loop with the production Python
+     global/cluster/replica/stage event boundaries.
+   - Make the existing scheduler ownership hierarchy functional.
+   - Support dense TP, PP, DP, and multiple replicas with per-target scheduler,
+     KV, in-flight batch, and stage state.
+   - Refactor whole-batch analytical timing into per-stage compute, TP
+     collective, and PP transfer timing.
+   - Require target, event, scheduler, batch-stage, and request-metric parity
+     before beginning PDD.
+   - Follow the detailed
+     [Step 2.5 dense co-location event and parallelism plan](cpp-porting-step2-5-colocation-parallelism-events.md).
 
 3. **Sequential PDD**
    - Add the prefill-to-decode handoff and analytical KV transfer.

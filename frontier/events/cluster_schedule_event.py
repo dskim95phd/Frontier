@@ -26,7 +26,11 @@ class ClusterScheduleEvent(BaseEvent):
 
         logger = get_cluster_logger(__name__, self._cluster_type.name)
 
-        self._dp_replica_set = set()
+        # Preserve the production routing order. A set made same-time batch
+        # IDs depend on Python's hash-table iteration order, which prevents
+        # stable cross-language event and stage traces.
+        self._dp_replica_set = []
+        seen_dp_replicas = set()
         self._ep_replica_set = set()
         cluster_scheduler: BaseClusterScheduler = scheduler.get_cluster_scheduler(self._cluster_type)
 
@@ -56,7 +60,10 @@ class ClusterScheduleEvent(BaseEvent):
 
         # replica[num_replica][dp_size]
         for replica_id, dp_id, request in self._request_mapping:
-            self._dp_replica_set.add((replica_id, dp_id))
+            target = (replica_id, dp_id)
+            if target not in seen_dp_replicas:
+                seen_dp_replicas.add(target)
+                self._dp_replica_set.append(target)
             # Only add individual requests to replica scheduler
             # Batch-level assignments (request=None) are already handled by the cluster scheduler
             if request is not None:

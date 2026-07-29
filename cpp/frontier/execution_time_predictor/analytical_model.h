@@ -92,13 +92,18 @@ struct DenseModel {
   bool fused_add_norm;
 
   [[nodiscard]] static constexpr DenseModel llama2_7b_tp8() noexcept {
+    return llama2_7b(8);
+  }
+
+  [[nodiscard]] static constexpr DenseModel llama2_7b(
+      std::uint64_t tensor_parallel_size) noexcept {
     return DenseModel{
         .hidden_size = 4'096,
         .intermediate_size = 11'008,
         .num_query_heads = 32,
         .num_kv_heads = 32,
         .head_dim = 128,
-        .tensor_parallel_size = 8,
+        .tensor_parallel_size = tensor_parallel_size,
         .gated_mlp = true,
         .fused_add_norm = true,
     };
