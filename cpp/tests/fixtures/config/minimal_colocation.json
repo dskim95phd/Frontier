@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "run_id": "step1-minimal-colocation",
+  "simulation_mode": "offline",
+  "system_architecture": "co-location",
+  "enable_parallel_clusters": false,
+  "prefix_cache": {
+    "enabled": true,
+    "key_mode": "session"
+  }
+}

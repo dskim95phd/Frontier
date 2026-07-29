@@ -1,0 +1,99 @@
+{
+  "communication": {
+    "expected": {
+      "all_to_all_ms": 0.0015478044444444444,
+      "allgather_ms": 0.04044444444444444,
+      "allreduce_ms": 0.0020956790123456788,
+      "broadcast_ms": 0.010888888888888889,
+      "point_to_point_ms": 0.0015555555555555557,
+      "reduce_scatter_ms": 0.0015478395061728394
+    },
+    "input": {
+      "data_size_bytes": 1000000,
+      "intra_node_bandwidth_gbps": 14400.0,
+      "latency_us": 1.0,
+      "network_bandwidth_gbps": 400.0,
+      "num_devices": 72
+    }
+  },
+  "dense_cases": [
+    {
+      "expected": {
+        "attention_norm_ms": 0.005190650181818182,
+        "attention_post_projection_ms": 0.00534634294183683,
+        "attention_pre_projection_ms": 0.005911928704298369,
+        "decode_attention_ms": 0.0,
+        "kv_cache_save_ms": 0.0050317750303030305,
+        "mlp_activation_ms": 0.005064046545454545,
+        "mlp_down_projection_ms": 0.005823555928913753,
+        "mlp_norm_ms": 0.005190650181818182,
+        "mlp_up_projection_ms": 0.006583561797221445,
+        "prefill_attention_ms": 0.005038200613594406,
+        "residual_add_ms": 0.0,
+        "rope_ms": 0.0050317750303030305
+      },
+      "input": {
+        "past_context": 0,
+        "prefill": true,
+        "scheduled_tokens": 128
+      },
+      "name": "prefill_128"
+    },
+    {
+      "expected": {
+        "attention_norm_ms": 0.005001489454545455,
+        "attention_post_projection_ms": 0.005320545636848485,
+        "attention_pre_projection_ms": 0.005960395698424242,
+        "decode_attention_ms": 0.005641055069090909,
+        "kv_cache_save_ms": 0.005000248242424243,
+        "mlp_activation_ms": 0.005000500363636364,
+        "mlp_down_projection_ms": 0.005860419126303031,
+        "mlp_norm_ms": 0.005001489454545455,
+        "mlp_up_projection_ms": 0.006720217646545454,
+        "prefill_attention_ms": 0.0,
+        "residual_add_ms": 0.0,
+        "rope_ms": 0.005000248242424243
+      },
+      "input": {
+        "past_context": 4096,
+        "prefill": false,
+        "scheduled_tokens": 1
+      },
+      "name": "decode_1_past_4096"
+    }
+  ],
+  "kv_transfer": {
+    "expected": {
+      "size_bytes": 67108864,
+      "transfer_time_ms": 5.46870912
+    },
+    "input": {
+      "dtype_size_bytes": 2.0,
+      "head_dim": 128,
+      "kv_factor": 2,
+      "network_bandwidth_gbps": 100.0,
+      "network_latency_ms": 0.1,
+      "num_kv_heads_per_worker": 32,
+      "num_layers": 32,
+      "num_tokens": 128
+    }
+  },
+  "roofline": {
+    "expected": {
+      "bottleneck": "HBM",
+      "compute_time_ms": 0.002,
+      "launch_time_ms": 0.001,
+      "memory_time_ms": 0.003,
+      "predicted_time_ms": 0.0045000000000000005
+    },
+    "input": {
+      "compute_efficiency": 0.5,
+      "flops": 4000000000.0,
+      "hbm_bytes": 33000000.0,
+      "kernel_launch_latency_us": 1.0,
+      "memory_efficiency": 0.5,
+      "overlap_penalty": 0.25
+    }
+  },
+  "schema_version": 1
+}

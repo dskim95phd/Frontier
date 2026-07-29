@@ -17,6 +17,13 @@ the release stabilizes and community feedback arrives.
 
 Detailed implementation plans and records:
 
+- [C++ simulator port: session prefix-cache MVP](cpp-porting-session-prefix-plan.md) -
+  ID-based deterministic DES port covering co-location, sequential PDD,
+  analytical models, and session-scoped GPU/CPU KV caching.
+  - [Step 1: contracts, parity, and simulator foundation](cpp-porting-step1-foundation.md) -
+    WSL build setup, deterministic event core, versioned schemas, analytical
+    model validation, and the initial Python/C++ differential harness.
+
 - [NVIDIA Vera Rubin NVL72 analytical modeling](vera-rubin-nvl72-analytical-modeling-plan.md) -
   proposed profile-free MVP covering roofline-based operator timing, a logical
   72-GPU ASTRA analytical switch domain, and statically partitioned Vera CPU

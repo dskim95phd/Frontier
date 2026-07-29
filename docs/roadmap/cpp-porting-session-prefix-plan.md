@@ -15,6 +15,13 @@ This is a new implementation, not a line-by-line translation of the Python
 object model. The implementation should use compact ID-based state and a
 single deterministic event queue.
 
+The port should nevertheless preserve the Python simulator's domain boundaries
+and state-machine semantics where they define observable behavior. In
+particular, the scheduler and KV-cache implementation should have an explicit
+semantic mapping to the corresponding Python queues, block states,
+reservations, leases, and metrics. Python object references become stable C++
+IDs and contiguous storage; the behavior is not independently redesigned.
+
 ## MVP Scope
 
 ### Included
@@ -56,6 +63,8 @@ single deterministic event queue.
   profiling. Profiling remains Python-only.
 - Other replica schedulers (SGLang, Sarathi, Orca, SJ2Q, etc.), other
   communication backends, parallel-cluster execution, and W&B/plot export.
+- `prefix_caching_key_mode=block_hash` and explicit request
+  `block_hash_ids`. The C++ MVP supports only session-derived prefix keys.
 
 ## Semantics of Session Prefix Caching
 
@@ -91,32 +100,70 @@ cacheable only after a complete block is available.
 ```text
 cpp/
   CMakeLists.txt
-  include/frontier/
-    config.h
-    ids.h
-    event.h
-    request.h
-    batch.h
-    cluster.h
-    scheduler.h
-    kv_cache.h
-    analytical_model.h
-    metrics.h
-    simulator.h
-  src/
-    event_queue.cc
-    scheduler.cc
-    kv_cache.cc
-    analytical_model.cc
-    simulator.cc
-    workload.cc
-    metrics.cc
+  frontier/
+    config/
+      config.h
+      config.cc
+    core/
+      ids.h
+      event.h
+      event_queue.h
+      event_queue.cc
+    entities/
+      request.h
+      request.cc
+      batch.h
+      cluster.h
+    scheduler/
+      scheduler.h
+      vllm_v1_scheduler.h
+      vllm_v1_scheduler.cc
+    kv_cache/
+      kv_cache_block.h
+      block_pool.h
+      block_pool.cc
+      prefix_cache.h
+      prefix_cache.cc
+      cpu_cache.h
+      cpu_cache.cc
+      tiered_prefix_plan.h
+    execution_time_predictor/
+      analytical_model.h
+      analytical_model.cc
+    cc_backend/
+      analytical_model.h
+      analytical_model.cc
+    kv_cache_transfer/
+      analytical_transfer.h
+      analytical_transfer.cc
+    request_generator/
+      workload.h
+      synthetic.cc
+      csv_trace.cc
+    metrics/
+      metrics.h
+      metrics.cc
+    simulator/
+      simulator.h
+      simulator.cc
     main.cc
   tests/
+    core/
+    scheduler/
+    kv_cache/
+    analytical_model/
+    parity/
 ```
 
+Headers and implementation files live together in functional directories.
+This mirrors the navigational boundaries of the Python package without copying
+its inheritance hierarchy or object graph. A separate public `include/` tree is
+unnecessary while the MVP is an internal executable rather than a distributed
+C++ library.
+
 The directory structure is a target layout, not a requirement to create every
-file before the corresponding milestone is implemented.
+file before the corresponding milestone is implemented. Only directories
+needed by an implemented vertical slice should be created.
 
 ### Core data structures
 
@@ -126,13 +173,50 @@ file before the corresponding milestone is implemented.
 | Event | value type `{time, sequence, type, payload}` in a min-heap | Deterministic DES ordering without event-object allocation. |
 | Batch | ephemeral value containing `std::vector<RequestId>` and scheduled token counts | It has no need to own request lifetime. |
 | Scheduler queues | `std::deque<RequestId>` for waiting, vectors for running work | Matches vLLM-style admission and minimizes allocations. |
-| KV blocks | contiguous block pool plus per-request block counts | Fast ordinary allocation/free. |
-| Session cache | `unordered_map<SessionBlockKey, BlockId>` plus intrusive/LRU eviction list | O(1) lookup while preserving an explicit eviction policy. |
+| GPU KV block | contiguous block pool of `{BlockId, ref_count, optional<SessionBlockKey>, prev_free, next_free}` | Preserves Python `KVCacheBlock` semantics with ID-based links. |
+| GPU free blocks | intrusive queue over block IDs | Mirrors `FreeKVCacheBlockQueue` and provides allocation/eviction order parity. |
+| Session cache | `std::unordered_map<SessionBlockKey, std::set<BlockId>>` plus the intrusive free/eviction queue | Preserves the Python ability to associate more than one physical block with a key and deterministically select the lowest block ID. |
+| CPU KV block | `{BlockId, FREE/RESERVED/COMMITTED, session, block_index, pin_count, reservation_id}` | Direct semantic mapping of Python `CPUKVCacheBlock`. |
+| CPU session state | session entry plus offload reservations and restore leases referenced by IDs | Preserves committed frontier, capacity reservation, pinning, cancellation, and generation behavior. |
 | Cluster routing | `SessionId -> ReplicaTarget` affinity map | Necessary because prefix cache state is target-local. |
 
 Events should reference IDs and a generation/epoch number rather than owning
 `Request` or `Batch` pointers. A stale event is ignored when its stored epoch
 does not match the request's current epoch.
+
+The initial implementation should port the observable Python state transitions,
+not replace them with a new cache policy:
+
+- GPU blocks retain Python-compatible reference counting, cache-key assignment,
+  free-list ordering, touch, release, and eviction behavior.
+- CPU blocks retain `FREE`, `RESERVED`, and `COMMITTED` states.
+- CPU session entries retain committed/reserved frontiers, generation checks,
+  active reservation IDs, restore pins, and session-level eviction behavior.
+- `CPUOffloadReservation`, `CPURestoreLease`, and `TieredPrefixPlan` remain
+  explicit value types. Their references to requests and blocks use IDs.
+
+## Input, Output, and Determinism Contracts
+
+Freeze a small, versioned C++ input schema before implementing scheduler
+behavior. Do not reproduce the full flattened Python dataclass CLI.
+
+- A normalized JSON configuration contains a required `schema_version`.
+- CSV trace input supports `arrived_at`, `num_prefill_tokens`,
+  `num_decode_tokens`, and optional `session_id` / `session_turn_index`.
+  `block_hash_ids` is intentionally unsupported.
+- Invalid nonfinite/negative arrival times and nonfinite/nonpositive token
+  counts are rejected rather than clipped.
+- Output JSON/CSV schemas define timestamp and latency units, float
+  serialization precision, optional-field behavior, and the canonical TTFT
+  definition.
+- Unsupported architectures, key modes, and feature combinations fail fast
+  with clear errors.
+
+The event queue ordering key is `(time, sequence)`, where `sequence` is a
+monotonically increasing event-creation ID. Floating-point event times are
+compared exactly for queue ordering; numerical tolerances apply only to
+reported analytical metrics. Equal-time ordering fixtures must verify the same
+creation and processing order as Python.
 
 ## Architecture Simplification
 
@@ -154,18 +238,29 @@ queue both matches the release contract and removes synchronization overhead.
 
 ## Implementation Milestones
 
-1. **Analytical model and simulator foundation**
+1. **Contracts, parity harness, and simulator foundation**
    - Establish the CMake build, JSON configuration reader, deterministic event
      queue, and basic request/batch/metrics types.
+   - Freeze the normalized input and output schemas and add fixture validation.
+   - Add a differential runner that invokes Python and C++ with the same input,
+     normalizes their outputs, and reports field-level differences.
+   - Add equal-time event-order and basic request-lifecycle golden fixtures.
    - Port only the analytical roofline and communication formulas needed by the
      selected dense model and NVL72 topology.
    - Keep formulas side-effect-free and test them independently of the DES.
+   - Follow the detailed
+     [Step 1 foundation plan](cpp-porting-step1-foundation.md).
 
 2. **Co-location scheduler**
-   - Implement vLLM-style waiting/running queues, token budgeting, KV block
-     allocation, batching, decode iterations, and preemption rules.
-   - Match request completion count, TTFT, E2E latency, and block accounting
-     for deterministic Python workloads.
+   - Implement and validate in small vertical slices:
+     1. one fixed-latency request;
+     2. multiple requests and continuous batching;
+     3. token budgeting and ordinary KV-block admission;
+     4. decode iterations;
+     5. chunked prefill; and
+     6. memory-pressure preemption.
+   - Require request completion count, TTFT, E2E latency, queue state, and block
+     accounting parity at each slice before proceeding.
 
 3. **Sequential PDD**
    - Add the prefill-to-decode handoff and analytical KV transfer.
@@ -175,14 +270,19 @@ queue both matches the release contract and removes synchronization overhead.
 4. **Session prefix cache**
    - Add session affinity, complete-block GPU cache lookup, allocation,
      eviction, and metrics to the validated co-location and PDD paths.
+   - Port the Python GPU block-pool, reference-counting, free-list, and
+     cache-admission semantics using IDs rather than object references.
    - Validate repeated turns in one session, interleaved sessions, and
      multiple replica/DP targets.
+   - Reject `prefix_caching_key_mode=block_hash`.
 
 5. **CPU KV-cache tiering**
    - Add analytical GPU-to-CPU offload and CPU-to-GPU restore events only after
      the GPU-resident session cache has parity.
    - Add a bounded CPU block pool, session-aware CPU cache lookup/eviction,
      restore admission, and tiered-cache metrics.
+   - Preserve the Python reservation, lease, pin, generation, cancellation,
+     and committed-frontier state transitions.
    - Validate GPU-only hit, CPU-cache hit plus restore, miss, eviction, and
      capacity-pressure cases independently from PDD.
 
@@ -194,6 +294,8 @@ queue both matches the release contract and removes synchronization overhead.
 
 Python remains the oracle until a C++ case is accepted. Each deterministic
 test compares normalized inputs and outputs, not implementation internals.
+The parity harness is introduced in milestone 1 and is a gate for every later
+milestone; it is not deferred to final hardening.
 
 Required checks:
 
@@ -220,6 +322,8 @@ The existing Python references for the session-cache behavior are primarily:
 - A C++ executable runs deterministic co-location and sequential PDD inputs.
 - It uses only the analytical predictor and supports session-scoped GPU and
   CPU-tiered prefix caching, including analytical offload/restore.
+- It supports only `prefix_caching_key_mode=session` and clearly rejects
+  `block_hash`.
 - It rejects all excluded modes with clear errors.
 - It passes the agreed Python-vs-C++ parity suite for dense session-prefix
   workloads, including multi-target affinity and PDD handoff cases.
