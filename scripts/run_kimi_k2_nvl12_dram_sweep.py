@@ -9,6 +9,7 @@ import csv
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -100,6 +101,13 @@ def _capacity_label(capacity_gb: float) -> str:
     if float(capacity_gb).is_integer():
         return str(int(capacity_gb))
     return str(capacity_gb).replace(".", "p")
+
+
+def _normalize_python_executable(value: str) -> str:
+    """Return an absolute executable path without resolving venv symlinks."""
+    expanded = os.path.expanduser(value)
+    discovered = shutil.which(expanded)
+    return os.path.abspath(discovered or expanded)
 
 
 def build_trial(
@@ -724,7 +732,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             capacity_gb=capacity,
             output_dir=output_dir,
             trace_path=trace_path,
-            python_executable=str(Path(args.python).resolve()),
+            python_executable=_normalize_python_executable(args.python),
             enable_cprofile=args.cprofile,
             max_context_tokens=workload_config.max_context_tokens,
             batch_size_cap=(

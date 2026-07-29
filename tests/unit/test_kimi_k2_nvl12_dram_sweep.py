@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from frontier.config.model_config import BaseModelConfig
 from scripts.generate_kimi_k2_probabilistic_workload import (
     WorkloadConfig,
@@ -7,6 +9,7 @@ from scripts.generate_kimi_k2_probabilistic_workload import (
 )
 from scripts.run_kimi_k2_nvl12_dram_sweep import (
     _collect_prefix_tier_metrics,
+    _normalize_python_executable,
     build_trial,
     write_dashboard,
 )
@@ -86,6 +89,21 @@ def test_tool_seconds_128k_workload_uses_only_second_scale_gaps():
         "slow_tool",
     }
     assert manifest["realized"]["think_time_seconds"]["max"] <= 60.0
+
+
+def test_python_executable_normalization_preserves_venv_symlink(tmp_path):
+    system_python = tmp_path / "system-python"
+    system_python.touch()
+    venv_python = tmp_path / "venv-python"
+    try:
+        venv_python.symlink_to(system_python)
+    except OSError as error:
+        pytest.skip(f"symlink creation is unavailable: {error}")
+
+    normalized = Path(_normalize_python_executable(str(venv_python)))
+
+    assert normalized == venv_python.absolute()
+    assert normalized != venv_python.resolve()
 
 
 def test_sweep_trial_maps_tp4_dp3_ep12_and_total_dram_to_per_gpu():
