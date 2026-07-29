@@ -155,6 +155,45 @@ def scale_nonnegative_arrival_time(
     return scaled_value
 
 
+def scale_nonnegative_think_time(
+    value,
+    scale_factor,
+    *,
+    context: str,
+) -> float:
+    """Apply trace time scaling to a post-completion session think time."""
+    raw_value = _finite_float(
+        value,
+        field_name="think_time",
+        context=context,
+    )
+    if raw_value < 0:
+        raise ValueError(
+            f"think_time must be nonnegative before scaling. "
+            f"{context}; value={value!r}."
+        )
+
+    factor = _finite_float(
+        scale_factor,
+        field_name="time_scale_factor",
+        context=context,
+    )
+    if factor <= 0:
+        raise ValueError(
+            f"time_scale_factor must be positive. "
+            f"{context}; value={scale_factor!r}."
+        )
+
+    scaled_value = raw_value * factor
+    if not math.isfinite(scaled_value) or scaled_value < 0:
+        raise ValueError(
+            "think_time must be finite and nonnegative after scaling. "
+            f"{context}; value={value!r}; scale_factor={scale_factor!r}; "
+            f"scaled_value={scaled_value!r}."
+        )
+    return scaled_value
+
+
 def parse_thinking_round_plans(
     value,
     *,
@@ -270,11 +309,23 @@ class TraceReplayRequestGenerator(BaseRequestGenerator):
 
         # load into a pd dataframe
         self.trace_df = pd.read_csv(config.trace_file)
-        for column_name in (
+        self._closed_loop_session_mode = "think_time" in self.trace_df.columns
+        self.config.closed_loop_session_mode = self._closed_loop_session_mode
+        required_columns = {
             "arrived_at",
             "num_prefill_tokens",
             "num_decode_tokens",
-        ):
+        }
+        if self._closed_loop_session_mode:
+            required_columns.update({"session_id", "turn_index", "think_time"})
+        missing_columns = sorted(required_columns - set(self.trace_df.columns))
+        if missing_columns:
+            raise ValueError(
+                f"Trace file {config.trace_file} is missing required "
+                f"columns {missing_columns}."
+            )
+
+        for column_name in ("num_prefill_tokens", "num_decode_tokens"):
             if column_name not in self.trace_df.columns:
                 raise ValueError(
                     f"Trace file {config.trace_file} is missing required "
@@ -289,6 +340,82 @@ class TraceReplayRequestGenerator(BaseRequestGenerator):
                         f"Trace file: {config.trace_file}; "
                         f"row_index={row_index}"
                     ),
+                )
+
+        self.trace_df["_raw_arrived_at"] = self.trace_df["arrived_at"]
+        if self._closed_loop_session_mode:
+            self.trace_df["_raw_think_time"] = self.trace_df["think_time"]
+            turns_by_session: dict[int, list[int]] = {}
+            for row_index, row in self.trace_df.iterrows():
+                row_context = (
+                    f"Trace file: {config.trace_file}; row_index={row_index}"
+                )
+                session_id = _parse_optional_int(row.get("session_id"))
+                if session_id is None:
+                    raise ValueError(
+                        "session_id is required for closed-loop traces. "
+                        f"{row_context}."
+                    )
+                raw_turn_index = _finite_float(
+                    row.get("turn_index"),
+                    field_name="turn_index",
+                    context=row_context,
+                )
+                turn_index = int(raw_turn_index)
+                if turn_index < 0 or float(turn_index) != raw_turn_index:
+                    raise ValueError(
+                        "turn_index must be a nonnegative integer. "
+                        f"{row_context}; value={row.get('turn_index')!r}."
+                    )
+                think_time = scale_nonnegative_think_time(
+                    row.get("_raw_think_time"),
+                    config.time_scale_factor,
+                    context=row_context,
+                )
+                if turn_index == 0:
+                    if think_time != 0:
+                        raise ValueError(
+                            "The first closed-loop turn must use think_time=0. "
+                            f"{row_context}; value={think_time!r}."
+                        )
+                    arrived_at = scale_nonnegative_arrival_time(
+                        row.get("_raw_arrived_at"),
+                        config.time_scale_factor,
+                        context=row_context,
+                    )
+                else:
+                    if not _is_missing_value(row.get("_raw_arrived_at")):
+                        raise ValueError(
+                            "Only turn_index=0 may provide arrived_at in a "
+                            f"closed-loop trace. {row_context}."
+                        )
+                    arrived_at = 0.0
+
+                self.trace_df.at[row_index, "turn_index"] = turn_index
+                self.trace_df.at[row_index, "think_time"] = think_time
+                self.trace_df.at[row_index, "arrived_at"] = arrived_at
+                turns_by_session.setdefault(session_id, []).append(turn_index)
+
+            for session_id, turn_indices in turns_by_session.items():
+                expected = list(range(len(turn_indices)))
+                if turn_indices != expected:
+                    raise ValueError(
+                        "Closed-loop turn_index values must be ordered and "
+                        "contiguous within each session: "
+                        f"session_id={session_id}; got={turn_indices}; "
+                        f"expected={expected}."
+                    )
+        else:
+            for row_index, raw_value in self.trace_df["arrived_at"].items():
+                self.trace_df.at[row_index, "arrived_at"] = (
+                    scale_nonnegative_arrival_time(
+                        raw_value,
+                        config.time_scale_factor,
+                        context=(
+                            f"Trace file: {config.trace_file}; "
+                            f"row_index={row_index}"
+                        ),
+                    )
                 )
 
         for factor_name in (
@@ -390,20 +517,6 @@ class TraceReplayRequestGenerator(BaseRequestGenerator):
             <= config.max_tokens
         )
 
-        # rescale the time to change QPS
-        self.trace_df["arrived_at"] = (
-            self.trace_df["arrived_at"] * config.time_scale_factor
-        )
-        for row_index, scaled_arrived_at in self.trace_df["arrived_at"].items():
-            _finite_float(
-                scaled_arrived_at,
-                field_name="arrived_at",
-                context=(
-                    f"Trace file: {config.trace_file}; "
-                    f"row_index={row_index}; after scaling"
-                ),
-            )
-
         logger.info(
             f"Loaded trace file {config.trace_file} with {len(self.trace_df)} requests"
         )
@@ -414,6 +527,54 @@ class TraceReplayRequestGenerator(BaseRequestGenerator):
         logger.debug(
             f"Prompt/decode token ratio stats\n:{pd_ratio.describe(percentiles=[0.25, 0.5, 0.75, 0.9, 0.95, 0.99])}"
         )
+
+    def _closed_loop_request_kwargs(self, row) -> dict[str, int | float | None]:
+        if not self._closed_loop_session_mode:
+            return {
+                "session_turn_index": None,
+                "think_time_after_previous": None,
+            }
+        return {
+            "session_turn_index": int(row["turn_index"]),
+            "think_time_after_previous": float(row["think_time"]),
+        }
+
+    def _link_closed_loop_requests(
+        self, requests: list[Request]
+    ) -> list[Request]:
+        if not self._closed_loop_session_mode:
+            return requests
+
+        requests_by_session: dict[int, list[Request]] = {}
+        for request in requests:
+            if request.session_id is None:
+                raise ValueError("Closed-loop requests require session_id.")
+            requests_by_session.setdefault(int(request.session_id), []).append(
+                request
+            )
+
+        for session_id, session_requests in requests_by_session.items():
+            ordered_requests = sorted(
+                session_requests,
+                key=lambda request: int(request.session_turn_index),
+            )
+            expected_turn_indices = list(range(len(ordered_requests)))
+            actual_turn_indices = [
+                int(request.session_turn_index)
+                for request in ordered_requests
+            ]
+            if actual_turn_indices != expected_turn_indices:
+                raise ValueError(
+                    "Closed-loop request turns must be contiguous after "
+                    f"materialization: session_id={session_id}; "
+                    f"got={actual_turn_indices}; "
+                    f"expected={expected_turn_indices}."
+                )
+            for current_request, successor in zip(
+                ordered_requests, ordered_requests[1:]
+            ):
+                current_request.set_closed_loop_successor(successor)
+        return requests
 
     def generate_requests(self) -> List[Request]:
         if self._session_prefix_incremental_isl:
@@ -456,6 +617,7 @@ class TraceReplayRequestGenerator(BaseRequestGenerator):
                     block_hash_ids=block_hash_ids,
                     session_id=session_id,
                     cohort=cohort,
+                    **self._closed_loop_request_kwargs(row),
                 )
                 requests.append(request)
                 continue
@@ -491,11 +653,12 @@ class TraceReplayRequestGenerator(BaseRequestGenerator):
                 thinking_depth=thinking_depth,
                 tool_call_latency=row_tool_call_latency,
                 thinking_round_plans=row_thinking_round_plans,
+                **self._closed_loop_request_kwargs(row),
             )
 
             requests.append(request)
 
-        return requests
+        return self._link_closed_loop_requests(requests)
 
     def _generate_incremental_session_requests(self) -> List[Request]:
         requests: list[Request] = []
@@ -544,11 +707,7 @@ class TraceReplayRequestGenerator(BaseRequestGenerator):
                     context=row_context,
                 ),
             )
-            arrived_at = scale_nonnegative_arrival_time(
-                row["_raw_arrived_at"],
-                self.config.time_scale_factor,
-                context=row_context,
-            )
+            arrived_at = float(row["arrived_at"])
 
             has_row_thinking_override = (
                 row_thinking_depth is not None
@@ -637,7 +796,8 @@ class TraceReplayRequestGenerator(BaseRequestGenerator):
                         if preserve_round_plans or thinking_depth > 1
                         else None
                     ),
+                    **self._closed_loop_request_kwargs(row),
                 )
             )
 
-        return requests
+        return self._link_closed_loop_requests(requests)

@@ -55,12 +55,15 @@ class Cluster(BaseEntity):
 
         is_vera_rubin_rack_domain = (
             str(replica_config.network_device).strip().lower()
-            == "vera_rubin_nvl72_domain"
+            in {
+                "vera_rubin_nvl72_domain",
+                "vera_rubin_nvl12_partition",
+            }
         )
         if self._config.num_racks is not None and not is_vera_rubin_rack_domain:
             raise ValueError(
                 "cluster_config.num_racks is currently supported only with "
-                "network_device='vera_rubin_nvl72_domain'"
+                "a Vera Rubin rack-domain network device"
             )
         self._rack_placement = (
             build_rack_local_replica_placement(

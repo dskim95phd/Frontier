@@ -12,3 +12,4 @@ class NodeSKUType(BaseIntEnum):
     H800_DGX = 8
     H20_DGX = 9
     VERA_RUBIN_NVL72_DOMAIN = 10
+    VERA_RUBIN_NVL12_PARTITION = 11

@@ -25,6 +25,7 @@ from frontier.request_generator.trace_replay_request_generator import (
     materialize_incremental_session_round_plans,
     parse_thinking_round_plans,
     scale_nonnegative_arrival_time,
+    scale_nonnegative_think_time,
     scale_positive_token_count,
 )
 from frontier.types import (
@@ -191,8 +192,12 @@ class BaseClusterScheduler(ABC):
                     "num_decode_tokens",
                     "session_id",
                 }
+                closed_loop_trace = "think_time" in set(header or [])
+                if closed_loop_trace:
+                    required_columns.update({"think_time", "turn_index"})
             else:
                 required_columns = {"session_id", "block_hash_ids"}
+                closed_loop_trace = False
             missing_columns = sorted(required_columns - set(header or []))
             if missing_columns:
                 raise ValueError(
@@ -203,9 +208,19 @@ class BaseClusterScheduler(ABC):
 
             previous_turn_by_session: dict[int, tuple[float, int, int]] = {}
             for row_number, row in enumerate(reader, start=2):
+                allowed_empty_columns: set[str] = set()
+                if closed_loop_trace:
+                    raw_turn_index = row.get("turn_index")
+                    if raw_turn_index is not None and raw_turn_index.strip():
+                        try:
+                            if int(raw_turn_index) > 0:
+                                allowed_empty_columns.add("arrived_at")
+                        except ValueError:
+                            pass
                 missing_values = sorted(
                     column
                     for column in required_columns
+                    if column not in allowed_empty_columns
                     if row.get(column) is None or not row[column].strip()
                 )
                 if missing_values:
@@ -224,11 +239,40 @@ class BaseClusterScheduler(ABC):
                 )
                 try:
                     session_id = int(row["session_id"])
-                    arrived_at = scale_nonnegative_arrival_time(
-                        row["arrived_at"],
-                        request_generator_config.time_scale_factor,
-                        context=row_context,
-                    )
+                    if closed_loop_trace:
+                        turn_index = int(row["turn_index"])
+                        if turn_index < 0:
+                            raise ValueError(
+                                "turn_index must be nonnegative"
+                            )
+                        think_time = scale_nonnegative_think_time(
+                            row["think_time"],
+                            request_generator_config.time_scale_factor,
+                            context=row_context,
+                        )
+                        if turn_index == 0:
+                            if think_time != 0:
+                                raise ValueError(
+                                    "the first turn must use think_time=0"
+                                )
+                            arrived_at = scale_nonnegative_arrival_time(
+                                row["arrived_at"],
+                                request_generator_config.time_scale_factor,
+                                context=row_context,
+                            )
+                        else:
+                            if row.get("arrived_at", "").strip():
+                                raise ValueError(
+                                    "only turn_index=0 may provide arrived_at"
+                                )
+                            arrived_at = float(turn_index)
+                    else:
+                        turn_index = None
+                        arrived_at = scale_nonnegative_arrival_time(
+                            row["arrived_at"],
+                            request_generator_config.time_scale_factor,
+                            context=row_context,
+                        )
                     prefill_tokens = scale_positive_token_count(
                         row["num_prefill_tokens"],
                         request_generator_config.prefill_scale_factor,
@@ -254,7 +298,17 @@ class BaseClusterScheduler(ABC):
                         previous_context_tokens,
                         previous_row_number,
                     ) = previous_turn
-                    if arrived_at < previous_arrived_at:
+                    if closed_loop_trace:
+                        if turn_index != int(previous_arrived_at) + 1:
+                            raise ValueError(
+                                "Closed-loop session turns must use contiguous "
+                                "turn_index values. "
+                                f"Trace file: {trace_file}; "
+                                f"session_id={session_id}; "
+                                f"previous row={previous_row_number}; "
+                                f"current row={row_number}."
+                            )
+                    elif arrived_at < previous_arrived_at:
                         raise ValueError(
                             "Session prefix-caching turns must be ordered by "
                             "nondecreasing arrived_at. "
@@ -263,6 +317,12 @@ class BaseClusterScheduler(ABC):
                             f"current row={row_number}."
                         )
                 else:
+                    if closed_loop_trace and turn_index != 0:
+                        raise ValueError(
+                            "The first closed-loop row for each session must "
+                            f"use turn_index=0. Trace file: {trace_file}; "
+                            f"session_id={session_id}; row={row_number}."
+                        )
                     previous_context_tokens = 0
 
                 incremental_round_plans = [
@@ -327,7 +387,7 @@ class BaseClusterScheduler(ABC):
                     ) from exc
 
                 previous_turn_by_session[session_id] = (
-                    arrived_at,
+                    float(turn_index) if closed_loop_trace else arrived_at,
                     resulting_context_tokens,
                     row_number,
                 )
@@ -3064,19 +3124,21 @@ class BaseClusterScheduler(ABC):
             )
             return events
 
-        single_layer_execution_time = execution_time_predictor.predict_stage_execution_time(
-            sample_batch,
-            stage_id,
-            self._cluster_type,
-            num_layers=1,
-            layer_id=layer_id,
-        )
         if hasattr(execution_time_predictor, "_get_expert_parallel_communication_time"):
             post_moe_comm_time = (
                 execution_time_predictor._get_expert_parallel_communication_time(global_batch)
                 * 1e-3
             )
         else:
+            single_layer_execution_time = (
+                execution_time_predictor.predict_stage_execution_time(
+                    sample_batch,
+                    stage_id,
+                    self._cluster_type,
+                    num_layers=1,
+                    layer_id=layer_id,
+                )
+            )
             post_moe_comm_time = (
                 single_layer_execution_time.expert_parallel_communication_time * 1e-3
             )
@@ -3370,7 +3432,14 @@ class BaseClusterScheduler(ABC):
         from frontier.events.cluster_schedule_event import ClusterScheduleEvent
 
         simulation_mode = get_simulation_mode()
-        if simulation_mode == "offline":
+        closed_loop_trace = bool(
+            getattr(
+                self._request_generator_config,
+                "closed_loop_session_mode",
+                False,
+            )
+        )
+        if simulation_mode == "offline" and not closed_loop_trace:
             expected_num_requests = getattr(
                 self._request_generator_config, "num_decode_bound_requests", None
             )
@@ -3404,7 +3473,8 @@ class BaseClusterScheduler(ABC):
             return [ClusterScheduleEvent(time, self._cluster_type)]
 
         logger.info(
-            "Online mode: triggering immediate cluster scheduling for %s requests",
+            "%s mode: triggering immediate cluster scheduling for %s requests",
+            "Closed-loop" if closed_loop_trace else "Online",
             len(batch.requests),
         )
         return [ClusterScheduleEvent(time, self._cluster_type)]

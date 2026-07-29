@@ -2579,6 +2579,11 @@ class MetricsStore:
                 "arrived_at_ms": float(request.arrived_at) * 1000.0,
                 "num_prefill_tokens": int(request.num_prefill_tokens),
                 "num_decode_tokens": int(request.num_decode_tokens),
+                "session_id": request.session_id,
+                "turn_index": request.session_turn_index,
+                "think_time_after_previous_s": (
+                    request.think_time_after_previous
+                ),
             }
         )
 
@@ -2828,6 +2833,11 @@ class MetricsStore:
                 "completed_at_ms": float(request.completed_at) * 1000.0,
                 "num_prefill_tokens": int(request.num_prefill_tokens),
                 "num_decode_tokens": int(request.num_decode_tokens),
+                "session_id": request.session_id,
+                "turn_index": request.session_turn_index,
+                "think_time_after_previous_s": (
+                    request.think_time_after_previous
+                ),
                 "request_e2e_time_s": float(request.e2e_time),
                 "request_e2e_time_ms": float(request.e2e_time) * 1000.0,
                 "request_waiting_time_total_s": float(request_waiting_time_total),

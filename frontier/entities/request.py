@@ -48,6 +48,8 @@ class Request(BaseEntity):
         thinking_depth: int = 1,
         tool_call_latency: float = 0.001,
         thinking_round_plans: Optional[Sequence[RequestRoundPlan]] = None,
+        session_turn_index: Optional[int] = None,
+        think_time_after_previous: Optional[float] = None,
     ):
         resolved_round_plans = self._resolve_thinking_round_plans(
             num_prefill_tokens=num_prefill_tokens,
@@ -72,6 +74,11 @@ class Request(BaseEntity):
         )
         self._session_id = session_id
         self._cohort = cohort
+        self._session_turn_index = session_turn_index
+        self._think_time_after_previous = think_time_after_previous
+        self._closed_loop_successor: Optional["Request"] = None
+        self._closed_loop_predecessor: Optional["Request"] = None
+        self._closed_loop_successor_scheduled = False
         self._num_prefill_tokens_cached = 0
         self._prefix_cache_query_blocks = 0
         self._prefix_cache_hit_blocks = 0
@@ -358,6 +365,82 @@ class Request(BaseEntity):
     @property
     def arrived_at(self) -> float:
         return self._arrived_at
+
+    @property
+    def session_turn_index(self) -> Optional[int]:
+        return self._session_turn_index
+
+    @property
+    def think_time_after_previous(self) -> Optional[float]:
+        return self._think_time_after_previous
+
+    @property
+    def is_closed_loop_turn(self) -> bool:
+        return self._session_turn_index is not None
+
+    @property
+    def is_deferred_closed_loop_turn(self) -> bool:
+        return self._closed_loop_predecessor is not None
+
+    def set_closed_loop_successor(self, successor: "Request") -> None:
+        if self._session_id is None or successor.session_id is None:
+            raise ValueError("Closed-loop requests require session_id.")
+        if int(self._session_id) != int(successor.session_id):
+            raise ValueError(
+                "Closed-loop successor must belong to the same session: "
+                f"current_session={self._session_id}, "
+                f"successor_session={successor.session_id}."
+            )
+        if successor.think_time_after_previous is None:
+            raise ValueError(
+                "Closed-loop successor requires think_time_after_previous."
+            )
+        if float(successor.think_time_after_previous) < 0:
+            raise ValueError(
+                "Closed-loop successor think time must be nonnegative."
+            )
+        if (
+            self._session_turn_index is not None
+            and successor.session_turn_index is not None
+            and int(successor.session_turn_index)
+            != int(self._session_turn_index) + 1
+        ):
+            raise ValueError(
+                "Closed-loop successor turn indices must be contiguous: "
+                f"current_turn={self._session_turn_index}, "
+                f"successor_turn={successor.session_turn_index}."
+            )
+        if self._closed_loop_successor is not None:
+            raise ValueError(
+                f"Request {self._id} already has a closed-loop successor."
+            )
+        if successor._closed_loop_predecessor is not None:
+            raise ValueError(
+                f"Request {successor.id} already has a closed-loop predecessor."
+            )
+        self._closed_loop_successor = successor
+        successor._closed_loop_predecessor = self
+
+    def take_closed_loop_successor(
+        self, completion_time: float
+    ) -> Optional["Request"]:
+        """Materialize the next session turn exactly once after completion."""
+        successor = self._closed_loop_successor
+        if successor is None or self._closed_loop_successor_scheduled:
+            return None
+        if not self._completed:
+            raise ValueError(
+                "Closed-loop successor cannot be scheduled before request "
+                f"completion: request_id={self._id}."
+            )
+        think_time = successor.think_time_after_previous
+        if think_time is None:
+            raise ValueError(
+                "Closed-loop successor is missing think_time_after_previous."
+            )
+        successor.set_arrived_at(float(completion_time) + float(think_time))
+        self._closed_loop_successor_scheduled = True
+        return successor
 
     @property
     def num_prefill_tokens(self) -> int:

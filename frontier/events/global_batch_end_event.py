@@ -241,16 +241,38 @@ class GlobalBatchEndEvent(BaseEvent):
         # Ensure completion counters update even if metrics writing is disabled.
         # Request metric validation errors must propagate; otherwise malformed KPI
         # state can be silently reported as a successful simulation.
+        closed_loop_arrival_events: List[BaseEvent] = []
         for _, request in pre_batch_request_entries:
             if not getattr(request, "completed", False):
                 continue
             metrics_store._on_request_end(self.time, request)
+            successor = request.take_closed_loop_successor(self.time)
+            if successor is None:
+                continue
+            from frontier.events.request_arrival_event import RequestArrivalEvent
+
+            successor_cluster_type = (
+                ClusterType.MONOLITHIC
+                if self._cluster_type == ClusterType.MONOLITHIC
+                else ClusterType.PREFILL
+            )
+            closed_loop_arrival_events.append(
+                RequestArrivalEvent(
+                    successor.arrived_at,
+                    successor,
+                    successor_cluster_type,
+                )
+            )
 
         # Schedule next batch for this DP replica
         # Note: Idle batch mechanism now handles MoE synchronization when num_requests < dp_size
         next_events = [ReplicaScheduleEvent(self.time, self._replica_id, self._cluster_type, self._dp_id)]
 
-        return next_events + thinking_requeue_events
+        return (
+            next_events
+            + thinking_requeue_events
+            + closed_loop_arrival_events
+        )
 
     def get_target_cluster(self) -> ClusterType:
         # Processed by DECODE_ATTN cluster

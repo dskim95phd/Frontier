@@ -126,6 +126,8 @@ class BaseRequestGenerator(ABC):
         block_hash_ids=None,
         session_id: Optional[int] = None,
         cohort: Optional[str] = None,
+        session_turn_index: Optional[int] = None,
+        think_time_after_previous: Optional[float] = None,
     ) -> Request:
         hidden_round_plans = self._build_hidden_round_plans(
             final_prefill_tokens=num_prefill_tokens,
@@ -148,6 +150,8 @@ class BaseRequestGenerator(ABC):
             thinking_depth=self._thinking_depth if self._thinking_mode_enabled else 1,
             tool_call_latency=self._tool_call_latency,
             thinking_round_plans=thinking_round_plans,
+            session_turn_index=session_turn_index,
+            think_time_after_previous=think_time_after_previous,
         )
 
     @abstractmethod

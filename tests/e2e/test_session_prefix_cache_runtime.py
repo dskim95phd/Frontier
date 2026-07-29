@@ -414,6 +414,194 @@ def test_pdd_prefill_cpu_kv_offload_runtime_metrics(tmp_path: Path) -> None:
     assert system_metrics["kv_cache_transfer_statistics"]["total_transfers"] == 6
 
 
+@pytest.mark.parametrize("simulation_mode", ["online", "offline"])
+def test_pdd_closed_loop_turn_arrives_after_completion_plus_think_time(
+    tmp_path: Path,
+    simulation_mode: str,
+) -> None:
+    trace_file = tmp_path / "closed_loop_session.csv"
+    pd.DataFrame(
+        [
+            {
+                "arrived_at": 0.0,
+                "think_time": 0.0,
+                "turn_index": 0,
+                "num_prefill_tokens": 32,
+                "num_decode_tokens": 16,
+                "session_id": 7,
+            },
+            {
+                "arrived_at": "",
+                "think_time": 2.0,
+                "turn_index": 1,
+                "num_prefill_tokens": 16,
+                "num_decode_tokens": 8,
+                "session_id": 7,
+            },
+        ]
+    ).to_csv(trace_file, index=False)
+
+    output_root = tmp_path / "metrics"
+    run_id = "pdd_closed_loop"
+    command = [
+        sys.executable,
+        *_common_args(
+            output_root,
+            run_id,
+            trace_file=trace_file,
+            key_mode="session",
+        ),
+        *_pdd_args(),
+        *_cpu_offload_args(),
+        "--metrics_config_enable_metrics_ground_truth_trace",
+    ]
+    command[command.index("--simulation_mode") + 1] = simulation_mode
+    if simulation_mode == "offline":
+        command.append("--offline_use_generated_request_arrivals")
+    env = os.environ.copy()
+    env.update(
+        {
+            "PYTHONPATH": str(REPO_ROOT),
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "WANDB_DISABLED": "true",
+            "VIDUR_DISABLE_WANDB": "1",
+            "FRONTIER_LOG_LEVEL": "ERROR",
+        }
+    )
+
+    completed = subprocess.run(
+        command,
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+        timeout=60,
+    )
+    assert completed.returncode == 0, completed.stdout[-10000:]
+
+    run_dir = (
+        output_root
+        / "phi_tiny_moe_instruct"
+        / (
+            "online_serving"
+            if simulation_mode == "online"
+            else "offline_batch"
+        )
+        / run_id
+    )
+    ground_truth_records = [
+        json.loads(line)
+        for line in (run_dir / "metrics_ground_truth.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line.strip()
+    ]
+    arrivals = [
+        record
+        for record in ground_truth_records
+        if record["event_type"] == "request_arrival"
+    ]
+    completions = [
+        record
+        for record in ground_truth_records
+        if record["event_type"] == "request_completion"
+    ]
+
+    assert len(arrivals) == 2
+    assert len(completions) == 2
+    assert arrivals[0]["time_s"] == pytest.approx(0.0)
+    assert arrivals[1]["time_s"] == pytest.approx(
+        completions[0]["time_s"] + 2.0
+    )
+
+    request_metrics = pd.read_csv(run_dir / "request_metrics.csv")
+    assert request_metrics["request_gpu_prefix_cache_hit_blocks"].tolist() == [
+        0,
+        2,
+    ]
+
+
+def test_pdd_closed_loop_revisit_can_restore_evicted_cpu_kv(
+    tmp_path: Path,
+) -> None:
+    trace_file = tmp_path / "closed_loop_cpu_restore.csv"
+    rows = []
+    for offset, session_id in enumerate((7, 8, 9)):
+        rows.extend(
+            [
+                {
+                    "arrived_at": float(offset),
+                    "think_time": 0.0,
+                    "turn_index": 0,
+                    "num_prefill_tokens": 32,
+                    "num_decode_tokens": 16,
+                    "session_id": session_id,
+                },
+                {
+                    "arrived_at": "",
+                    "think_time": 100.0,
+                    "turn_index": 1,
+                    "num_prefill_tokens": 16,
+                    "num_decode_tokens": 8,
+                    "session_id": session_id,
+                },
+            ]
+        )
+    pd.DataFrame(rows).to_csv(trace_file, index=False)
+
+    output_root = tmp_path / "metrics"
+    run_id = "pdd_closed_loop_cpu_restore"
+    command = [
+        sys.executable,
+        *_common_args(
+            output_root,
+            run_id,
+            trace_file=trace_file,
+            key_mode="session",
+        ),
+        *_pdd_args(),
+        *_cpu_offload_args(),
+    ]
+    env = os.environ.copy()
+    env.update(
+        {
+            "PYTHONPATH": str(REPO_ROOT),
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "WANDB_DISABLED": "true",
+            "VIDUR_DISABLE_WANDB": "1",
+            "FRONTIER_LOG_LEVEL": "ERROR",
+        }
+    )
+
+    completed = subprocess.run(
+        command,
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+        timeout=60,
+    )
+    assert completed.returncode == 0, completed.stdout[-10000:]
+
+    run_dir = (
+        output_root
+        / "phi_tiny_moe_instruct"
+        / "online_serving"
+        / run_id
+    )
+    system_metrics = json.loads(
+        (run_dir / "system_metrics.json").read_text(encoding="utf-8")
+    )
+    cpu_statistics = system_metrics["cpu_kv_cache_statistics"]
+    assert cpu_statistics["restore_operations"] > 0
+    assert cpu_statistics["restore_blocks"] > 0
+    assert cpu_statistics["cpu_hit_blocks"] > 0
+
+
 @pytest.mark.parametrize(
     ("num_sessions", "cpu_capacity_blocks", "prefill_dp_size"),
     [(4, 1024, 1), (4, 8, 1), (16, 8, 1), (8, 8, 2)],

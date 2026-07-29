@@ -383,6 +383,25 @@ class Simulator:
         """Initialize events for parallel mode."""
         requests = self._request_generator.generate()
         logger.info(f"Generated {len(requests)} requests for parallel processing")
+        has_closed_loop_requests = any(
+            request.is_closed_loop_turn for request in requests
+        )
+        if (
+            has_closed_loop_requests
+            and self._config.simulation_mode == "offline"
+            and not getattr(
+                self._config, "offline_use_generated_request_arrivals", False
+            )
+        ):
+            raise ValueError(
+                "Closed-loop traces require --simulation_mode online or "
+                "--offline_use_generated_request_arrivals."
+            )
+        initial_requests = [
+            request
+            for request in requests
+            if not request.is_deferred_closed_loop_turn
+        ]
         # Register total requests for completion-based termination.
         # Registration errors must propagate so request completion accounting
         # cannot silently drift from the generated workload.
@@ -412,7 +431,7 @@ class Simulator:
             )
         ):
             # In offline mode, all requests are added to the scheduler at time 0.
-            for request in requests:
+            for request in initial_requests:
                 request.set_arrived_at(0)
                 request.on_arrival(0, ClusterType.PREFILL)
                 # Record request arrival metrics (histogram data: num_tokens, prefill_tokens, decode_tokens, etc.)
@@ -434,7 +453,7 @@ class Simulator:
                 )
         else:
             # Handle online mode for parallel processing
-            for request in requests:
+            for request in initial_requests:
                 cluster_type = (
                     ClusterType.PREFILL
                     if self._config.is_disaggregated_mode()
@@ -1313,6 +1332,25 @@ class Simulator:
         with self._profiler.profile("request_generation"):
             requests = self._request_generator.generate()
         logger.info(f"Generated {len(requests)} requests")
+        has_closed_loop_requests = any(
+            request.is_closed_loop_turn for request in requests
+        )
+        if (
+            has_closed_loop_requests
+            and self._config.simulation_mode == "offline"
+            and not getattr(
+                self._config, "offline_use_generated_request_arrivals", False
+            )
+        ):
+            raise ValueError(
+                "Closed-loop traces require --simulation_mode online or "
+                "--offline_use_generated_request_arrivals."
+            )
+        initial_requests = [
+            request
+            for request in requests
+            if not request.is_deferred_closed_loop_turn
+        ]
         self._all_requests = list(requests)
         self._requests_by_session_id = {
             int(request.session_id): request
@@ -1343,7 +1381,7 @@ class Simulator:
             )
         ):
             # In offline mode, all requests are added to the scheduler at time 0.
-            for request in requests:
+            for request in initial_requests:
                 request.set_arrived_at(0)
                 request.on_arrival(0, ClusterType.PREFILL)
                 # Record request arrival metrics (histogram data: num_tokens, prefill_tokens, decode_tokens, etc.)
@@ -1365,7 +1403,7 @@ class Simulator:
         ):
             # Offline mode for monolithic (co-location) mode
             # All requests are added to the scheduler at time 0, similar to disaggregated mode
-            for request in requests:
+            for request in initial_requests:
                 request.set_arrived_at(0)
                 request.on_arrival(0, ClusterType.MONOLITHIC)
                 # Record request arrival metrics
@@ -1379,7 +1417,7 @@ class Simulator:
             # Kick off the scheduling process.
             self._add_event(GlobalScheduleEvent(0))
         else:
-            for request in requests:
+            for request in initial_requests:
                 # In disaggregated mode, a request first arrives at the prefill cluster
                 # In monolithic mode, it arrives at the monolithic cluster
                 cluster_type = (

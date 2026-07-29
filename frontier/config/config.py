@@ -5236,7 +5236,10 @@ class ClusterConfig:
                 )
             if (
                 str(replica_config.network_device).strip().lower()
-                == "vera_rubin_nvl72_domain"
+                in {
+                    "vera_rubin_nvl72_domain",
+                    "vera_rubin_nvl12_partition",
+                }
             ):
                 rack_placement = build_rack_local_replica_placement(
                     num_replicas=int(num_replicas),

@@ -112,3 +112,15 @@ class VeraRubinNVL72DomainNodeSKUConfig(BaseNodeSKUConfig):
     @staticmethod
     def get_type():
         return NodeSKUType.VERA_RUBIN_NVL72_DOMAIN
+
+
+@dataclass
+class VeraRubinNVL12PartitionNodeSKUConfig(BaseNodeSKUConfig):
+    """A hypothetical 12-GPU partition of one NVL72 switch domain."""
+
+    device_sku_type: DeviceSKUType = DeviceSKUType.RUBIN
+    num_devices_per_node: int = 12
+
+    @staticmethod
+    def get_type():
+        return NodeSKUType.VERA_RUBIN_NVL12_PARTITION

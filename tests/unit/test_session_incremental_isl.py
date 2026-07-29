@@ -296,6 +296,147 @@ def test_incremental_session_mode_is_opt_in_for_non_session_prefix_traces(
     assert [request.num_prefill_tokens for request in requests] == [32, 56]
 
 
+def test_closed_loop_session_trace_links_turns_with_scaled_think_time(
+    tmp_path: Path,
+) -> None:
+    trace_file = tmp_path / "closed_loop.csv"
+    _write_trace(
+        trace_file,
+        [
+            {
+                "arrived_at": 2.0,
+                "think_time": 0.0,
+                "turn_index": 0,
+                "num_prefill_tokens": 32,
+                "num_decode_tokens": 16,
+                "session_id": 7,
+            },
+            {
+                "arrived_at": "",
+                "think_time": 5.0,
+                "turn_index": 1,
+                "num_prefill_tokens": 8,
+                "num_decode_tokens": 8,
+                "session_id": 7,
+            },
+            {
+                "arrived_at": 3.0,
+                "think_time": 0.0,
+                "turn_index": 0,
+                "num_prefill_tokens": 24,
+                "num_decode_tokens": 8,
+                "session_id": 8,
+            },
+        ],
+    )
+
+    requests = _generator(
+        trace_file,
+        time_scale_factor=2.0,
+    ).generate_requests()
+
+    assert [request.num_prefill_tokens for request in requests] == [32, 56, 24]
+    assert [request.arrived_at for request in requests] == [4.0, 0.0, 6.0]
+    assert [request.session_turn_index for request in requests] == [0, 1, 0]
+    assert [request.think_time_after_previous for request in requests] == [
+        0.0,
+        10.0,
+        0.0,
+    ]
+    assert [request.is_deferred_closed_loop_turn for request in requests] == [
+        False,
+        True,
+        False,
+    ]
+
+    predecessor, successor = requests[:2]
+    predecessor._completed = True
+    released = predecessor.take_closed_loop_successor(completion_time=20.0)
+    assert released is successor
+    assert successor.arrived_at == 30.0
+    assert predecessor.take_closed_loop_successor(completion_time=40.0) is None
+
+
+@pytest.mark.parametrize(
+    ("rows", "error_pattern"),
+    [
+        (
+            [
+                {
+                    "arrived_at": 0.0,
+                    "think_time": 0.0,
+                    "turn_index": 0,
+                    "num_prefill_tokens": 32,
+                    "num_decode_tokens": 8,
+                    "session_id": 7,
+                },
+                {
+                    "arrived_at": "",
+                    "think_time": -1.0,
+                    "turn_index": 1,
+                    "num_prefill_tokens": 8,
+                    "num_decode_tokens": 8,
+                    "session_id": 7,
+                },
+            ],
+            "think_time must be nonnegative",
+        ),
+        (
+            [
+                {
+                    "arrived_at": 0.0,
+                    "think_time": 0.0,
+                    "turn_index": 0,
+                    "num_prefill_tokens": 32,
+                    "num_decode_tokens": 8,
+                    "session_id": 7,
+                },
+                {
+                    "arrived_at": 1.0,
+                    "think_time": 2.0,
+                    "turn_index": 1,
+                    "num_prefill_tokens": 8,
+                    "num_decode_tokens": 8,
+                    "session_id": 7,
+                },
+            ],
+            "Only turn_index=0 may provide arrived_at",
+        ),
+        (
+            [
+                {
+                    "arrived_at": 0.0,
+                    "think_time": 0.0,
+                    "turn_index": 0,
+                    "num_prefill_tokens": 32,
+                    "num_decode_tokens": 8,
+                    "session_id": 7,
+                },
+                {
+                    "arrived_at": "",
+                    "think_time": 2.0,
+                    "turn_index": 2,
+                    "num_prefill_tokens": 8,
+                    "num_decode_tokens": 8,
+                    "session_id": 7,
+                },
+            ],
+            "ordered and contiguous",
+        ),
+    ],
+)
+def test_closed_loop_session_trace_rejects_invalid_timing(
+    tmp_path: Path,
+    rows: list[dict[str, object]],
+    error_pattern: str,
+) -> None:
+    trace_file = tmp_path / "invalid_closed_loop.csv"
+    _write_trace(trace_file, rows)
+
+    with pytest.raises(ValueError, match=error_pattern):
+        _generator(trace_file).generate_requests()
+
+
 def test_incremental_session_isl_rejects_expanded_context_instead_of_clipping(
     tmp_path: Path,
 ) -> None:

@@ -126,6 +126,41 @@ def test_rubin_and_nvl72_logical_skus_publish_analytical_ceilings():
     assert node.num_devices_per_node == 72
 
 
+def test_rubin_nvl12_partition_is_a_twelve_gpu_logical_domain():
+    node = BaseNodeSKUConfig.create_from_type_string(
+        "vera_rubin_nvl12_partition"
+    )
+
+    assert node.device_sku_type.name == "RUBIN"
+    assert node.num_devices_per_node == 12
+
+
+def test_rubin_nvl12_partition_packs_one_twelve_gpu_replica():
+    cluster = Cluster(
+        ClusterConfig(
+            num_replicas=1,
+            num_racks=1,
+            replica_config=ReplicaConfig(
+                device="rubin",
+                network_device="vera_rubin_nvl12_partition",
+                attn_tensor_parallel_size=4,
+                attn_data_parallel_size=3,
+                moe_tensor_parallel_size=1,
+                moe_expert_parallel_size=12,
+                model_name="moonshotai/Kimi-K2-Instruct",
+                total_expert_num=384,
+                router_topk=8,
+            ),
+        ),
+        MetricsConfig(write_json_trace=False),
+        SyntheticRequestGeneratorConfig(),
+    )
+
+    assert cluster.rack_placement.gpus_per_rack == 12
+    assert cluster.rack_placement.active_gpus == 12
+    assert cluster.rack_placement.idle_gpus == 0
+
+
 @pytest.mark.parametrize(
     ("precision", "expected_tflops"),
     [
@@ -562,6 +597,76 @@ def test_analytical_moe_models_grouped_projection_once_per_gpu():
     assert len(grouped_records) == 2
     assert "projection=up,groups=2" in grouped_records[0]["local_shape"]
     assert "projection=down,groups=2" in grouped_records[1]["local_shape"]
+
+
+def test_analytical_mixed_moe_uses_dense_ffn_for_dense_layer():
+    predictor = _moe_predictor()
+    predictor._model_config.moe_layers_enum = "1"
+    predictor._model_config._moe_layer_ids_cache = None
+    batch = _Batch(scheduled_tokens=16, processed_tokens=0, prefill=True)
+
+    dense = predictor.predict_stage_execution_time(
+        batch,
+        stage_id=0,
+        cluster_type=ClusterType.PREFILL,
+        num_layers=1,
+        layer_id=0,
+    )
+    moe = predictor.predict_stage_execution_time(
+        batch,
+        stage_id=0,
+        cluster_type=ClusterType.PREFILL,
+        num_layers=1,
+        layer_id=1,
+    )
+
+    assert dense._is_moe is False
+    assert dense._mlp_layer_up_proj_execution_time > 0.0
+    assert dense._moe_grouped_gemm_time == 0.0
+    assert dense._expert_parallel_communication_time == 0.0
+    assert moe._is_moe is True
+    assert moe._moe_grouped_gemm_time > 0.0
+    assert moe._mlp_layer_up_proj_execution_time == 0.0
+
+
+def test_analytical_roofline_supports_kimi_k2_latent_mla():
+    replica_config = ReplicaConfig(
+        model_name="moonshotai/Kimi-K2-Instruct",
+        device="rubin",
+        network_device="vera_rubin_nvl12_partition",
+        attn_tensor_parallel_size=4,
+        attn_data_parallel_size=3,
+        moe_tensor_parallel_size=1,
+        moe_expert_parallel_size=12,
+        total_expert_num=384,
+        router_topk=8,
+    )
+    predictor = AnalyticalRooflineExecutionTimePredictor(
+        AnalyticalRooflineExecutionTimePredictorConfig(),
+        replica_config,
+        VllmV1SchedulerConfig(),
+        MetricsConfig(),
+        cluster_type=ClusterType.DECODE,
+        cc_backend=_NoCommunicationBackend(),
+    )
+
+    short = predictor.predict_attention_layer_time(
+        _Batch(scheduled_tokens=1, processed_tokens=1_024, prefill=False),
+        layer_id=1,
+        cluster_type=ClusterType.DECODE,
+    )
+    long = predictor.predict_attention_layer_time(
+        _Batch(scheduled_tokens=1, processed_tokens=65_535, prefill=False),
+        layer_id=1,
+        cluster_type=ClusterType.DECODE,
+    )
+
+    assert predictor._model_config.get_runtime_num_kv_heads() == 1
+    assert predictor._model_config.get_runtime_head_size() == 576
+    assert (
+        long.attention_decode_execution_time
+        > short.attention_decode_execution_time
+    )
 
 
 def test_cluster_scheduler_validates_predictor_ep_lane_times():

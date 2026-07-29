@@ -232,6 +232,31 @@ class ModelArchitectureProfile:
             match=match or _matches_step3_text,
         )
 
+    @classmethod
+    def kimi_k2(
+        cls,
+        profile_id: str = "kimi_k2",
+        match: ArchitectureMatcher | None = None,
+    ) -> "ModelArchitectureProfile":
+        return cls(
+            profile_id=profile_id,
+            display_name="Kimi K2 MLA",
+            linear_attention=LinearAttentionProfile(
+                sharded_impl=LinearAttentionImplementation.GENERIC,
+                sharded_ops=(
+                    "attn_pre_proj",
+                    "attn_rope",
+                    "attn_post_proj",
+                ),
+            ),
+            expert_parallel_collective=ExpertParallelCollective.ALLTOALL,
+            attention_shape_log_kind="mla",
+            structural_requirements=(
+                _requires_attention_family("latent_mla_attention"),
+            ),
+            match=match or _matches_kimi_k2,
+        )
+
     def validate_structural_requirements(self, config: Any) -> None:
         """Validate profile-owned structural requirements against a config."""
 
@@ -376,6 +401,10 @@ def _matches_step3_text(config: Any) -> bool:
     return _normalized_attr(config, "model_type") == "step3_text"
 
 
+def _matches_kimi_k2(config: Any) -> bool:
+    return _normalized_attr(config, "model_type") == "kimi_k2"
+
+
 class ModelArchitectureRegistry:
     """Ordered plugin registry for model architecture profiles."""
 
@@ -415,6 +444,7 @@ MODEL_ARCHITECTURE_REGISTRY = ModelArchitectureRegistry()
 for _profile in (
     ModelArchitectureProfile.step3_text(),
     ModelArchitectureProfile.step2_mini(),
+    ModelArchitectureProfile.kimi_k2(),
     ModelArchitectureProfile.generic(),
 ):
     MODEL_ARCHITECTURE_REGISTRY.register(_profile)

@@ -8,6 +8,7 @@ latency, and a configurable amount of non-overlapped compute/memory service.
 from __future__ import annotations
 
 from collections import deque
+from copy import deepcopy
 from dataclasses import asdict, dataclass
 import math
 from typing import Dict, Optional
@@ -73,6 +74,12 @@ class AnalyticalRooflineExecutionTimePredictor(BaseExecutionTimePredictor):
         self._diagnostics = deque(
             maxlen=int(predictor_config.max_diagnostic_records)
         )
+        self._ep_lane_moe_time_cache: Dict[
+            tuple[int, int, ClusterType], Dict[int, float]
+        ] = {}
+        self._moe_layer_time_cache: Dict[
+            tuple[int, int, ClusterType], MoETime
+        ] = {}
         super().__init__(
             predictor_config,
             replica_config,
@@ -117,11 +124,6 @@ class AnalyticalRooflineExecutionTimePredictor(BaseExecutionTimePredictor):
                 "moe_routing_distribution_type must be one of "
                 "['balanced', 'random', 'skewed', 'zipf'], "
                 f"got {self._moe_routing_distribution_type!r}"
-            )
-        if self._model_config.uses_mla():
-            raise NotImplementedError(
-                "analytical_roofline MVP supports dense-KV attention; MLA needs "
-                "a separate latent-cache operator model"
             )
         self._quantization_manager = get_quantization_manager()
         self._quantization_manager.configure_from_model_config(self._model_config)
@@ -362,6 +364,166 @@ class AnalyticalRooflineExecutionTimePredictor(BaseExecutionTimePredictor):
             shapes.append(f"q={query_tokens}:past={past_context}")
         return total_flops, total_elements, ",".join(shapes)
 
+    def _mla_attention_context_costs(
+        self, batch: Batch, *, prefill: bool
+    ) -> tuple[float, float, str]:
+        """Return latent-MLA attention FLOPs and IO without expanding cached K/V."""
+
+        tp = max(1, int(self._replica_config.attn_tensor_parallel_size))
+        q_heads = math.ceil(int(self._model_config.num_q_heads) / tp)
+        qk_dim = int(self._model_config.qk_head_dim)
+        v_dim = int(self._model_config.v_head_dim)
+        latent_dim = int(self._model_config.get_runtime_head_size())
+        total_flops = 0.0
+        total_elements = 0.0
+        shapes: list[str] = []
+        for request, scheduled_tokens in zip(batch.requests, batch.num_tokens):
+            is_prefill_request = not bool(request.is_prefill_complete)
+            if is_prefill_request != prefill:
+                continue
+            query_tokens = int(scheduled_tokens)
+            past_context = int(request.num_processed_tokens)
+            average_visible_kv = past_context + (query_tokens + 1) / 2.0
+            total_flops += (
+                2.0
+                * q_heads
+                * query_tokens
+                * average_visible_kv
+                * (qk_dim + v_dim)
+            )
+            query_and_output = query_tokens * q_heads * (qk_dim + v_dim)
+            new_latent_kv = query_tokens * latent_dim
+            cached_latent_kv = past_context * latent_dim
+            total_elements += (
+                query_and_output + new_latent_kv + cached_latent_kv
+            )
+            shapes.append(f"q={query_tokens}:past={past_context}:mla={latent_dim}")
+        return total_flops, total_elements, ",".join(shapes)
+
+    def _predict_mla_attention_layer_time(
+        self,
+        batch: Batch,
+        cluster_type: ClusterType,
+    ) -> AttentionTime:
+        tokens = self._tokens(batch, cluster_type)
+        hidden = int(self._model_config.embedding_dim)
+        tp = max(1, int(self._replica_config.attn_tensor_parallel_size))
+        local_q_heads = math.ceil(int(self._model_config.num_q_heads) / tp)
+        q_lora_rank = int(self._model_config.q_lora_rank or hidden)
+        kv_lora_rank = int(self._model_config.kv_lora_rank)
+        qk_dim = int(self._model_config.qk_head_dim)
+        qk_rope_dim = int(self._model_config.qk_rope_head_dim)
+        v_dim = int(self._model_config.v_head_dim)
+        latent_dim = int(self._model_config.get_runtime_head_size())
+
+        pre_proj = self._gemm(
+            "attn_pre_proj",
+            batch,
+            tokens,
+            hidden,
+            q_lora_rank,
+            cluster_type,
+        )
+        pre_proj += self._gemm(
+            "attn_pre_proj",
+            batch,
+            tokens,
+            q_lora_rank,
+            local_q_heads * qk_dim,
+            cluster_type,
+        )
+        pre_proj += self._gemm(
+            "attn_pre_proj",
+            batch,
+            tokens,
+            hidden,
+            latent_dim,
+            cluster_type,
+        )
+        pre_proj += self._gemm(
+            "attn_pre_proj",
+            batch,
+            tokens,
+            kv_lora_rank,
+            local_q_heads
+            * (int(self._model_config.qk_nope_head_dim) + v_dim),
+            cluster_type,
+        )
+        post_proj = self._gemm(
+            "attn_post_proj",
+            batch,
+            tokens,
+            local_q_heads * v_dim,
+            hidden,
+            cluster_type,
+        )
+        rope_elements = tokens * (local_q_heads + 1) * qk_rope_dim
+        rope = self._streaming(
+            "attn_rope",
+            batch,
+            elements_read=rope_elements,
+            elements_written=rope_elements,
+            flops=6.0 * rope_elements,
+            cluster_type=cluster_type,
+        )
+        kv_save = self._streaming(
+            "attn_kv_cache_save",
+            batch,
+            elements_read=tokens * latent_dim,
+            elements_written=tokens * latent_dim,
+            flops=0.0,
+            cluster_type=cluster_type,
+        )
+        norm_io_factor = 3 if self._model_config.uses_fused_add_norm else 2
+        norm = self._streaming(
+            "input_layernorm",
+            batch,
+            elements_read=tokens * hidden * (norm_io_factor - 1),
+            elements_written=tokens * hidden,
+            flops=5.0 * tokens * hidden,
+            cluster_type=cluster_type,
+        )
+
+        prefill_flops, prefill_elements, prefill_shape = (
+            self._mla_attention_context_costs(batch, prefill=True)
+        )
+        decode_flops, decode_elements, decode_shape = (
+            self._mla_attention_context_costs(batch, prefill=False)
+        )
+        prefill_precision = self._precision("attn_prefill", cluster_type)
+        decode_precision = self._precision("attn_decode", cluster_type)
+        prefill_time = self.predict_roofline_kernel(
+            operator_name="attn_prefill",
+            phase="prefill",
+            local_shape=prefill_shape,
+            flops=prefill_flops,
+            hbm_bytes=prefill_elements * prefill_precision.bytes_per_element,
+            precision=prefill_precision,
+            compute_efficiency=self._config.prefill_attention_compute_efficiency,
+            memory_efficiency=self._config.prefill_attention_memory_efficiency,
+            overlap_penalty=self._config.prefill_attention_overlap_penalty,
+        )
+        decode_time = self.predict_roofline_kernel(
+            operator_name="attn_decode",
+            phase="decode",
+            local_shape=decode_shape,
+            flops=decode_flops,
+            hbm_bytes=decode_elements * decode_precision.bytes_per_element,
+            precision=decode_precision,
+            compute_efficiency=self._config.decode_attention_compute_efficiency,
+            memory_efficiency=self._config.decode_attention_memory_efficiency,
+            overlap_penalty=self._config.decode_attention_overlap_penalty,
+        )
+        return AttentionTime(
+            attention_prefill_execution_time=prefill_time,
+            attention_decode_execution_time=decode_time,
+            attention_layer_pre_proj_execution_time=pre_proj,
+            attention_layer_post_proj_execution_time=post_proj,
+            attention_rope_execution_time=rope,
+            attention_kv_cache_save_execution_time=kv_save,
+            attn_norm_time=norm,
+        )
+
     def predict_attention_layer_time(
         self,
         batch: Batch,
@@ -371,6 +533,11 @@ class AnalyticalRooflineExecutionTimePredictor(BaseExecutionTimePredictor):
         del layer_id
         if cluster_type == ClusterType.DECODE_FFN:
             return AttentionTime()
+        if self._model_config.uses_mla():
+            return self._predict_mla_attention_layer_time(
+                batch,
+                cluster_type,
+            )
         tokens = self._tokens(batch, cluster_type)
         hidden = int(self._model_config.embedding_dim)
         tp = int(self._replica_config.attn_tensor_parallel_size)
@@ -465,8 +632,6 @@ class AnalyticalRooflineExecutionTimePredictor(BaseExecutionTimePredictor):
         cluster_type: ClusterType,
     ) -> MLPTime:
         del layer_id
-        if self._model_config.is_moe:
-            raise ValueError("Dense MLP prediction requested for an MoE model")
         if cluster_type == ClusterType.DECODE_ATTN:
             return MLPTime()
         tokens = self._tokens(batch, cluster_type)
@@ -811,12 +976,21 @@ class AnalyticalRooflineExecutionTimePredictor(BaseExecutionTimePredictor):
     ) -> Dict[int, float]:
         """Predict local MoE compute time for every EP lane."""
 
+        cache_key = (
+            self._tokens(batch, cluster_type),
+            int(layer_id),
+            cluster_type,
+        )
+        cached = self._ep_lane_moe_time_cache.get(cache_key)
+        if cached is not None:
+            return dict(cached)
+
         lane_allocations = self._get_ep_lane_per_expert_tokens(
             batch,
             layer_id,
             cluster_type,
         )
-        return {
+        predicted = {
             ep_id: self.predict_moe_layer_time(
                 batch,
                 layer_id,
@@ -825,6 +999,10 @@ class AnalyticalRooflineExecutionTimePredictor(BaseExecutionTimePredictor):
             ).total_time()
             for ep_id, local_allocation in lane_allocations.items()
         }
+        if len(self._ep_lane_moe_time_cache) >= 4096:
+            self._ep_lane_moe_time_cache.clear()
+        self._ep_lane_moe_time_cache[cache_key] = dict(predicted)
+        return predicted
 
     def predict_monolithic_decode_shared_domain_lane_moe_times_ms(
         self,
@@ -852,6 +1030,15 @@ class AnalyticalRooflineExecutionTimePredictor(BaseExecutionTimePredictor):
             return MoETime()
         batch = batch_or_group
         tokens = self._tokens(batch, cluster_type)
+        can_cache = (
+            per_expert_tokens is None
+            and not bool(getattr(batch, "per_expert_tokens", {}) or {})
+        )
+        cache_key = (tokens, int(layer_id), cluster_type)
+        if can_cache:
+            cached = self._moe_layer_time_cache.get(cache_key)
+            if cached is not None:
+                return deepcopy(cached)
         hidden = int(self._model_config.embedding_dim)
         experts = int(self._model_config.num_experts)
         intermediate = int(self._model_config.mlp_hidden_dim)
@@ -919,13 +1106,18 @@ class AnalyticalRooflineExecutionTimePredictor(BaseExecutionTimePredictor):
             flops=5.0 * tokens * hidden,
             cluster_type=cluster_type,
         )
-        return MoETime(
+        predicted = MoETime(
             moe_grouped_gemm_time=grouped_gemm,
             moe_gating_linear_time=gating,
             moe_gating_routing_topk_time=routing,
             moe_shuffling_time=shuffling,
             mlp_norm_time=norm,
         )
+        if can_cache:
+            if len(self._moe_layer_time_cache) >= 4096:
+                self._moe_layer_time_cache.clear()
+            self._moe_layer_time_cache[cache_key] = deepcopy(predicted)
+        return predicted
 
     def _require_cc_backend(self):
         if self._cc_backend is None:
@@ -1067,7 +1259,11 @@ class AnalyticalRooflineExecutionTimePredictor(BaseExecutionTimePredictor):
         )
         mlp = MLPTime()
         moe = MoETime()
-        if self._model_config.is_moe:
+        include_moe = bool(self._model_config.is_moe)
+        if num_layers == 1 and include_moe:
+            include_moe = self._model_config.is_moe_layer(layer_id)
+
+        if include_moe:
             moe = self.predict_moe_layer_time(
                 batch, layer_id, cluster_type
             )
@@ -1085,21 +1281,21 @@ class AnalyticalRooflineExecutionTimePredictor(BaseExecutionTimePredictor):
         )
         ffn_tp_size = (
             int(self._replica_config.moe_tensor_parallel_size)
-            if self._model_config.is_moe
+            if include_moe
             else int(self._replica_config.attn_tensor_parallel_size)
         )
         ffn_tp = self.predict_allreduce_time(
             payload,
             ffn_tp_size,
             cluster_type,
-            comm_domain=("MOE_TP" if self._model_config.is_moe else "ATTN_TP"),
+            comm_domain=("MOE_TP" if include_moe else "ATTN_TP"),
         )
         pp = 0.0
         if stage_id < int(self._replica_config.num_pipeline_stages) - 1:
             pp = self.predict_p2p_time(payload, cluster_type, comm_domain="PP")
         ep = (
             self._get_expert_parallel_communication_time(batch)
-            if self._model_config.is_moe
+            if include_moe
             else 0.0
         )
         residual = self._residual_add_time(batch, cluster_type)
@@ -1124,7 +1320,7 @@ class AnalyticalRooflineExecutionTimePredictor(BaseExecutionTimePredictor):
             ),
             attn_norm_time=attention.attn_norm_time,
             mlp_norm_time=(
-                moe.mlp_norm_time if self._model_config.is_moe else mlp.mlp_norm_time
+                moe.mlp_norm_time if include_moe else mlp.mlp_norm_time
             ),
             add_time=2.0 * residual,
             add_attn_residual_time=residual,
@@ -1151,7 +1347,7 @@ class AnalyticalRooflineExecutionTimePredictor(BaseExecutionTimePredictor):
             prepare_inputs_e2e_time=0.0,
             process_model_outputs_time=0.0,
             ray_comm_time=0.0,
-            is_moe=bool(self._model_config.is_moe),
+            is_moe=include_moe,
         )
 
     # Legacy granular methods retained for scheduler compatibility.

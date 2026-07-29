@@ -219,6 +219,27 @@ Context truncation and branching under one session ID are not supported.
 Request and batch metrics continue to report the materialized effective prompt
 length, not the raw incremental ISL from the CSV.
 
+For causal multi-turn replay, add `turn_index` and `think_time`. Only the first
+turn has an absolute `arrived_at`; every later turn is released after the
+previous turn completes:
+
+```csv
+arrived_at,think_time,turn_index,num_prefill_tokens,num_decode_tokens,session_id
+0.0,0.0,0,32,16,7
+,5.0,1,8,8,7
+```
+
+The second request arrives at `first_completion_time + 5.0s`, not at an
+absolute trace timestamp. `turn_index` must start at zero and remain contiguous
+within each session. Later turns must leave `arrived_at` empty, all think times
+must be finite and nonnegative, and the first think time must be zero.
+`trace_request_generator_config_time_scale_factor` scales both first-turn
+arrivals and think times. Closed-loop traces require `--simulation_mode online`
+or offline replay with `--offline_use_generated_request_arrivals`.
+
+Traces without a `think_time` column retain the legacy open-loop interpretation
+where every row provides an absolute `arrived_at`.
+
 KV cache state is local to each `(replica_id, dp_id)` target. When
 `num_replicas * data_parallel_size > 1`, Prefix Caching therefore requires a
 sticky cluster scheduler even if there is only one physical replica.
