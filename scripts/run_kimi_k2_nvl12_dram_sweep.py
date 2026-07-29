@@ -33,11 +33,13 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT = REPO_ROOT / "outputs" / "kimi_k2_nvl12_dram_sweep"
 MODEL_NAME = "moonshotai/Kimi-K2-Instruct"
 GPU_COUNT_PER_CLUSTER = 12
+GPU_COUNT_PER_CPU = 2
+CPU_COUNT_PER_CLUSTER = GPU_COUNT_PER_CLUSTER // GPU_COUNT_PER_CPU
 
 
 @dataclass(frozen=True)
 class Trial:
-    capacity_gb: float
+    capacity_gb_per_cpu: float
     run_id: str
     command: tuple[str, ...]
     log_path: Path
@@ -64,8 +66,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--capacities-gb",
         type=parse_capacities,
-        default=parse_capacities("0,4,8,16,32,9000"),
-        help="Total decimal GB assigned to the 12-GPU prefill partition.",
+        default=parse_capacities("0,200,400,600,800,1000"),
+        help=(
+            "Comma-separated decimal GB assigned to each Vera CPU. "
+            "An NVL12 partition has six Vera CPUs and two Rubin GPUs per CPU."
+        ),
     )
     parser.add_argument("--sessions", type=int, default=4)
     parser.add_argument("--seed", type=int, default=20260728)
@@ -112,7 +117,7 @@ def _normalize_python_executable(value: str) -> str:
 
 def build_trial(
     *,
-    capacity_gb: float,
+    capacity_gb_per_cpu: float,
     output_dir: Path,
     trace_path: Path,
     python_executable: str,
@@ -120,7 +125,7 @@ def build_trial(
     max_context_tokens: int = 65_536,
     batch_size_cap: int = 128,
 ) -> Trial:
-    run_id = f"dram_{_capacity_label(capacity_gb)}gb"
+    run_id = f"dram_{_capacity_label(capacity_gb_per_cpu)}gb_per_cpu"
     log_path = output_dir / "logs" / f"{run_id}.log"
     command = [python_executable]
     if enable_cprofile:
@@ -252,8 +257,14 @@ def build_trial(
         "--no-metrics_config_store_frontier_stage_batch_ledger",
         ]
     )
-    if capacity_gb > 0:
-        per_gpu_bytes = int(round(capacity_gb * 1_000_000_000 / GPU_COUNT_PER_CLUSTER))
+    if capacity_gb_per_cpu > 0:
+        per_gpu_bytes = int(
+            round(
+                capacity_gb_per_cpu
+                * 1_000_000_000
+                / GPU_COUNT_PER_CPU
+            )
+        )
         command.extend(
             [
                 "--cpu_kv_cache_config_enable",
@@ -269,7 +280,7 @@ def build_trial(
             ]
         )
     return Trial(
-        capacity_gb=capacity_gb,
+        capacity_gb_per_cpu=capacity_gb_per_cpu,
         run_id=run_id,
         command=tuple(command),
         log_path=log_path,
@@ -447,8 +458,15 @@ def collect_result(output_dir: Path, trial: Trial) -> dict[str, Any]:
         else {}
     )
     return {
-        "capacity_gb": trial.capacity_gb,
-        "capacity_tb": trial.capacity_gb / 1000.0,
+        "capacity_gb_per_cpu": trial.capacity_gb_per_cpu,
+        "capacity_tb_per_cpu": trial.capacity_gb_per_cpu / 1000.0,
+        "total_cpu_dram_gb": (
+            trial.capacity_gb_per_cpu * CPU_COUNT_PER_CLUSTER
+        ),
+        "vera_cpu_count": CPU_COUNT_PER_CLUSTER,
+        # Compatibility aliases: capacities are now per Vera CPU.
+        "capacity_gb": trial.capacity_gb_per_cpu,
+        "capacity_tb": trial.capacity_gb_per_cpu / 1000.0,
         "run_id": trial.run_id,
         "wall_clock_seconds": timing.get("wall_clock_seconds"),
         "completed_requests": _nested(
@@ -493,7 +511,11 @@ def collect_result(output_dir: Path, trial: Trial) -> dict[str, Any]:
 
 
 def write_results(output_dir: Path, results: list[dict[str, Any]]) -> None:
-    results.sort(key=lambda row: float(row["capacity_gb"]))
+    results.sort(
+        key=lambda row: float(
+            row.get("capacity_gb_per_cpu", row.get("capacity_gb", 0.0))
+        )
+    )
     baseline = results[0]
     for result in results:
         result["ttft_mean_improvement_pct"] = (
@@ -530,8 +552,16 @@ def write_dashboard(
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
 
-    ordered = sorted(results, key=lambda row: float(row["capacity_gb"]))
-    capacities = [float(row["capacity_gb"]) for row in ordered]
+    ordered = sorted(
+        results,
+        key=lambda row: float(
+            row.get("capacity_gb_per_cpu", row.get("capacity_gb", 0.0))
+        ),
+    )
+    capacities = [
+        float(row.get("capacity_gb_per_cpu", row.get("capacity_gb", 0.0)))
+        for row in ordered
+    ]
 
     figure = make_subplots(
         rows=3,
@@ -573,7 +603,7 @@ def write_dashboard(
                 mode="lines+markers",
                 name=name,
                 hovertemplate=(
-                    "CPU DRAM %{x:g} GB<br>"
+                    "CPU DRAM %{x:g} GB / Vera CPU<br>"
                     + name
                     + " %{y:,.3f}<extra></extra>"
                 ),
@@ -630,7 +660,9 @@ def write_dashboard(
     ):
         add_line(key=key, name=name, row=3, col=2)
 
-    figure.update_xaxes(title_text="CPU DRAM capacity (decimal GB)")
+    figure.update_xaxes(
+        title_text="CPU DRAM capacity per Vera CPU (decimal GB)"
+    )
     figure.update_yaxes(title_text="Latency (ms)", row=1, col=1)
     figure.update_yaxes(title_text="Latency (ms/token)", row=1, col=2)
     figure.update_yaxes(
@@ -649,7 +681,7 @@ def write_dashboard(
     figure.update_yaxes(title_text="Actual / ideal", row=3, col=1)
     figure.update_yaxes(title_text="Data volume (GB)", row=3, col=2)
     figure.update_layout(
-        title="Kimi K2 NVL12 CPU DRAM Sweep",
+        title="Kimi K2 NVL12 CPU DRAM Sweep (per Vera CPU)",
         template="plotly_white",
         height=1200,
         hovermode="x unified",
@@ -729,7 +761,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     trials = [
         build_trial(
-            capacity_gb=capacity,
+            capacity_gb_per_cpu=capacity,
             output_dir=output_dir,
             trace_path=trace_path,
             python_executable=_normalize_python_executable(args.python),

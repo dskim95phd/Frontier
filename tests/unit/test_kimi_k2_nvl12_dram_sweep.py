@@ -106,9 +106,9 @@ def test_python_executable_normalization_preserves_venv_symlink(tmp_path):
     assert normalized != venv_python.resolve()
 
 
-def test_sweep_trial_maps_tp4_dp3_ep12_and_total_dram_to_per_gpu():
+def test_sweep_trial_maps_tp4_dp3_ep12_and_per_cpu_dram_to_per_gpu():
     trial = build_trial(
-        capacity_gb=96,
+        capacity_gb_per_cpu=96,
         output_dir=Path("outputs/test"),
         trace_path=Path("trace.csv"),
         python_executable="python",
@@ -135,7 +135,7 @@ def test_sweep_trial_maps_tp4_dp3_ep12_and_total_dram_to_per_gpu():
     ] == "12"
     assert command[
         command.index("--cpu_kv_cache_config_capacity_bytes_per_gpu") + 1
-    ] == "8000000000"
+    ] == "48000000000"
     assert "vera_rubin_nvl12_partition" in command
     assert command[
         command.index("--vllm_v1_scheduler_config_num_blocks_mode") + 1
@@ -182,8 +182,8 @@ def test_prefix_tier_metrics_separate_gpu_and_cpu_reuse(tmp_path: Path):
 
 
 def test_server_capacity_range_is_inclusive_and_validated():
-    assert build_capacity_range(0, 1000, 100) == [
-        float(value) for value in range(0, 1001, 100)
+    assert build_capacity_range(0, 1000, 200) == [
+        float(value) for value in range(0, 1001, 200)
     ]
 
     try:
@@ -199,6 +199,7 @@ def test_dashboard_writes_standalone_html(tmp_path: Path):
     for capacity in (0.0, 100.0):
         rows.append(
             {
+                "capacity_gb_per_cpu": capacity,
                 "capacity_gb": capacity,
                 "ttft_mean_ms": 10.0,
                 "ttft_p90_ms": 12.0,

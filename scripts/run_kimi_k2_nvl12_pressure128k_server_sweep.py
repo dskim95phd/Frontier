@@ -2,7 +2,8 @@
 """Run the server-oriented Kimi K2 NVL12 128K CPU-DRAM sweep.
 
 Defaults:
-  * CPU DRAM: 0 through 1000 decimal GB, inclusive, in 100 GB steps
+  * CPU DRAM per Vera CPU: 0 through 1000 decimal GB, inclusive, in 200 GB steps
+  * NVL12 mapping: 6 Vera CPUs, 2 Rubin GPUs per CPU
   * Workload: pressure128k, 144 closed-loop sessions, 2 sessions/s
   * Parallelism: up to 4 independent simulator worker processes
   * Outputs: CSV, JSON, per-run logs/metrics, and sweep_dashboard.html
@@ -63,9 +64,24 @@ def build_capacity_range(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--capacity-start-gb", type=float, default=0.0)
-    parser.add_argument("--capacity-stop-gb", type=float, default=1000.0)
-    parser.add_argument("--capacity-step-gb", type=float, default=100.0)
+    parser.add_argument(
+        "--capacity-start-gb",
+        type=float,
+        default=0.0,
+        help="CPU DRAM capacity per Vera CPU in decimal GB.",
+    )
+    parser.add_argument(
+        "--capacity-stop-gb",
+        type=float,
+        default=1000.0,
+        help="Inclusive CPU DRAM capacity per Vera CPU in decimal GB.",
+    )
+    parser.add_argument(
+        "--capacity-step-gb",
+        type=float,
+        default=200.0,
+        help="CPU DRAM capacity step per Vera CPU in decimal GB.",
+    )
     parser.add_argument("--sessions", type=int, default=144)
     parser.add_argument("--seed", type=int, default=20260728)
     parser.add_argument("--session-arrival-rate", type=float, default=2.0)
@@ -79,7 +95,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--smoke-test",
         action="store_true",
         help=(
-            "Run one session at 0 and 100 GB with at most two workers. "
+            "Run one session at 0 and 200 GB per CPU with at most two workers. "
             "This validates multiprocessing, metrics collection, and graphs."
         ),
     )
@@ -100,7 +116,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise SystemExit("--max-workers must be positive")
 
     if args.smoke_test:
-        capacities = [0.0, 100.0]
+        capacities = [0.0, 200.0]
         sessions = 1
         max_workers = min(args.max_workers, 2)
     else:
