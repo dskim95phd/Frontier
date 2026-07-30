@@ -19,7 +19,13 @@ using OrderedJson = nlohmann::ordered_json;
 
 bool has_scheduler_contract(int schema_version) {
   return schema_version == config::kSchedulerSchemaVersion ||
-      schema_version == config::kParallelSchemaVersion;
+      schema_version == config::kParallelSchemaVersion ||
+      schema_version == config::kPddSchemaVersion;
+}
+
+bool has_parallel_contract(int schema_version) {
+  return schema_version == config::kParallelSchemaVersion ||
+      schema_version == config::kPddSchemaVersion;
 }
 
 void require_valid_time(SimTime time, std::string_view field) {
@@ -87,6 +93,36 @@ void validate_request_metrics(
             "first token completion must not precede prefill completion");
       }
     }
+    if (schema_version == config::kPddSchemaVersion) {
+      if (!request.prefill_replica_id.has_value() ||
+          !request.prefill_dp_id.has_value() ||
+          !request.decode_replica_id.has_value() ||
+          !request.decode_dp_id.has_value() ||
+          !request.transfer_id.has_value() ||
+          !request.kv_cache_transfer_start_time.has_value() ||
+          !request.kv_cache_transfer_end_time.has_value() ||
+          !request.decode_arrived_at.has_value() ||
+          request.kv_cache_transfer_size_bytes == 0) {
+        throw std::invalid_argument(
+            "schema v4 request metrics require complete PDD ownership");
+      }
+      const SimTime transfer_start =
+          request.kv_cache_transfer_start_time.value();
+      const SimTime transfer_end =
+          request.kv_cache_transfer_end_time.value();
+      const SimTime decode_arrival =
+          request.decode_arrived_at.value();
+      require_valid_time(transfer_start, "kv transfer start");
+      require_valid_time(transfer_end, "kv transfer end");
+      require_valid_time(decode_arrival, "decode arrival");
+      if (transfer_start.seconds() <
+              request.prefill_completed_at.seconds() ||
+          transfer_end.seconds() < transfer_start.seconds() ||
+          decode_arrival != transfer_end) {
+        throw std::invalid_argument(
+            "schema v4 transfer timestamps are out of order");
+      }
+    }
   }
 }
 
@@ -129,6 +165,39 @@ OrderedJson serialize_request(
   if (schema_version == config::kParallelSchemaVersion) {
     json["replica_id"] = request.replica_id.value();
     json["dp_id"] = request.dp_id.value();
+  } else if (schema_version == config::kPddSchemaVersion) {
+    if (!request.prefill_replica_id.has_value() ||
+        !request.prefill_dp_id.has_value() ||
+        !request.decode_replica_id.has_value() ||
+        !request.decode_dp_id.has_value() ||
+        !request.transfer_id.has_value() ||
+        !request.kv_cache_transfer_start_time.has_value() ||
+        !request.kv_cache_transfer_end_time.has_value() ||
+        !request.decode_arrived_at.has_value() ||
+        request.kv_cache_transfer_size_bytes == 0) {
+      throw std::invalid_argument(
+          "schema v4 request metrics require complete PDD ownership");
+    }
+    json["prefill_replica_id"] =
+        request.prefill_replica_id->value();
+    json["prefill_dp_id"] = request.prefill_dp_id->value();
+    json["decode_replica_id"] =
+        request.decode_replica_id->value();
+    json["decode_dp_id"] = request.decode_dp_id->value();
+    json["transfer_id"] = request.transfer_id->value();
+    json["kv_cache_transfer_start_time_s"] =
+        request.kv_cache_transfer_start_time->seconds();
+    json["kv_cache_transfer_end_time_s"] =
+        request.kv_cache_transfer_end_time->seconds();
+    json["kv_cache_transfer_time_ms"] =
+        milliseconds_between(
+            request.kv_cache_transfer_end_time.value(),
+            request.kv_cache_transfer_start_time.value(),
+            "kv_cache_transfer_end_time");
+    json["kv_cache_transfer_size_bytes"] =
+        request.kv_cache_transfer_size_bytes;
+    json["decode_arrived_at_s"] =
+        request.decode_arrived_at->seconds();
   }
   return json;
 }
@@ -157,6 +226,14 @@ OrderedJson serialize_event(const Event& event) {
   }
   if (event.payload.generation.has_value()) {
     json["generation"] = event.payload.generation->value();
+  }
+  if (event.payload.cluster_type.has_value()) {
+    json["cluster_type"] =
+        to_string(event.payload.cluster_type.value());
+  }
+  if (event.payload.transfer_id.has_value()) {
+    json["transfer_id"] =
+        event.payload.transfer_id->value();
   }
   return json;
 }
@@ -208,11 +285,14 @@ OrderedJson serialize_batch(
   json["num_prefill_tokens"] = batch.num_prefill_tokens;
   json["num_decode_tokens"] = batch.num_decode_tokens;
   json["predicted_execution_ms"] = batch.predicted_execution_ms;
-  if (schema_version == config::kParallelSchemaVersion) {
+  if (has_parallel_contract(schema_version)) {
     json["replica_id"] = batch.replica_id.value();
     json["dp_id"] = batch.dp_id.value();
     json["num_pipeline_stages"] =
         batch.num_pipeline_stages;
+    if (schema_version == config::kPddSchemaVersion) {
+      json["cluster_type"] = to_string(batch.cluster_type);
+    }
   }
   return json;
 }
@@ -238,7 +318,7 @@ OrderedJson serialize_batch_stage(
     throw std::invalid_argument(
         "batch stage execution time is invalid");
   }
-  return OrderedJson::object({
+  OrderedJson json = OrderedJson::object({
       {"batch_id", stage.batch_id.value()},
       {"replica_id", stage.replica_id.value()},
       {"dp_id", stage.dp_id.value()},
@@ -251,6 +331,10 @@ OrderedJson serialize_batch_stage(
       {"pp_communication_ms", execution.pp_communication_ms},
       {"duration_ms", execution.total_ms()},
   });
+  if (stage.cluster_type != ClusterType::kMonolithic) {
+    json["cluster_type"] = to_string(stage.cluster_type);
+  }
+  return json;
 }
 
 OrderedJson serialize_scheduler_trace(
@@ -293,11 +377,47 @@ OrderedJson serialize_scheduler_trace(
     json["batch_request_ids"].push_back(request_id.value());
   }
   json["request_num_tokens"] = trace.request_num_tokens;
-  if (schema_version == config::kParallelSchemaVersion) {
+  if (has_parallel_contract(schema_version)) {
     json["replica_id"] = trace.replica_id.value();
     json["dp_id"] = trace.dp_id.value();
+    if (schema_version == config::kPddSchemaVersion) {
+      json["cluster_type"] = to_string(trace.cluster_type);
+    }
   }
   return json;
+}
+
+OrderedJson serialize_kv_cache_transfer(
+    const KVCacheTransferMetricsRecord& transfer) {
+  require_valid_time(transfer.started_at, "transfer.started_at");
+  require_valid_time(transfer.completed_at, "transfer.completed_at");
+  if (transfer.completed_at.seconds() <
+          transfer.started_at.seconds() ||
+      transfer.size_bytes == 0 ||
+      !std::isfinite(transfer.predicted_time_ms) ||
+      transfer.predicted_time_ms < 0.0) {
+    throw std::invalid_argument(
+        "KV transfer metrics are invalid");
+  }
+  return OrderedJson::object({
+      {"transfer_id", transfer.transfer_id.value()},
+      {"request_id", transfer.request_id.value()},
+      {"source_batch_id", transfer.source_batch_id.value()},
+      {
+          "source_cluster_type",
+          to_string(transfer.source_cluster_type),
+      },
+      {
+          "target_cluster_type",
+          to_string(transfer.target_cluster_type),
+      },
+      {"source_replica_id", transfer.source_replica_id.value()},
+      {"source_dp_id", transfer.source_dp_id.value()},
+      {"size_bytes", transfer.size_bytes},
+      {"predicted_time_ms", transfer.predicted_time_ms},
+      {"started_at_s", transfer.started_at.seconds()},
+      {"completed_at_s", transfer.completed_at.seconds()},
+  });
 }
 
 OrderedJson serialize_diagnostic(
@@ -358,6 +478,10 @@ std::string_view to_string(EventType event_type) noexcept {
       return "cluster_batch_end";
     case EventType::kGlobalBatchEnd:
       return "global_batch_end";
+    case EventType::kKvCacheTransferStart:
+      return "kv_cache_transfer_start";
+    case EventType::kKvCacheTransferEnd:
+      return "kv_cache_transfer_end";
   }
   return "unknown";
 }
@@ -376,9 +500,10 @@ std::string serialize_simulation_output_json(
     const SimulationOutput& output) {
   if (output.schema_version != config::kFoundationSchemaVersion &&
       output.schema_version != config::kSchedulerSchemaVersion &&
-      output.schema_version != config::kParallelSchemaVersion) {
+      output.schema_version != config::kParallelSchemaVersion &&
+      output.schema_version != config::kPddSchemaVersion) {
     throw std::invalid_argument(
-        "output schema_version must be 1, 2, or 3");
+        "output schema_version must be 1, 2, 3, or 4");
   }
   if (output.run.run_id.empty()) {
     throw std::invalid_argument("output run_id must not be empty");
@@ -432,12 +557,21 @@ std::string serialize_simulation_output_json(
               trace, output.schema_version));
     }
   }
-  if (output.schema_version == config::kParallelSchemaVersion) {
+  if (has_parallel_contract(output.schema_version)) {
     root["batch_stages"] = OrderedJson::array();
     for (const BatchStageMetricsRecord& stage :
          output.batch_stages) {
       root["batch_stages"].push_back(
           serialize_batch_stage(stage));
+    }
+  }
+
+  if (output.schema_version == config::kPddSchemaVersion) {
+    root["kv_cache_transfers"] = OrderedJson::array();
+    for (const KVCacheTransferMetricsRecord& transfer :
+         output.kv_cache_transfers) {
+      root["kv_cache_transfers"].push_back(
+          serialize_kv_cache_transfer(transfer));
     }
   }
 
@@ -480,9 +614,19 @@ std::string serialize_request_metrics_csv(
            "prefill_completed_at_s,first_token_completed_at_s,"
            "completed_at_s,scheduling_delay_ms,ttft_ms,e2e_ms,"
            "num_processed_tokens,preemption_count,replica_id,dp_id\n";
+  } else if (schema_version == config::kPddSchemaVersion) {
+    output
+        << "request_id,arrived_at_s,first_scheduled_at_s,"
+           "prefill_completed_at_s,first_token_completed_at_s,"
+           "completed_at_s,scheduling_delay_ms,ttft_ms,e2e_ms,"
+           "num_processed_tokens,preemption_count,"
+           "prefill_replica_id,prefill_dp_id,decode_replica_id,decode_dp_id,"
+           "transfer_id,kv_cache_transfer_start_time_s,"
+           "kv_cache_transfer_end_time_s,kv_cache_transfer_time_ms,"
+           "kv_cache_transfer_size_bytes,decode_arrived_at_s\n";
   } else {
     throw std::invalid_argument(
-        "request CSV schema_version must be 1, 2, or 3");
+        "request CSV schema_version must be 1, 2, 3, or 4");
   }
 
   for (const RequestMetricsRecord& request : requests) {
@@ -518,6 +662,23 @@ std::string serialize_request_metrics_csv(
       if (schema_version == config::kParallelSchemaVersion) {
         output << ',' << request.replica_id.value() << ','
                << request.dp_id.value();
+      } else if (schema_version == config::kPddSchemaVersion) {
+        output << ',' << request.prefill_replica_id->value()
+               << ',' << request.prefill_dp_id->value()
+               << ',' << request.decode_replica_id->value()
+               << ',' << request.decode_dp_id->value()
+               << ',' << request.transfer_id->value()
+               << ','
+               << request.kv_cache_transfer_start_time->seconds()
+               << ','
+               << request.kv_cache_transfer_end_time->seconds()
+               << ','
+               << (
+                      request.kv_cache_transfer_end_time->seconds() -
+                      request.kv_cache_transfer_start_time->seconds()) *
+                      1e3
+               << ',' << request.kv_cache_transfer_size_bytes
+               << ',' << request.decode_arrived_at->seconds();
       }
     }
     output << '\n';

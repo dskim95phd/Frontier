@@ -33,6 +33,10 @@ FRONTIER_DECLARE_EVENT_HANDLER(
     ClusterBatchEndEvent, kClusterBatchEnd);
 FRONTIER_DECLARE_EVENT_HANDLER(
     GlobalBatchEndEvent, kGlobalBatchEnd);
+FRONTIER_DECLARE_EVENT_HANDLER(
+    KVCacheTransferStartEvent, kKvCacheTransferStart);
+FRONTIER_DECLARE_EVENT_HANDLER(
+    KVCacheTransferEndEvent, kKvCacheTransferEnd);
 
 #undef FRONTIER_DECLARE_EVENT_HANDLER
 
@@ -52,6 +56,8 @@ class EventDispatcher {
   BatchStageEndEvent batch_stage_end_;
   ClusterBatchEndEvent cluster_batch_end_;
   GlobalBatchEndEvent global_batch_end_;
+  KVCacheTransferStartEvent kv_cache_transfer_start_;
+  KVCacheTransferEndEvent kv_cache_transfer_end_;
 };
 
 }  // namespace frontier::events

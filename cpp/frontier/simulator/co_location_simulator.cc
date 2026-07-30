@@ -75,14 +75,21 @@ void validate_inputs(
     const config::SimulationConfig& config,
     const std::vector<request_generator::WorkloadRequest>& workload) {
   if (config.schema_version != config::kSchedulerSchemaVersion &&
-      config.schema_version != config::kParallelSchemaVersion) {
+      config.schema_version != config::kParallelSchemaVersion &&
+      config.schema_version != config::kPddSchemaVersion) {
     throw CoLocationSimulationError(
-        "co-location scheduler requires config schema_version=2 or 3");
+        "typed scheduler requires config schema_version=2, 3, or 4");
   }
-  if (config.system_architecture !=
-      config::SystemArchitecture::kCoLocation) {
+  const bool pdd =
+      config.schema_version == config::kPddSchemaVersion;
+  if ((!pdd &&
+       config.system_architecture !=
+           config::SystemArchitecture::kCoLocation) ||
+      (pdd &&
+       config.system_architecture !=
+           config::SystemArchitecture::kPdDisaggregation)) {
     throw CoLocationSimulationError(
-        "Step 2 scheduler supports only co-location");
+        "scheduler schema and system architecture disagree");
   }
   if (config.enable_parallel_clusters) {
     throw CoLocationSimulationError(
@@ -92,8 +99,12 @@ void validate_inputs(
     throw CoLocationSimulationError(
         "Step 2 scheduler requires prefix caching disabled");
   }
-  if (!config.scheduler.has_value() ||
-      !config.execution_model.has_value()) {
+  if ((!pdd &&
+       (!config.scheduler.has_value() ||
+        !config.execution_model.has_value())) ||
+      (pdd &&
+       (!config.clusters.has_value() ||
+        !config.kv_cache_transfer.has_value()))) {
     throw CoLocationSimulationError(
         "schema v2 requires scheduler and execution model configs");
   }
@@ -256,6 +267,17 @@ metrics::RequestMetricsRecord make_request_metrics(
       // Production Python records this list only for disaggregated decode
       // clusters; MONOLITHIC exposes the count but keeps the list empty.
       .tokens_at_preemption = {},
+      .replica_id = ReplicaId{0},
+      .dp_id = DataParallelId{0},
+      .prefill_replica_id = std::nullopt,
+      .prefill_dp_id = std::nullopt,
+      .decode_replica_id = std::nullopt,
+      .decode_dp_id = std::nullopt,
+      .transfer_id = std::nullopt,
+      .kv_cache_transfer_start_time = std::nullopt,
+      .kv_cache_transfer_end_time = std::nullopt,
+      .decode_arrived_at = std::nullopt,
+      .kv_cache_transfer_size_bytes = 0,
   };
 }
 
@@ -266,7 +288,8 @@ metrics::SimulationOutput run_co_location_simulation(
     const std::vector<request_generator::WorkloadRequest>& workload) {
   validate_inputs(config, workload);
   request_generator::validate_workload_for_config(workload, config);
-  if (config.schema_version == config::kParallelSchemaVersion) {
+  if (config.schema_version == config::kParallelSchemaVersion ||
+      config.schema_version == config::kPddSchemaVersion) {
     return run_step25_simulation(config, workload);
   }
 
@@ -311,6 +334,7 @@ metrics::SimulationOutput run_co_location_simulation(
       .scheduler_trace = {},
       .event_trace = {},
       .analytical_diagnostics = {},
+      .kv_cache_transfers = {},
   };
   output.event_trace.reserve(workload.size() * 3);
 
@@ -346,7 +370,9 @@ metrics::SimulationOutput run_co_location_simulation(
           scheduler::BaseClusterScheduler& cluster =
               global_scheduler.get_cluster_scheduler(
                   assignment.cluster_type);
-          cluster.add_request(assignment.request_id);
+          cluster.add_request(
+              assignment.request_id,
+              request.arrived_at());
           static_cast<void>(cluster.schedule());
         }
         event_queue.push(event.time, EventType::kSchedulerPoll);
@@ -462,6 +488,8 @@ metrics::SimulationOutput run_co_location_simulation(
       case EventType::kBatchStageEnd:
       case EventType::kClusterBatchEnd:
       case EventType::kGlobalBatchEnd:
+      case EventType::kKvCacheTransferStart:
+      case EventType::kKvCacheTransferEnd:
         throw CoLocationSimulationError(
             "schema v3 event leaked into schema v2");
     }

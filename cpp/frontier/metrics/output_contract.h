@@ -39,6 +39,15 @@ struct RequestMetricsRecord {
   std::vector<std::uint64_t> tokens_at_preemption;
   ReplicaId replica_id{0};
   DataParallelId dp_id{0};
+  std::optional<ReplicaId> prefill_replica_id;
+  std::optional<DataParallelId> prefill_dp_id;
+  std::optional<ReplicaId> decode_replica_id;
+  std::optional<DataParallelId> decode_dp_id;
+  std::optional<TransferId> transfer_id;
+  std::optional<SimTime> kv_cache_transfer_start_time;
+  std::optional<SimTime> kv_cache_transfer_end_time;
+  std::optional<SimTime> decode_arrived_at;
+  std::uint64_t kv_cache_transfer_size_bytes = 0;
 };
 
 struct BatchMetricsRecord {
@@ -55,6 +64,7 @@ struct BatchMetricsRecord {
   ReplicaId replica_id{0};
   DataParallelId dp_id{0};
   std::uint64_t num_pipeline_stages = 1;
+  ClusterType cluster_type = ClusterType::kMonolithic;
 };
 
 struct BatchStageMetricsRecord {
@@ -66,6 +76,7 @@ struct BatchStageMetricsRecord {
   SimTime started_at;
   SimTime completed_at;
   entities::ExecutionTime execution_time;
+  ClusterType cluster_type = ClusterType::kMonolithic;
 };
 
 struct SchedulerDecisionRecord {
@@ -93,6 +104,21 @@ struct SchedulerTraceRecord {
   std::vector<std::uint64_t> request_num_tokens;
   ReplicaId replica_id{0};
   DataParallelId dp_id{0};
+  ClusterType cluster_type = ClusterType::kMonolithic;
+};
+
+struct KVCacheTransferMetricsRecord {
+  TransferId transfer_id;
+  RequestId request_id;
+  BatchId source_batch_id;
+  ClusterType source_cluster_type = ClusterType::kPrefill;
+  ClusterType target_cluster_type = ClusterType::kDecode;
+  ReplicaId source_replica_id{0};
+  DataParallelId source_dp_id{0};
+  std::uint64_t size_bytes = 0;
+  double predicted_time_ms = 0.0;
+  SimTime started_at = SimTime::from_seconds(0.0);
+  SimTime completed_at = SimTime::from_seconds(0.0);
 };
 
 struct AnalyticalDiagnostic {
@@ -109,6 +135,7 @@ struct SimulationOutput {
   std::vector<SchedulerTraceRecord> scheduler_trace;
   std::vector<Event> event_trace;
   std::vector<AnalyticalDiagnostic> analytical_diagnostics;
+  std::vector<KVCacheTransferMetricsRecord> kv_cache_transfers;
 };
 
 [[nodiscard]] std::string_view to_string(EventType event_type) noexcept;

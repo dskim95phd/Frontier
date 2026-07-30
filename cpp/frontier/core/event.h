@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <optional>
 
+#include "frontier/core/cluster_type.h"
 #include "frontier/core/ids.h"
 
 namespace frontier {
@@ -37,6 +38,8 @@ enum class EventType : std::uint8_t {
   kBatchStageEnd,
   kClusterBatchEnd,
   kGlobalBatchEnd,
+  kKvCacheTransferStart,
+  kKvCacheTransferEnd,
 };
 
 struct EventPayload {
@@ -46,6 +49,8 @@ struct EventPayload {
   std::optional<DataParallelId> dp_id;
   std::optional<StageId> stage_id;
   std::optional<Generation> generation;
+  std::optional<ClusterType> cluster_type;
+  std::optional<TransferId> transfer_id;
 };
 
 struct Event {

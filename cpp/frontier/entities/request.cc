@@ -86,7 +86,20 @@ void Request::leave_waiting(SimTime time) {
   waiting_since_.reset();
 }
 
-void Request::on_arrival(SimTime time) {
+void Request::on_arrival(
+    SimTime time,
+    ClusterType cluster_type) {
+  if (cluster_type == ClusterType::kDecode) {
+    if (state_ != RequestState::kTransferInFlight ||
+        !kv_cache_transfer_end_time_.has_value() ||
+        time != kv_cache_transfer_end_time_.value()) {
+      throw RequestError(
+          "decode arrival requires a completed KV transfer");
+    }
+    decode_arrived_at_ = time;
+    enter_waiting(time);
+    return;
+  }
   if (state_ != RequestState::kPending) {
     throw RequestError("request arrived more than once");
   }
@@ -126,7 +139,8 @@ void Request::advance_scheduler_frontier(
 
 void Request::on_batch_completion(
     SimTime time,
-    std::uint64_t scheduled_tokens) {
+    std::uint64_t scheduled_tokens,
+    ClusterType cluster_type) {
   validate_time(time, "batch-completion");
   if (state_ != RequestState::kRunning || completed()) {
     throw RequestError("batch completed for a non-running request");
@@ -149,11 +163,13 @@ void Request::on_batch_completion(
       if (!prefill_completed_at_.has_value()) {
         prefill_completed_at_ = time;
       }
-      // Frontier's monolithic Python path exposes the first generated token
-      // at the same boundary as the final prefill chunk.
-      ++num_processed_tokens_;
-      if (!first_token_completed_at_.has_value()) {
-        first_token_completed_at_ = time;
+      if (cluster_type == ClusterType::kMonolithic) {
+        // Frontier's monolithic Python path exposes the first generated token
+        // at the same boundary as the final prefill chunk.
+        ++num_processed_tokens_;
+        if (!first_token_completed_at_.has_value()) {
+          first_token_completed_at_ = time;
+        }
       }
     }
   } else {
@@ -176,7 +192,9 @@ void Request::on_batch_completion(
   validate_progress();
 }
 
-void Request::on_preempted(SimTime time) {
+void Request::on_preempted(
+    SimTime time,
+    ClusterType cluster_type) {
   validate_time(time, "preemption");
   if (state_ != RequestState::kRunning || completed()) {
     throw RequestError("only a running request can be preempted");
@@ -185,12 +203,70 @@ void Request::on_preempted(SimTime time) {
   ++preemption_count_;
   ++runtime_epoch_;
   ++execution_epoch_;
-  num_processed_tokens_ = 0;
-  scheduler_num_computed_tokens_ = 0;
-  is_prefill_complete_ = false;
+  if (cluster_type == ClusterType::kDecode) {
+    // Production Python vLLM V1 recompute preemption resets both token
+    // frontiers to zero even in the unified DECODE cluster, while retaining
+    // the prefill-complete phase marker.  The imported KV is discarded and
+    // subsequent decode iterations rebuild the full request frontier.
+    num_processed_tokens_ = 0;
+    scheduler_num_computed_tokens_ = 0;
+    is_prefill_complete_ = true;
+  } else {
+    num_processed_tokens_ = 0;
+    scheduler_num_computed_tokens_ = 0;
+    is_prefill_complete_ = false;
+  }
   preempted_ = true;
   enter_waiting(time);
   validate_progress();
+}
+
+void Request::mark_prefill_transfer_pending() {
+  if (state_ != RequestState::kRunning ||
+      !is_prefill_complete_ ||
+      num_processed_tokens_ != num_prefill_tokens_) {
+    throw RequestError(
+        "only a fully prefetched running request can await transfer");
+  }
+  state_ = RequestState::kTransferPending;
+}
+
+void Request::on_kv_cache_transfer_start(SimTime time) {
+  validate_time(time, "kv-transfer-start");
+  if (state_ != RequestState::kTransferPending ||
+      kv_cache_transfer_start_time_.has_value()) {
+    throw RequestError(
+        "KV transfer start requires one pending transfer");
+  }
+  if (!prefill_completed_at_.has_value() ||
+      time.seconds() < prefill_completed_at_->seconds()) {
+    throw RequestError(
+        "KV transfer start precedes prefill completion");
+  }
+  kv_cache_transfer_start_time_ = time;
+  state_ = RequestState::kTransferInFlight;
+}
+
+void Request::on_kv_cache_transfer_complete(
+    SimTime time,
+    std::uint64_t size_bytes) {
+  validate_time(time, "kv-transfer-completion");
+  if (state_ != RequestState::kTransferInFlight ||
+      !kv_cache_transfer_start_time_.has_value() ||
+      kv_cache_transfer_end_time_.has_value()) {
+    throw RequestError(
+        "KV transfer completion requires one in-flight transfer");
+  }
+  if (time.seconds() <
+      kv_cache_transfer_start_time_->seconds()) {
+    throw RequestError(
+        "KV transfer completion precedes transfer start");
+  }
+  kv_cache_transfer_end_time_ = time;
+  kv_cache_transfer_size_bytes_ = size_bytes;
+  kv_cache_transfer_time_s_ =
+      time.seconds() -
+      kv_cache_transfer_start_time_->seconds();
 }
 
 }  // namespace frontier::entities

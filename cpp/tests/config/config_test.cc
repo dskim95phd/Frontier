@@ -11,6 +11,7 @@
 namespace {
 
 using frontier::config::ConfigError;
+using frontier::config::SimulationConfig;
 using frontier::config::SimulationMode;
 using frontier::config::SystemArchitecture;
 using frontier::config::parse_simulation_config_json;
@@ -130,6 +131,78 @@ void test_checked_in_step2_configs() {
             unsupported_analytical));
       },
       "unsupported analytical hardware must fail fast");
+}
+
+void test_checked_in_step3_config_round_trip() {
+  const std::filesystem::path fixture_root{
+      FRONTIER_TEST_FIXTURE_DIR};
+  const auto config = parse_simulation_config_json(read_text_file(
+      fixture_root / "config/step3_fixed_pdd.json"));
+  expect(
+      config.schema_version == frontier::config::kPddSchemaVersion &&
+          config.system_architecture ==
+              SystemArchitecture::kPdDisaggregation &&
+          config.clusters.has_value() &&
+          config.kv_cache_transfer.has_value(),
+      "Step 3 fixture must select schema v4 sequential PDD");
+  expect(
+      parse_simulation_config_json(
+          serialize_simulation_config_json(config)) == config,
+      "schema v4 must round-trip deterministically");
+}
+
+void test_step3_rejects_deferred_and_invalid_surfaces() {
+  const std::filesystem::path fixture_root{
+      FRONTIER_TEST_FIXTURE_DIR};
+  const auto config = parse_simulation_config_json(read_text_file(
+      fixture_root / "config/step3_fixed_pdd.json"));
+
+  SimulationConfig parallel = config;
+  parallel.enable_parallel_clusters = true;
+  expect_throws<ConfigError>(
+      [&parallel] {
+        static_cast<void>(
+            serialize_simulation_config_json(parallel));
+      },
+      "Step 3 parallel clusters must be rejected");
+
+  SimulationConfig prefix = config;
+  prefix.prefix_cache.enabled = true;
+  expect_throws<ConfigError>(
+      [&prefix] {
+        static_cast<void>(
+            serialize_simulation_config_json(prefix));
+      },
+      "Step 3 prefix caching must remain deferred");
+
+  SimulationConfig compression = config;
+  compression.kv_cache_transfer->enable_compression = true;
+  expect_throws<ConfigError>(
+      [&compression] {
+        static_cast<void>(parse_simulation_config_json(
+            serialize_simulation_config_json(compression)));
+      },
+      "Step 3 transfer compression must remain deferred");
+
+  SimulationConfig bad_pipeline = config;
+  bad_pipeline.clusters->prefill.parallelism
+      .pipeline_parallel_size = 3;
+  expect_throws<ConfigError>(
+      [&bad_pipeline] {
+        static_cast<void>(parse_simulation_config_json(
+            serialize_simulation_config_json(bad_pipeline)));
+      },
+      "pipeline size that does not divide the model must fail");
+
+  SimulationConfig bad_stages = config;
+  bad_stages.clusters->decode.execution_model.fixed
+      .stage_latencies_ms = {1.0, 1.0};
+  expect_throws<ConfigError>(
+      [&bad_stages] {
+        static_cast<void>(parse_simulation_config_json(
+            serialize_simulation_config_json(bad_stages)));
+      },
+      "fixed stage count must equal pipeline parallel size");
 }
 
 void test_sequential_pdd_is_accepted() {
@@ -359,6 +432,12 @@ int main() {
   failures += frontier::test::run(
       "checked-in Step 2 configs",
       test_checked_in_step2_configs);
+  failures += frontier::test::run(
+      "checked-in Step 3 config round trip",
+      test_checked_in_step3_config_round_trip);
+  failures += frontier::test::run(
+      "Step 3 rejects deferred and invalid surfaces",
+      test_step3_rejects_deferred_and_invalid_surfaces);
   failures += frontier::test::run(
       "sequential PDD is accepted",
       test_sequential_pdd_is_accepted);

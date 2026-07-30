@@ -624,10 +624,100 @@ ExecutionModelConfig parse_execution_model(
       type + "'");
 }
 
+ClusterRuntimeConfig parse_cluster_runtime(
+    const Json& clusters,
+    std::string_view name) {
+  const std::string context =
+      "config.clusters." + std::string{name};
+  if (!clusters.contains(name)) {
+    throw ConfigError(
+        "config.clusters is missing required field '" +
+        std::string{name} + "'");
+  }
+  const Json& cluster = clusters.at(name);
+  require_exact_keys(
+      cluster,
+      {"parallelism", "scheduler", "execution_model"},
+      context);
+  const ParallelismConfig parallelism =
+      parse_parallelism(cluster);
+  return ClusterRuntimeConfig{
+      .parallelism = parallelism,
+      .scheduler = parse_scheduler(cluster),
+      .execution_model = parse_execution_model(
+          cluster,
+          kParallelSchemaVersion,
+          parallelism),
+  };
+}
+
+PddClustersConfig parse_pdd_clusters(const Json& root) {
+  const Json& clusters = root.at("clusters");
+  require_exact_keys(
+      clusters,
+      {"prefill", "decode"},
+      "config.clusters");
+  return PddClustersConfig{
+      .prefill = parse_cluster_runtime(clusters, "prefill"),
+      .decode = parse_cluster_runtime(clusters, "decode"),
+  };
+}
+
+KvCacheTransferConfig parse_kv_cache_transfer(const Json& root) {
+  const Json& transfer = root.at("kv_cache_transfer");
+  require_exact_keys(
+      transfer,
+      {
+          "type",
+          "network_bandwidth_gbps",
+          "network_latency_ms",
+          "kv_cache_dtype_size_bytes",
+          "enable_compression",
+      },
+      "config.kv_cache_transfer");
+  const std::string type = require_string(
+      transfer, "type", "config.kv_cache_transfer");
+  if (type != "analytical") {
+    throw ConfigError(
+        "config.kv_cache_transfer.type must be 'analytical'");
+  }
+  KvCacheTransferConfig parsed{
+      .network_bandwidth_gbps = require_finite_number(
+          transfer,
+          "network_bandwidth_gbps",
+          "config.kv_cache_transfer"),
+      .network_latency_ms = require_finite_number(
+          transfer,
+          "network_latency_ms",
+          "config.kv_cache_transfer"),
+      .kv_cache_dtype_size_bytes = require_finite_number(
+          transfer,
+          "kv_cache_dtype_size_bytes",
+          "config.kv_cache_transfer"),
+      .enable_compression = require_bool(
+          transfer,
+          "enable_compression",
+          "config.kv_cache_transfer"),
+  };
+  if (parsed.network_bandwidth_gbps <= 0.0 ||
+      parsed.network_latency_ms < 0.0 ||
+      parsed.kv_cache_dtype_size_bytes <= 0.0) {
+    throw ConfigError(
+        "config.kv_cache_transfer requires positive bandwidth/dtype and "
+        "nonnegative latency");
+  }
+  if (parsed.enable_compression) {
+    throw ConfigError(
+        "config.kv_cache_transfer.enable_compression=true is outside Step 3");
+  }
+  return parsed;
+}
+
 void validate_common_for_serialization(const SimulationConfig& config) {
   if (config.schema_version != kFoundationSchemaVersion &&
       config.schema_version != kSchedulerSchemaVersion &&
-      config.schema_version != kParallelSchemaVersion) {
+      config.schema_version != kParallelSchemaVersion &&
+      config.schema_version != kPddSchemaVersion) {
     throw ConfigError(
         "cannot serialize unsupported config schema_version=" +
         std::to_string(config.schema_version));
@@ -737,6 +827,42 @@ OrderedJson serialize_execution_model(
     return ordered;
   }
   return result;
+}
+
+OrderedJson serialize_cluster_runtime(
+    const ClusterRuntimeConfig& cluster) {
+  return OrderedJson::object({
+      {"parallelism", serialize_parallelism(cluster.parallelism)},
+      {"scheduler", serialize_scheduler(cluster.scheduler)},
+      {
+          "execution_model",
+          serialize_execution_model(
+              cluster.execution_model,
+              kParallelSchemaVersion),
+      },
+  });
+}
+
+OrderedJson serialize_pdd_clusters(
+    const PddClustersConfig& clusters) {
+  return OrderedJson::object({
+      {"prefill", serialize_cluster_runtime(clusters.prefill)},
+      {"decode", serialize_cluster_runtime(clusters.decode)},
+  });
+}
+
+OrderedJson serialize_kv_cache_transfer(
+    const KvCacheTransferConfig& transfer) {
+  return OrderedJson::object({
+      {"type", "analytical"},
+      {"network_bandwidth_gbps", transfer.network_bandwidth_gbps},
+      {"network_latency_ms", transfer.network_latency_ms},
+      {
+          "kv_cache_dtype_size_bytes",
+          transfer.kv_cache_dtype_size_bytes,
+      },
+      {"enable_compression", transfer.enable_compression},
+  });
 }
 
 }  // namespace
@@ -859,10 +985,25 @@ SimulationConfig parse_simulation_config_json(std::string_view json_text) {
             "execution_model",
         },
         "config");
+  } else if (schema_version == kPddSchemaVersion) {
+    require_exact_keys(
+        root,
+        {
+            "schema_version",
+            "run_id",
+            "simulation_mode",
+            "system_architecture",
+            "enable_parallel_clusters",
+            "prefix_cache",
+            "cluster_scheduler",
+            "clusters",
+            "kv_cache_transfer",
+        },
+        "config");
   } else {
     throw ConfigError(
         "unsupported config schema_version=" +
-        std::to_string(schema_version) + "; expected 1, 2, or 3");
+        std::to_string(schema_version) + "; expected 1, 2, 3, or 4");
   }
 
   std::string run_id = require_string(root, "run_id", "config");
@@ -893,6 +1034,36 @@ SimulationConfig parse_simulation_config_json(std::string_view json_text) {
         .cluster_scheduler = std::nullopt,
         .scheduler = std::nullopt,
         .execution_model = std::nullopt,
+        .clusters = std::nullopt,
+        .kv_cache_transfer = std::nullopt,
+    };
+  }
+
+  if (schema_version == kPddSchemaVersion) {
+    if (system_architecture !=
+        SystemArchitecture::kPdDisaggregation) {
+      throw ConfigError(
+          "schema v4 requires "
+          "system_architecture='pd-disaggregation'");
+    }
+    if (prefix_cache.enabled) {
+      throw ConfigError(
+          "schema v4 requires prefix_cache.enabled=false; "
+          "session prefix caching begins in Step 4");
+    }
+    return SimulationConfig{
+        .schema_version = schema_version,
+        .run_id = std::move(run_id),
+        .simulation_mode = simulation_mode,
+        .system_architecture = system_architecture,
+        .enable_parallel_clusters = enable_parallel_clusters,
+        .prefix_cache = prefix_cache,
+        .parallelism = std::nullopt,
+        .cluster_scheduler = parse_cluster_scheduler(root),
+        .scheduler = std::nullopt,
+        .execution_model = std::nullopt,
+        .clusters = parse_pdd_clusters(root),
+        .kv_cache_transfer = parse_kv_cache_transfer(root),
     };
   }
 
@@ -926,6 +1097,8 @@ SimulationConfig parse_simulation_config_json(std::string_view json_text) {
       .scheduler = parse_scheduler(root),
       .execution_model = parse_execution_model(
           root, schema_version, parallelism),
+      .clusters = std::nullopt,
+      .kv_cache_transfer = std::nullopt,
   };
 }
 
@@ -939,6 +1112,29 @@ std::string serialize_simulation_config_json(
   root["simulation_mode"] = to_string(config.simulation_mode);
   root["system_architecture"] = to_string(config.system_architecture);
   root["enable_parallel_clusters"] = config.enable_parallel_clusters;
+  if (config.schema_version == kPddSchemaVersion) {
+    if (config.system_architecture !=
+            SystemArchitecture::kPdDisaggregation ||
+        config.prefix_cache.enabled ||
+        !config.cluster_scheduler.has_value() ||
+        !config.clusters.has_value() ||
+        !config.kv_cache_transfer.has_value() ||
+        config.parallelism.has_value() ||
+        config.scheduler.has_value() ||
+        config.execution_model.has_value()) {
+      throw ConfigError(
+          "schema v4 requires sequential PDD cluster and transfer configs");
+    }
+    root["prefix_cache"] =
+        serialize_prefix_cache(config.prefix_cache);
+    root["cluster_scheduler"] =
+        serialize_cluster_scheduler(config.cluster_scheduler.value());
+    root["clusters"] =
+        serialize_pdd_clusters(config.clusters.value());
+    root["kv_cache_transfer"] =
+        serialize_kv_cache_transfer(config.kv_cache_transfer.value());
+    return root.dump(2) + '\n';
+  }
   if (config.schema_version == kParallelSchemaVersion) {
     if (!config.parallelism.has_value() ||
         !config.cluster_scheduler.has_value()) {
@@ -956,13 +1152,17 @@ std::string serialize_simulation_config_json(
     if (config.parallelism.has_value() ||
         config.cluster_scheduler.has_value() ||
         config.scheduler.has_value() ||
-        config.execution_model.has_value()) {
+        config.execution_model.has_value() ||
+        config.clusters.has_value() ||
+        config.kv_cache_transfer.has_value()) {
       throw ConfigError(
           "schema v1 must not contain parallel or scheduler fields");
     }
   } else {
     if (!config.scheduler.has_value() ||
-        !config.execution_model.has_value()) {
+        !config.execution_model.has_value() ||
+        config.clusters.has_value() ||
+        config.kv_cache_transfer.has_value()) {
       throw ConfigError(
           "scheduler schemas require scheduler and execution_model");
     }

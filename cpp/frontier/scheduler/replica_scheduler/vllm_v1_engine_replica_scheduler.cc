@@ -38,12 +38,14 @@ VllmV1Scheduler::VllmV1Scheduler(
         execution_model,
     ReplicaId replica_id,
     DataParallelId dp_id,
-    std::uint64_t pipeline_parallel_size)
+    std::uint64_t pipeline_parallel_size,
+    ClusterType cluster_type)
     : BaseReplicaScheduler(
           replica_id,
           dp_id,
           std::move(execution_model),
-          pipeline_parallel_size),
+          pipeline_parallel_size,
+          cluster_type),
       config_(std::move(config)),
       requests_(&requests),
       kv_blocks_(config_),
@@ -127,6 +129,13 @@ std::uint64_t VllmV1Scheduler::next_num_tokens(
     return value.num_prefill_tokens() -
         value.scheduler_num_computed_tokens();
   }
+  if (cluster_type() == ClusterType::kPrefill) {
+    throw SchedulerError(
+        "PREFILL scheduler retained a completed prefill as runnable");
+  }
+  if (cluster_type() == ClusterType::kDecode) {
+    return 1;
+  }
   if (value.num_processed_tokens() <
       value.scheduler_num_computed_tokens()) {
     throw SchedulerError(
@@ -138,6 +147,9 @@ std::uint64_t VllmV1Scheduler::next_num_tokens(
 
 std::uint64_t VllmV1Scheduler::kv_accounted_tokens(
     const entities::Request& value) const {
+  if (cluster_type() == ClusterType::kDecode) {
+    return value.scheduler_num_computed_tokens();
+  }
   if (!value.is_prefill_complete()) {
     return value.scheduler_num_computed_tokens();
   }
@@ -169,7 +181,8 @@ VllmV1Scheduler::select_preemption_victim(
 
 std::uint64_t
 VllmV1Scheduler::extra_terminal_release_iterations() const noexcept {
-  if (pipeline_parallel_size_ <= 1) {
+  if (cluster_type() != ClusterType::kMonolithic ||
+      pipeline_parallel_size_ <= 1) {
     return 0;
   }
   return pipeline_parallel_size_ / 2 - 1;
@@ -284,7 +297,7 @@ void VllmV1Scheduler::preempt_request(
   }
   running_.erase(running_position);
   static_cast<void>(kv_blocks_.free(victim));
-  value.on_preempted(time);
+  value.on_preempted(time, cluster_type());
   waiting_.push_front(victim);
   newly_preempted.push_back(victim);
   ++result.preempted_count;
@@ -419,7 +432,9 @@ ScheduleResult VllmV1Scheduler::schedule(SimTime time) {
       ++running_index;
       continue;
     }
-    if (request_is_active(request_id)) {
+    if (request_is_active(request_id) &&
+        (cluster_type() != ClusterType::kPrefill ||
+         value.is_prefill_complete())) {
       ++running_index;
       continue;
     }
@@ -475,11 +490,21 @@ ScheduleResult VllmV1Scheduler::schedule(SimTime time) {
   std::vector<ScheduledRequest> waiting_scheduled;
   if (preempted_requests.empty() &&
       pending_terminal_release_iterations_.empty()) {
-    std::deque<RequestId> queue = std::move(preempted_);
-    queue.insert(
-        queue.end(),
-        waiting_.begin(),
-        waiting_.end());
+    std::deque<RequestId> queue;
+    if (cluster_type() == ClusterType::kDecode) {
+      // Python's unified DECODE scheduler has one waiting queue. A newly
+      // preempted request is inserted at its front and must stay ahead of
+      // older preempted requests already waiting for readmission.
+      queue = std::move(waiting_);
+    } else {
+      // MONOLITHIC and PREFILL retain Python's two-list priority:
+      // _preempted_requests before newly arrived _request_queue entries.
+      queue = std::move(preempted_);
+      queue.insert(
+          queue.end(),
+          waiting_.begin(),
+          waiting_.end());
+    }
     preempted_.clear();
     waiting_.clear();
     std::deque<RequestId> skipped;
@@ -542,7 +567,8 @@ ScheduleResult VllmV1Scheduler::schedule(SimTime time) {
 
     queue.insert(queue.end(), skipped.begin(), skipped.end());
     for (const RequestId request_id : queue) {
-      if (request(request_id).preempted()) {
+      if (cluster_type() != ClusterType::kDecode &&
+          request(request_id).preempted()) {
         preempted_.push_back(request_id);
       } else {
         waiting_.push_back(request_id);
@@ -595,10 +621,20 @@ void VllmV1Scheduler::mark_batch_started(
   request_ids.reserve(batch.requests().size());
   for (const entities::RequestBatchSnapshot& snapshot :
        batch.requests()) {
-    if (!active_requests_.insert(snapshot.request_id).second) {
+    auto [position, inserted] =
+        active_requests_.try_emplace(snapshot.request_id, 0);
+    static_cast<void>(inserted);
+    if (cluster_type() != ClusterType::kPrefill &&
+        position->second != 0) {
       throw SchedulerError(
           "request is already active in another pipeline batch");
     }
+    if (position->second ==
+        std::numeric_limits<std::uint64_t>::max()) {
+      throw SchedulerError(
+          "active request batch count overflows uint64");
+    }
+    ++position->second;
     request_ids.push_back(snapshot.request_id);
   }
   if (!in_flight_batches_
@@ -624,17 +660,52 @@ bool VllmV1Scheduler::on_batch_completed(
   for (const entities::RequestBatchSnapshot& snapshot :
        batch.requests()) {
     entities::Request& value = request(snapshot.request_id);
+    if (snapshot.scheduler_frontier <
+        snapshot.scheduled_tokens) {
+      throw SchedulerError(
+          "batch snapshot scheduler frontier underflows");
+    }
+    const std::uint64_t expected_processed_tokens =
+        std::max(
+            snapshot.processed_tokens,
+            snapshot.scheduler_frontier -
+                snapshot.scheduled_tokens);
+    const bool frontier_matches =
+        cluster_type() == ClusterType::kPrefill
+        ? value.num_processed_tokens() ==
+                  expected_processed_tokens &&
+              value.scheduler_num_computed_tokens() >=
+                  snapshot.scheduler_frontier
+        : value.num_processed_tokens() ==
+                  snapshot.processed_tokens &&
+              value.scheduler_num_computed_tokens() ==
+                  snapshot.scheduler_frontier;
     if (value.completed() ||
         value.runtime_epoch() != snapshot.runtime_epoch ||
         value.execution_epoch() != snapshot.execution_epoch ||
-        value.num_processed_tokens() != snapshot.processed_tokens ||
-        value.scheduler_num_computed_tokens() !=
-            snapshot.scheduler_frontier) {
+        !frontier_matches) {
       continue;
     }
-    value.on_batch_completion(time, snapshot.scheduled_tokens);
+    value.on_batch_completion(
+        time,
+        snapshot.scheduled_tokens,
+        cluster_type());
     has_valid_request = true;
-    if (value.completed()) {
+    if (cluster_type() == ClusterType::kPrefill &&
+        value.is_prefill_complete()) {
+      const auto position = std::find(
+          running_.begin(), running_.end(), value.id());
+      if (position == running_.end()) {
+        throw SchedulerError(
+            "completed prefill is missing from running order");
+      }
+      running_.erase(position);
+      value.mark_prefill_transfer_pending();
+      if (!pending_kv_transfers_.insert(value.id()).second) {
+        throw SchedulerError(
+            "request already has a pending KV transfer");
+      }
+    } else if (value.completed()) {
       const std::uint64_t extra =
           extra_terminal_release_iterations();
       if (extra > 0) {
@@ -651,7 +722,16 @@ bool VllmV1Scheduler::on_batch_completed(
   }
   batch.mark_completed(time);
   for (const RequestId request_id : in_flight->second) {
-    active_requests_.erase(request_id);
+    const auto active = active_requests_.find(request_id);
+    if (active == active_requests_.end() ||
+        active->second == 0) {
+      throw SchedulerError(
+          "completed batch is missing active request state");
+    }
+    --active->second;
+    if (active->second == 0) {
+      active_requests_.erase(active);
+    }
   }
   in_flight_batches_.erase(in_flight);
   if (in_flight_batch_count_ == 0) {
@@ -662,6 +742,24 @@ bool VllmV1Scheduler::on_batch_completed(
   return has_valid_request;
 }
 
+void VllmV1Scheduler::complete_kv_transfer(
+    RequestId request_id) {
+  if (cluster_type() != ClusterType::kPrefill) {
+    throw SchedulerError(
+        "KV transfer completion must target a PREFILL scheduler");
+  }
+  if (!pending_kv_transfers_.erase(request_id)) {
+    throw SchedulerError(
+        "KV transfer completion has no pending source request");
+  }
+  if (kv_blocks_.allocated_blocks(request_id) == 0) {
+    throw SchedulerError(
+        "pending KV transfer source owns no blocks");
+  }
+  static_cast<void>(kv_blocks_.free(request_id));
+  validate_state();
+}
+
 bool VllmV1Scheduler::
 consume_terminal_release_followup_poll() noexcept {
   const bool pending = terminal_release_followup_poll_pending_;
@@ -670,6 +768,11 @@ consume_terminal_release_followup_poll() noexcept {
 }
 
 void VllmV1Scheduler::validate_state() const {
+  if (cluster_type() == ClusterType::kDecode &&
+      !preempted_.empty()) {
+    throw SchedulerError(
+        "DECODE scheduler must retain preempted requests in waiting order");
+  }
   std::unordered_set<RequestId, StrongIdHash<RequestId>> ids;
   for (const RequestId request_id : preempted_) {
     if (!ids.insert(request_id).second) {
@@ -713,16 +816,24 @@ void VllmV1Scheduler::validate_state() const {
       in_flight_batch_count_ > pipeline_parallel_size_) {
     throw SchedulerError("in-flight batch registry invariant failed");
   }
-  std::unordered_set<RequestId, StrongIdHash<RequestId>>
+  std::unordered_map<
+      RequestId,
+      std::uint64_t,
+      StrongIdHash<RequestId>>
       expected_active;
   for (const auto& [batch_id, request_ids] :
        in_flight_batches_) {
     static_cast<void>(batch_id);
     for (const RequestId request_id : request_ids) {
-      if (!expected_active.insert(request_id).second) {
+      auto [position, inserted] =
+          expected_active.try_emplace(request_id, 0);
+      static_cast<void>(inserted);
+      if (position->second ==
+          std::numeric_limits<std::uint64_t>::max()) {
         throw SchedulerError(
-            "request appears in multiple in-flight batches");
+            "expected active request count overflows uint64");
       }
+      ++position->second;
     }
   }
   if (expected_active != active_requests_) {
@@ -745,6 +856,16 @@ void VllmV1Scheduler::validate_state() const {
             running_.end()) {
       throw SchedulerError(
           "terminal release registry invariant failed");
+    }
+  }
+  for (const RequestId request_id : pending_kv_transfers_) {
+    const entities::RequestState state = request(request_id).state();
+    if ((state != entities::RequestState::kTransferPending &&
+         state != entities::RequestState::kTransferInFlight) ||
+        kv_blocks_.allocated_blocks(request_id) == 0 ||
+        ids.contains(request_id)) {
+      throw SchedulerError(
+          "pending KV transfer registry invariant failed");
     }
   }
 }

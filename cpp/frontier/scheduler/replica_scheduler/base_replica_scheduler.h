@@ -66,7 +66,8 @@ class BaseReplicaScheduler {
       std::unique_ptr<
           execution_time_predictor::BatchExecutionModel>
           execution_model,
-      std::uint64_t pipeline_parallel_size = 1);
+      std::uint64_t pipeline_parallel_size = 1,
+      ClusterType cluster_type = ClusterType::kMonolithic);
   virtual ~BaseReplicaScheduler() = default;
 
   BaseReplicaScheduler(const BaseReplicaScheduler&) = delete;
@@ -83,6 +84,15 @@ class BaseReplicaScheduler {
   [[nodiscard]] virtual bool
   consume_terminal_release_followup_poll() noexcept {
     return false;
+  }
+  virtual void complete_kv_transfer(RequestId request_id) {
+    static_cast<void>(request_id);
+    throw SchedulerError(
+        "replica scheduler has no pending KV transfer support");
+  }
+  [[nodiscard]] virtual std::size_t pending_kv_transfer_count()
+      const noexcept {
+    return 0;
   }
 
   [[nodiscard]] virtual bool has_in_flight_batch()
@@ -106,6 +116,9 @@ class BaseReplicaScheduler {
   [[nodiscard]] DataParallelId dp_id() const noexcept {
     return dp_id_;
   }
+  [[nodiscard]] ClusterType cluster_type() const noexcept {
+    return cluster_type_;
+  }
   [[nodiscard]] ReplicaStageScheduler& get_replica_stage_scheduler(
       StageId stage_id);
   [[nodiscard]] const ReplicaStageScheduler&
@@ -114,6 +127,7 @@ class BaseReplicaScheduler {
  private:
   ReplicaId replica_id_;
   DataParallelId dp_id_;
+  ClusterType cluster_type_;
   std::vector<ReplicaStageScheduler> stage_schedulers_;
 };
 

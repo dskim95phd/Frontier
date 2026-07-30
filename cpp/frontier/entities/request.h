@@ -5,6 +5,7 @@
 #include <stdexcept>
 #include <vector>
 
+#include "frontier/core/cluster_type.h"
 #include "frontier/core/event.h"
 #include "frontier/core/ids.h"
 #include "frontier/request_generator/workload.h"
@@ -15,6 +16,8 @@ enum class RequestState : std::uint8_t {
   kPending,
   kWaiting,
   kRunning,
+  kTransferPending,
+  kTransferInFlight,
   kCompleted,
 };
 
@@ -93,17 +96,46 @@ class Request {
   [[nodiscard]] const std::optional<SimTime>& completed_at() const noexcept {
     return completed_at_;
   }
+  [[nodiscard]] const std::optional<SimTime>&
+  kv_cache_transfer_start_time() const noexcept {
+    return kv_cache_transfer_start_time_;
+  }
+  [[nodiscard]] const std::optional<SimTime>&
+  kv_cache_transfer_end_time() const noexcept {
+    return kv_cache_transfer_end_time_;
+  }
+  [[nodiscard]] const std::optional<SimTime>&
+  decode_arrived_at() const noexcept {
+    return decode_arrived_at_;
+  }
+  [[nodiscard]] std::uint64_t kv_cache_transfer_size_bytes()
+      const noexcept {
+    return kv_cache_transfer_size_bytes_;
+  }
+  [[nodiscard]] double kv_cache_transfer_time_s() const noexcept {
+    return kv_cache_transfer_time_s_;
+  }
   [[nodiscard]] double cumulative_waiting_time_s() const noexcept {
     return cumulative_waiting_time_s_;
   }
 
-  void on_arrival(SimTime time);
+  void on_arrival(
+      SimTime time,
+      ClusterType cluster_type = ClusterType::kMonolithic);
   void on_admitted(SimTime time);
   void advance_scheduler_frontier(std::uint64_t scheduled_tokens);
   void on_batch_completion(
       SimTime time,
-      std::uint64_t scheduled_tokens);
-  void on_preempted(SimTime time);
+      std::uint64_t scheduled_tokens,
+      ClusterType cluster_type = ClusterType::kMonolithic);
+  void on_preempted(
+      SimTime time,
+      ClusterType cluster_type = ClusterType::kMonolithic);
+  void mark_prefill_transfer_pending();
+  void on_kv_cache_transfer_start(SimTime time);
+  void on_kv_cache_transfer_complete(
+      SimTime time,
+      std::uint64_t size_bytes);
 
  private:
   void enter_waiting(SimTime time);
@@ -132,6 +164,11 @@ class Request {
   std::optional<SimTime> prefill_completed_at_;
   std::optional<SimTime> first_token_completed_at_;
   std::optional<SimTime> completed_at_;
+  std::optional<SimTime> kv_cache_transfer_start_time_;
+  std::optional<SimTime> kv_cache_transfer_end_time_;
+  std::optional<SimTime> decode_arrived_at_;
+  std::uint64_t kv_cache_transfer_size_bytes_ = 0;
+  double kv_cache_transfer_time_s_ = 0.0;
   std::optional<SimTime> waiting_since_;
   double cumulative_waiting_time_s_ = 0.0;
 };

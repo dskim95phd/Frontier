@@ -30,7 +30,8 @@ Batch::Batch(
     Generation schedule_epoch,
     ReplicaId replica_id,
     DataParallelId dp_id,
-    std::uint64_t num_pipeline_stages)
+    std::uint64_t num_pipeline_stages,
+    ClusterType cluster_type)
     : batch_id_(batch_id),
       iteration_id_(iteration_id),
       requests_(std::move(requests)),
@@ -38,7 +39,8 @@ Batch::Batch(
       schedule_epoch_(schedule_epoch),
       replica_id_(replica_id),
       dp_id_(dp_id),
-      num_pipeline_stages_(num_pipeline_stages) {
+      num_pipeline_stages_(num_pipeline_stages),
+      cluster_type_(cluster_type) {
   if (requests_.empty()) {
     throw BatchError("batch must contain at least one request");
   }

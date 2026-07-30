@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <map>
 #include <vector>
 
 #include "frontier/scheduler/global_scheduler/base_global_scheduler.h"
@@ -12,6 +13,9 @@ class CoLocationGlobalScheduler final
  public:
   explicit CoLocationGlobalScheduler(
       std::unique_ptr<BaseClusterScheduler> cluster_scheduler);
+  explicit CoLocationGlobalScheduler(
+      std::vector<std::unique_ptr<BaseClusterScheduler>>
+          cluster_schedulers);
 
   void add_request(
       RequestId request_id,
@@ -27,7 +31,10 @@ class CoLocationGlobalScheduler final
   get_cluster_scheduler(ClusterType cluster_type) const override;
 
  private:
-  std::unique_ptr<BaseClusterScheduler> cluster_scheduler_;
+  std::map<
+      ClusterType,
+      std::unique_ptr<BaseClusterScheduler>>
+      cluster_schedulers_;
   std::vector<GlobalRequestAssignment> request_queue_;
 };
 

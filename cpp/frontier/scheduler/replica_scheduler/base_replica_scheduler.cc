@@ -23,9 +23,11 @@ BaseReplicaScheduler::BaseReplicaScheduler(
     std::unique_ptr<
         execution_time_predictor::BatchExecutionModel>
         execution_model,
-    std::uint64_t pipeline_parallel_size)
+    std::uint64_t pipeline_parallel_size,
+    ClusterType cluster_type)
     : replica_id_(replica_id),
-      dp_id_(dp_id) {
+      dp_id_(dp_id),
+      cluster_type_(cluster_type) {
   if (execution_model == nullptr ||
       pipeline_parallel_size == 0) {
     throw SchedulerError(

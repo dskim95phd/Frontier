@@ -12,6 +12,7 @@ namespace frontier::config {
 inline constexpr int kFoundationSchemaVersion = 1;
 inline constexpr int kSchedulerSchemaVersion = 2;
 inline constexpr int kParallelSchemaVersion = 3;
+inline constexpr int kPddSchemaVersion = 4;
 // Kept for Step 1 callers that use the original constant.
 inline constexpr int kSchemaVersion = kFoundationSchemaVersion;
 
@@ -126,6 +127,36 @@ struct ExecutionModelConfig {
       const ExecutionModelConfig&) = default;
 };
 
+struct ClusterRuntimeConfig {
+  ParallelismConfig parallelism;
+  SchedulerConfig scheduler;
+  ExecutionModelConfig execution_model;
+
+  friend bool operator==(
+      const ClusterRuntimeConfig&,
+      const ClusterRuntimeConfig&) = default;
+};
+
+struct PddClustersConfig {
+  ClusterRuntimeConfig prefill;
+  ClusterRuntimeConfig decode;
+
+  friend bool operator==(
+      const PddClustersConfig&,
+      const PddClustersConfig&) = default;
+};
+
+struct KvCacheTransferConfig {
+  double network_bandwidth_gbps = 100.0;
+  double network_latency_ms = 0.1;
+  double kv_cache_dtype_size_bytes = 2.0;
+  bool enable_compression = false;
+
+  friend bool operator==(
+      const KvCacheTransferConfig&,
+      const KvCacheTransferConfig&) = default;
+};
+
 struct SimulationConfig {
   int schema_version;
   std::string run_id;
@@ -137,6 +168,8 @@ struct SimulationConfig {
   std::optional<ClusterSchedulerConfig> cluster_scheduler;
   std::optional<SchedulerConfig> scheduler;
   std::optional<ExecutionModelConfig> execution_model;
+  std::optional<PddClustersConfig> clusters;
+  std::optional<KvCacheTransferConfig> kv_cache_transfer;
 
   friend bool operator==(
       const SimulationConfig&,

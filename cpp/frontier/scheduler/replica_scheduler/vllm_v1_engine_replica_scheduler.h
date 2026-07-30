@@ -32,7 +32,8 @@ class VllmV1Scheduler final : public BaseReplicaScheduler {
           execution_model,
       ReplicaId replica_id = ReplicaId{0},
       DataParallelId dp_id = DataParallelId{0},
-      std::uint64_t pipeline_parallel_size = 1);
+      std::uint64_t pipeline_parallel_size = 1,
+      ClusterType cluster_type = ClusterType::kMonolithic);
 
   void add_request(RequestId request_id) override;
   [[nodiscard]] ScheduleResult schedule(SimTime time) override;
@@ -42,6 +43,11 @@ class VllmV1Scheduler final : public BaseReplicaScheduler {
       SimTime time) override;
   [[nodiscard]] bool
   consume_terminal_release_followup_poll() noexcept override;
+  void complete_kv_transfer(RequestId request_id) override;
+  [[nodiscard]] std::size_t pending_kv_transfer_count()
+      const noexcept override {
+    return pending_kv_transfers_.size();
+  }
 
   [[nodiscard]] bool has_in_flight_batch()
       const noexcept override {
@@ -61,7 +67,7 @@ class VllmV1Scheduler final : public BaseReplicaScheduler {
   }
   [[nodiscard]] bool idle() const noexcept override {
     return !has_pending_work() && in_flight_batch_count_ == 0 &&
-        kv_blocks_.empty();
+        pending_kv_transfers_.empty() && kv_blocks_.empty();
   }
   [[nodiscard]] std::size_t waiting_count()
       const noexcept override {
@@ -144,7 +150,10 @@ class VllmV1Scheduler final : public BaseReplicaScheduler {
       std::vector<RequestId>,
       StrongIdHash<BatchId>>
       in_flight_batches_;
-  std::unordered_set<RequestId, StrongIdHash<RequestId>>
+  std::unordered_map<
+      RequestId,
+      std::uint64_t,
+      StrongIdHash<RequestId>>
       active_requests_;
   std::unordered_map<
       RequestId,
@@ -153,6 +162,8 @@ class VllmV1Scheduler final : public BaseReplicaScheduler {
       pending_terminal_release_iterations_;
   std::unordered_set<RequestId, StrongIdHash<RequestId>>
       waiting_sensitive_release_extensions_;
+  std::unordered_set<RequestId, StrongIdHash<RequestId>>
+      pending_kv_transfers_;
   bool terminal_release_followup_poll_pending_ = false;
 };
 

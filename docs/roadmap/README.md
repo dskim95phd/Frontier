@@ -30,6 +30,11 @@ Detailed implementation plans and records:
   - [Step 2.5: dense co-location event and parallelism parity](cpp-porting-step2-5-colocation-parallelism-events.md) -
     completed event/scheduler hierarchy, multi-replica routing, dense
     TP/PP/DP execution, and expanded PP4/PP8 terminal-drain parity.
+  - [Step 3: dense sequential PDD parity](cpp-porting-step3-sequential-pdd.md) -
+    completed two-cluster extension with retained PREFILL KV, analytical
+    per-request transfer events, independent PREFILL/DECODE topology,
+    online/offline decode-admission parity, and a 14-case production-Python
+    differential matrix.
 
 - [NVIDIA Vera Rubin NVL72 analytical modeling](vera-rubin-nvl72-analytical-modeling-plan.md) -
   proposed profile-free MVP covering roofline-based operator timing, a logical

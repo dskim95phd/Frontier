@@ -278,6 +278,20 @@ void test_step2_batch_model_matches_python_golden() {
           .session_id = std::nullopt,
           .session_turn_index = std::nullopt,
       });
+      Request& request = requests.back();
+      const SimTime now = SimTime::from_seconds(0.0);
+      request.on_arrival(now);
+      request.on_admitted(now);
+      if (past_context > 0) {
+        request.advance_scheduler_frontier(past_context);
+        request.on_batch_completion(
+            now,
+            past_context,
+            phase == "decode"
+                ? frontier::ClusterType::kPrefill
+                : frontier::ClusterType::kMonolithic);
+      }
+      request.advance_scheduler_frontier(scheduled_tokens);
       snapshots.push_back(RequestBatchSnapshot{
           .request_id = RequestId{request_index},
           .scheduled_tokens = scheduled_tokens,

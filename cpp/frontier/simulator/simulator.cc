@@ -108,6 +108,7 @@ metrics::SimulationOutput run_foundation_lifecycle(
       .scheduler_trace = {},
       .event_trace = {},
       .analytical_diagnostics = {},
+      .kv_cache_transfers = {},
   };
   output.requests.reserve(workload.size());
   output.event_trace.reserve(workload.size() * 2);
@@ -193,6 +194,17 @@ metrics::SimulationOutput run_foundation_lifecycle(
             .num_processed_tokens = 0,
             .preemption_count = 0,
             .tokens_at_preemption = {},
+            .replica_id = ReplicaId{0},
+            .dp_id = DataParallelId{0},
+            .prefill_replica_id = std::nullopt,
+            .prefill_dp_id = std::nullopt,
+            .decode_replica_id = std::nullopt,
+            .decode_dp_id = std::nullopt,
+            .transfer_id = std::nullopt,
+            .kv_cache_transfer_start_time = std::nullopt,
+            .kv_cache_transfer_end_time = std::nullopt,
+            .decode_arrived_at = std::nullopt,
+            .kv_cache_transfer_size_bytes = 0,
         });
         break;
       case EventType::kSchedulerPoll:
@@ -205,6 +217,8 @@ metrics::SimulationOutput run_foundation_lifecycle(
       case EventType::kBatchStageEnd:
       case EventType::kClusterBatchEnd:
       case EventType::kGlobalBatchEnd:
+      case EventType::kKvCacheTransferStart:
+      case EventType::kKvCacheTransferEnd:
         throw FoundationSimulationError(
             "scheduler event leaked into foundation lifecycle");
     }
@@ -231,7 +245,8 @@ metrics::SimulationOutput run_simulation(
     return run_foundation_lifecycle(config, workload);
   }
   if (config.schema_version == config::kSchedulerSchemaVersion ||
-      config.schema_version == config::kParallelSchemaVersion) {
+      config.schema_version == config::kParallelSchemaVersion ||
+      config.schema_version == config::kPddSchemaVersion) {
     return run_co_location_simulation(config, workload);
   }
   throw FoundationSimulationError(

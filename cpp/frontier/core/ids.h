@@ -38,6 +38,7 @@ struct StageIdTag;
 struct SessionIdTag;
 struct GenerationTag;
 struct IterationIdTag;
+struct TransferIdTag;
 
 using EventSequence = StrongId<EventSequenceTag>;
 using RequestId = StrongId<RequestIdTag>;
@@ -48,5 +49,6 @@ using StageId = StrongId<StageIdTag>;
 using SessionId = StrongId<SessionIdTag>;
 using Generation = StrongId<GenerationTag>;
 using IterationId = StrongId<IterationIdTag>;
+using TransferId = StrongId<TransferIdTag>;
 
 }  // namespace frontier

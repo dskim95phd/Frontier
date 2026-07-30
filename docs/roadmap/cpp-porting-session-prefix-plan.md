@@ -277,10 +277,20 @@ queue both matches the release contract and removes synchronization overhead.
    - Follow the detailed
      [Step 2.5 dense co-location event and parallelism plan](cpp-porting-step2-5-colocation-parallelism-events.md).
 
-3. **Sequential PDD**
-   - Add the prefill-to-decode handoff and analytical KV transfer.
-   - Validate baseline PDD completion ordering, TTFT/E2E metrics, and KV
-     transfer counts against Python before adding cache behavior.
+3. **Dense sequential PDD (complete)**
+   - Generalize the Step 2.5 event, scheduler, entity, and metrics contracts
+     from one `MONOLITHIC` cluster to independently configured `PREFILL` and
+     `DECODE` clusters.
+   - Add source-KV retention, per-request analytical PREFILL-to-DECODE
+     transfer events, online immediate decode admission, and the offline
+     decode-arrival barrier.
+   - Preserve dense TP, PP, DP, multiple replicas, continuous batching,
+     chunked prefill, preemption, and stale-event behavior in both clusters.
+   - Require cluster-scoped routing, event, scheduler, batch-stage, transfer,
+     memory-ownership, TTFT/E2E, completion-order, and final-quiescence parity
+     before adding cache behavior.
+   - Follow the detailed
+     [Step 3 dense sequential PDD plan](cpp-porting-step3-sequential-pdd.md).
 
 4. **Session prefix cache**
    - Add session affinity, complete-block GPU cache lookup, allocation,

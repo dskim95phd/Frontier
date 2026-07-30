@@ -2,13 +2,12 @@
 
 #include <cstdint>
 
+#include "frontier/core/cluster_type.h"
 #include "frontier/core/ids.h"
 
 namespace frontier::scheduler {
 
-enum class ClusterType : std::uint8_t {
-  kMonolithic,
-};
+using ::frontier::ClusterType;
 
 struct ReplicaTarget {
   ReplicaId replica_id;

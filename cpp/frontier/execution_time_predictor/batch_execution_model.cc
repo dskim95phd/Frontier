@@ -127,16 +127,18 @@ BatchExecutionPrediction AnalyticalBatchExecutionModel::predict(
        batch.requests()) {
     const entities::Request& request =
         get_request(requests, snapshot.request_id);
-    if (snapshot.processed_tokens < request.num_prefill_tokens()) {
-      dense_batch.prefill_requests.push_back(AttentionRequestSlice{
-          .query_tokens = snapshot.scheduled_tokens,
-          .past_context = snapshot.processed_tokens,
-      });
+    // Production Python evaluates analytical attention from the request's
+    // mutable state when each PP stage starts, rather than from the batch
+    // creation snapshot. Earlier overlapping stages may have made additional
+    // progress visible by then.
+    const AttentionRequestSlice slice{
+        .query_tokens = snapshot.scheduled_tokens,
+        .past_context = request.num_processed_tokens(),
+    };
+    if (!request.is_prefill_complete()) {
+      dense_batch.prefill_requests.push_back(slice);
     } else {
-      dense_batch.decode_requests.push_back(AttentionRequestSlice{
-          .query_tokens = snapshot.scheduled_tokens,
-          .past_context = snapshot.processed_tokens,
-      });
+      dense_batch.decode_requests.push_back(slice);
     }
   }
 

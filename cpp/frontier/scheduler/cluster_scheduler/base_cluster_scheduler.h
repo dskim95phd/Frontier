@@ -4,6 +4,7 @@
 #include <stdexcept>
 #include <vector>
 
+#include "frontier/core/event.h"
 #include "frontier/core/ids.h"
 #include "frontier/scheduler/replica_scheduler/base_replica_scheduler.h"
 #include "frontier/scheduler/scheduler_types.h"
@@ -32,7 +33,9 @@ class BaseClusterScheduler {
 
   [[nodiscard]] virtual ClusterType cluster_type()
       const noexcept = 0;
-  virtual void add_request(RequestId request_id) = 0;
+  virtual void add_request(
+      RequestId request_id,
+      SimTime arrived_at) = 0;
   [[nodiscard]] virtual std::vector<ClusterRequestAssignment>
   schedule() = 0;
   [[nodiscard]] virtual bool empty() const noexcept = 0;

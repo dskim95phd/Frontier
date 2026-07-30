@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <map>
 #include <optional>
 #include <vector>
 
@@ -9,6 +10,7 @@
 #include "frontier/entities/batch.h"
 #include "frontier/entities/batch_stage.h"
 #include "frontier/entities/cluster.h"
+#include "frontier/entities/kv_cache_transfer_info.h"
 #include "frontier/entities/request.h"
 #include "frontier/execution_time_predictor/batch_execution_model.h"
 #include "frontier/metrics/output_contract.h"
@@ -37,6 +39,10 @@ class SimulationContext {
   }
   [[nodiscard]] scheduler::BaseClusterScheduler&
   monolithic_cluster();
+  [[nodiscard]] scheduler::BaseClusterScheduler&
+  cluster(ClusterType cluster_type);
+  [[nodiscard]] const scheduler::BaseClusterScheduler&
+  cluster(ClusterType cluster_type) const;
   [[nodiscard]] entities::Request& request(RequestId request_id);
   [[nodiscard]] const entities::Request& request(
       RequestId request_id) const;
@@ -53,10 +59,15 @@ class SimulationContext {
       const noexcept {
     return parallelism_;
   }
+  [[nodiscard]] const config::ParallelismConfig& parallelism(
+      ClusterType cluster_type) const;
+  [[nodiscard]] const config::ExecutionModelConfig& execution_model(
+      ClusterType cluster_type) const;
 
   BatchId create_batch(
       const scheduler::ScheduleResult& schedule,
-      scheduler::ReplicaTarget target);
+      scheduler::ReplicaTarget target,
+      ClusterType cluster_type = ClusterType::kMonolithic);
   void record_stage_arrival(
       BatchId batch_id,
       StageId stage_id,
@@ -74,9 +85,22 @@ class SimulationContext {
 
   void assign_request_target(
       RequestId request_id,
-      scheduler::ReplicaTarget target);
+      scheduler::ReplicaTarget target,
+      ClusterType cluster_type = ClusterType::kMonolithic);
   [[nodiscard]] scheduler::ReplicaTarget request_target(
+      RequestId request_id,
+      ClusterType cluster_type = ClusterType::kMonolithic) const;
+  TransferId create_kv_cache_transfer(
+      RequestId request_id,
+      BatchId source_batch_id,
+      scheduler::ReplicaTarget source_target);
+  [[nodiscard]] entities::KVCacheTransferInfo& kv_cache_transfer(
+      TransferId transfer_id);
+  [[nodiscard]] const entities::KVCacheTransferInfo&
+  kv_cache_transfer(TransferId transfer_id) const;
+  [[nodiscard]] TransferId request_transfer_id(
       RequestId request_id) const;
+  [[nodiscard]] bool on_decode_kv_arrival();
   void record_request_completion(RequestId request_id);
   [[nodiscard]] bool request_completion_recorded(
       RequestId request_id) const;
@@ -92,6 +116,8 @@ class SimulationContext {
   config::SimulationConfig config_;
   config::ParallelismConfig parallelism_;
   entities::Cluster cluster_;
+  std::map<ClusterType, config::ParallelismConfig>
+      cluster_parallelism_;
   std::vector<entities::Request> requests_;
   std::vector<entities::Batch> batches_;
   std::vector<entities::BatchStage> batch_stages_;
@@ -100,8 +126,14 @@ class SimulationContext {
   std::vector<std::vector<std::optional<std::size_t>>>
       stage_record_indices_;
   std::vector<double> predicted_batch_ms_;
-  std::vector<std::optional<scheduler::ReplicaTarget>>
+  std::map<
+      ClusterType,
+      std::vector<std::optional<scheduler::ReplicaTarget>>>
       request_targets_;
+  std::vector<entities::KVCacheTransferInfo> kv_cache_transfers_;
+  std::vector<std::optional<TransferId>> request_transfer_ids_;
+  std::size_t expected_decode_arrivals_ = 0;
+  std::size_t decode_arrivals_ = 0;
   std::vector<bool> completion_recorded_;
   std::vector<RequestId> completion_order_;
   EventQueue event_queue_;

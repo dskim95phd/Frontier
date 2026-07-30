@@ -74,7 +74,9 @@ void test_colocation_scheduler_hierarchy_routes_and_executes() {
   BaseClusterScheduler& monolithic =
       global.get_cluster_scheduler(ClusterType::kMonolithic);
   for (const auto& assignment : global.schedule()) {
-    monolithic.add_request(assignment.request_id);
+    monolithic.add_request(
+        assignment.request_id,
+        requests[0].arrived_at());
   }
   static_cast<void>(monolithic.schedule());
   BaseReplicaScheduler& replica_scheduler =

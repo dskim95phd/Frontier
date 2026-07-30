@@ -77,6 +77,7 @@ add_library(
   frontier/entities/batch_stage.cc
   frontier/entities/cluster.cc
   frontier/entities/replica.cc
+  frontier/entities/kv_cache_transfer_info.cc
   frontier/events/co_location_events.cc
   frontier/execution_time_predictor/analytical_model.cc
   frontier/execution_time_predictor/batch_execution_model.cc
@@ -368,5 +369,26 @@ if(BUILD_TESTING)
   add_test(
     NAME frontier_simulator.parallel_colocation
     COMMAND $<TARGET_FILE:frontier_parallel_colocation_test>
+  )
+
+  add_executable(
+    frontier_sequential_pdd_test
+    tests/simulator/sequential_pdd_test.cc
+  )
+  target_compile_definitions(
+    frontier_sequential_pdd_test
+    PRIVATE
+      FRONTIER_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures"
+  )
+  target_link_libraries(
+    frontier_sequential_pdd_test
+    PRIVATE
+      frontier_core
+      nlohmann_json::nlohmann_json
+  )
+  frontier_enable_warnings(frontier_sequential_pdd_test)
+  add_test(
+    NAME frontier_simulator.sequential_pdd
+    COMMAND $<TARGET_FILE:frontier_sequential_pdd_test>
   )
 endif()

@@ -6,15 +6,30 @@ namespace frontier::scheduler {
 
 CoLocationGlobalScheduler::CoLocationGlobalScheduler(
     std::unique_ptr<BaseClusterScheduler> cluster_scheduler)
-    : cluster_scheduler_(std::move(cluster_scheduler)) {
-  if (cluster_scheduler_ == nullptr) {
+    : CoLocationGlobalScheduler(
+          [&cluster_scheduler] {
+            std::vector<std::unique_ptr<BaseClusterScheduler>> result;
+            result.push_back(std::move(cluster_scheduler));
+            return result;
+          }()) {}
+
+CoLocationGlobalScheduler::CoLocationGlobalScheduler(
+    std::vector<std::unique_ptr<BaseClusterScheduler>>
+        cluster_schedulers) {
+  if (cluster_schedulers.empty()) {
     throw GlobalSchedulerError(
-        "co-location global scheduler requires one cluster");
+        "global scheduler requires at least one cluster");
   }
-  if (cluster_scheduler_->cluster_type() !=
-      ClusterType::kMonolithic) {
-    throw GlobalSchedulerError(
-        "co-location global scheduler requires a monolithic cluster");
+  for (auto& cluster : cluster_schedulers) {
+    if (cluster == nullptr) {
+      throw GlobalSchedulerError(
+          "global scheduler received a null cluster");
+    }
+    const ClusterType type = cluster->cluster_type();
+    if (!cluster_schedulers_.emplace(type, std::move(cluster)).second) {
+      throw GlobalSchedulerError(
+          "global scheduler received a duplicate cluster type");
+    }
   }
 }
 
@@ -39,21 +54,23 @@ CoLocationGlobalScheduler::schedule() {
 BaseClusterScheduler&
 CoLocationGlobalScheduler::get_cluster_scheduler(
     ClusterType cluster_type) {
-  if (cluster_type != cluster_scheduler_->cluster_type()) {
+  const auto position = cluster_schedulers_.find(cluster_type);
+  if (position == cluster_schedulers_.end()) {
     throw GlobalSchedulerError(
-        "co-location run references an unknown cluster");
+        "global scheduler references an unknown cluster");
   }
-  return *cluster_scheduler_;
+  return *position->second;
 }
 
 const BaseClusterScheduler&
 CoLocationGlobalScheduler::get_cluster_scheduler(
     ClusterType cluster_type) const {
-  if (cluster_type != cluster_scheduler_->cluster_type()) {
+  const auto position = cluster_schedulers_.find(cluster_type);
+  if (position == cluster_schedulers_.end()) {
     throw GlobalSchedulerError(
-        "co-location run references an unknown cluster");
+        "global scheduler references an unknown cluster");
   }
-  return *cluster_scheduler_;
+  return *position->second;
 }
 
 }  // namespace frontier::scheduler

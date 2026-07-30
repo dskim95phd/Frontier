@@ -6,6 +6,7 @@
 #include <utility>
 #include <vector>
 
+#include "frontier/core/cluster_type.h"
 #include "frontier/core/event.h"
 #include "frontier/core/ids.h"
 #include "frontier/entities/request.h"
@@ -46,7 +47,8 @@ class Batch {
       Generation schedule_epoch,
       ReplicaId replica_id,
       DataParallelId dp_id,
-      std::uint64_t num_pipeline_stages);
+      std::uint64_t num_pipeline_stages,
+      ClusterType cluster_type = ClusterType::kMonolithic);
 
   [[nodiscard]] BatchId id() const noexcept { return batch_id_; }
   [[nodiscard]] IterationId iteration_id() const noexcept {
@@ -75,6 +77,9 @@ class Batch {
   [[nodiscard]] std::uint64_t num_pipeline_stages() const noexcept {
     return num_pipeline_stages_;
   }
+  [[nodiscard]] ClusterType cluster_type() const noexcept {
+    return cluster_type_;
+  }
   [[nodiscard]] std::uint64_t total_scheduled_tokens() const noexcept;
   [[nodiscard]] bool completed() const noexcept {
     return completed_at_.has_value();
@@ -92,6 +97,7 @@ class Batch {
   ReplicaId replica_id_{0};
   DataParallelId dp_id_{0};
   std::uint64_t num_pipeline_stages_ = 1;
+  ClusterType cluster_type_ = ClusterType::kMonolithic;
 };
 
 }  // namespace frontier::entities

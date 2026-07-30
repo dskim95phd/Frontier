@@ -26,11 +26,18 @@ Id require_id(
 }
 
 EventPayload target_payload(
-    scheduler::ReplicaTarget target) {
+    scheduler::ReplicaTarget target,
+    ClusterType cluster_type) {
   EventPayload payload;
   payload.replica_id = target.replica_id;
   payload.dp_id = target.dp_id;
+  payload.cluster_type = cluster_type;
   return payload;
+}
+
+ClusterType require_cluster(const Event& event) {
+  return require_id(
+      event.payload.cluster_type, "cluster_type");
 }
 
 scheduler::ReplicaTarget require_target(const Event& event) {
@@ -43,7 +50,8 @@ scheduler::ReplicaTarget require_target(const Event& event) {
 
 metrics::SchedulerTraceRecord make_trace(
     const scheduler::ScheduleResult& schedule,
-    scheduler::ReplicaTarget target) {
+    scheduler::ReplicaTarget target,
+    ClusterType cluster_type) {
   metrics::SchedulerTraceRecord trace{
       .iteration_id = schedule.iteration_id,
       .simulation_time = schedule.simulation_time,
@@ -61,6 +69,7 @@ metrics::SchedulerTraceRecord make_trace(
       .request_num_tokens = {},
       .replica_id = target.replica_id,
       .dp_id = target.dp_id,
+      .cluster_type = cluster_type,
   };
   for (const scheduler::SchedulerDecision& decision :
        schedule.decisions) {
@@ -107,6 +116,7 @@ metrics::BatchMetricsRecord make_batch_metrics(
       .dp_id = batch.dp_id(),
       .num_pipeline_stages =
           batch.num_pipeline_stages(),
+      .cluster_type = batch.cluster_type(),
   };
   for (const entities::RequestBatchSnapshot& snapshot :
        batch.requests()) {
@@ -134,12 +144,15 @@ void RequestArrivalEvent::handle(
     simulator::SimulationContext& context) const {
   const RequestId request_id = require_id(
       event.payload.request_id, "request_id");
+  const ClusterType cluster_type = require_cluster(event);
   entities::Request& request = context.request(request_id);
-  request.on_arrival(event.time);
+  request.on_arrival(event.time, cluster_type);
   context.global_scheduler().add_request(
-      request_id, scheduler::ClusterType::kMonolithic);
+      request_id, cluster_type);
+  EventPayload payload;
+  payload.cluster_type = cluster_type;
   context.event_queue().push(
-      event.time, EventType::kGlobalSchedule);
+      event.time, EventType::kGlobalSchedule, std::move(payload));
 }
 
 void GlobalScheduleEvent::handle(
@@ -150,20 +163,36 @@ void GlobalScheduleEvent::handle(
   if (assignments.empty()) {
     return;
   }
+  std::vector<ClusterType> affected;
   for (const auto& assignment : assignments) {
     context.global_scheduler()
         .get_cluster_scheduler(assignment.cluster_type)
-        .add_request(assignment.request_id);
+        .add_request(
+            assignment.request_id,
+            context.request(assignment.request_id).arrived_at());
+    if (std::find(
+            affected.begin(),
+            affected.end(),
+            assignment.cluster_type) == affected.end()) {
+      affected.push_back(assignment.cluster_type);
+    }
   }
-  context.event_queue().push(
-      event.time, EventType::kClusterSchedule);
+  for (const ClusterType cluster_type : affected) {
+    EventPayload payload;
+    payload.cluster_type = cluster_type;
+    context.event_queue().push(
+        event.time,
+        EventType::kClusterSchedule,
+        std::move(payload));
+  }
 }
 
 void ClusterScheduleEvent::handle(
     const Event& event,
     simulator::SimulationContext& context) const {
+  const ClusterType cluster_type = require_cluster(event);
   const auto assignments =
-      context.monolithic_cluster().schedule();
+      context.cluster(cluster_type).schedule();
   std::vector<scheduler::ReplicaTarget> affected;
   for (const auto& assignment : assignments) {
     const scheduler::ReplicaTarget target{
@@ -171,7 +200,7 @@ void ClusterScheduleEvent::handle(
         .dp_id = assignment.dp_id,
     };
     context.assign_request_target(
-        assignment.request_id, target);
+        assignment.request_id, target, cluster_type);
     if (std::find(affected.begin(), affected.end(), target) ==
         affected.end()) {
       affected.push_back(target);
@@ -181,7 +210,7 @@ void ClusterScheduleEvent::handle(
     context.event_queue().push(
         event.time,
         EventType::kReplicaSchedule,
-        target_payload(target));
+        target_payload(target, cluster_type));
   }
 }
 
@@ -190,8 +219,9 @@ void ReplicaScheduleEvent::handle(
     simulator::SimulationContext& context) const {
   const scheduler::ReplicaTarget target =
       require_target(event);
+  const ClusterType cluster_type = require_cluster(event);
   scheduler::BaseReplicaScheduler& replica =
-      context.monolithic_cluster().get_replica_scheduler(
+      context.cluster(cluster_type).get_replica_scheduler(
           target.replica_id, target.dp_id);
   bool returned_empty_schedule = false;
   bool produced_batch = false;
@@ -200,17 +230,17 @@ void ReplicaScheduleEvent::handle(
     scheduler::ScheduleResult schedule =
         replica.schedule(event.time);
     context.output().scheduler_trace.push_back(
-        make_trace(schedule, target));
+        make_trace(schedule, target, cluster_type));
     if (schedule.scheduled_requests.empty()) {
       returned_empty_schedule = true;
       break;
     }
     const BatchId batch_id =
-        context.create_batch(schedule, target);
+        context.create_batch(schedule, target, cluster_type);
     produced_batch = true;
     entities::Batch& batch = context.batch(batch_id);
     replica.mark_batch_started(batch);
-    EventPayload payload = target_payload(target);
+    EventPayload payload = target_payload(target, cluster_type);
     payload.batch_id = batch_id;
     payload.stage_id = StageId{0};
     payload.generation = batch.schedule_epoch();
@@ -224,7 +254,7 @@ void ReplicaScheduleEvent::handle(
     context.event_queue().push(
         event.time,
         EventType::kReplicaSchedule,
-        target_payload(target));
+        target_payload(target, cluster_type));
   }
 }
 
@@ -233,6 +263,7 @@ void BatchStageArrivalEvent::handle(
     simulator::SimulationContext& context) const {
   const scheduler::ReplicaTarget target =
       require_target(event);
+  const ClusterType cluster_type = require_cluster(event);
   const BatchId batch_id = require_id(
       event.payload.batch_id, "batch_id");
   const StageId stage_id = require_id(
@@ -246,13 +277,13 @@ void BatchStageArrivalEvent::handle(
   context.record_stage_arrival(
       batch_id, stage_id, event.time);
   scheduler::ReplicaStageScheduler& stage =
-      context.monolithic_cluster()
+      context.cluster(cluster_type)
           .get_replica_scheduler(
               target.replica_id, target.dp_id)
           .get_replica_stage_scheduler(stage_id);
   stage.add_batch(batch);
   if (!stage.is_busy()) {
-    EventPayload payload = target_payload(target);
+    EventPayload payload = target_payload(target, cluster_type);
     payload.stage_id = stage_id;
     context.event_queue().push(
         event.time,
@@ -266,10 +297,11 @@ void ReplicaStageScheduleEvent::handle(
     simulator::SimulationContext& context) const {
   const scheduler::ReplicaTarget target =
       require_target(event);
+  const ClusterType cluster_type = require_cluster(event);
   const StageId stage_id = require_id(
       event.payload.stage_id, "stage_id");
   scheduler::ReplicaStageScheduler& stage =
-      context.monolithic_cluster()
+      context.cluster(cluster_type)
           .get_replica_scheduler(
               target.replica_id, target.dp_id)
           .get_replica_stage_scheduler(stage_id);
@@ -282,7 +314,7 @@ void ReplicaStageScheduleEvent::handle(
   if (batch.schedule_epoch() != ticket->schedule_epoch) {
     stage.on_stage_end(ticket->batch_id);
     if (!stage.empty()) {
-      EventPayload payload = target_payload(target);
+      EventPayload payload = target_payload(target, cluster_type);
       payload.stage_id = stage_id;
       context.event_queue().push(
           event.time,
@@ -296,7 +328,7 @@ void ReplicaStageScheduleEvent::handle(
   entities::BatchStage& batch_stage =
       context.create_batch_stage(
           batch.id(), stage_id, event.time, prediction);
-  if (context.config().execution_model->type ==
+  if (context.execution_model(cluster_type).type ==
       config::ExecutionModelType::kAnalytical) {
     context.output().analytical_diagnostics.push_back(
         metrics::AnalyticalDiagnostic{
@@ -310,12 +342,12 @@ void ReplicaStageScheduleEvent::handle(
   }
   const double completion_seconds =
       event.time.seconds() +
-      batch_stage.execution_time().total_ms() / 1e3;
+      batch_stage.execution_time().total_ms() * 1e-3;
   if (!std::isfinite(completion_seconds)) {
     throw std::runtime_error(
         "batch stage completion time is nonfinite");
   }
-  EventPayload payload = target_payload(target);
+  EventPayload payload = target_payload(target, cluster_type);
   payload.batch_id = batch.id();
   payload.stage_id = stage_id;
   payload.generation = batch.schedule_epoch();
@@ -330,6 +362,7 @@ void BatchStageEndEvent::handle(
     simulator::SimulationContext& context) const {
   const scheduler::ReplicaTarget target =
       require_target(event);
+  const ClusterType cluster_type = require_cluster(event);
   const BatchId batch_id = require_id(
       event.payload.batch_id, "batch_id");
   const StageId stage_id = require_id(
@@ -341,7 +374,7 @@ void BatchStageEndEvent::handle(
     return;
   }
   scheduler::ReplicaStageScheduler& stage =
-      context.monolithic_cluster()
+      context.cluster(cluster_type)
           .get_replica_scheduler(
               target.replica_id, target.dp_id)
           .get_replica_stage_scheduler(stage_id);
@@ -360,10 +393,12 @@ void BatchStageEndEvent::handle(
           .completed_at = event.time,
           .execution_time =
               batch_stage.execution_time(),
+          .cluster_type = cluster_type,
       });
 
   if (!stage.empty()) {
-    EventPayload same_stage = target_payload(target);
+    EventPayload same_stage =
+        target_payload(target, cluster_type);
     same_stage.stage_id = stage_id;
     context.event_queue().push(
         event.time,
@@ -371,7 +406,7 @@ void BatchStageEndEvent::handle(
         std::move(same_stage));
   }
 
-  EventPayload next = target_payload(target);
+  EventPayload next = target_payload(target, cluster_type);
   next.batch_id = batch_id;
   next.generation = batch.schedule_epoch();
   if (stage.is_last_stage()) {
@@ -391,6 +426,62 @@ void BatchStageEndEvent::handle(
 void ClusterBatchEndEvent::handle(
     const Event& event,
     simulator::SimulationContext& context) const {
+  const ClusterType cluster_type = require_cluster(event);
+  if (cluster_type == ClusterType::kPrefill) {
+    const scheduler::ReplicaTarget target =
+        require_target(event);
+    const BatchId batch_id = require_id(
+        event.payload.batch_id, "batch_id");
+    entities::Batch& batch = context.batch(batch_id);
+    if (!event.payload.generation.has_value() ||
+        event.payload.generation.value() !=
+            batch.schedule_epoch()) {
+      return;
+    }
+    scheduler::BaseReplicaScheduler& replica =
+        context.cluster(cluster_type).get_replica_scheduler(
+            target.replica_id, target.dp_id);
+    if (!replica.on_batch_completed(batch, event.time)) {
+      return;
+    }
+    context.output().batches.push_back(make_batch_metrics(
+        batch,
+        context.requests(),
+        context.predicted_batch_ms(batch_id)));
+    for (const entities::RequestBatchSnapshot& snapshot :
+         batch.requests()) {
+      const entities::Request& request =
+          context.request(snapshot.request_id);
+      if (!request.is_prefill_complete() ||
+          request.state() !=
+              entities::RequestState::kTransferPending) {
+        continue;
+      }
+      const TransferId transfer_id =
+          context.create_kv_cache_transfer(
+              snapshot.request_id,
+              batch_id,
+              target);
+      EventPayload transfer_payload;
+      transfer_payload.transfer_id = transfer_id;
+      transfer_payload.request_id = snapshot.request_id;
+      transfer_payload.batch_id = batch_id;
+      transfer_payload.replica_id = target.replica_id;
+      transfer_payload.dp_id = target.dp_id;
+      transfer_payload.cluster_type = ClusterType::kDecode;
+      transfer_payload.generation =
+          batch.schedule_epoch();
+      context.event_queue().push(
+          event.time,
+          EventType::kKvCacheTransferStart,
+          std::move(transfer_payload));
+    }
+    context.event_queue().push(
+        event.time,
+        EventType::kReplicaSchedule,
+        target_payload(target, ClusterType::kPrefill));
+    return;
+  }
   EventPayload payload = event.payload;
   context.event_queue().push(
       event.time,
@@ -403,6 +494,7 @@ void GlobalBatchEndEvent::handle(
     simulator::SimulationContext& context) const {
   const scheduler::ReplicaTarget target =
       require_target(event);
+  const ClusterType cluster_type = require_cluster(event);
   const BatchId batch_id = require_id(
       event.payload.batch_id, "batch_id");
   entities::Batch& batch = context.batch(batch_id);
@@ -412,7 +504,7 @@ void GlobalBatchEndEvent::handle(
     return;
   }
   scheduler::BaseReplicaScheduler& replica =
-      context.monolithic_cluster().get_replica_scheduler(
+      context.cluster(cluster_type).get_replica_scheduler(
           target.replica_id, target.dp_id);
   static_cast<void>(
       replica.on_batch_completed(batch, event.time));
@@ -429,7 +521,113 @@ void GlobalBatchEndEvent::handle(
   context.event_queue().push(
       event.time,
       EventType::kReplicaSchedule,
-      target_payload(target));
+      target_payload(target, cluster_type));
+}
+
+void KVCacheTransferStartEvent::handle(
+    const Event& event,
+    simulator::SimulationContext& context) const {
+  const TransferId transfer_id = require_id(
+      event.payload.transfer_id, "transfer_id");
+  entities::KVCacheTransferInfo& transfer =
+      context.kv_cache_transfer(transfer_id);
+  if (!event.payload.generation.has_value() ||
+      event.payload.generation.value() !=
+          transfer.source_generation()) {
+    return;
+  }
+  transfer.mark_started(event.time);
+  context.request(transfer.request_id())
+      .on_kv_cache_transfer_start(event.time);
+  const double completion_seconds =
+      event.time.seconds() +
+      transfer.predicted_time_ms() * 1e-3;
+  if (!std::isfinite(completion_seconds)) {
+    throw std::runtime_error(
+        "KV transfer completion time is nonfinite");
+  }
+  EventPayload payload = event.payload;
+  context.event_queue().push(
+      SimTime::from_seconds(completion_seconds),
+      EventType::kKvCacheTransferEnd,
+      std::move(payload));
+}
+
+void KVCacheTransferEndEvent::handle(
+    const Event& event,
+    simulator::SimulationContext& context) const {
+  const TransferId transfer_id = require_id(
+      event.payload.transfer_id, "transfer_id");
+  entities::KVCacheTransferInfo& transfer =
+      context.kv_cache_transfer(transfer_id);
+  if (!event.payload.generation.has_value() ||
+      event.payload.generation.value() !=
+          transfer.source_generation()) {
+    return;
+  }
+  transfer.mark_completed(event.time);
+  entities::Request& request =
+      context.request(transfer.request_id());
+  request.on_kv_cache_transfer_complete(
+      event.time, transfer.size_bytes());
+
+  // Match Python mutation order: make the target arrival visible first, then
+  // release the retained source allocation.
+  request.on_arrival(event.time, ClusterType::kDecode);
+  context.cluster(ClusterType::kDecode)
+      .add_request(request.id(), request.arrived_at());
+  const bool schedule_decode =
+      context.on_decode_kv_arrival();
+
+  scheduler::BaseReplicaScheduler& source =
+      context.cluster(ClusterType::kPrefill)
+          .get_replica_scheduler(
+              transfer.source_replica_id(),
+              transfer.source_dp_id());
+  source.complete_kv_transfer(request.id());
+
+  context.output().kv_cache_transfers.push_back(
+      metrics::KVCacheTransferMetricsRecord{
+          .transfer_id = transfer.id(),
+          .request_id = transfer.request_id(),
+          .source_batch_id = transfer.source_batch_id(),
+          .source_cluster_type =
+              transfer.source_cluster_type(),
+          .target_cluster_type =
+              transfer.target_cluster_type(),
+          .source_replica_id =
+              transfer.source_replica_id(),
+          .source_dp_id = transfer.source_dp_id(),
+          .size_bytes = transfer.size_bytes(),
+          .predicted_time_ms =
+              transfer.predicted_time_ms(),
+          .started_at = transfer.started_at().value(),
+          .completed_at = event.time,
+      });
+
+  if (schedule_decode) {
+    EventPayload decode_payload;
+    decode_payload.cluster_type = ClusterType::kDecode;
+    context.event_queue().push(
+        event.time,
+        EventType::kClusterSchedule,
+        std::move(decode_payload));
+  }
+  // Python only emits this wake-up when a request is waiting to be
+  // scheduled and the source target has no batch in flight.  A request that
+  // is already running is not pending work for this purpose.
+  if (source.waiting_count() > 0 &&
+      source.in_flight_batch_count() == 0) {
+    context.event_queue().push(
+        event.time,
+        EventType::kReplicaSchedule,
+        target_payload(
+            scheduler::ReplicaTarget{
+                .replica_id = transfer.source_replica_id(),
+                .dp_id = transfer.source_dp_id(),
+            },
+            ClusterType::kPrefill));
+  }
 }
 
 void EventDispatcher::dispatch(
@@ -464,11 +662,17 @@ void EventDispatcher::dispatch(
     case EventType::kGlobalBatchEnd:
       handler = &global_batch_end_;
       break;
+    case EventType::kKvCacheTransferStart:
+      handler = &kv_cache_transfer_start_;
+      break;
+    case EventType::kKvCacheTransferEnd:
+      handler = &kv_cache_transfer_end_;
+      break;
     case EventType::kFoundationCompletion:
     case EventType::kSchedulerPoll:
     case EventType::kBatchCompletion:
       throw std::logic_error(
-          "legacy event leaked into schema v3 dispatcher");
+        "legacy event leaked into typed dispatcher");
   }
   if (handler == nullptr || handler->type() != event.type) {
     throw std::logic_error("event dispatcher registry mismatch");

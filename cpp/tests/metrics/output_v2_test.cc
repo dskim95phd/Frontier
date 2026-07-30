@@ -8,12 +8,14 @@
 namespace {
 
 using frontier::BatchId;
+using frontier::DataParallelId;
 using frontier::Event;
 using frontier::EventPayload;
 using frontier::EventSequence;
 using frontier::EventType;
 using frontier::IterationId;
 using frontier::RequestId;
+using frontier::ReplicaId;
 using frontier::SimTime;
 using frontier::config::SimulationMode;
 using frontier::config::SystemArchitecture;
@@ -52,6 +54,17 @@ SimulationOutput make_output() {
               .num_processed_tokens = 6,
               .preemption_count = 1,
               .tokens_at_preemption = {},
+              .replica_id = ReplicaId{0},
+              .dp_id = DataParallelId{0},
+              .prefill_replica_id = std::nullopt,
+              .prefill_dp_id = std::nullopt,
+              .decode_replica_id = std::nullopt,
+              .decode_dp_id = std::nullopt,
+              .transfer_id = std::nullopt,
+              .kv_cache_transfer_start_time = std::nullopt,
+              .kv_cache_transfer_end_time = std::nullopt,
+              .decode_arrived_at = std::nullopt,
+              .kv_cache_transfer_size_bytes = 0,
           },
       },
       .batches = {
@@ -104,6 +117,7 @@ SimulationOutput make_output() {
           },
       },
       .analytical_diagnostics = {},
+      .kv_cache_transfers = {},
   };
 }
 
