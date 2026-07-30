@@ -6,6 +6,8 @@
 #include <unordered_set>
 #include <utility>
 
+#include "frontier/execution_time_predictor/fixed_execution_time_predictor.h"
+
 namespace frontier::scheduler {
 namespace {
 
@@ -28,23 +30,21 @@ VllmV1Scheduler::VllmV1Scheduler(config::SchedulerConfig config,
                                  std::vector<entities::Request> &requests)
     : VllmV1Scheduler(
           std::move(config), requests,
-          std::make_unique<execution_time_predictor::FixedBatchExecutionModel>(
-              [&]() {
-                  config::FixedExecutionModelConfig value{};
-                  value.batch_latency_ms = 0.0;
-                  value.stage_latencies_ms = {};
-                  return value;
-              }())) {}
+          std::make_unique<
+              execution_time_predictor::FixedExecutionTimePredictor>([&]() {
+              config::FixedExecutionModelConfig value{};
+              value.batch_latency_ms = 0.0;
+              value.stage_latencies_ms = {};
+              return value;
+          }())) {}
 
 VllmV1Scheduler::VllmV1Scheduler(
     config::SchedulerConfig config, std::vector<entities::Request> &requests,
-    std::unique_ptr<execution_time_predictor::BatchExecutionModel>
-        execution_model)
-    : BaseReplicaScheduler(default_replica(), DataParallelId{0},
-                           std::move(execution_model),
-                           ClusterType::kMonolithic),
-      config_(std::move(config)), requests_(&requests), kv_blocks_(config_),
-      pipeline_parallel_size_(1) {
+    std::unique_ptr<execution_time_predictor::BaseExecutionTimePredictor>
+        predictor)
+    : BaseReplicaScheduler(config, requests, default_replica(),
+                           DataParallelId{0}, std::move(predictor),
+                           ClusterType::kMonolithic) {
     if (config_.type != config::SchedulerType::kVllmV1 ||
         config_.scheduling_policy != config::SchedulingPolicy::kFcfs) {
         throw SchedulerError(
@@ -54,14 +54,11 @@ VllmV1Scheduler::VllmV1Scheduler(
 
 VllmV1Scheduler::VllmV1Scheduler(
     config::SchedulerConfig config, std::vector<entities::Request> &requests,
-    std::shared_ptr<const execution_time_predictor::BatchExecutionModel>
-        execution_model,
+    execution_time_predictor::ExecutionTimePredictorPtr predictor,
     const entities::Replica &replica, DataParallelId dp_id,
     ClusterType cluster_type)
-    : BaseReplicaScheduler(replica, dp_id, std::move(execution_model),
-                           cluster_type),
-      config_(std::move(config)), requests_(&requests), kv_blocks_(config_),
-      pipeline_parallel_size_(replica.pipeline_parallel_size()) {
+    : BaseReplicaScheduler(std::move(config), requests, replica, dp_id,
+                           std::move(predictor), cluster_type) {
     if (config_.type != config::SchedulerType::kVllmV1 ||
         config_.scheduling_policy != config::SchedulingPolicy::kFcfs) {
         throw SchedulerError(
@@ -73,28 +70,6 @@ VllmV1Scheduler::VllmV1Scheduler(
     }
 }
 
-entities::Request &VllmV1Scheduler::request(RequestId request_id) {
-    if (!request_id.valid() || request_id.index() >= requests_->size()) {
-        throw SchedulerError("scheduler references an unknown request ID");
-    }
-    entities::Request &value = requests_->at(request_id.index());
-    if (value.id() != request_id) {
-        throw SchedulerError("request arena ID/index invariant failed");
-    }
-    return value;
-}
-
-const entities::Request &VllmV1Scheduler::request(RequestId request_id) const {
-    if (!request_id.valid() || request_id.index() >= requests_->size()) {
-        throw SchedulerError("scheduler references an unknown request ID");
-    }
-    const entities::Request &value = requests_->at(request_id.index());
-    if (value.id() != request_id) {
-        throw SchedulerError("request arena ID/index invariant failed");
-    }
-    return value;
-}
-
 bool VllmV1Scheduler::contains_request(RequestId request_id) const {
     return std::find(preempted_.begin(), preempted_.end(), request_id) !=
                preempted_.end() ||
@@ -102,22 +77,6 @@ bool VllmV1Scheduler::contains_request(RequestId request_id) const {
                waiting_.end() ||
            std::find(running_.begin(), running_.end(), request_id) !=
                running_.end();
-}
-
-bool VllmV1Scheduler::request_is_active(RequestId request_id) const {
-    return active_requests_.find(request_id) != active_requests_.end();
-}
-
-void VllmV1Scheduler::add_request(RequestId request_id) {
-    entities::Request &value = request(request_id);
-    if (value.state() != entities::RequestState::kWaiting) {
-        throw SchedulerError("scheduler accepts only waiting requests");
-    }
-    if (contains_request(request_id)) {
-        throw SchedulerError("request is already present in scheduler state");
-    }
-    waiting_.push_back(request_id);
-    validate_state();
 }
 
 std::uint64_t
@@ -380,16 +339,9 @@ void VllmV1Scheduler::restore_admission_queue(std::deque<RequestId> queue) {
     }
 }
 
-ScheduleResult VllmV1Scheduler::schedule(SimTime time) {
-    if (!std::isfinite(time.seconds()) || time.seconds() < 0.0) {
-        throw SchedulerError("schedule time must be finite and nonnegative");
-    }
-    if (in_flight_batch_count_ >= pipeline_parallel_size_) {
-        throw SchedulerError(
-            "cannot schedule beyond pipeline in-flight capacity");
-    }
+ScheduleResult VllmV1Scheduler::schedule_requests(SimTime time) {
     materialize_terminal_releases_before_iteration();
-    validate_state();
+    validate_policy_state();
 
     ScheduleResult result = [&]() {
         ScheduleResult value{};
@@ -478,7 +430,7 @@ ScheduleResult VllmV1Scheduler::schedule(SimTime time) {
         ++running_index;
 
         if (preempted_requests.size() != preempted_before) {
-            validate_state();
+            validate_policy_state();
         }
     }
 
@@ -572,46 +524,12 @@ ScheduleResult VllmV1Scheduler::schedule(SimTime time) {
         result.running_count_after = checked_size(
             running_.size(), "running queue size overflows uint64");
     }
-    validate_state();
+    validate_policy_state();
     return result;
 }
 
-void VllmV1Scheduler::mark_batch_started(const entities::Batch &batch) {
-    if (in_flight_batch_count_ >= pipeline_parallel_size_) {
-        throw SchedulerError("a scheduler batch exceeds pipeline capacity");
-    }
-    std::vector<RequestId> request_ids;
-    request_ids.reserve(batch.requests().size());
-    for (const entities::RequestBatchSnapshot &snapshot : batch.requests()) {
-        auto [position, inserted] =
-            active_requests_.try_emplace(snapshot.request_id, 0);
-        static_cast<void>(inserted);
-        if (cluster_type() != ClusterType::kPrefill && position->second != 0) {
-            throw SchedulerError(
-                "request is already active in another pipeline batch");
-        }
-        if (position->second == std::numeric_limits<std::uint64_t>::max()) {
-            throw SchedulerError("active request batch count overflows uint64");
-        }
-        ++position->second;
-        request_ids.push_back(snapshot.request_id);
-    }
-    if (!in_flight_batches_.emplace(batch.id(), std::move(request_ids))
-             .second) {
-        throw SchedulerError("batch is already in flight");
-    }
-    ++in_flight_batch_count_;
-}
-
-bool VllmV1Scheduler::on_batch_completed(entities::Batch &batch, SimTime time) {
-    const auto in_flight = in_flight_batches_.find(batch.id());
-    if (in_flight == in_flight_batches_.end()) {
-        return false;
-    }
-    if (batch.completed()) {
-        return false;
-    }
-
+bool VllmV1Scheduler::apply_batch_completion(entities::Batch &batch,
+                                             SimTime time) {
     bool has_valid_request = false;
     for (const entities::RequestBatchSnapshot &snapshot : batch.requests()) {
         entities::Request &value = request(snapshot.request_id);
@@ -667,24 +585,6 @@ bool VllmV1Scheduler::on_batch_completed(entities::Batch &batch, SimTime time) {
             }
         }
     }
-    batch.mark_completed(time);
-    for (const RequestId request_id : in_flight->second) {
-        const auto active = active_requests_.find(request_id);
-        if (active == active_requests_.end() || active->second == 0) {
-            throw SchedulerError(
-                "completed batch is missing active request state");
-        }
-        --active->second;
-        if (active->second == 0) {
-            active_requests_.erase(active);
-        }
-    }
-    in_flight_batches_.erase(in_flight);
-    if (in_flight_batch_count_ == 0) {
-        throw SchedulerError("in-flight batch count underflow");
-    }
-    --in_flight_batch_count_;
-    validate_state();
     return has_valid_request;
 }
 
@@ -701,7 +601,7 @@ void VllmV1Scheduler::complete_kv_transfer(RequestId request_id) {
         throw SchedulerError("pending KV transfer source owns no blocks");
     }
     static_cast<void>(kv_blocks_.free(request_id));
-    validate_state();
+    validate_policy_state();
 }
 
 bool VllmV1Scheduler::consume_terminal_release_followup_poll() noexcept {
@@ -710,7 +610,7 @@ bool VllmV1Scheduler::consume_terminal_release_followup_poll() noexcept {
     return pending;
 }
 
-void VllmV1Scheduler::validate_state() const {
+void VllmV1Scheduler::validate_policy_state() const {
     if (cluster_type() == ClusterType::kDecode && !preempted_.empty()) {
         throw SchedulerError(
             "DECODE scheduler must retain preempted requests in waiting order");
@@ -756,28 +656,6 @@ void VllmV1Scheduler::validate_state() const {
     }
     if (running_.size() > config_.batch_size_cap) {
         throw SchedulerError("running request count exceeds batch_size_cap");
-    }
-    if (in_flight_batch_count_ != in_flight_batches_.size() ||
-        in_flight_batch_count_ > pipeline_parallel_size_) {
-        throw SchedulerError("in-flight batch registry invariant failed");
-    }
-    std::unordered_map<RequestId, std::uint64_t, StrongIdHash<RequestId>>
-        expected_active;
-    for (const auto &[batch_id, request_ids] : in_flight_batches_) {
-        static_cast<void>(batch_id);
-        for (const RequestId request_id : request_ids) {
-            auto [position, inserted] =
-                expected_active.try_emplace(request_id, 0);
-            static_cast<void>(inserted);
-            if (position->second == std::numeric_limits<std::uint64_t>::max()) {
-                throw SchedulerError(
-                    "expected active request count overflows uint64");
-            }
-            ++position->second;
-        }
-    }
-    if (expected_active != active_requests_) {
-        throw SchedulerError("active request registry invariant failed");
     }
     if (kv_blocks_.total_allocated_blocks() > kv_blocks_.capacity_blocks()) {
         throw SchedulerError("KV block accounting exceeds capacity");

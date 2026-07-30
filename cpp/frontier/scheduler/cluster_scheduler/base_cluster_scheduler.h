@@ -22,7 +22,7 @@ class Batch;
 }
 
 namespace frontier::execution_time_predictor {
-struct BatchExecutionPrediction;
+struct ExecutionTimePrediction;
 }
 
 namespace frontier::simulator {
@@ -40,93 +40,6 @@ struct ClusterRequestAssignment {
     ReplicaId replica_id;
     DataParallelId dp_id;
     RequestId request_id;
-};
-
-enum class MoESyncPath : std::uint8_t {
-    kPrefill,
-    kDecode,
-};
-
-class MoEBarrierError : public std::runtime_error {
-  public:
-    using std::runtime_error::runtime_error;
-};
-
-struct MoEBarrierKey {
-    ClusterType cluster_type;
-    ReplicaId replica_id;
-    StageId stage_id;
-    MoESyncGroupId sync_group_id;
-    LayerId layer_id;
-    MoESyncPhase phase;
-    Generation generation;
-
-    friend bool operator==(const MoEBarrierKey &lhs, const MoEBarrierKey &rhs) {
-        return std::tie(lhs.cluster_type, lhs.replica_id, lhs.stage_id,
-                        lhs.sync_group_id, lhs.layer_id, lhs.phase,
-                        lhs.generation) ==
-               std::tie(rhs.cluster_type, rhs.replica_id, rhs.stage_id,
-                        rhs.sync_group_id, rhs.layer_id, rhs.phase,
-                        rhs.generation);
-    }
-    friend bool operator<(const MoEBarrierKey &lhs, const MoEBarrierKey &rhs) {
-        return std::tie(lhs.cluster_type, lhs.replica_id, lhs.stage_id,
-                        lhs.sync_group_id, lhs.layer_id, lhs.phase,
-                        lhs.generation) <
-               std::tie(rhs.cluster_type, rhs.replica_id, rhs.stage_id,
-                        rhs.sync_group_id, rhs.layer_id, rhs.phase,
-                        rhs.generation);
-    }
-};
-
-struct MoEBarrierParticipant {
-    MoEParticipantId participant_id;
-    BatchId batch_id;
-    SimTime arrival_time;
-    double elapsed_component_ms = 0.0;
-    bool is_idle = false;
-
-    friend bool operator==(const MoEBarrierParticipant &lhs,
-                           const MoEBarrierParticipant &rhs) {
-        return std::tie(lhs.participant_id, lhs.batch_id, lhs.arrival_time,
-                        lhs.elapsed_component_ms, lhs.is_idle) ==
-               std::tie(rhs.participant_id, rhs.batch_id, rhs.arrival_time,
-                        rhs.elapsed_component_ms, rhs.is_idle);
-    }
-};
-
-struct MoEBarrierReady {
-    MoEBarrierKey key;
-    SimTime collective_time;
-};
-
-class MoEBarrierCoordinator {
-  public:
-    [[nodiscard]] std::optional<MoEBarrierReady>
-    arrive(const MoEBarrierKey &key, MoEBarrierParticipant participant,
-           std::uint64_t expected_participants);
-    [[nodiscard]] std::optional<MoEBarrierReady>
-    compact_missing_idle(const MoEBarrierKey &key,
-                         std::uint64_t expected_participants,
-                         SimTime arrival_time);
-    [[nodiscard]] std::vector<MoEBarrierParticipant>
-    consume(const MoEBarrierKey &key);
-
-    [[nodiscard]] bool empty() const noexcept { return waiting_.empty(); }
-    void require_empty() const;
-
-  private:
-    struct Entry {
-        std::uint64_t expected_participants = 0;
-        std::map<MoEParticipantId, MoEBarrierParticipant> participants;
-        bool collective_emitted = false;
-    };
-
-    [[nodiscard]] std::optional<MoEBarrierReady>
-    maybe_ready(const MoEBarrierKey &key, Entry &entry);
-
-    std::map<MoEBarrierKey, Entry> waiting_;
-    std::map<MoEBarrierKey, bool> consumed_;
 };
 
 // Owns the state and behavior common to every scheduler for one cluster.
@@ -166,24 +79,18 @@ class BaseClusterScheduler {
                                  const simulator::Simulator &simulator) const;
     void begin_moe_stage(
         entities::Batch &batch, StageId stage_id, SimTime started_at,
-        const execution_time_predictor::BatchExecutionPrediction &prediction,
+        const execution_time_predictor::ExecutionTimePrediction &prediction,
         simulator::Simulator &simulator);
-    void ensure_moe_group_participants(const MoEBarrierKey &key,
-                                       MoESyncPath path,
-                                       MoEParticipantId arriving_participant,
-                                       SimTime time,
-                                       simulator::Simulator &simulator);
-    [[nodiscard]] std::optional<MoEBarrierReady>
-    compact_moe_group_participants(const MoEBarrierKey &key, MoESyncPath path,
+    void on_prefill_sync(const PrefillSyncPayload &payload, SimTime time,
+                         simulator::Simulator &simulator);
+    void on_prefill_sync_collective(const PrefillSyncCollectivePayload &payload,
+                                    SimTime time,
+                                    simulator::Simulator &simulator);
+    void on_decode_sync(const DecodeSyncPayload &payload, SimTime time,
+                        simulator::Simulator &simulator);
+    void on_decode_sync_collective(const DecodeSyncCollectivePayload &payload,
                                    SimTime time,
                                    simulator::Simulator &simulator);
-    void
-    continue_moe_stage(const MoEBarrierKey &key, MoESyncPath path,
-                       const std::vector<MoEBarrierParticipant> &participants,
-                       SimTime time, simulator::Simulator &simulator);
-    [[nodiscard]] MoEBarrierCoordinator &moe_barrier() noexcept {
-        return moe_barrier_;
-    }
     void require_quiescent() const;
 
   protected:
@@ -195,8 +102,7 @@ class BaseClusterScheduler {
     BaseClusterScheduler(
         const entities::Cluster &cluster,
         std::vector<entities::Request> &requests,
-        std::shared_ptr<const execution_time_predictor::BatchExecutionModel>
-            predictor,
+        execution_time_predictor::ExecutionTimePredictorPtr predictor,
         std::shared_ptr<const kv_cache_transfer::BaseKVCacheTransferPredictor>
             kv_cache_transfer_predictor);
 
@@ -210,6 +116,93 @@ class BaseClusterScheduler {
     std::vector<QueuedRequest> request_queue_;
 
   private:
+    enum class MoESyncPath : std::uint8_t {
+        kPrefill,
+        kDecode,
+    };
+
+    class MoEBarrierError : public std::runtime_error {
+      public:
+        using std::runtime_error::runtime_error;
+    };
+
+    struct MoEBarrierKey {
+        ClusterType cluster_type;
+        ReplicaId replica_id;
+        StageId stage_id;
+        MoESyncGroupId sync_group_id;
+        LayerId layer_id;
+        MoESyncPhase phase;
+        Generation generation;
+
+        friend bool operator==(const MoEBarrierKey &lhs,
+                               const MoEBarrierKey &rhs) {
+            return std::tie(lhs.cluster_type, lhs.replica_id, lhs.stage_id,
+                            lhs.sync_group_id, lhs.layer_id, lhs.phase,
+                            lhs.generation) ==
+                   std::tie(rhs.cluster_type, rhs.replica_id, rhs.stage_id,
+                            rhs.sync_group_id, rhs.layer_id, rhs.phase,
+                            rhs.generation);
+        }
+        friend bool operator<(const MoEBarrierKey &lhs,
+                              const MoEBarrierKey &rhs) {
+            return std::tie(lhs.cluster_type, lhs.replica_id, lhs.stage_id,
+                            lhs.sync_group_id, lhs.layer_id, lhs.phase,
+                            lhs.generation) <
+                   std::tie(rhs.cluster_type, rhs.replica_id, rhs.stage_id,
+                            rhs.sync_group_id, rhs.layer_id, rhs.phase,
+                            rhs.generation);
+        }
+    };
+
+    struct MoEBarrierParticipant {
+        MoEParticipantId participant_id;
+        BatchId batch_id;
+        SimTime arrival_time;
+        double elapsed_component_ms = 0.0;
+        bool is_idle = false;
+
+        friend bool operator==(const MoEBarrierParticipant &lhs,
+                               const MoEBarrierParticipant &rhs) {
+            return std::tie(lhs.participant_id, lhs.batch_id, lhs.arrival_time,
+                            lhs.elapsed_component_ms, lhs.is_idle) ==
+                   std::tie(rhs.participant_id, rhs.batch_id, rhs.arrival_time,
+                            rhs.elapsed_component_ms, rhs.is_idle);
+        }
+    };
+
+    struct MoEBarrierReady {
+        MoEBarrierKey key;
+        SimTime collective_time;
+    };
+
+    class MoEBarrierCoordinator {
+      public:
+        [[nodiscard]] std::optional<MoEBarrierReady>
+        arrive(const MoEBarrierKey &key, MoEBarrierParticipant participant,
+               std::uint64_t expected_participants);
+        [[nodiscard]] std::optional<MoEBarrierReady>
+        compact_missing_idle(const MoEBarrierKey &key,
+                             std::uint64_t expected_participants,
+                             SimTime arrival_time);
+        [[nodiscard]] std::vector<MoEBarrierParticipant>
+        consume(const MoEBarrierKey &key);
+        void require_empty() const;
+
+      private:
+        struct Entry {
+            std::uint64_t expected_participants = 0;
+            std::map<MoEParticipantId, MoEBarrierParticipant> participants;
+            bool collective_emitted = false;
+        };
+
+        [[nodiscard]] std::optional<MoEBarrierReady>
+        maybe_ready(const MoEBarrierKey &key, Entry &entry);
+
+        std::map<MoEBarrierKey, Entry> waiting_;
+        std::map<MoEBarrierKey, bool> consumed_;
+    };
+
     struct MoEStageKey {
         BatchId batch_id;
         StageId stage_id;
@@ -331,6 +324,19 @@ class BaseClusterScheduler {
                                   MoESyncPhase phase, SimTime time,
                                   double elapsed_component_ms,
                                   simulator::Simulator &simulator);
+    void ensure_moe_group_participants(const MoEBarrierKey &key,
+                                       MoESyncPath path,
+                                       MoEParticipantId arriving_participant,
+                                       SimTime time,
+                                       simulator::Simulator &simulator);
+    [[nodiscard]] std::optional<MoEBarrierReady>
+    compact_moe_group_participants(const MoEBarrierKey &key, MoESyncPath path,
+                                   SimTime time,
+                                   simulator::Simulator &simulator);
+    void
+    continue_moe_stage(const MoEBarrierKey &key, MoESyncPath path,
+                       const std::vector<MoEBarrierParticipant> &participants,
+                       SimTime time, simulator::Simulator &simulator);
 
     std::vector<std::unique_ptr<BaseReplicaScheduler>> replica_schedulers_;
     const entities::Cluster *cluster_;

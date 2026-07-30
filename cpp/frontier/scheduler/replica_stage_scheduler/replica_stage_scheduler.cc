@@ -9,12 +9,10 @@ namespace frontier::scheduler {
 ReplicaStageScheduler::ReplicaStageScheduler(
     ReplicaId replica_id, DataParallelId dp_id, StageId stage_id,
     bool is_last_stage,
-    std::shared_ptr<const execution_time_predictor::BatchExecutionModel>
-        execution_model)
+    execution_time_predictor::ExecutionTimePredictorPtr predictor)
     : replica_id_(replica_id), dp_id_(dp_id), stage_id_(stage_id),
-      is_last_stage_(is_last_stage),
-      execution_model_(std::move(execution_model)) {
-    if (execution_model_ == nullptr) {
+      is_last_stage_(is_last_stage), predictor_(std::move(predictor)) {
+    if (predictor_ == nullptr) {
         throw ReplicaStageSchedulerError(
             "replica stage requires an execution model");
     }
@@ -56,7 +54,7 @@ std::optional<StageBatchTicket> ReplicaStageScheduler::pop_batch_if_not_busy() {
     return ticket;
 }
 
-execution_time_predictor::BatchExecutionPrediction
+execution_time_predictor::ExecutionTimePrediction
 ReplicaStageScheduler::predict(
     const entities::Batch &batch,
     const std::vector<entities::Request> &requests) const {
@@ -64,7 +62,7 @@ ReplicaStageScheduler::predict(
         throw ReplicaStageSchedulerError(
             "only the active stage batch can be predicted");
     }
-    return execution_model_->predict(batch, requests, stage_id_);
+    return predictor_->predict_stage_execution_time(batch, requests, stage_id_);
 }
 
 void ReplicaStageScheduler::on_stage_end(BatchId batch_id) {

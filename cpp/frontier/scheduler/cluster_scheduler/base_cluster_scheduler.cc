@@ -1,6 +1,7 @@
 #include "frontier/scheduler/cluster_scheduler/base_cluster_scheduler.h"
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <set>
 #include <utility>
@@ -8,16 +9,142 @@
 #include "frontier/entities/batch.h"
 #include "frontier/entities/cluster.h"
 #include "frontier/entities/request.h"
-#include "frontier/execution_time_predictor/analytical_roofline_execution_time_predictor.h"
-#include "frontier/scheduler/replica_scheduler/vllm_v1_engine_replica_scheduler.h"
+#include "frontier/execution_time_predictor/base_execution_time_predictor.h"
+#include "frontier/scheduler/replica_scheduler/replica_scheduler_factory.h"
 #include "frontier/simulator/simulator.h"
 
 namespace frontier::scheduler {
 
+std::optional<BaseClusterScheduler::MoEBarrierReady>
+BaseClusterScheduler::MoEBarrierCoordinator::arrive(
+    const MoEBarrierKey &key, MoEBarrierParticipant participant,
+    std::uint64_t expected_participants) {
+    if (!key.replica_id.valid() || !key.stage_id.valid() ||
+        !key.sync_group_id.valid() || !key.layer_id.valid() ||
+        !key.generation.valid()) {
+        throw MoEBarrierError("MoE barrier key contains an invalid ID");
+    }
+    if (expected_participants == 0 || !participant.participant_id.valid() ||
+        static_cast<std::uint64_t>(participant.participant_id.value()) >=
+            expected_participants) {
+        throw MoEBarrierError("MoE participant is outside the barrier domain");
+    }
+    if (!participant.arrival_time.valid() ||
+        !std::isfinite(participant.elapsed_component_ms) ||
+        participant.elapsed_component_ms < 0.0) {
+        throw MoEBarrierError("MoE barrier participant timing is invalid");
+    }
+    if (consumed_.find(key) != consumed_.end()) {
+        return std::nullopt;
+    }
+
+    Entry &entry = waiting_[key];
+    if (entry.expected_participants == 0) {
+        entry.expected_participants = expected_participants;
+    } else if (entry.expected_participants != expected_participants) {
+        throw MoEBarrierError("MoE barrier participant count changed");
+    }
+
+    const auto position = entry.participants.find(participant.participant_id);
+    if (position == entry.participants.end()) {
+        entry.participants.emplace(participant.participant_id,
+                                   std::move(participant));
+    } else if (position->second.is_idle && !participant.is_idle) {
+        position->second = std::move(participant);
+    } else if (!position->second.is_idle && participant.is_idle) {
+        return maybe_ready(key, entry);
+    } else if (position->second == participant) {
+        return maybe_ready(key, entry);
+    } else {
+        throw MoEBarrierError("duplicate MoE barrier participant");
+    }
+    return maybe_ready(key, entry);
+}
+
+std::optional<BaseClusterScheduler::MoEBarrierReady>
+BaseClusterScheduler::MoEBarrierCoordinator::compact_missing_idle(
+    const MoEBarrierKey &key, std::uint64_t expected_participants,
+    SimTime arrival_time) {
+    std::optional<MoEBarrierReady> ready;
+    for (std::uint64_t participant = 0; participant < expected_participants;
+         ++participant) {
+        const MoEParticipantId id{participant};
+        const auto waiting = waiting_.find(key);
+        if (waiting != waiting_.end() &&
+            waiting->second.participants.find(id) !=
+                waiting->second.participants.end()) {
+            continue;
+        }
+        ready = arrive(
+            key,
+            [&]() {
+                MoEBarrierParticipant value{};
+                value.participant_id = id;
+                value.batch_id = BatchId{};
+                value.arrival_time = arrival_time;
+                value.elapsed_component_ms = 0.0;
+                value.is_idle = true;
+                return value;
+            }(),
+            expected_participants);
+    }
+    return ready;
+}
+
+std::optional<BaseClusterScheduler::MoEBarrierReady>
+BaseClusterScheduler::MoEBarrierCoordinator::maybe_ready(
+    const MoEBarrierKey &key, Entry &entry) {
+    if (entry.collective_emitted ||
+        entry.participants.size() != entry.expected_participants) {
+        return std::nullopt;
+    }
+    SimTime maximum;
+    for (const auto &[unused, participant] : entry.participants) {
+        static_cast<void>(unused);
+        if (!maximum.valid() || participant.arrival_time > maximum) {
+            maximum = participant.arrival_time;
+        }
+    }
+    entry.collective_emitted = true;
+    return MoEBarrierReady{key, maximum};
+}
+
+std::vector<BaseClusterScheduler::MoEBarrierParticipant>
+BaseClusterScheduler::MoEBarrierCoordinator::consume(const MoEBarrierKey &key) {
+    if (consumed_.find(key) != consumed_.end()) {
+        return {};
+    }
+    const auto position = waiting_.find(key);
+    if (position == waiting_.end()) {
+        return {};
+    }
+    if (!position->second.collective_emitted ||
+        position->second.participants.size() !=
+            position->second.expected_participants) {
+        throw MoEBarrierError(
+            "MoE barrier consumed before collective readiness");
+    }
+    std::vector<MoEBarrierParticipant> participants;
+    participants.reserve(position->second.participants.size());
+    for (auto &[unused, participant] : position->second.participants) {
+        static_cast<void>(unused);
+        participants.push_back(std::move(participant));
+    }
+    waiting_.erase(position);
+    consumed_.emplace(key, true);
+    return participants;
+}
+
+void BaseClusterScheduler::MoEBarrierCoordinator::require_empty() const {
+    if (!waiting_.empty()) {
+        throw MoEBarrierError(
+            "MoE barrier state remains at simulator quiescence");
+    }
+}
+
 BaseClusterScheduler::BaseClusterScheduler(
     const entities::Cluster &cluster, std::vector<entities::Request> &requests,
-    std::shared_ptr<const execution_time_predictor::BatchExecutionModel>
-        predictor,
+    execution_time_predictor::ExecutionTimePredictorPtr predictor,
     std::shared_ptr<const kv_cache_transfer::BaseKVCacheTransferPredictor>
         kv_cache_transfer_predictor)
     : cluster_(&cluster),
@@ -39,10 +166,10 @@ BaseClusterScheduler::BaseClusterScheduler(
     const config::ClusterRuntimeConfig &runtime = cluster.runtime_config();
     for (std::uint64_t replica = 0; replica < num_replicas; ++replica) {
         for (std::uint64_t dp = 0; dp < data_parallel_size; ++dp) {
-            replica_schedulers_.push_back(std::make_unique<VllmV1Scheduler>(
-                runtime.scheduler, requests, predictor,
-                cluster.replica(ReplicaId{replica}), DataParallelId{dp},
-                cluster.type()));
+            replica_schedulers_.push_back(
+                make_replica_scheduler(runtime.scheduler, requests, predictor,
+                                       cluster.replica(ReplicaId{replica}),
+                                       DataParallelId{dp}, cluster.type()));
         }
     }
     for (std::uint64_t replica = 0; replica < num_replicas; ++replica) {
@@ -268,7 +395,7 @@ void BaseClusterScheduler::enqueue_idle_moe_arrival(
 
 void BaseClusterScheduler::begin_moe_stage(
     entities::Batch &batch, StageId stage_id, SimTime started_at,
-    const execution_time_predictor::BatchExecutionPrediction &prediction,
+    const execution_time_predictor::ExecutionTimePrediction &prediction,
     simulator::Simulator &simulator) {
     if (!requires_moe_synchronization(batch, simulator)) {
         throw std::logic_error(
@@ -524,7 +651,7 @@ void BaseClusterScheduler::ensure_moe_group_participants(
     }
 }
 
-std::optional<MoEBarrierReady>
+std::optional<BaseClusterScheduler::MoEBarrierReady>
 BaseClusterScheduler::compact_moe_group_participants(
     const MoEBarrierKey &key, MoESyncPath path, SimTime time,
     simulator::Simulator &simulator) {
@@ -723,6 +850,104 @@ void BaseClusterScheduler::continue_moe_stage(
         moe_stage_states_.erase(stage_key);
     }
     moe_group_states_.erase(group_position);
+}
+
+void BaseClusterScheduler::on_prefill_sync(const PrefillSyncPayload &payload,
+                                           SimTime time,
+                                           simulator::Simulator &simulator) {
+    const entities::Batch &batch = simulator.batch(payload.batch_id);
+    if (batch.schedule_epoch() != payload.generation) {
+        return;
+    }
+    if (batch.is_idle() != payload.is_idle) {
+        throw MoEBarrierError(
+            "prefill synchronization idle marker disagrees with batch");
+    }
+    const MoEBarrierKey key{payload.cluster_type,   payload.replica_id,
+                            payload.stage_id,       payload.sync_group_id,
+                            payload.layer_id,       payload.sync_phase,
+                            payload.sync_generation};
+    ensure_moe_group_participants(key, MoESyncPath::kPrefill,
+                                  payload.participant_id, time, simulator);
+    const auto ready = moe_barrier_.arrive(
+        key,
+        MoEBarrierParticipant{payload.participant_id, payload.batch_id, time,
+                              payload.elapsed_component_ms, payload.is_idle},
+        simulator.parallelism(payload.cluster_type).data_parallel_size);
+    if (ready.has_value()) {
+        simulator.event_queue().push(
+            ready->collective_time,
+            PrefillSyncCollectivePayload{
+                payload.replica_id, payload.stage_id, payload.sync_group_id,
+                payload.layer_id, payload.sync_phase, payload.sync_generation,
+                payload.cluster_type});
+    }
+}
+
+void BaseClusterScheduler::on_prefill_sync_collective(
+    const PrefillSyncCollectivePayload &payload, SimTime time,
+    simulator::Simulator &simulator) {
+    const MoEBarrierKey key{payload.cluster_type,   payload.replica_id,
+                            payload.stage_id,       payload.sync_group_id,
+                            payload.layer_id,       payload.sync_phase,
+                            payload.sync_generation};
+    const auto participants = moe_barrier_.consume(key);
+    continue_moe_stage(key, MoESyncPath::kPrefill, participants, time,
+                       simulator);
+}
+
+void BaseClusterScheduler::on_decode_sync(const DecodeSyncPayload &payload,
+                                          SimTime time,
+                                          simulator::Simulator &simulator) {
+    const entities::Batch &batch = simulator.batch(payload.batch_id);
+    if (batch.schedule_epoch() != payload.generation) {
+        return;
+    }
+    if (batch.is_idle() != payload.is_idle) {
+        throw MoEBarrierError(
+            "decode synchronization idle marker disagrees with batch");
+    }
+    const MoEBarrierKey key{payload.cluster_type,   payload.replica_id,
+                            payload.stage_id,       payload.sync_group_id,
+                            payload.layer_id,       payload.sync_phase,
+                            payload.sync_generation};
+    ensure_moe_group_participants(key, MoESyncPath::kDecode,
+                                  payload.participant_id, time, simulator);
+    const config::ParallelismConfig &parallelism =
+        simulator.parallelism(payload.cluster_type);
+    const std::uint64_t expected_participants =
+        payload.cluster_type == ClusterType::kMonolithic
+            ? parallelism.moe_expert_parallel_size
+            : parallelism.data_parallel_size;
+    auto ready = moe_barrier_.arrive(
+        key,
+        MoEBarrierParticipant{payload.participant_id, payload.batch_id, time,
+                              payload.elapsed_component_ms, payload.is_idle},
+        expected_participants);
+    if (!ready.has_value() && payload.sync_phase == MoESyncPhase::kPreMoe) {
+        ready = compact_moe_group_participants(key, MoESyncPath::kDecode, time,
+                                               simulator);
+    }
+    if (ready.has_value()) {
+        simulator.event_queue().push(
+            ready->collective_time,
+            DecodeSyncCollectivePayload{
+                payload.replica_id, payload.stage_id, payload.sync_group_id,
+                payload.layer_id, payload.sync_phase, payload.sync_generation,
+                payload.cluster_type});
+    }
+}
+
+void BaseClusterScheduler::on_decode_sync_collective(
+    const DecodeSyncCollectivePayload &payload, SimTime time,
+    simulator::Simulator &simulator) {
+    const MoEBarrierKey key{payload.cluster_type,   payload.replica_id,
+                            payload.stage_id,       payload.sync_group_id,
+                            payload.layer_id,       payload.sync_phase,
+                            payload.sync_generation};
+    const auto participants = moe_barrier_.consume(key);
+    continue_moe_stage(key, MoESyncPath::kDecode, participants, time,
+                       simulator);
 }
 
 void BaseClusterScheduler::require_quiescent() const {

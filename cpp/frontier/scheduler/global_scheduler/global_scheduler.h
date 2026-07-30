@@ -9,7 +9,7 @@
 #include "frontier/core/ids.h"
 #include "frontier/entities/cluster.h"
 #include "frontier/entities/request.h"
-#include "frontier/execution_time_predictor/analytical_roofline_execution_time_predictor.h"
+#include "frontier/execution_time_predictor/base_execution_time_predictor.h"
 #include "frontier/kv_cache_transfer/base_kv_cache_transfer_predictor.h"
 #include "frontier/scheduler/cluster_scheduler/base_cluster_scheduler.h"
 #include "frontier/scheduler/scheduler_types.h"
@@ -28,9 +28,9 @@ struct GlobalRequestAssignment {
 
 class GlobalScheduler final {
   public:
-    using PredictorMap = std::map<
-        ClusterType,
-        std::shared_ptr<const execution_time_predictor::BatchExecutionModel>>;
+    using PredictorMap =
+        std::map<ClusterType,
+                 execution_time_predictor::ExecutionTimePredictorPtr>;
 
     GlobalScheduler(
         const std::map<ClusterType, entities::Cluster> &clusters,

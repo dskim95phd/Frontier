@@ -320,7 +320,7 @@ CoLocationGlobalScheduler
   -> CoLocationClusterScheduler
     -> VllmV1Scheduler : BaseReplicaScheduler
       -> ReplicaStageScheduler
-        -> BatchExecutionModel
+        -> BaseExecutionTimePredictor
 ```
 
 Global and cluster routing are deterministic pass-through operations for the
@@ -685,11 +685,11 @@ Batch completion has two stale-event levels:
 
 #### Scope
 
-Introduce a small execution-model interface:
+Introduce a small execution-predictor interface:
 
 ```text
-BatchExecutionModel
-  FixedBatchExecutionModel
+BaseExecutionTimePredictor
+  FixedExecutionTimePredictor
   AnalyticalRooflineExecutionTimePredictor
 ```
 

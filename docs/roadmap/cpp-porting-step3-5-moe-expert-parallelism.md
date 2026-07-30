@@ -73,14 +73,41 @@ used only for explicitly named timing fields.
 
 ### Production Python Oracle Limitations
 
-Two attempted PDD stress combinations cannot currently serve as differential
-oracles: DECODE attention DP2 combined with PP2, and two DECODE replicas
-combined with PP2. In both cases the production Python simulator drains its
-event queue with requests stopped at 30 of 32 completed layers. The passing
-matrix therefore uses PP1 for those two DECODE variants while retaining DP2,
-EP, asymmetric topology, multiple replicas, and PP coverage in other cases.
-This is an oracle/runtime limitation, not a C++ parity result, so those exact
-combinations are not claimed as validated.
+#### Known upstream issue: MoE PDD DECODE with PP greater than one
+
+- **Recorded:** 2026-07-31
+- **Status:** Open in the production Python simulator; intentionally not fixed
+  as part of the C++ port
+- **Disposition:** Keep the C++ implementation unchanged and exclude the
+  affected topology from Python/C++ parity claims until the Python behavior is
+  resolved or the public configuration contract explicitly rejects it
+
+The concrete reproducer uses sequential analytical MoE PDD with two requests
+and a nonzero KV-transfer delay:
+
+| Cluster | Replicas | Attention | Pipeline | MoE |
+| --- | ---: | --- | ---: | --- |
+| PREFILL | 2 | TP4 / DP2 | PP4 | TP1 / EP8 |
+| DECODE | 2 | TP4 / DP2 | PP2 | TP2 / EP4 |
+
+The production Python simulator drains its event queue while DECODE requests
+remain at 30 of 32 completed layers and then reports:
+
+```text
+Sequential simulation ended with non-empty scheduler state
+```
+
+The C++ simulator reaches quiescence for the same normalized input. That does
+not establish a C++ parity success because the production Python oracle
+produces no completed result to compare. Current evidence therefore classifies
+this as a Python oracle/runtime issue rather than a C++ defect; no compensating
+C++ behavior or topology-specific workaround should be added.
+
+Related stress combinations—DECODE attention DP2 with PP2 and two DECODE
+replicas with PP2—show the same Python terminal state. The passing differential
+matrix uses PP1 for those DECODE variants while retaining DP2, EP, asymmetric
+topology, multiple replicas, and PP coverage in other cases. None of the
+affected exact combinations is claimed as validated.
 
 Python's public dense-PDD configuration validation also rejects DP greater
 than one. The differential oracle first constructs a public-valid topology and
@@ -621,8 +648,9 @@ fixtures match exactly.
 
 ## Execution-Time Model
 
-Refactor `BatchExecutionModel` so synchronized MoE code can request
-single-layer components without reverse-engineering an aggregate stage time.
+Extend the shared `BaseExecutionTimePredictor` contract so synchronized MoE
+code can request single-layer components without reverse-engineering an
+aggregate stage time.
 
 The predictor interface needs equivalent operations for:
 
@@ -822,20 +850,23 @@ Suggested additions:
 ```text
 cpp/frontier/
   execution_time_predictor/
+    base_execution_time_predictor.h
+    execution_time_predictor_factory.h/.cc
+    fixed_execution_time_predictor.h/.cc
     analytical_roofline_execution_time_predictor.h/.cc
-    analytical_roofline_dense_model.cc
-    analytical_roofline_moe_domain.cc
-    analytical_roofline_moe_routing.cc
-    analytical_roofline_moe_model.cc
   scheduler/cluster_scheduler/
     base_cluster_scheduler.h/.cc
-    base_cluster_scheduler_moe_barrier.cc
   events/
     prefill_sync_event.cc
     prefill_sync_collective_event.cc
     decode_sync_event.cc
     decode_sync_collective_event.cc
 ```
+
+The analytical predictor intentionally keeps its dense and MoE formulas in
+one implementation file. Likewise, the MoE barrier is a private part of
+`BaseClusterScheduler` rather than a separately exposed source-level
+subsystem.
 
 Existing files that require contract changes include:
 

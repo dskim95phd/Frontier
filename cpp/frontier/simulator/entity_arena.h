@@ -10,7 +10,7 @@
 #include "frontier/entities/batch_stage.h"
 #include "frontier/entities/kv_cache_transfer_info.h"
 #include "frontier/entities/request.h"
-#include "frontier/execution_time_predictor/analytical_roofline_execution_time_predictor.h"
+#include "frontier/execution_time_predictor/base_execution_time_predictor.h"
 #include "frontier/request_generator/workload.h"
 #include "frontier/scheduler/replica_scheduler/base_replica_scheduler.h"
 #include "frontier/scheduler/scheduler_types.h"
@@ -54,7 +54,7 @@ class EntityArena {
     void record_stage_arrival(BatchId batch_id, StageId stage_id, SimTime time);
     entities::BatchStage &create_batch_stage(
         BatchId batch_id, StageId stage_id, SimTime started_at,
-        const execution_time_predictor::BatchExecutionPrediction &prediction);
+        const execution_time_predictor::ExecutionTimePrediction &prediction);
     [[nodiscard]] entities::BatchStage &batch_stage(BatchId batch_id,
                                                     StageId stage_id);
     [[nodiscard]] double predicted_batch_ms(BatchId batch_id) const;

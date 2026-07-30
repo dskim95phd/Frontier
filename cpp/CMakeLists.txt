@@ -97,21 +97,19 @@ add_library(
   frontier/events/prefill_sync_collective_event.cc
   frontier/events/decode_sync_event.cc
   frontier/events/decode_sync_collective_event.cc
-  frontier/execution_time_predictor/analytical_roofline_dense_model.cc
+  frontier/execution_time_predictor/execution_time_predictor_factory.cc
+  frontier/execution_time_predictor/fixed_execution_time_predictor.cc
   frontier/execution_time_predictor/analytical_roofline_execution_time_predictor.cc
-  frontier/execution_time_predictor/analytical_roofline_moe_domain.cc
-  frontier/execution_time_predictor/analytical_roofline_moe_model.cc
-  frontier/execution_time_predictor/analytical_roofline_moe_routing.cc
   frontier/kv_cache_transfer/analytical_transfer.cc
   frontier/metrics/output_contract.cc
   frontier/metrics/metrics_store.cc
   frontier/request_generator/workload.cc
   frontier/scheduler/cluster_scheduler/base_cluster_scheduler.cc
-  frontier/scheduler/cluster_scheduler/base_cluster_scheduler_moe_barrier.cc
   frontier/scheduler/cluster_scheduler/round_robin_cluster_scheduler.cc
   frontier/scheduler/global_scheduler/global_scheduler.cc
   frontier/scheduler/kv_block_accounting.cc
   frontier/scheduler/replica_scheduler/base_replica_scheduler.cc
+  frontier/scheduler/replica_scheduler/replica_scheduler_factory.cc
   frontier/scheduler/replica_scheduler/vllm_v1_engine_replica_scheduler.cc
   frontier/scheduler/replica_stage_scheduler/replica_stage_scheduler.cc
   frontier/simulator/entity_arena.cc

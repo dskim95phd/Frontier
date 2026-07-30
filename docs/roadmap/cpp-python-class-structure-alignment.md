@@ -13,7 +13,11 @@ Implemented on the C++ port branch before Step 4.
 - [x] Python-aligned scheduler construction chain
 - [x] `SimulationContext` absorbed into `Simulator`
 - [x] Python-aligned `AnalyticalRooflineExecutionTimePredictor` responsibility
+- [x] Shared `BaseExecutionTimePredictor` contract and predictor factory
+- [x] Common replica lifecycle/state in `BaseReplicaScheduler`
+- [x] Replica-scheduler construction isolated behind a factory
 - [x] MoE synchronization state returned to `BaseClusterScheduler`
+- [x] MoE barrier hidden behind cluster-scheduler event entry points
 
 The default rule is to preserve the production Python ownership and class
 responsibility boundaries unless C++ requires a materially different design.
@@ -64,8 +68,8 @@ facade were removed.
 ### Previous Difference
 
 Python creates one predictor per cluster and injects it through the scheduler
-hierarchy. C++ currently creates a `BatchExecutionModel` per replica scheduler
-and clones it for pipeline stages.
+hierarchy. C++ previously created an execution model per replica scheduler and
+cloned it for pipeline stages.
 
 ### Target
 
@@ -89,11 +93,25 @@ Implemented: `Simulator` owns the per-cluster predictor map, matching Python's
 `Simulator._predictors`, while each `Cluster` owns its communication backend.
 `GlobalScheduler` injects the matching predictor into each cluster scheduler;
 replica and PP-stage schedulers share it rather than cloning it.
-The former public `AnalyticalBatchExecutionModel` and `frontier/moe/`
-calculation modules were consolidated behind the Python-aligned
-`AnalyticalRooflineExecutionTimePredictor` entry point. Dense roofline, routing,
-EP ownership, and MoE timing source files are now implementation units of that
-predictor rather than a separate runtime subsystem.
+`BaseExecutionTimePredictor` is the scheduler-facing contract, while a factory
+selects fixed or analytical implementations. The former public
+`AnalyticalBatchExecutionModel` and `frontier/moe/` calculation modules were
+consolidated behind the Python-aligned
+`AnalyticalRooflineExecutionTimePredictor` entry point. Its dense roofline,
+routing, EP ownership, and MoE timing implementation now lives in one `.cc`
+file rather than being exposed as a separate runtime subsystem.
+
+## 2.1 Align Replica-Scheduler Ownership
+
+Python's base replica scheduler owns request admission, in-flight batch
+lifecycle, pipeline capacity, and shared request state. The C++ base now owns
+those same cross-policy responsibilities. `VllmV1Scheduler` retains only the
+vLLM-specific batching, preemption, KV accounting policy, and completion
+mutation hooks.
+
+`BaseClusterScheduler` constructs replica schedulers through
+`make_replica_scheduler()`. Adding another scheduler therefore requires a new
+derived policy and one factory case, without changing cluster scheduling.
 
 ## 3. Match `ReplicaStageScheduler` Queue Ordering
 
@@ -152,6 +170,11 @@ reconstructed normalized output records directly.
 
 Implemented: event handlers record observations through `MetricsStore`;
 request record materialization and final output ownership also live there.
+
+MoE synchronization follows the same ownership rule: sync event files only
+delegate typed payloads to `BaseClusterScheduler`. Barrier keys, participants,
+waiting rooms, idle compaction, and collective continuation are private
+cluster-scheduler details implemented in `base_cluster_scheduler.cc`.
 
 ## 5. Add KV-Transfer and Communication-Backend Interfaces
 

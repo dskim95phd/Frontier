@@ -206,7 +206,7 @@ void test_long_context_decode_cost_increases() {
            "long-context decode attention must cost more");
 }
 
-double diagnostic_value(const predictor::BatchExecutionPrediction &prediction,
+double diagnostic_value(const predictor::ExecutionTimePrediction &prediction,
                         std::string_view name) {
     const auto iterator = std::find_if(
         prediction.diagnostics.begin(), prediction.diagnostics.end(),
@@ -278,8 +278,9 @@ void test_batch_model_matches_python_golden() {
             std::move(snapshots), SimTime::from_seconds(0.0),
             Generation{0},
         };
-        const predictor::BatchExecutionPrediction prediction =
-            model.predict(batch, requests, frontier::StageId{0});
+        const predictor::ExecutionTimePrediction prediction =
+            model.predict_stage_execution_time(batch, requests,
+                                               frontier::StageId{0});
         const Json &expected = test_case.at("expected");
         expect_approximately_equal(
             prediction.duration_ms,

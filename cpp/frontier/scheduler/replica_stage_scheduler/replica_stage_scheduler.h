@@ -11,7 +11,7 @@
 #include "frontier/core/ids.h"
 #include "frontier/entities/batch.h"
 #include "frontier/entities/request.h"
-#include "frontier/execution_time_predictor/analytical_roofline_execution_time_predictor.h"
+#include "frontier/execution_time_predictor/base_execution_time_predictor.h"
 
 namespace frontier::scheduler {
 
@@ -42,13 +42,12 @@ class ReplicaStageScheduler {
     ReplicaStageScheduler(
         ReplicaId replica_id, DataParallelId dp_id, StageId stage_id,
         bool is_last_stage,
-        std::shared_ptr<const execution_time_predictor::BatchExecutionModel>
-            execution_model);
+        execution_time_predictor::ExecutionTimePredictorPtr predictor);
 
     void add_batch(const entities::Batch &batch);
     [[nodiscard]] std::optional<StageBatchTicket> pop_batch_if_not_busy();
     [[nodiscard]]
-    execution_time_predictor::BatchExecutionPrediction
+    execution_time_predictor::ExecutionTimePrediction
     predict(const entities::Batch &batch,
             const std::vector<entities::Request> &requests) const;
     void on_stage_end(BatchId batch_id);
@@ -67,8 +66,7 @@ class ReplicaStageScheduler {
     DataParallelId dp_id_;
     StageId stage_id_;
     bool is_last_stage_;
-    std::shared_ptr<const execution_time_predictor::BatchExecutionModel>
-        execution_model_;
+    execution_time_predictor::ExecutionTimePredictorPtr predictor_;
     std::priority_queue<StageBatchTicket, std::vector<StageBatchTicket>,
                         StageBatchTicketPriority>
         queue_;

@@ -1,3 +1,4 @@
+#include "frontier/execution_time_predictor/fixed_execution_time_predictor.h"
 #include "frontier/scheduler/global_scheduler/global_scheduler.h"
 #include "tests/test_support.h"
 
@@ -23,7 +24,7 @@ using frontier::entities::Batch;
 using frontier::entities::Cluster;
 using frontier::entities::Request;
 using frontier::entities::RequestBatchSnapshot;
-using frontier::execution_time_predictor::FixedBatchExecutionModel;
+using frontier::execution_time_predictor::FixedExecutionTimePredictor;
 using frontier::request_generator::WorkloadRequest;
 using frontier::scheduler::BaseClusterScheduler;
 using frontier::scheduler::BaseReplicaScheduler;
@@ -65,7 +66,7 @@ void test_colocation_scheduler_hierarchy_routes_and_executes() {
                      Cluster{ClusterType::kMonolithic, runtime});
     GlobalScheduler::PredictorMap predictors;
     predictors.emplace(ClusterType::kMonolithic,
-                       std::make_shared<FixedBatchExecutionModel>([&]() {
+                       std::make_shared<FixedExecutionTimePredictor>([&]() {
                            frontier::config::FixedExecutionModelConfig value{};
                            value.batch_latency_ms = 2.5;
                            value.stage_latencies_ms = {};
@@ -142,7 +143,7 @@ void test_colocation_scheduler_hierarchy_routes_and_executes() {
 void test_stage_scheduler_prioritizes_global_batch_id() {
     ReplicaStageScheduler stage{
         ReplicaId{0}, DataParallelId{0}, StageId{0}, true,
-        std::make_shared<FixedBatchExecutionModel>([&]() {
+        std::make_shared<FixedExecutionTimePredictor>([&]() {
             frontier::config::FixedExecutionModelConfig value{};
             value.batch_latency_ms = 1.0;
             value.stage_latencies_ms = {};
@@ -197,7 +198,7 @@ void test_colocation_hierarchy_rejects_unknown_targets() {
                      Cluster{ClusterType::kMonolithic, runtime});
     GlobalScheduler::PredictorMap predictors;
     predictors.emplace(ClusterType::kMonolithic,
-                       std::make_shared<FixedBatchExecutionModel>([&]() {
+                       std::make_shared<FixedExecutionTimePredictor>([&]() {
                            frontier::config::FixedExecutionModelConfig value{};
                            value.batch_latency_ms = 0.0;
                            value.stage_latencies_ms = {};

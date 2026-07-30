@@ -150,7 +150,7 @@ void EntityArena::record_stage_arrival(BatchId batch_id, StageId stage_id,
 
 entities::BatchStage &EntityArena::create_batch_stage(
     BatchId batch_id, StageId stage_id, SimTime started_at,
-    const execution_time_predictor::BatchExecutionPrediction &prediction) {
+    const execution_time_predictor::ExecutionTimePrediction &prediction) {
     const std::size_t batch_index = batch_id.index();
     const std::size_t stage_index = stage_id.index();
     const SimTime arrival =

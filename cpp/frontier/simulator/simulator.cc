@@ -8,7 +8,7 @@
 #include <utility>
 
 #include "frontier/events/event_dispatcher.h"
-#include "frontier/execution_time_predictor/analytical_roofline_execution_time_predictor.h"
+#include "frontier/execution_time_predictor/execution_time_predictor_factory.h"
 #include "frontier/kv_cache_transfer/analytical_transfer.h"
 #include "frontier/scheduler/global_scheduler/global_scheduler.h"
 
@@ -88,7 +88,7 @@ Simulator::Simulator(
     for (const auto &[cluster_type, cluster] : clusters_) {
         predictors_.emplace(
             cluster_type,
-            execution_time_predictor::make_batch_execution_model(
+            execution_time_predictor::make_execution_time_predictor(
                 cluster.runtime_config().execution_model, cluster.parallelism(),
                 cluster.model(), cluster.runtime_config().moe_routing,
                 cluster.communication_backend()));
@@ -206,7 +206,7 @@ void Simulator::record_stage_arrival(BatchId batch_id, StageId stage_id,
 
 entities::BatchStage &Simulator::create_batch_stage(
     BatchId batch_id, StageId stage_id, SimTime started_at,
-    const execution_time_predictor::BatchExecutionPrediction &prediction) {
+    const execution_time_predictor::ExecutionTimePrediction &prediction) {
     return entities_.create_batch_stage(batch_id, stage_id, started_at,
                                         prediction);
 }

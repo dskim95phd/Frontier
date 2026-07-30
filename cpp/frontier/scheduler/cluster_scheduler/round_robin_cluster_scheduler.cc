@@ -7,8 +7,7 @@ namespace frontier::scheduler {
 
 RoundRobinClusterScheduler::RoundRobinClusterScheduler(
     const entities::Cluster &cluster, std::vector<entities::Request> &requests,
-    std::shared_ptr<const execution_time_predictor::BatchExecutionModel>
-        predictor,
+    execution_time_predictor::ExecutionTimePredictorPtr predictor,
     std::shared_ptr<const kv_cache_transfer::BaseKVCacheTransferPredictor>
         kv_cache_transfer_predictor)
     : BaseClusterScheduler(cluster, requests, std::move(predictor),

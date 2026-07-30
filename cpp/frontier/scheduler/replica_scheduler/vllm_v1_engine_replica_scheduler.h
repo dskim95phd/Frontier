@@ -13,7 +13,7 @@
 #include "frontier/core/ids.h"
 #include "frontier/entities/batch.h"
 #include "frontier/entities/request.h"
-#include "frontier/execution_time_predictor/analytical_roofline_execution_time_predictor.h"
+#include "frontier/execution_time_predictor/base_execution_time_predictor.h"
 #include "frontier/scheduler/kv_block_accounting.h"
 #include "frontier/scheduler/replica_scheduler/base_replica_scheduler.h"
 
@@ -26,21 +26,15 @@ class VllmV1Scheduler final : public BaseReplicaScheduler {
     VllmV1Scheduler(
         config::SchedulerConfig config,
         std::vector<entities::Request> &requests,
-        std::unique_ptr<execution_time_predictor::BatchExecutionModel>
-            execution_model);
+        std::unique_ptr<execution_time_predictor::BaseExecutionTimePredictor>
+            predictor);
     VllmV1Scheduler(
         config::SchedulerConfig config,
         std::vector<entities::Request> &requests,
-        std::shared_ptr<const execution_time_predictor::BatchExecutionModel>
-            execution_model,
+        execution_time_predictor::ExecutionTimePredictorPtr predictor,
         const entities::Replica &replica, DataParallelId dp_id,
         ClusterType cluster_type);
 
-    void add_request(RequestId request_id) override;
-    [[nodiscard]] ScheduleResult schedule(SimTime time) override;
-    void mark_batch_started(const entities::Batch &batch) override;
-    [[nodiscard]] bool on_batch_completed(entities::Batch &batch,
-                                          SimTime time) override;
     [[nodiscard]] bool
     consume_terminal_release_followup_poll() noexcept override;
     void complete_kv_transfer(RequestId request_id) override;
@@ -49,17 +43,6 @@ class VllmV1Scheduler final : public BaseReplicaScheduler {
         return pending_kv_transfers_.size();
     }
 
-    [[nodiscard]] bool has_in_flight_batch() const noexcept override {
-        return in_flight_batch_count_ > 0;
-    }
-    [[nodiscard]] std::uint64_t
-    in_flight_batch_count() const noexcept override {
-        return in_flight_batch_count_;
-    }
-    [[nodiscard]] std::uint64_t
-    pipeline_parallel_size() const noexcept override {
-        return pipeline_parallel_size_;
-    }
     [[nodiscard]] bool has_pending_work() const noexcept override {
         return !preempted_.empty() || !waiting_.empty() || !running_.empty();
     }
@@ -91,10 +74,11 @@ class VllmV1Scheduler final : public BaseReplicaScheduler {
     }
 
   private:
-    [[nodiscard]] entities::Request &request(RequestId request_id);
-    [[nodiscard]] const entities::Request &request(RequestId request_id) const;
-    [[nodiscard]] bool contains_request(RequestId request_id) const;
-    [[nodiscard]] bool request_is_active(RequestId request_id) const;
+    [[nodiscard]] bool contains_request(RequestId request_id) const override;
+    [[nodiscard]] ScheduleResult schedule_requests(SimTime time) override;
+    [[nodiscard]] bool apply_batch_completion(entities::Batch &batch,
+                                              SimTime time) override;
+    void validate_policy_state() const override;
     [[nodiscard]] std::uint64_t
     next_num_tokens(const entities::Request &request) const;
     [[nodiscard]] std::uint64_t
@@ -123,21 +107,9 @@ class VllmV1Scheduler final : public BaseReplicaScheduler {
         std::uint64_t &token_budget, ScheduleResult &result);
     [[nodiscard]] std::deque<RequestId> take_admission_queue();
     void restore_admission_queue(std::deque<RequestId> queue);
-    void validate_state() const;
-
-    config::SchedulerConfig config_;
-    std::vector<entities::Request> *requests_;
-    KvBlockAccounting kv_blocks_;
     std::deque<RequestId> preempted_;
-    std::deque<RequestId> waiting_;
     std::vector<RequestId> running_;
     std::uint64_t next_iteration_id_ = 0;
-    std::uint64_t pipeline_parallel_size_ = 1;
-    std::uint64_t in_flight_batch_count_ = 0;
-    std::unordered_map<BatchId, std::vector<RequestId>, StrongIdHash<BatchId>>
-        in_flight_batches_;
-    std::unordered_map<RequestId, std::uint64_t, StrongIdHash<RequestId>>
-        active_requests_;
     std::unordered_map<RequestId, std::uint64_t, StrongIdHash<RequestId>>
         pending_terminal_release_iterations_;
     std::unordered_set<RequestId, StrongIdHash<RequestId>>

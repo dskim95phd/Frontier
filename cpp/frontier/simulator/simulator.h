@@ -10,7 +10,7 @@
 #include "frontier/config/config.h"
 #include "frontier/core/event_queue.h"
 #include "frontier/entities/cluster.h"
-#include "frontier/execution_time_predictor/analytical_roofline_execution_time_predictor.h"
+#include "frontier/execution_time_predictor/base_execution_time_predictor.h"
 #include "frontier/kv_cache_transfer/base_kv_cache_transfer_predictor.h"
 #include "frontier/metrics/metrics_store.h"
 #include "frontier/request_generator/workload.h"
@@ -75,7 +75,7 @@ class Simulator {
     void record_stage_arrival(BatchId batch_id, StageId stage_id, SimTime time);
     entities::BatchStage &create_batch_stage(
         BatchId batch_id, StageId stage_id, SimTime started_at,
-        const execution_time_predictor::BatchExecutionPrediction &prediction);
+        const execution_time_predictor::ExecutionTimePrediction &prediction);
     [[nodiscard]] entities::BatchStage &batch_stage(BatchId batch_id,
                                                     StageId stage_id);
     [[nodiscard]] double predicted_batch_ms(BatchId batch_id) const;
