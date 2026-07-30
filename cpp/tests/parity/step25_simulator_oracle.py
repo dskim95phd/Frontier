@@ -71,6 +71,27 @@ def _build_python_config(
     topology = cluster_config["parallelism"]
     scheduler = cluster_config["scheduler"]
     execution = cluster_config["execution_model"]
+    model = cluster_config.get(
+        "model",
+        {
+            "name": "llama2-7b",
+            "runtime_total_experts": 1,
+            "router_topk": 1,
+        },
+    )
+    routing = cluster_config.get(
+        "moe_routing",
+        {
+            "mode": "simulation",
+            "distribution": "balanced",
+            "seed": 42,
+        },
+    )
+    model_name = (
+        "meta-llama/Llama-2-7b-hf"
+        if model["name"] == "llama2-7b"
+        else str(model["name"])
+    )
     replica_scheduler = VllmV1SchedulerConfig(
         batch_size_cap=int(scheduler["batch_size_cap"]),
         block_size=int(scheduler["block_size"]),
@@ -95,7 +116,7 @@ def _build_python_config(
         num_blocks_mode="explicit",
     )
     replica = ReplicaConfig(
-        model_name="meta-llama/Llama-2-7b-hf",
+        model_name=model_name,
         device=str(execution.get("device", "rubin")),
         network_device="vera_rubin_nvl72_domain",
         attn_tensor_parallel_size=int(
@@ -107,6 +128,22 @@ def _build_python_config(
         num_pipeline_stages=int(
             topology["pipeline_parallel_size"]
         ),
+        data_parallel_size=int(topology["data_parallel_size"]),
+        moe_tensor_parallel_size=int(
+            topology.get("moe_tensor_parallel_size", 1)
+        ),
+        moe_expert_parallel_size=int(
+            topology.get("moe_expert_parallel_size", 1)
+        ),
+        total_expert_num=int(
+            model.get("runtime_total_experts", 1)
+        ),
+        router_topk=int(model.get("router_topk", 1)),
+        moe_routing_mode=str(routing.get("mode", "simulation")),
+        moe_routing_distribution_type=str(
+            routing.get("distribution", "balanced")
+        ),
+        moe_routing_seed=int(routing.get("seed", 42)),
     )
     predictor = AnalyticalRooflineExecutionTimePredictorConfig()
     cluster = ClusterConfig(
@@ -243,7 +280,7 @@ def _capture_predictions(
             **kwargs,
         )
         key = (int(batch.id), int(pipeline_stage))
-        if key in captured:
+        if key in captured and not self._model_config.is_moe:
             raise Step25OracleError(
                 f"stage prediction repeated for {key}"
             )
@@ -267,6 +304,10 @@ _EVENT_NAMES = {
     "BATCH_STAGE_END": "batch_stage_end",
     "CLUSTER_BATCH_END": "cluster_batch_end",
     "GLOBAL_BATCH_END": "global_batch_end",
+    "PREFILL_SYNC": "prefill_sync",
+    "PREFILL_SYNC_COLLECTIVE": "prefill_sync_collective",
+    "DECODE_SYNC": "decode_sync",
+    "DECODE_SYNC_COLLECTIVE": "decode_sync_collective",
 }
 
 
@@ -299,9 +340,14 @@ def _normalize_events(
             "batch_stage_arrival",
             "replica_stage_schedule",
             "batch_stage_end",
+            "prefill_sync",
+            "prefill_sync_collective",
+            "decode_sync",
+            "decode_sync_collective",
         }:
             event["replica_id"] = int(raw["replica_id"])
-            event["dp_id"] = int(raw["dp_id"])
+            if "dp_id" in raw:
+                event["dp_id"] = int(raw["dp_id"])
         if event_type in {
             "batch_stage_arrival",
             "batch_stage_end",
@@ -311,8 +357,30 @@ def _normalize_events(
             "batch_stage_arrival",
             "replica_stage_schedule",
             "batch_stage_end",
+            "prefill_sync",
+            "prefill_sync_collective",
+            "decode_sync",
+            "decode_sync_collective",
         }:
             event["stage_id"] = int(raw["stage_id"])
+        if event_type in {
+            "prefill_sync",
+            "prefill_sync_collective",
+            "decode_sync",
+            "decode_sync_collective",
+        }:
+            event["sync_stage"] = str(raw["sync_stage"])
+            event["layer_id"] = int(raw["layer_id"])
+        if event_type in {
+            "prefill_sync",
+            "decode_sync",
+        }:
+            event["batch_id"] = int(raw["batch_id"])
+        if event_type in {
+            "prefill_sync_collective",
+            "decode_sync_collective",
+        }:
+            event["sync_group_id"] = int(raw["batch_global_id"])
         result.append(event)
     return result
 

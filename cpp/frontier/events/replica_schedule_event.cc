@@ -19,9 +19,8 @@ void handle_event(
   while (replica.in_flight_batch_count() <
          replica.pipeline_parallel_size()) {
     scheduler::ScheduleResult schedule = replica.schedule(time);
-    context.output().scheduler_trace.push_back(
-        make_scheduler_trace(
-            schedule, target, payload.cluster_type));
+    context.metrics().record_scheduler_trace(
+        schedule, target, payload.cluster_type);
     if (schedule.scheduled_requests.empty()) {
       returned_empty_schedule = true;
       break;

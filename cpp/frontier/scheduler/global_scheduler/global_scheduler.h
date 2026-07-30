@@ -1,15 +1,27 @@
 #pragma once
 
-#include <memory>
 #include <map>
+#include <memory>
+#include <stdexcept>
 #include <vector>
 
-#include "frontier/scheduler/global_scheduler/base_global_scheduler.h"
+#include "frontier/core/ids.h"
+#include "frontier/scheduler/cluster_scheduler/base_cluster_scheduler.h"
+#include "frontier/scheduler/scheduler_types.h"
 
 namespace frontier::scheduler {
 
-class GlobalScheduler final
-    : public BaseGlobalScheduler {
+class GlobalSchedulerError : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
+};
+
+struct GlobalRequestAssignment {
+  RequestId request_id;
+  ClusterType cluster_type;
+};
+
+class GlobalScheduler final {
  public:
   explicit GlobalScheduler(
       std::unique_ptr<BaseClusterScheduler> cluster_scheduler);
@@ -18,17 +30,16 @@ class GlobalScheduler final
           cluster_schedulers);
 
   void add_request(
-      RequestId request_id,
-      ClusterType cluster_type) override;
+      RequestId request_id, ClusterType cluster_type);
   [[nodiscard]] std::vector<GlobalRequestAssignment>
-  schedule() override;
-  [[nodiscard]] bool empty() const noexcept override {
+  schedule();
+  [[nodiscard]] bool empty() const noexcept {
     return request_queue_.empty();
   }
   [[nodiscard]] BaseClusterScheduler& get_cluster_scheduler(
-      ClusterType cluster_type) override;
+      ClusterType cluster_type);
   [[nodiscard]] const BaseClusterScheduler&
-  get_cluster_scheduler(ClusterType cluster_type) const override;
+  get_cluster_scheduler(ClusterType cluster_type) const;
 
  private:
   std::map<

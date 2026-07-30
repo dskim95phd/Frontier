@@ -101,7 +101,8 @@ BatchId EntityArena::create_batch(
     const scheduler::ScheduleResult& schedule,
     scheduler::ReplicaTarget target,
     ClusterType cluster_type,
-    std::uint64_t pipeline_parallel_size) {
+    std::uint64_t pipeline_parallel_size,
+    config::ModelKind model_kind) {
   const BatchId batch_id{
       static_cast<BatchId::ValueType>(batches_.size())};
   const Generation generation{
@@ -115,7 +116,47 @@ BatchId EntityArena::create_batch(
       target.replica_id,
       target.dp_id,
       pipeline_parallel_size,
-      cluster_type);
+      cluster_type,
+      entities::BatchKind::kWork,
+      model_kind);
+  stage_arrival_times_.emplace_back(
+      static_cast<std::size_t>(pipeline_parallel_size));
+  stage_record_indices_.emplace_back(
+      static_cast<std::size_t>(pipeline_parallel_size));
+  predicted_batch_ms_.push_back(0.0);
+  return batch_id;
+}
+
+BatchId EntityArena::create_moe_idle_batch(
+    MoESyncGroupId sync_group_id,
+    MoEParticipantId participant_id,
+    scheduler::ReplicaTarget target,
+    ClusterType cluster_type,
+    std::uint64_t pipeline_parallel_size,
+    SimTime created_at,
+    Generation generation) {
+  if (!sync_group_id.valid() || !participant_id.valid() ||
+      !target.replica_id.valid() || !target.dp_id.valid() ||
+      !generation.valid()) {
+    throw std::invalid_argument(
+        "idle MoE batch requires valid synchronization ownership");
+  }
+  const BatchId batch_id{
+      static_cast<BatchId::ValueType>(batches_.size())};
+  batches_.emplace_back(
+      batch_id,
+      IterationId{sync_group_id.value()},
+      std::vector<entities::RequestBatchSnapshot>{},
+      created_at,
+      generation,
+      target.replica_id,
+      target.dp_id,
+      pipeline_parallel_size,
+      cluster_type,
+      entities::BatchKind::kMoeIdle,
+      config::ModelKind::kMoe,
+      sync_group_id,
+      participant_id);
   stage_arrival_times_.emplace_back(
       static_cast<std::size_t>(pipeline_parallel_size));
   stage_record_indices_.emplace_back(

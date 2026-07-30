@@ -20,19 +20,14 @@ void handle_event(
   stage.on_stage_end(payload.batch_id);
   entities::BatchStage& batch_stage =
       context.batch_stage(payload.batch_id, payload.stage_id);
+  if (batch.moe_sync_group_id().valid()) {
+    batch_stage.reconcile_synchronization_wait(time);
+  }
   batch_stage.mark_completed(time);
-  context.output().batch_stages.push_back(
-      metrics::BatchStageMetricsRecord{
-          .batch_id = payload.batch_id,
-          .replica_id = payload.replica_id,
-          .dp_id = payload.dp_id,
-          .stage_id = payload.stage_id,
-          .arrived_at = batch_stage.arrived_at(),
-          .started_at = batch_stage.started_at(),
-          .completed_at = time,
-          .execution_time = batch_stage.execution_time(),
-          .cluster_type = payload.cluster_type,
-      });
+  context.metrics().record_batch_stage(
+      batch_stage,
+      batch,
+      context.runtime_config(payload.cluster_type));
 
   if (!stage.empty()) {
     context.event_queue().push(

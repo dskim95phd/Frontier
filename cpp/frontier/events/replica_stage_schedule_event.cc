@@ -36,15 +36,29 @@ void handle_event(
           batch.id(), payload.stage_id, time, prediction);
   if (context.execution_model(payload.cluster_type).type ==
       config::ExecutionModelType::kAnalytical) {
-    context.output().analytical_diagnostics.push_back(
-        metrics::AnalyticalDiagnostic{
-            .name =
-                "batch_" +
-                std::to_string(batch.id().value()) +
-                "_stage_" +
-                std::to_string(payload.stage_id.value()),
-            .values = prediction.diagnostics,
-        });
+    context.metrics().record_analytical_diagnostic(
+        "batch_" + std::to_string(batch.id().value()) +
+            "_stage_" +
+            std::to_string(payload.stage_id.value()),
+        prediction.diagnostics);
+  }
+  scheduler::BaseClusterScheduler& cluster_scheduler =
+      context.cluster(payload.cluster_type);
+  const bool requires_sync =
+      cluster_scheduler.requires_moe_synchronization(
+          batch, context);
+  if (requires_sync) {
+    cluster_scheduler.begin_moe_stage(
+        batch, payload.stage_id, time, prediction, context);
+  }
+  const config::ClusterRuntimeConfig& runtime =
+      context.runtime_config(payload.cluster_type);
+  for (const auto& diagnostic : prediction.moe_routing) {
+    context.metrics().record_moe_routing(
+        batch, payload.stage_id, diagnostic, runtime);
+  }
+  if (requires_sync) {
+    return;
   }
   const double completion_seconds =
       time.seconds() +

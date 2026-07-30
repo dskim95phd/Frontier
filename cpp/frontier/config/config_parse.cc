@@ -241,6 +241,129 @@ ClusterSchedulerType parse_cluster_scheduler_type(
       std::string{value} + "'");
 }
 
+MoeRoutingMode parse_moe_routing_mode(std::string_view value) {
+  if (value == "simulation") {
+    return MoeRoutingMode::kSimulation;
+  }
+  if (value == "uniform_legacy") {
+    return MoeRoutingMode::kUniformLegacy;
+  }
+  if (value == "uniform_random") {
+    return MoeRoutingMode::kUniformRandom;
+  }
+  throw ConfigError(
+      "config.moe_routing.mode must be 'simulation', "
+      "'uniform_legacy', or 'uniform_random', got '" +
+      std::string{value} + "'");
+}
+
+MoeRoutingDistribution parse_moe_routing_distribution(
+    std::string_view value) {
+  if (value == "balanced") {
+    return MoeRoutingDistribution::kBalanced;
+  }
+  if (value == "random") {
+    return MoeRoutingDistribution::kRandom;
+  }
+  if (value == "skewed") {
+    return MoeRoutingDistribution::kSkewed;
+  }
+  if (value == "zipf") {
+    return MoeRoutingDistribution::kZipf;
+  }
+  throw ConfigError(
+      "config.moe_routing.distribution must be 'balanced', "
+      "'random', 'skewed', or 'zipf', got '" +
+      std::string{value} + "'");
+}
+
+ModelConfig parse_model(const Json& root) {
+  const Json& model = root.at("model");
+  require_exact_keys(
+      model,
+      {"name", "runtime_total_experts", "router_topk"},
+      "config.model");
+  const std::string name =
+      require_string(model, "name", "config.model");
+  const std::uint64_t runtime_total_experts = require_uint64(
+      model, "runtime_total_experts", "config.model");
+  const std::uint64_t router_topk =
+      require_uint64(model, "router_topk", "config.model");
+
+  ModelConfig parsed;
+  if (name == "llama2-7b") {
+    parsed = ModelConfig{
+        .name = name,
+        .kind = ModelKind::kDense,
+        .num_layers = 32,
+        .hidden_size = 4'096,
+        .intermediate_size = 11'008,
+        .num_query_heads = 32,
+        .num_kv_heads = 32,
+        .head_dim = 128,
+        .gated_mlp = true,
+        .fused_add_norm = true,
+        .model_num_experts = 1,
+        .runtime_total_experts = runtime_total_experts,
+        .router_topk = router_topk,
+    };
+    if (runtime_total_experts != 1 || router_topk != 1) {
+      throw ConfigError(
+          "dense llama2-7b requires runtime_total_experts=1 and "
+          "router_topk=1");
+    }
+    return parsed;
+  }
+
+  if (name == "Phi-tiny-MoE-instruct") {
+    parsed = ModelConfig{
+        .name = name,
+        .kind = ModelKind::kMoe,
+        .num_layers = 32,
+        .hidden_size = 4'096,
+        .intermediate_size = 448,
+        .num_query_heads = 16,
+        .num_kv_heads = 4,
+        .head_dim = 128,
+        .gated_mlp = true,
+        .fused_add_norm = false,
+        .model_num_experts = 16,
+        .runtime_total_experts = runtime_total_experts,
+        .router_topk = router_topk,
+    };
+    if (runtime_total_experts < 2) {
+      throw ConfigError(
+          "Phi-tiny-MoE-instruct requires at least two runtime experts");
+    }
+    if (router_topk == 0 ||
+        router_topk > runtime_total_experts) {
+      throw ConfigError(
+          "MoE router_topk must be in [1, runtime_total_experts]");
+    }
+    return parsed;
+  }
+
+  throw ConfigError(
+      "config.model.name must be 'llama2-7b' or "
+      "'Phi-tiny-MoE-instruct', got '" + name + "'");
+}
+
+MoeRoutingConfig parse_moe_routing(const Json& root) {
+  const Json& routing = root.at("moe_routing");
+  require_exact_keys(
+      routing,
+      {"mode", "distribution", "seed"},
+      "config.moe_routing");
+  return MoeRoutingConfig{
+      .mode = parse_moe_routing_mode(require_string(
+          routing, "mode", "config.moe_routing")),
+      .distribution = parse_moe_routing_distribution(require_string(
+          routing, "distribution", "config.moe_routing")),
+      .seed = require_uint64(
+          routing, "seed", "config.moe_routing"),
+  };
+}
+
 PrefixCacheConfig parse_prefix_cache(const Json& root) {
   const Json& prefix_cache = root.at("prefix_cache");
   require_exact_keys(
@@ -343,7 +466,9 @@ SchedulerConfig parse_scheduler(const Json& root) {
   return parsed;
 }
 
-ParallelismConfig parse_parallelism(const Json& root) {
+ParallelismConfig parse_parallelism(
+    const Json& root,
+    const ModelConfig& model) {
   const Json& parallelism = root.at("parallelism");
   require_exact_keys(
       parallelism,
@@ -352,6 +477,8 @@ ParallelismConfig parse_parallelism(const Json& root) {
           "tensor_parallel_size",
           "pipeline_parallel_size",
           "data_parallel_size",
+          "moe_tensor_parallel_size",
+          "moe_expert_parallel_size",
       },
       "config.parallelism");
   ParallelismConfig parsed{
@@ -363,11 +490,21 @@ ParallelismConfig parse_parallelism(const Json& root) {
           parallelism, "pipeline_parallel_size", "config.parallelism"),
       .data_parallel_size = require_uint64(
           parallelism, "data_parallel_size", "config.parallelism"),
+      .moe_tensor_parallel_size = require_uint64(
+          parallelism,
+          "moe_tensor_parallel_size",
+          "config.parallelism"),
+      .moe_expert_parallel_size = require_uint64(
+          parallelism,
+          "moe_expert_parallel_size",
+          "config.parallelism"),
   };
   if (parsed.num_replicas == 0 ||
       parsed.tensor_parallel_size == 0 ||
       parsed.pipeline_parallel_size == 0 ||
-      parsed.data_parallel_size == 0) {
+      parsed.data_parallel_size == 0 ||
+      parsed.moe_tensor_parallel_size == 0 ||
+      parsed.moe_expert_parallel_size == 0) {
     throw ConfigError(
         "all config.parallelism dimensions must be positive");
   }
@@ -378,16 +515,41 @@ ParallelismConfig parse_parallelism(const Json& root) {
     throw ConfigError(
         "config.parallelism.tensor_parallel_size must be one of 1, 2, 4, 8");
   }
-  if (32 % parsed.pipeline_parallel_size != 0) {
+  if (model.num_layers % parsed.pipeline_parallel_size != 0) {
     throw ConfigError(
-        "Llama-2-7B num_layers=32 must be divisible by "
+        "model num_layers must be divisible by "
         "config.parallelism.pipeline_parallel_size");
   }
-  if (4'096 % parsed.tensor_parallel_size != 0 ||
-      32 % parsed.tensor_parallel_size != 0) {
+  if (model.hidden_size % parsed.tensor_parallel_size != 0 ||
+      model.num_query_heads % parsed.tensor_parallel_size != 0) {
     throw ConfigError(
-        "Llama-2-7B hidden size and attention heads must be divisible by "
+        "model hidden size and attention heads must be divisible by "
         "config.parallelism.tensor_parallel_size");
+  }
+  if (model.is_moe()) {
+    if (parsed.attention_parallel_size() !=
+        parsed.moe_parallel_size()) {
+      throw ConfigError(
+          "MoE shared parallel domain requires "
+          "tensor_parallel_size*data_parallel_size == "
+          "moe_tensor_parallel_size*moe_expert_parallel_size");
+    }
+    if (model.runtime_total_experts %
+            parsed.moe_expert_parallel_size != 0) {
+      throw ConfigError(
+          "runtime_total_experts must be divisible by "
+          "moe_expert_parallel_size");
+    }
+    if (model.intermediate_size %
+            parsed.moe_tensor_parallel_size != 0) {
+      throw ConfigError(
+          "MoE intermediate size must be divisible by "
+          "moe_tensor_parallel_size");
+    }
+  } else if (parsed.moe_tensor_parallel_size != 1 ||
+             parsed.moe_expert_parallel_size != 1) {
+    throw ConfigError(
+        "dense models require MoE TP=1 and EP=1");
   }
   const auto checked_multiply = [](std::uint64_t left,
                                    std::uint64_t right,
@@ -470,7 +632,8 @@ std::vector<double> require_finite_number_array(
 
 ExecutionModelConfig parse_execution_model(
     const Json& root,
-    const ParallelismConfig& parallelism) {
+    const ParallelismConfig& parallelism,
+    const ModelConfig& model) {
   const Json& execution = root.at("execution_model");
   require_object(execution, "config.execution_model");
   if (!execution.contains("type")) {
@@ -546,12 +709,13 @@ ExecutionModelConfig parse_execution_model(
             "config.execution_model"),
     };
     if (analytical.device != "rubin" ||
-        analytical.model != "llama2-7b" ||
-        analytical.precision != "fp16" ||
-        analytical.num_layers != 32) {
+        analytical.model != model.name ||
+        (analytical.precision != "fp16" &&
+         analytical.precision != "bf16") ||
+        analytical.num_layers != model.num_layers) {
       throw ConfigError(
-          "analytical execution supports only "
-          "rubin/llama2-7b/fp16/32-layers");
+          "analytical execution requires the selected model on Rubin "
+          "with fp16 or bf16 precision and matching layer count");
     }
     if (analytical.network_bandwidth_gbps <= 0.0 ||
         analytical.intra_node_bandwidth_gbps <= 0.0 ||
@@ -585,15 +749,24 @@ ClusterRuntimeConfig parse_cluster_runtime(
   const Json& cluster = clusters.at(name);
   require_exact_keys(
       cluster,
-      {"parallelism", "scheduler", "execution_model"},
+      {
+          "parallelism",
+          "scheduler",
+          "execution_model",
+          "model",
+          "moe_routing",
+      },
       context);
+  const ModelConfig model = parse_model(cluster);
   const ParallelismConfig parallelism =
-      parse_parallelism(cluster);
+      parse_parallelism(cluster, model);
   return ClusterRuntimeConfig{
       .parallelism = parallelism,
       .scheduler = parse_scheduler(cluster),
       .execution_model = parse_execution_model(
-          cluster, parallelism),
+          cluster, parallelism, model),
+      .model = model,
+      .moe_routing = parse_moe_routing(cluster),
   };
 }
 
@@ -603,10 +776,16 @@ PddClustersConfig parse_pdd_clusters(const Json& root) {
       clusters,
       {"prefill", "decode"},
       "config.clusters");
-  return PddClustersConfig{
+  PddClustersConfig parsed{
       .prefill = parse_cluster_runtime(clusters, "prefill"),
       .decode = parse_cluster_runtime(clusters, "decode"),
   };
+  if (parsed.prefill.model != parsed.decode.model) {
+    throw ConfigError(
+        "PDD PREFILL and DECODE must use the same model and expert "
+        "contract");
+  }
+  return parsed;
 }
 
 KvCacheTransferConfig parse_kv_cache_transfer(const Json& root) {

@@ -233,6 +233,7 @@ paper/2026-ISCA/figures
 *.swp
 
 .tmp/
+.build-*/
 
 # collective-sim runtime artifact accidentally written to repo root
 idmap.txt

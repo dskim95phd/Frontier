@@ -54,6 +54,43 @@ std::string_view to_string(ClusterSchedulerType type) noexcept {
   return "unknown";
 }
 
+std::string_view to_string(ModelKind kind) noexcept {
+  switch (kind) {
+    case ModelKind::kDense:
+      return "dense";
+    case ModelKind::kMoe:
+      return "moe";
+  }
+  return "unknown";
+}
+
+std::string_view to_string(MoeRoutingMode mode) noexcept {
+  switch (mode) {
+    case MoeRoutingMode::kSimulation:
+      return "simulation";
+    case MoeRoutingMode::kUniformLegacy:
+      return "uniform_legacy";
+    case MoeRoutingMode::kUniformRandom:
+      return "uniform_random";
+  }
+  return "unknown";
+}
+
+std::string_view to_string(
+    MoeRoutingDistribution distribution) noexcept {
+  switch (distribution) {
+    case MoeRoutingDistribution::kBalanced:
+      return "balanced";
+    case MoeRoutingDistribution::kRandom:
+      return "random";
+    case MoeRoutingDistribution::kSkewed:
+      return "skewed";
+    case MoeRoutingDistribution::kZipf:
+      return "zipf";
+  }
+  return "unknown";
+}
+
 std::string_view to_string(ExecutionModelType type) noexcept {
   switch (type) {
     case ExecutionModelType::kFixed:

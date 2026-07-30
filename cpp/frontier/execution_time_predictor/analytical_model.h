@@ -66,6 +66,8 @@ struct AnalyticalConfig {
   Efficiency prefill_attention{0.55, 0.65, 0.20};
   Efficiency decode_attention{0.20, 0.60, 0.50};
   Efficiency streaming{0.20, 0.75, 0.0};
+  Efficiency moe{0.45, 0.65, 0.30};
+  Efficiency routing{0.15, 0.55, 0.75};
   double kernel_launch_latency_us = 5.0;
   std::uint64_t small_gemm_token_threshold = 128;
 };

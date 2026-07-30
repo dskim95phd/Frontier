@@ -17,7 +17,9 @@
         "num_replicas": 1,
         "tensor_parallel_size": 2,
         "pipeline_parallel_size": 2,
-        "data_parallel_size": 2
+        "data_parallel_size": 2,
+        "moe_tensor_parallel_size": 1,
+        "moe_expert_parallel_size": 1
       },
       "scheduler": {
         "type": "vllm_v1",
@@ -38,6 +40,16 @@
           1.0,
           2.0
         ]
+      },
+      "model": {
+        "name": "llama2-7b",
+        "runtime_total_experts": 1,
+        "router_topk": 1
+      },
+      "moe_routing": {
+        "mode": "simulation",
+        "distribution": "balanced",
+        "seed": 42
       }
     }
   }

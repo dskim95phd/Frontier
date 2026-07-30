@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <limits>
+#include <utility>
 
 namespace frontier::kv_cache_transfer {
 
@@ -69,6 +70,42 @@ TransferPrediction predict_transfer(
           config.network_latency_ms +
           effective_size / bandwidth_bytes_per_ms,
   };
+}
+
+AnalyticalKVCacheTransferPredictor::
+    AnalyticalKVCacheTransferPredictor(
+        config::KvCacheTransferConfig config)
+    : config_(std::move(config)) {}
+
+TransferPrediction AnalyticalKVCacheTransferPredictor::predict(
+    std::uint64_t num_tokens,
+    const config::ModelConfig& model) const {
+  const std::uint64_t size_bytes = dense_kv_cache_size_bytes(
+      num_tokens,
+      DenseKvLayout{
+          .num_layers = model.num_layers,
+          .num_kv_heads_per_worker = model.num_kv_heads,
+          .head_dim = model.head_dim,
+          .kv_factor = 2,
+          .dtype_size_bytes =
+              config_.kv_cache_dtype_size_bytes,
+      });
+  return predict_transfer(
+      size_bytes,
+      TransferConfig{
+          .network_bandwidth_gbps =
+              config_.network_bandwidth_gbps,
+          .network_latency_ms = config_.network_latency_ms,
+          .enable_compression = config_.enable_compression,
+          .compression_ratio = 1.0,
+      });
+}
+
+std::shared_ptr<const BaseKVCacheTransferPredictor>
+make_kv_cache_transfer_predictor(
+    const config::KvCacheTransferConfig& config) {
+  return std::make_shared<
+      AnalyticalKVCacheTransferPredictor>(config);
 }
 
 }  // namespace frontier::kv_cache_transfer

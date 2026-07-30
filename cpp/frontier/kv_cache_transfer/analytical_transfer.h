@@ -1,7 +1,11 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <stdexcept>
+
+#include "frontier/config/config.h"
+#include "frontier/kv_cache_transfer/base_kv_cache_transfer_predictor.h"
 
 namespace frontier::kv_cache_transfer {
 
@@ -20,12 +24,6 @@ struct TransferConfig {
   double compression_ratio = 1.0;
 };
 
-struct TransferPrediction {
-  std::uint64_t size_bytes;
-  double effective_size_bytes;
-  double transfer_time_ms;
-};
-
 class TransferModelError : public std::runtime_error {
  public:
   using std::runtime_error::runtime_error;
@@ -37,5 +35,24 @@ class TransferModelError : public std::runtime_error {
 [[nodiscard]] TransferPrediction predict_transfer(
     std::uint64_t size_bytes,
     const TransferConfig& config);
+
+class AnalyticalKVCacheTransferPredictor final
+    : public BaseKVCacheTransferPredictor {
+ public:
+  explicit AnalyticalKVCacheTransferPredictor(
+      config::KvCacheTransferConfig config);
+
+  [[nodiscard]] TransferPrediction predict(
+      std::uint64_t num_tokens,
+      const config::ModelConfig& model) const override;
+
+ private:
+  config::KvCacheTransferConfig config_;
+};
+
+[[nodiscard]] std::shared_ptr<
+    const BaseKVCacheTransferPredictor>
+make_kv_cache_transfer_predictor(
+    const config::KvCacheTransferConfig& config);
 
 }  // namespace frontier::kv_cache_transfer

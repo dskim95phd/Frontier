@@ -17,7 +17,9 @@
         "num_replicas": 1,
         "tensor_parallel_size": 1,
         "pipeline_parallel_size": 1,
-        "data_parallel_size": 1
+        "data_parallel_size": 1,
+        "moe_tensor_parallel_size": 1,
+        "moe_expert_parallel_size": 1
       },
       "scheduler": {
         "type": "vllm_v1",
@@ -37,6 +39,16 @@
         "stage_latencies_ms": [
           1.0
         ]
+      },
+      "model": {
+        "name": "llama2-7b",
+        "runtime_total_experts": 1,
+        "router_topk": 1
+      },
+      "moe_routing": {
+        "mode": "simulation",
+        "distribution": "balanced",
+        "seed": 42
       }
     },
     "decode": {
@@ -44,7 +56,9 @@
         "num_replicas": 1,
         "tensor_parallel_size": 1,
         "pipeline_parallel_size": 1,
-        "data_parallel_size": 1
+        "data_parallel_size": 1,
+        "moe_tensor_parallel_size": 1,
+        "moe_expert_parallel_size": 1
       },
       "scheduler": {
         "type": "vllm_v1",
@@ -64,6 +78,16 @@
         "stage_latencies_ms": [
           1.0
         ]
+      },
+      "model": {
+        "name": "llama2-7b",
+        "runtime_total_experts": 1,
+        "router_topk": 1
+      },
+      "moe_routing": {
+        "mode": "simulation",
+        "distribution": "balanced",
+        "seed": 42
       }
     }
   },

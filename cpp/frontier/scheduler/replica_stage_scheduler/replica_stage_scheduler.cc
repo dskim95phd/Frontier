@@ -1,6 +1,7 @@
 #include "frontier/scheduler/replica_stage_scheduler/replica_stage_scheduler.h"
 
 #include <algorithm>
+#include <limits>
 #include <utility>
 
 namespace frontier::scheduler {
@@ -10,8 +11,8 @@ ReplicaStageScheduler::ReplicaStageScheduler(
     DataParallelId dp_id,
     StageId stage_id,
     bool is_last_stage,
-    std::unique_ptr<
-        execution_time_predictor::BatchExecutionModel>
+    std::shared_ptr<
+        const execution_time_predictor::BatchExecutionModel>
         execution_model)
     : replica_id_(replica_id),
       dp_id_(dp_id),
@@ -26,21 +27,28 @@ ReplicaStageScheduler::ReplicaStageScheduler(
 
 void ReplicaStageScheduler::add_batch(
     const entities::Batch& batch) {
-  const auto has_batch_id =
-      [&batch](const StageBatchTicket& ticket) {
-        return ticket.batch_id == batch.id();
-      };
+  if (!batch.global_id().valid()) {
+    throw ReplicaStageSchedulerError(
+        "replica stage batch requires a valid global ID");
+  }
   if ((active_batch_id_.valid() &&
        active_batch_id_ == batch.id()) ||
-      std::find_if(queue_.begin(), queue_.end(), has_batch_id) !=
-          queue_.end()) {
+      queued_batch_ids_.contains(batch.id())) {
     throw ReplicaStageSchedulerError(
         "batch is already present in replica stage state");
   }
-  queue_.push_back(StageBatchTicket{
+  if (next_insertion_order_ ==
+      std::numeric_limits<std::uint64_t>::max()) {
+    throw ReplicaStageSchedulerError(
+        "replica stage insertion order overflow");
+  }
+  queue_.push(StageBatchTicket{
       .batch_id = batch.id(),
+      .batch_global_id = batch.global_id(),
+      .insertion_order = next_insertion_order_++,
       .schedule_epoch = batch.schedule_epoch(),
   });
+  queued_batch_ids_.insert(batch.id());
 }
 
 std::optional<StageBatchTicket>
@@ -48,8 +56,9 @@ ReplicaStageScheduler::pop_batch_if_not_busy() {
   if (active_batch_id_.valid() || queue_.empty()) {
     return std::nullopt;
   }
-  const StageBatchTicket ticket = queue_.front();
-  queue_.pop_front();
+  const StageBatchTicket ticket = queue_.top();
+  queue_.pop();
+  queued_batch_ids_.erase(ticket.batch_id);
   active_batch_id_ = ticket.batch_id;
   return ticket;
 }

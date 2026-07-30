@@ -59,6 +59,11 @@ struct BatchMetricsRecord {
   DataParallelId dp_id{0};
   std::uint64_t num_pipeline_stages = 1;
   ClusterType cluster_type = ClusterType::kMonolithic;
+  config::ModelKind model_kind = config::ModelKind::kDense;
+  std::uint64_t runtime_total_experts = 1;
+  std::uint64_t router_topk = 1;
+  MoESyncGroupId moe_sync_group_id;
+  config::ParallelismConfig parallelism;
 };
 
 struct BatchStageMetricsRecord {
@@ -71,6 +76,11 @@ struct BatchStageMetricsRecord {
   SimTime completed_at;
   entities::ExecutionTime execution_time;
   ClusterType cluster_type = ClusterType::kMonolithic;
+  config::ModelKind model_kind = config::ModelKind::kDense;
+  std::uint64_t runtime_total_experts = 1;
+  std::uint64_t router_topk = 1;
+  MoESyncGroupId moe_sync_group_id;
+  config::ParallelismConfig parallelism;
 };
 
 struct SchedulerDecisionRecord {
@@ -120,6 +130,26 @@ struct AnalyticalDiagnostic {
   std::vector<std::pair<std::string, double>> values;
 };
 
+struct MoERoutingMetricsRecord {
+  BatchId batch_id;
+  StageId stage_id;
+  ClusterType cluster_type = ClusterType::kMonolithic;
+  MoESyncGroupId sync_group_id;
+  LayerId layer_id;
+  config::MoeRoutingMode mode =
+      config::MoeRoutingMode::kSimulation;
+  config::MoeRoutingDistribution distribution =
+      config::MoeRoutingDistribution::kBalanced;
+  std::uint64_t seed = 0;
+  std::uint64_t input_tokens = 0;
+  std::uint64_t routed_tokens = 0;
+  std::vector<std::uint64_t> global_expert_tokens;
+  std::vector<std::vector<std::uint64_t>> lane_expert_tokens;
+  std::vector<double> lane_times_ms;
+  std::uint64_t critical_lane = 0;
+  double critical_lane_time_ms = 0.0;
+};
+
 struct SimulationOutput {
   int schema_version = kOutputSchemaVersion;
   RunMetadata run;
@@ -129,6 +159,7 @@ struct SimulationOutput {
   std::vector<SchedulerTraceRecord> scheduler_trace;
   std::vector<Event> event_trace;
   std::vector<AnalyticalDiagnostic> analytical_diagnostics;
+  std::vector<MoERoutingMetricsRecord> moe_routing;
   std::vector<KVCacheTransferMetricsRecord> kv_cache_transfers;
 };
 

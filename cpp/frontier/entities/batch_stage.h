@@ -25,6 +25,7 @@ class BatchStage {
 
   void mark_started(SimTime time);
   void mark_completed(SimTime time);
+  void reconcile_synchronization_wait(SimTime completed_at);
 
   [[nodiscard]] BatchId batch_id() const noexcept { return batch_id_; }
   [[nodiscard]] ReplicaId replica_id() const noexcept {

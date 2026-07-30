@@ -16,6 +16,14 @@ std::uint64_t checked_size(std::size_t value, const char* context) {
   return static_cast<std::uint64_t>(value);
 }
 
+const entities::Replica& default_replica() {
+  static const entities::Replica replica{
+      ReplicaId{0},
+      config::ParallelismConfig{},
+      config::ModelConfig{}};
+  return replica;
+}
+
 }  // namespace
 
 VllmV1Scheduler::VllmV1Scheduler(
@@ -36,21 +44,41 @@ VllmV1Scheduler::VllmV1Scheduler(
     std::vector<entities::Request>& requests,
     std::unique_ptr<
         execution_time_predictor::BatchExecutionModel>
+        execution_model)
+    : BaseReplicaScheduler(
+          default_replica(),
+          DataParallelId{0},
+          std::move(execution_model),
+          ClusterType::kMonolithic),
+      config_(std::move(config)),
+      requests_(&requests),
+      kv_blocks_(config_),
+      pipeline_parallel_size_(1) {
+  if (config_.type != config::SchedulerType::kVllmV1 ||
+      config_.scheduling_policy != config::SchedulingPolicy::kFcfs) {
+    throw SchedulerError("the C++ port requires the FCFS vLLM V1 scheduler");
+  }
+}
+
+VllmV1Scheduler::VllmV1Scheduler(
+    config::SchedulerConfig config,
+    std::vector<entities::Request>& requests,
+    std::shared_ptr<
+        const execution_time_predictor::BatchExecutionModel>
         execution_model,
-    ReplicaId replica_id,
+    const entities::Replica& replica,
     DataParallelId dp_id,
-    std::uint64_t pipeline_parallel_size,
     ClusterType cluster_type)
     : BaseReplicaScheduler(
-          replica_id,
+          replica,
           dp_id,
           std::move(execution_model),
-          pipeline_parallel_size,
           cluster_type),
       config_(std::move(config)),
       requests_(&requests),
       kv_blocks_(config_),
-      pipeline_parallel_size_(pipeline_parallel_size) {
+      pipeline_parallel_size_(
+          replica.pipeline_parallel_size()) {
   if (config_.type != config::SchedulerType::kVllmV1 ||
       config_.scheduling_policy != config::SchedulingPolicy::kFcfs) {
     throw SchedulerError("the C++ port requires the FCFS vLLM V1 scheduler");

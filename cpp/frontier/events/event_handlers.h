@@ -52,5 +52,21 @@ void handle_event(
     const KVCacheTransferEndPayload& payload,
     SimTime time,
     simulator::SimulationContext& context);
+void handle_event(
+    const PrefillSyncPayload& payload,
+    SimTime time,
+    simulator::SimulationContext& context);
+void handle_event(
+    const PrefillSyncCollectivePayload& payload,
+    SimTime time,
+    simulator::SimulationContext& context);
+void handle_event(
+    const DecodeSyncPayload& payload,
+    SimTime time,
+    simulator::SimulationContext& context);
+void handle_event(
+    const DecodeSyncCollectivePayload& payload,
+    SimTime time,
+    simulator::SimulationContext& context);
 
 }  // namespace frontier::events

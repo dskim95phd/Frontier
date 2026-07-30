@@ -46,7 +46,16 @@ class EntityArena {
       const scheduler::ScheduleResult& schedule,
       scheduler::ReplicaTarget target,
       ClusterType cluster_type,
-      std::uint64_t pipeline_parallel_size);
+      std::uint64_t pipeline_parallel_size,
+      config::ModelKind model_kind);
+  BatchId create_moe_idle_batch(
+      MoESyncGroupId sync_group_id,
+      MoEParticipantId participant_id,
+      scheduler::ReplicaTarget target,
+      ClusterType cluster_type,
+      std::uint64_t pipeline_parallel_size,
+      SimTime created_at,
+      Generation generation);
   void record_stage_arrival(
       BatchId batch_id,
       StageId stage_id,

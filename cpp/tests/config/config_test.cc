@@ -118,7 +118,7 @@ void test_legacy_schemas_and_shapes_are_rejected() {
     "prefix_cache": {"enabled": false, "key_mode": "session"}
   })json";
   expect_throws<ConfigError>(
-      [] {
+      [old_flat_shape] {
         static_cast<void>(
             parse_simulation_config_json(old_flat_shape));
       },
@@ -178,6 +178,67 @@ void test_schema_version_range_is_checked_before_conversion() {
   }
 }
 
+void test_moe_contract_and_invalid_topologies() {
+  const auto moe =
+      load("analytical_moe_ep4_colocation.json");
+  expect(
+      moe.cluster().model.is_moe() &&
+          moe.cluster().model.model_num_experts == 16 &&
+          moe.cluster().model.runtime_total_experts == 8 &&
+          moe.cluster().model.router_topk == 2 &&
+          moe.cluster().parallelism.attention_parallel_size() == 4 &&
+          moe.cluster().parallelism.moe_parallel_size() == 4,
+      "Phi MoE model and shared parallel domain must normalize");
+  expect(
+      parse_simulation_config_json(
+          serialize_simulation_config_json(moe)) == moe,
+      "MoE normalized schema must round trip exactly");
+
+  auto bad_shared_domain = moe;
+  bad_shared_domain.cluster()
+      .parallelism.moe_expert_parallel_size = 2;
+  expect_throws<ConfigError>(
+      [&bad_shared_domain] {
+        static_cast<void>(
+            parse_simulation_config_json(
+                serialize_simulation_config_json(
+                    bad_shared_domain)));
+      },
+      "attention and MoE physical domains must match");
+
+  auto bad_expert_partition = moe;
+  bad_expert_partition.cluster().model.runtime_total_experts = 6;
+  expect_throws<ConfigError>(
+      [&bad_expert_partition] {
+        static_cast<void>(
+            parse_simulation_config_json(
+                serialize_simulation_config_json(
+                    bad_expert_partition)));
+      },
+      "runtime experts must divide evenly over EP lanes");
+
+  auto bad_topk = moe;
+  bad_topk.cluster().model.router_topk = 9;
+  expect_throws<ConfigError>(
+      [&bad_topk] {
+        static_cast<void>(
+            parse_simulation_config_json(
+                serialize_simulation_config_json(bad_topk)));
+      },
+      "router top-k cannot exceed runtime expert count");
+
+  auto mismatched_pdd = load("fixed_moe_sequential_pdd.json");
+  mismatched_pdd.pdd().clusters.decode.model.router_topk = 1;
+  expect_throws<ConfigError>(
+      [&mismatched_pdd] {
+        static_cast<void>(
+            parse_simulation_config_json(
+                serialize_simulation_config_json(
+                    mismatched_pdd)));
+      },
+      "PDD clusters must share the same MoE model contract");
+}
+
 }  // namespace
 
 int main() {
@@ -200,5 +261,8 @@ int main() {
   failures += frontier::test::run(
       "schema range is checked before conversion",
       test_schema_version_range_is_checked_before_conversion);
+  failures += frontier::test::run(
+      "MoE contract and invalid topologies",
+      test_moe_contract_and_invalid_topologies);
   return failures == 0 ? 0 : 1;
 }

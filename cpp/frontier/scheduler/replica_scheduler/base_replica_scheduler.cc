@@ -18,16 +18,17 @@ std::string_view to_string(
 }
 
 BaseReplicaScheduler::BaseReplicaScheduler(
-    ReplicaId replica_id,
+    const entities::Replica& replica,
     DataParallelId dp_id,
-    std::unique_ptr<
-        execution_time_predictor::BatchExecutionModel>
+    std::shared_ptr<
+        const execution_time_predictor::BatchExecutionModel>
         execution_model,
-    std::uint64_t pipeline_parallel_size,
     ClusterType cluster_type)
-    : replica_id_(replica_id),
+    : replica_(&replica),
       dp_id_(dp_id),
       cluster_type_(cluster_type) {
+  const std::uint64_t pipeline_parallel_size =
+      replica.pipeline_parallel_size();
   if (execution_model == nullptr ||
       pipeline_parallel_size == 0) {
     throw SchedulerError(
@@ -38,18 +39,12 @@ BaseReplicaScheduler::BaseReplicaScheduler(
   for (std::uint64_t stage = 0;
        stage < pipeline_parallel_size;
        ++stage) {
-    std::unique_ptr<
-        execution_time_predictor::BatchExecutionModel>
-        stage_model =
-            stage + 1 == pipeline_parallel_size
-            ? std::move(execution_model)
-            : execution_model->clone();
     stage_schedulers_.emplace_back(
-        replica_id,
+        replica.id(),
         dp_id,
         StageId{stage},
         stage + 1 == pipeline_parallel_size,
-        std::move(stage_model));
+        execution_model);
   }
 }
 

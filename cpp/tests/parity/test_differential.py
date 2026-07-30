@@ -1210,6 +1210,8 @@ def _write_step25_matrix_config(
         "tensor_parallel_size": int(tp),
         "pipeline_parallel_size": int(pp),
         "data_parallel_size": int(dp),
+        "moe_tensor_parallel_size": 1,
+        "moe_expert_parallel_size": 1,
     }
     cluster["scheduler"].update(case["scheduler"])
     if execution_type == "fixed":
@@ -1323,6 +1325,8 @@ def _write_step3_matrix_config(
             "tensor_parallel_size": int(tp),
             "pipeline_parallel_size": int(pp),
             "data_parallel_size": int(dp),
+            "moe_tensor_parallel_size": 1,
+            "moe_expert_parallel_size": 1,
         }
         cluster["scheduler"].update(
             case.get(f"{cluster_name}_scheduler", {})

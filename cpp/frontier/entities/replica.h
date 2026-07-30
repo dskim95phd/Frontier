@@ -17,34 +17,47 @@ class Replica {
  public:
   Replica(
       ReplicaId replica_id,
-      const config::ParallelismConfig& parallelism,
-      std::uint64_t num_layers = 32);
+      config::ParallelismConfig parallelism,
+      config::ModelConfig model);
 
   [[nodiscard]] ReplicaId id() const noexcept { return replica_id_; }
+  [[nodiscard]] const config::ParallelismConfig& parallelism()
+      const noexcept {
+    return parallelism_;
+  }
+  [[nodiscard]] const config::ModelConfig& model() const noexcept {
+    return model_;
+  }
   [[nodiscard]] std::uint64_t tensor_parallel_size() const noexcept {
-    return tensor_parallel_size_;
+    return parallelism_.tensor_parallel_size;
   }
   [[nodiscard]] std::uint64_t pipeline_parallel_size() const noexcept {
-    return pipeline_parallel_size_;
+    return parallelism_.pipeline_parallel_size;
   }
   [[nodiscard]] std::uint64_t data_parallel_size() const noexcept {
-    return data_parallel_size_;
+    return parallelism_.data_parallel_size;
+  }
+  [[nodiscard]] std::uint64_t moe_tensor_parallel_size()
+      const noexcept {
+    return parallelism_.moe_tensor_parallel_size;
+  }
+  [[nodiscard]] std::uint64_t moe_expert_parallel_size()
+      const noexcept {
+    return parallelism_.moe_expert_parallel_size;
   }
   [[nodiscard]] std::uint64_t num_layers_per_pipeline_stage()
       const noexcept {
-    return num_layers_ / pipeline_parallel_size_;
+    return model_.num_layers / parallelism_.pipeline_parallel_size;
   }
   [[nodiscard]] std::uint64_t accelerator_count() const noexcept {
-    return tensor_parallel_size_ * pipeline_parallel_size_ *
-        data_parallel_size_;
+    return parallelism_.attention_parallel_size() *
+        parallelism_.pipeline_parallel_size;
   }
 
  private:
   ReplicaId replica_id_;
-  std::uint64_t tensor_parallel_size_;
-  std::uint64_t pipeline_parallel_size_;
-  std::uint64_t data_parallel_size_;
-  std::uint64_t num_layers_;
+  config::ParallelismConfig parallelism_;
+  config::ModelConfig model_;
 };
 
 }  // namespace frontier::entities

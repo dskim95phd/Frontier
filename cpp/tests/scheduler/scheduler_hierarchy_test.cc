@@ -11,14 +11,17 @@
 namespace {
 
 using frontier::BatchId;
+using frontier::BatchGlobalId;
 using frontier::DataParallelId;
 using frontier::Generation;
+using frontier::IterationId;
 using frontier::ReplicaId;
 using frontier::RequestId;
 using frontier::SimTime;
 using frontier::StageId;
 using frontier::config::SchedulerConfig;
 using frontier::entities::Batch;
+using frontier::entities::Cluster;
 using frontier::entities::Request;
 using frontier::entities::RequestBatchSnapshot;
 using frontier::execution_time_predictor::FixedBatchExecutionModel;
@@ -56,16 +59,23 @@ void test_colocation_scheduler_hierarchy_routes_and_executes() {
       .session_turn_index = std::nullopt,
   });
 
-  auto replica = std::make_unique<VllmV1Scheduler>(
+  frontier::config::ClusterRuntimeConfig runtime;
+  runtime.scheduler = scheduler_config();
+  Cluster cluster_entity{ClusterType::kMonolithic, runtime};
+  std::vector<std::unique_ptr<BaseReplicaScheduler>> replicas;
+  replicas.push_back(std::make_unique<VllmV1Scheduler>(
       scheduler_config(),
       requests,
       std::make_unique<FixedBatchExecutionModel>(
           frontier::config::FixedExecutionModelConfig{
               .batch_latency_ms = 2.5,
               .stage_latencies_ms = {},
-          }));
+          }),
+      cluster_entity.replica(ReplicaId{0}),
+      DataParallelId{0},
+      ClusterType::kMonolithic));
   auto cluster = std::make_unique<RoundRobinClusterScheduler>(
-      std::move(replica));
+      std::move(replicas), cluster_entity);
   GlobalScheduler global{std::move(cluster)};
 
   requests[0].on_arrival(SimTime::from_seconds(0.0));
@@ -106,6 +116,7 @@ void test_colocation_scheduler_hierarchy_routes_and_executes() {
       },
       schedule.simulation_time,
       Generation{1}};
+  batch.set_global_id(BatchGlobalId{0});
   replica_scheduler.mark_batch_started(batch);
 
   ReplicaStageScheduler& stage =
@@ -141,6 +152,57 @@ void test_colocation_scheduler_hierarchy_routes_and_executes() {
       "the complete hierarchy must quiesce after request completion");
 }
 
+void test_stage_scheduler_prioritizes_global_batch_id() {
+  ReplicaStageScheduler stage{
+      ReplicaId{0},
+      DataParallelId{0},
+      StageId{0},
+      true,
+      std::make_shared<FixedBatchExecutionModel>(
+          frontier::config::FixedExecutionModelConfig{
+              .batch_latency_ms = 1.0,
+              .stage_latencies_ms = {},
+          })};
+  const auto snapshots = std::vector<RequestBatchSnapshot>{
+      RequestBatchSnapshot{
+          .request_id = RequestId{0},
+          .scheduled_tokens = 1,
+          .runtime_epoch = 0,
+          .execution_epoch = 0,
+          .processed_tokens = 0,
+          .scheduler_frontier = 0,
+      },
+  };
+  Batch inserted_first{
+      BatchId{0},
+      IterationId{0},
+      snapshots,
+      SimTime::from_seconds(0.0),
+      Generation{1}};
+  inserted_first.set_global_id(BatchGlobalId{10});
+  Batch inserted_second{
+      BatchId{1},
+      IterationId{1},
+      snapshots,
+      SimTime::from_seconds(0.0),
+      Generation{1}};
+  inserted_second.set_global_id(BatchGlobalId{2});
+
+  stage.add_batch(inserted_first);
+  stage.add_batch(inserted_second);
+  const auto first = stage.pop_batch_if_not_busy();
+  expect(
+      first.has_value() &&
+          first->batch_id == inserted_second.id(),
+      "stage scheduler must prioritize the lower global batch ID");
+  stage.on_stage_end(inserted_second.id());
+  const auto second = stage.pop_batch_if_not_busy();
+  expect(
+      second.has_value() &&
+          second->batch_id == inserted_first.id(),
+      "stage scheduler must retain the remaining batch");
+}
+
 void test_colocation_hierarchy_rejects_unknown_targets() {
   std::vector<Request> requests;
   requests.emplace_back(WorkloadRequest{
@@ -151,10 +213,23 @@ void test_colocation_hierarchy_rejects_unknown_targets() {
       .session_id = frontier::SessionId{},
       .session_turn_index = std::nullopt,
   });
-  auto replica = std::make_unique<VllmV1Scheduler>(
-      scheduler_config(), requests);
+  frontier::config::ClusterRuntimeConfig runtime;
+  runtime.scheduler = scheduler_config();
+  Cluster cluster_entity{ClusterType::kMonolithic, runtime};
+  std::vector<std::unique_ptr<BaseReplicaScheduler>> replicas;
+  replicas.push_back(std::make_unique<VllmV1Scheduler>(
+      scheduler_config(),
+      requests,
+      std::make_unique<FixedBatchExecutionModel>(
+          frontier::config::FixedExecutionModelConfig{
+              .batch_latency_ms = 0.0,
+              .stage_latencies_ms = {},
+          }),
+      cluster_entity.replica(ReplicaId{0}),
+      DataParallelId{0},
+      ClusterType::kMonolithic));
   auto cluster = std::make_unique<RoundRobinClusterScheduler>(
-      std::move(replica));
+      std::move(replicas), cluster_entity);
   GlobalScheduler global{std::move(cluster)};
 
   expect_throws<GlobalSchedulerError>(
@@ -189,6 +264,9 @@ int main() {
   failures += frontier::test::run(
       "co-location scheduler hierarchy routes and executes",
       test_colocation_scheduler_hierarchy_routes_and_executes);
+  failures += frontier::test::run(
+      "stage scheduler prioritizes global batch ID",
+      test_stage_scheduler_prioritizes_global_batch_id);
   failures += frontier::test::run(
       "co-location hierarchy rejects unknown targets",
       test_colocation_hierarchy_rejects_unknown_targets);

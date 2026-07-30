@@ -9,6 +9,7 @@
 #include "frontier/core/event.h"
 #include "frontier/core/ids.h"
 #include "frontier/entities/batch.h"
+#include "frontier/entities/replica.h"
 #include "frontier/execution_time_predictor/batch_execution_model.h"
 #include "frontier/scheduler/replica_stage_scheduler/replica_stage_scheduler.h"
 
@@ -61,12 +62,11 @@ class SchedulerError : public std::runtime_error {
 class BaseReplicaScheduler {
  public:
   BaseReplicaScheduler(
-      ReplicaId replica_id,
+      const entities::Replica& replica,
       DataParallelId dp_id,
-      std::unique_ptr<
-          execution_time_predictor::BatchExecutionModel>
+      std::shared_ptr<
+          const execution_time_predictor::BatchExecutionModel>
           execution_model,
-      std::uint64_t pipeline_parallel_size = 1,
       ClusterType cluster_type = ClusterType::kMonolithic);
   virtual ~BaseReplicaScheduler() = default;
 
@@ -111,7 +111,11 @@ class BaseReplicaScheduler {
       const noexcept = 0;
 
   [[nodiscard]] ReplicaId replica_id() const noexcept {
-    return replica_id_;
+    return replica_->id();
+  }
+  [[nodiscard]] const entities::Replica& replica_entity()
+      const noexcept {
+    return *replica_;
   }
   [[nodiscard]] DataParallelId dp_id() const noexcept {
     return dp_id_;
@@ -125,7 +129,7 @@ class BaseReplicaScheduler {
   get_replica_stage_scheduler(StageId stage_id) const;
 
  private:
-  ReplicaId replica_id_;
+  const entities::Replica* replica_;
   DataParallelId dp_id_;
   ClusterType cluster_type_;
   std::vector<ReplicaStageScheduler> stage_schedulers_;

@@ -44,6 +44,7 @@ struct StrongIdHash {
 struct EventSequenceTag;
 struct RequestIdTag;
 struct BatchIdTag;
+struct BatchGlobalIdTag;
 struct ReplicaIdTag;
 struct DataParallelIdTag;
 struct StageIdTag;
@@ -51,10 +52,14 @@ struct SessionIdTag;
 struct GenerationTag;
 struct IterationIdTag;
 struct TransferIdTag;
+struct MoESyncGroupIdTag;
+struct MoEParticipantIdTag;
+struct LayerIdTag;
 
 using EventSequence = StrongId<EventSequenceTag>;
 using RequestId = StrongId<RequestIdTag>;
 using BatchId = StrongId<BatchIdTag>;
+using BatchGlobalId = StrongId<BatchGlobalIdTag>;
 using ReplicaId = StrongId<ReplicaIdTag>;
 using DataParallelId = StrongId<DataParallelIdTag>;
 using StageId = StrongId<StageIdTag>;
@@ -62,5 +67,8 @@ using SessionId = StrongId<SessionIdTag>;
 using Generation = StrongId<GenerationTag>;
 using IterationId = StrongId<IterationIdTag>;
 using TransferId = StrongId<TransferIdTag>;
+using MoESyncGroupId = StrongId<MoESyncGroupIdTag>;
+using MoEParticipantId = StrongId<MoEParticipantIdTag>;
+using LayerId = StrongId<LayerIdTag>;
 
 }  // namespace frontier

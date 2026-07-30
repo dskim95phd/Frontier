@@ -1,27 +1,39 @@
 #include "frontier/entities/replica.h"
 
+#include <utility>
+
 namespace frontier::entities {
 
 Replica::Replica(
     ReplicaId replica_id,
-    const config::ParallelismConfig& parallelism,
-    std::uint64_t num_layers)
+    config::ParallelismConfig parallelism,
+    config::ModelConfig model)
     : replica_id_(replica_id),
-      tensor_parallel_size_(parallelism.tensor_parallel_size),
-      pipeline_parallel_size_(parallelism.pipeline_parallel_size),
-      data_parallel_size_(parallelism.data_parallel_size),
-      num_layers_(num_layers) {
-  if (tensor_parallel_size_ == 0 ||
-      pipeline_parallel_size_ == 0 ||
-      data_parallel_size_ == 0 ||
-      num_layers_ == 0) {
+      parallelism_(std::move(parallelism)),
+      model_(std::move(model)) {
+  if (!replica_id_.valid() ||
+      parallelism_.tensor_parallel_size == 0 ||
+      parallelism_.pipeline_parallel_size == 0 ||
+      parallelism_.data_parallel_size == 0 ||
+      parallelism_.moe_tensor_parallel_size == 0 ||
+      parallelism_.moe_expert_parallel_size == 0 ||
+      model_.num_layers == 0) {
     throw ReplicaError("replica topology dimensions must be positive");
   }
-  if (num_layers_ % pipeline_parallel_size_ != 0 ||
-      4'096 % tensor_parallel_size_ != 0 ||
-      32 % tensor_parallel_size_ != 0) {
+  if (model_.num_layers % parallelism_.pipeline_parallel_size != 0 ||
+      model_.hidden_size % parallelism_.tensor_parallel_size != 0 ||
+      model_.num_query_heads %
+              parallelism_.tensor_parallel_size !=
+          0 ||
+      model_.num_kv_heads % parallelism_.tensor_parallel_size != 0) {
     throw ReplicaError(
-        "replica topology does not divide Llama-2-7B model dimensions");
+        "replica topology does not divide model dimensions");
+  }
+  if (model_.is_moe() &&
+      parallelism_.attention_parallel_size() !=
+          parallelism_.moe_parallel_size()) {
+    throw ReplicaError(
+        "MoE replica requires a shared attention/expert domain");
   }
 }
 

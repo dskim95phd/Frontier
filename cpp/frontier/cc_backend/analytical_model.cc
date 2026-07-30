@@ -124,4 +124,9 @@ void AnalyticalCommunicationModel::require_devices(
   }
 }
 
+std::shared_ptr<const BaseCCBackend>
+make_analytical_cc_backend(AnalyticalCommunicationConfig config) {
+  return std::make_shared<AnalyticalCommunicationModel>(config);
+}
+
 }  // namespace frontier::cc_backend

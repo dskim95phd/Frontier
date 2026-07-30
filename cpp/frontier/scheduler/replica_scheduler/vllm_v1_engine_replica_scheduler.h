@@ -29,11 +29,16 @@ class VllmV1Scheduler final : public BaseReplicaScheduler {
       std::vector<entities::Request>& requests,
       std::unique_ptr<
           execution_time_predictor::BatchExecutionModel>
+          execution_model);
+  VllmV1Scheduler(
+      config::SchedulerConfig config,
+      std::vector<entities::Request>& requests,
+      std::shared_ptr<
+          const execution_time_predictor::BatchExecutionModel>
           execution_model,
-      ReplicaId replica_id = ReplicaId{0},
-      DataParallelId dp_id = DataParallelId{0},
-      std::uint64_t pipeline_parallel_size = 1,
-      ClusterType cluster_type = ClusterType::kMonolithic);
+      const entities::Replica& replica,
+      DataParallelId dp_id,
+      ClusterType cluster_type);
 
   void add_request(RequestId request_id) override;
   [[nodiscard]] ScheduleResult schedule(SimTime time) override;

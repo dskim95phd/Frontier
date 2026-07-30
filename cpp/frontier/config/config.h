@@ -46,11 +46,74 @@ enum class ClusterSchedulerType {
   kRoundRobin,
 };
 
+enum class ModelKind {
+  kDense,
+  kMoe,
+};
+
+struct ModelConfig {
+  std::string name = "llama2-7b";
+  ModelKind kind = ModelKind::kDense;
+  std::uint64_t num_layers = 32;
+  std::uint64_t hidden_size = 4'096;
+  std::uint64_t intermediate_size = 11'008;
+  std::uint64_t num_query_heads = 32;
+  std::uint64_t num_kv_heads = 32;
+  std::uint64_t head_dim = 128;
+  bool gated_mlp = true;
+  bool fused_add_norm = true;
+  std::uint64_t model_num_experts = 1;
+  std::uint64_t runtime_total_experts = 1;
+  std::uint64_t router_topk = 1;
+
+  [[nodiscard]] bool is_moe() const noexcept {
+    return kind == ModelKind::kMoe;
+  }
+
+  friend bool operator==(
+      const ModelConfig&,
+      const ModelConfig&) = default;
+};
+
+enum class MoeRoutingMode {
+  kSimulation,
+  kUniformLegacy,
+  kUniformRandom,
+};
+
+enum class MoeRoutingDistribution {
+  kBalanced,
+  kRandom,
+  kSkewed,
+  kZipf,
+};
+
+struct MoeRoutingConfig {
+  MoeRoutingMode mode = MoeRoutingMode::kSimulation;
+  MoeRoutingDistribution distribution =
+      MoeRoutingDistribution::kBalanced;
+  std::uint64_t seed = 42;
+
+  friend bool operator==(
+      const MoeRoutingConfig&,
+      const MoeRoutingConfig&) = default;
+};
+
 struct ParallelismConfig {
   std::uint64_t num_replicas = 1;
   std::uint64_t tensor_parallel_size = 1;
   std::uint64_t pipeline_parallel_size = 1;
   std::uint64_t data_parallel_size = 1;
+  std::uint64_t moe_tensor_parallel_size = 1;
+  std::uint64_t moe_expert_parallel_size = 1;
+
+  [[nodiscard]] std::uint64_t attention_parallel_size()
+      const noexcept {
+    return tensor_parallel_size * data_parallel_size;
+  }
+  [[nodiscard]] std::uint64_t moe_parallel_size() const noexcept {
+    return moe_tensor_parallel_size * moe_expert_parallel_size;
+  }
 
   friend bool operator==(
       const ParallelismConfig&,
@@ -126,6 +189,8 @@ struct ClusterRuntimeConfig {
   ParallelismConfig parallelism;
   SchedulerConfig scheduler;
   ExecutionModelConfig execution_model;
+  ModelConfig model;
+  MoeRoutingConfig moe_routing;
 
   friend bool operator==(
       const ClusterRuntimeConfig&,
@@ -200,6 +265,10 @@ struct SimulationConfig {
     SchedulingPolicy policy) noexcept;
 [[nodiscard]] std::string_view to_string(
     ClusterSchedulerType type) noexcept;
+[[nodiscard]] std::string_view to_string(ModelKind kind) noexcept;
+[[nodiscard]] std::string_view to_string(MoeRoutingMode mode) noexcept;
+[[nodiscard]] std::string_view to_string(
+    MoeRoutingDistribution distribution) noexcept;
 [[nodiscard]] std::string_view to_string(
     ExecutionModelType type) noexcept;
 

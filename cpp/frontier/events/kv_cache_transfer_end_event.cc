@@ -33,24 +33,7 @@ void handle_event(
               transfer.source_dp_id());
   source.complete_kv_transfer(request.id());
 
-  context.output().kv_cache_transfers.push_back(
-      metrics::KVCacheTransferMetricsRecord{
-          .transfer_id = transfer.id(),
-          .request_id = transfer.request_id(),
-          .source_batch_id = transfer.source_batch_id(),
-          .source_cluster_type =
-              transfer.source_cluster_type(),
-          .target_cluster_type =
-              transfer.target_cluster_type(),
-          .source_replica_id =
-              transfer.source_replica_id(),
-          .source_dp_id = transfer.source_dp_id(),
-          .size_bytes = transfer.size_bytes(),
-          .predicted_time_ms =
-              transfer.predicted_time_ms(),
-          .started_at = transfer.started_at(),
-          .completed_at = time,
-      });
+  context.metrics().record_kv_cache_transfer(transfer);
 
   if (schedule_decode) {
     context.event_queue().push(

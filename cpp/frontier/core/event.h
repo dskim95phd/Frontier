@@ -8,6 +8,7 @@
 
 #include "frontier/core/cluster_type.h"
 #include "frontier/core/ids.h"
+#include "frontier/moe/synchronization.h"
 
 namespace frontier {
 
@@ -45,6 +46,10 @@ enum class EventType : std::uint8_t {
   kGlobalBatchEnd,
   kKvCacheTransferStart,
   kKvCacheTransferEnd,
+  kPrefillSync,
+  kPrefillSyncCollective,
+  kDecodeSync,
+  kDecodeSyncCollective,
 };
 
 struct RequestArrivalPayload {
@@ -138,6 +143,62 @@ struct KVCacheTransferEndPayload {
   ClusterType cluster_type;
 };
 
+struct PrefillSyncPayload {
+  static constexpr EventType kType = EventType::kPrefillSync;
+  BatchId batch_id;
+  ReplicaId replica_id;
+  DataParallelId dp_id;
+  MoEParticipantId participant_id;
+  StageId stage_id;
+  MoESyncGroupId sync_group_id;
+  LayerId layer_id;
+  moe::SyncPhase sync_phase;
+  double elapsed_component_ms;
+  bool is_idle;
+  Generation generation;
+  Generation sync_generation;
+  ClusterType cluster_type;
+};
+
+struct PrefillSyncCollectivePayload {
+  static constexpr EventType kType = EventType::kPrefillSyncCollective;
+  ReplicaId replica_id;
+  StageId stage_id;
+  MoESyncGroupId sync_group_id;
+  LayerId layer_id;
+  moe::SyncPhase sync_phase;
+  Generation sync_generation;
+  ClusterType cluster_type;
+};
+
+struct DecodeSyncPayload {
+  static constexpr EventType kType = EventType::kDecodeSync;
+  BatchId batch_id;
+  ReplicaId replica_id;
+  DataParallelId dp_id;
+  MoEParticipantId participant_id;
+  StageId stage_id;
+  MoESyncGroupId sync_group_id;
+  LayerId layer_id;
+  moe::SyncPhase sync_phase;
+  double elapsed_component_ms;
+  bool is_idle;
+  Generation generation;
+  Generation sync_generation;
+  ClusterType cluster_type;
+};
+
+struct DecodeSyncCollectivePayload {
+  static constexpr EventType kType = EventType::kDecodeSyncCollective;
+  ReplicaId replica_id;
+  StageId stage_id;
+  MoESyncGroupId sync_group_id;
+  LayerId layer_id;
+  moe::SyncPhase sync_phase;
+  Generation sync_generation;
+  ClusterType cluster_type;
+};
+
 using EventPayload = std::variant<
     RequestArrivalPayload,
     GlobalSchedulePayload,
@@ -149,7 +210,11 @@ using EventPayload = std::variant<
     ClusterBatchEndPayload,
     GlobalBatchEndPayload,
     KVCacheTransferStartPayload,
-    KVCacheTransferEndPayload>;
+    KVCacheTransferEndPayload,
+    PrefillSyncPayload,
+    PrefillSyncCollectivePayload,
+    DecodeSyncPayload,
+    DecodeSyncCollectivePayload>;
 
 class Event {
  public:

@@ -31,7 +31,11 @@ Batch::Batch(
     ReplicaId replica_id,
     DataParallelId dp_id,
     std::uint64_t num_pipeline_stages,
-    ClusterType cluster_type)
+    ClusterType cluster_type,
+    BatchKind kind,
+    config::ModelKind model_kind,
+    MoESyncGroupId moe_sync_group_id,
+    MoEParticipantId moe_participant_id)
     : batch_id_(batch_id),
       iteration_id_(iteration_id),
       requests_(std::move(requests)),
@@ -40,9 +44,26 @@ Batch::Batch(
       replica_id_(replica_id),
       dp_id_(dp_id),
       num_pipeline_stages_(num_pipeline_stages),
-      cluster_type_(cluster_type) {
-  if (requests_.empty()) {
+      cluster_type_(cluster_type),
+      kind_(kind),
+      model_kind_(model_kind),
+      moe_sync_group_id_(moe_sync_group_id),
+      moe_participant_id_(moe_participant_id) {
+  if (requests_.empty() && kind_ != BatchKind::kMoeIdle) {
     throw BatchError("batch must contain at least one request");
+  }
+  if (kind_ == BatchKind::kMoeIdle &&
+      (!requests_.empty() ||
+       model_kind_ != config::ModelKind::kMoe ||
+       !moe_sync_group_id_.valid() ||
+       !moe_participant_id_.valid())) {
+    throw BatchError(
+        "idle MoE batch requires no requests and valid synchronization IDs");
+  }
+  if (kind_ == BatchKind::kWork &&
+      (moe_participant_id_.valid() != moe_sync_group_id_.valid())) {
+    throw BatchError(
+        "work batch MoE synchronization IDs must be both valid or invalid");
   }
   if (!std::isfinite(scheduled_at_.seconds()) ||
       scheduled_at_.seconds() < 0.0) {
@@ -87,6 +108,46 @@ void Batch::mark_completed(SimTime time) {
         "batch completion must be finite and not precede scheduling");
   }
   completed_at_ = time;
+}
+
+void Batch::set_global_id(BatchGlobalId global_id) {
+  if (!global_id.valid() || global_id_.valid()) {
+    throw BatchError(
+        "batch global ID must be valid and assigned exactly once");
+  }
+  global_id_ = global_id;
+}
+
+void Batch::set_stage_layer(LayerId layer_id) {
+  if (!layer_id.valid()) {
+    throw BatchError("batch stage layer must be valid");
+  }
+  if (stage_layer_.valid() && layer_id < stage_layer_) {
+    throw BatchError("batch stage layer cannot move backwards");
+  }
+  stage_layer_ = layer_id;
+}
+
+void Batch::reset_stage_layer() {
+  stage_layer_ = LayerId{0};
+}
+
+void Batch::set_moe_synchronization(
+    MoESyncGroupId sync_group_id,
+    MoEParticipantId participant_id) {
+  if (!is_moe() || !sync_group_id.valid() ||
+      !participant_id.valid()) {
+    throw BatchError(
+        "MoE synchronization requires a MoE batch and valid IDs");
+  }
+  if ((moe_sync_group_id_.valid() &&
+       moe_sync_group_id_ != sync_group_id) ||
+      (moe_participant_id_.valid() &&
+       moe_participant_id_ != participant_id)) {
+    throw BatchError("MoE synchronization IDs cannot be reassigned");
+  }
+  moe_sync_group_id_ = sync_group_id;
+  moe_participant_id_ = participant_id;
 }
 
 }  // namespace frontier::entities

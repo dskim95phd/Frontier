@@ -64,6 +64,30 @@ OrderedJson serialize_parallelism(
       {"tensor_parallel_size", parallelism.tensor_parallel_size},
       {"pipeline_parallel_size", parallelism.pipeline_parallel_size},
       {"data_parallel_size", parallelism.data_parallel_size},
+      {
+          "moe_tensor_parallel_size",
+          parallelism.moe_tensor_parallel_size,
+      },
+      {
+          "moe_expert_parallel_size",
+          parallelism.moe_expert_parallel_size,
+      },
+  });
+}
+
+OrderedJson serialize_model(const ModelConfig& model) {
+  return OrderedJson::object({
+      {"name", model.name},
+      {"runtime_total_experts", model.runtime_total_experts},
+      {"router_topk", model.router_topk},
+  });
+}
+
+OrderedJson serialize_moe_routing(const MoeRoutingConfig& routing) {
+  return OrderedJson::object({
+      {"mode", to_string(routing.mode)},
+      {"distribution", to_string(routing.distribution)},
+      {"seed", routing.seed},
   });
 }
 
@@ -110,6 +134,8 @@ OrderedJson serialize_cluster_runtime(
           "execution_model",
           serialize_execution_model(cluster.execution_model),
       },
+      {"model", serialize_model(cluster.model)},
+      {"moe_routing", serialize_moe_routing(cluster.moe_routing)},
   });
 }
 

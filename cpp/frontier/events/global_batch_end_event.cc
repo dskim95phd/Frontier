@@ -20,10 +20,11 @@ void handle_event(
           .get_replica_scheduler(
               target.replica_id, target.dp_id);
   static_cast<void>(replica.on_batch_completed(batch, time));
-  context.output().batches.push_back(make_batch_metrics(
+  context.metrics().record_batch(
       batch,
       context.requests(),
-      context.predicted_batch_ms(payload.batch_id)));
+      context.predicted_batch_ms(payload.batch_id),
+      context.runtime_config(payload.cluster_type));
   for (const entities::RequestBatchSnapshot& snapshot :
        batch.requests()) {
     if (context.request(snapshot.request_id).completed()) {

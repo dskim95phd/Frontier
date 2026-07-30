@@ -1,15 +1,19 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <map>
+#include <memory>
 #include <vector>
 
 #include "frontier/config/config.h"
 #include "frontier/core/event_queue.h"
+#include "frontier/entities/cluster.h"
 #include "frontier/execution_time_predictor/batch_execution_model.h"
-#include "frontier/metrics/output_contract.h"
+#include "frontier/kv_cache_transfer/base_kv_cache_transfer_predictor.h"
+#include "frontier/metrics/metrics_store.h"
 #include "frontier/request_generator/workload.h"
-#include "frontier/scheduler/global_scheduler/base_global_scheduler.h"
+#include "frontier/scheduler/global_scheduler/global_scheduler.h"
 #include "frontier/scheduler/scheduler_types.h"
 #include "frontier/simulator/entity_arena.h"
 
@@ -25,10 +29,10 @@ class SimulationContext {
     return config_;
   }
   [[nodiscard]] EventQueue& event_queue() noexcept { return event_queue_; }
-  [[nodiscard]] metrics::SimulationOutput& output() noexcept {
-    return output_;
+  [[nodiscard]] metrics::MetricsStore& metrics() noexcept {
+    return metrics_;
   }
-  [[nodiscard]] scheduler::BaseGlobalScheduler&
+  [[nodiscard]] scheduler::GlobalScheduler&
   global_scheduler() noexcept {
     return *global_scheduler_;
   }
@@ -50,13 +54,25 @@ class SimulationContext {
   }
   [[nodiscard]] const config::ParallelismConfig& parallelism(
       ClusterType cluster_type) const;
+  [[nodiscard]] const entities::Cluster& cluster_entity(
+      ClusterType cluster_type) const;
   [[nodiscard]] const config::ExecutionModelConfig& execution_model(
+      ClusterType cluster_type) const;
+  [[nodiscard]] const config::ClusterRuntimeConfig& runtime_config(
       ClusterType cluster_type) const;
 
   BatchId create_batch(
       const scheduler::ScheduleResult& schedule,
       scheduler::ReplicaTarget target,
       ClusterType cluster_type = ClusterType::kMonolithic);
+  BatchId create_moe_idle_batch(
+      MoESyncGroupId sync_group_id,
+      MoEParticipantId participant_id,
+      scheduler::ReplicaTarget target,
+      ClusterType cluster_type,
+      std::uint64_t pipeline_parallel_size,
+      SimTime created_at,
+      Generation generation);
   void record_stage_arrival(
       BatchId batch_id,
       StageId stage_id,
@@ -104,13 +120,15 @@ class SimulationContext {
  private:
   config::SimulationConfig config_;
   EntityArena entities_;
-  std::map<ClusterType, config::ParallelismConfig>
-      cluster_parallelism_;
+  std::map<ClusterType, entities::Cluster> clusters_;
   std::size_t expected_decode_arrivals_ = 0;
   std::size_t decode_arrivals_ = 0;
+  std::shared_ptr<
+      const kv_cache_transfer::BaseKVCacheTransferPredictor>
+      kv_cache_transfer_predictor_;
   EventQueue event_queue_;
-  metrics::SimulationOutput output_;
-  std::unique_ptr<scheduler::BaseGlobalScheduler>
+  metrics::MetricsStore metrics_;
+  std::unique_ptr<scheduler::GlobalScheduler>
       global_scheduler_;
 };
 

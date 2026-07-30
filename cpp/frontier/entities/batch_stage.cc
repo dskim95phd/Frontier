@@ -1,6 +1,8 @@
 #include "frontier/entities/batch_stage.h"
 
+#include <algorithm>
 #include <cmath>
+#include <array>
 
 namespace frontier::entities {
 namespace {
@@ -15,6 +17,29 @@ void require_time_at_or_after(
         std::string{context} +
         " must be finite and not precede the previous boundary");
   }
+}
+
+bool valid_execution_time(const ExecutionTime& execution_time) {
+  const std::array values{
+      execution_time.dense_compute_ms,
+      execution_time.tp_communication_ms,
+      execution_time.pp_communication_ms,
+      execution_time.moe_gating_linear_ms,
+      execution_time.moe_gating_routing_topk_ms,
+      execution_time.moe_grouped_gemm_ms,
+      execution_time.moe_shuffling_ms,
+      execution_time.moe_post_attention_norm_ms,
+      execution_time.moe_tp_communication_ms,
+      execution_time.ep_dispatch_ms,
+      execution_time.ep_combine_ms,
+      execution_time.dp_input_communication_ms,
+      execution_time.dp_output_communication_ms,
+      execution_time.synchronization_wait_ms,
+  };
+  return std::all_of(
+      values.begin(), values.end(), [](double value) {
+        return std::isfinite(value) && value >= 0.0;
+      });
 }
 
 }  // namespace
@@ -34,12 +59,7 @@ BatchStage::BatchStage(
       execution_time_(execution_time) {
   if (!std::isfinite(arrived_at_.seconds()) ||
       arrived_at_.seconds() < 0.0 ||
-      !std::isfinite(execution_time_.dense_compute_ms) ||
-      !std::isfinite(execution_time_.tp_communication_ms) ||
-      !std::isfinite(execution_time_.pp_communication_ms) ||
-      execution_time_.dense_compute_ms < 0.0 ||
-      execution_time_.tp_communication_ms < 0.0 ||
-      execution_time_.pp_communication_ms < 0.0) {
+      !valid_execution_time(execution_time_)) {
     throw BatchStageError("batch stage contains invalid timing");
   }
 }
@@ -61,6 +81,22 @@ void BatchStage::mark_completed(SimTime time) {
   }
   require_time_at_or_after(time, started_at_, "stage completion");
   completed_at_ = time;
+}
+
+void BatchStage::reconcile_synchronization_wait(
+    SimTime completed_at) {
+  if (!started_at_.valid() || !completed_at.valid() ||
+      completed_at < started_at_) {
+    throw BatchStageError(
+        "cannot reconcile synchronization wait without valid boundaries");
+  }
+  const double wall_ms =
+      (completed_at.seconds() - started_at_.seconds()) * 1e3;
+  const double modeled_without_wait =
+      execution_time_.total_ms() -
+      execution_time_.synchronization_wait_ms;
+  execution_time_.synchronization_wait_ms =
+      std::max(0.0, wall_ms - modeled_without_wait);
 }
 
 }  // namespace frontier::entities

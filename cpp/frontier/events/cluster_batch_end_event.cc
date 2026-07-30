@@ -23,10 +23,11 @@ void handle_event(
     if (!replica.on_batch_completed(batch, time)) {
       return;
     }
-    context.output().batches.push_back(make_batch_metrics(
+    context.metrics().record_batch(
         batch,
         context.requests(),
-        context.predicted_batch_ms(payload.batch_id)));
+        context.predicted_batch_ms(payload.batch_id),
+        context.runtime_config(payload.cluster_type));
     for (const entities::RequestBatchSnapshot& snapshot :
          batch.requests()) {
       const entities::Request& request =

@@ -80,12 +80,34 @@ def _scheduler_config(raw: dict[str, Any]) -> VllmV1SchedulerConfig:
 
 
 def _replica_config(
-    topology: dict[str, Any],
-    execution: dict[str, Any],
+    cluster: dict[str, Any],
     cluster_prefix: str,
 ) -> ReplicaConfig:
+    topology = cluster["parallelism"]
+    execution = cluster["execution_model"]
+    model = cluster.get(
+        "model",
+        {
+            "name": "llama2-7b",
+            "runtime_total_experts": 1,
+            "router_topk": 1,
+        },
+    )
+    routing = cluster.get(
+        "moe_routing",
+        {
+            "mode": "simulation",
+            "distribution": "balanced",
+            "seed": 42,
+        },
+    )
+    model_name = (
+        "meta-llama/Llama-2-7b-hf"
+        if model["name"] == "llama2-7b"
+        else str(model["name"])
+    )
     return ReplicaConfig(
-        model_name="meta-llama/Llama-2-7b-hf",
+        model_name=model_name,
         device=str(execution.get("device", "rubin")),
         network_device="vera_rubin_nvl72_domain",
         attn_tensor_parallel_size=int(
@@ -100,6 +122,21 @@ def _replica_config(
         data_parallel_size=int(
             topology["data_parallel_size"]
         ),
+        moe_tensor_parallel_size=int(
+            topology.get("moe_tensor_parallel_size", 1)
+        ),
+        moe_expert_parallel_size=int(
+            topology.get("moe_expert_parallel_size", 1)
+        ),
+        total_expert_num=int(
+            model.get("runtime_total_experts", 1)
+        ),
+        router_topk=int(model.get("router_topk", 1)),
+        moe_routing_mode=str(routing.get("mode", "simulation")),
+        moe_routing_distribution_type=str(
+            routing.get("distribution", "balanced")
+        ),
+        moe_routing_seed=int(routing.get("seed", 42)),
         cluster_prefix=cluster_prefix,
     )
 
@@ -114,13 +151,11 @@ def _build_python_config(
     prefill_scheduler = prefill["scheduler"]
     decode_scheduler = decode["scheduler"]
     prefill_replica = _replica_config(
-        prefill["parallelism"],
-        prefill["execution_model"],
+        prefill,
         "prefill",
     )
     decode_replica = _replica_config(
-        decode["parallelism"],
-        decode["execution_model"],
+        decode,
         "decode",
     )
     cluster = ClusterConfig(
@@ -152,13 +187,27 @@ def _build_python_config(
         prefill_replica_config_num_pipeline_stages=int(
             prefill["parallelism"]["pipeline_parallel_size"]
         ),
+        # The public constructor validates before the normalized private
+        # replica configs below are installed.  Bootstrap through DP1 with
+        # a TP size that preserves the shared attention/MoE domain, then
+        # replace it with the requested topology in get_normalized_clusters.
         prefill_replica_config_attn_tensor_parallel_size=int(
-            prefill["parallelism"]["tensor_parallel_size"]
+            prefill["parallelism"]["moe_tensor_parallel_size"]
+            * prefill["parallelism"]["moe_expert_parallel_size"]
         ),
         # Production Python currently rejects dense PDD DP > 1 while its
         # runtime schedulers support DP lanes.  Construct the public config
         # through DP1, then install the normalized cluster configs below.
         prefill_replica_config_attn_data_parallel_size=1,
+        prefill_replica_config_moe_tensor_parallel_size=int(
+            prefill["parallelism"]["moe_tensor_parallel_size"]
+        ),
+        prefill_replica_config_moe_expert_parallel_size=int(
+            prefill["parallelism"]["moe_expert_parallel_size"]
+        ),
+        prefill_replica_config_total_expert_num=int(
+            prefill["model"]["runtime_total_experts"]
+        ),
         prefill_replica_config_device=str(
             prefill["execution_model"].get("device", "rubin")
         ),
@@ -172,9 +221,19 @@ def _build_python_config(
             decode["parallelism"]["pipeline_parallel_size"]
         ),
         decode_replica_config_attn_tensor_parallel_size=int(
-            decode["parallelism"]["tensor_parallel_size"]
+            decode["parallelism"]["moe_tensor_parallel_size"]
+            * decode["parallelism"]["moe_expert_parallel_size"]
         ),
         decode_replica_config_attn_data_parallel_size=1,
+        decode_replica_config_moe_tensor_parallel_size=int(
+            decode["parallelism"]["moe_tensor_parallel_size"]
+        ),
+        decode_replica_config_moe_expert_parallel_size=int(
+            decode["parallelism"]["moe_expert_parallel_size"]
+        ),
+        decode_replica_config_total_expert_num=int(
+            decode["model"]["runtime_total_experts"]
+        ),
         decode_replica_config_device=str(
             decode["execution_model"].get("device", "rubin")
         ),
@@ -384,6 +443,10 @@ def _normalize_events(
             "batch_stage_arrival",
             "replica_stage_schedule",
             "batch_stage_end",
+            "prefill_sync",
+            "prefill_sync_collective",
+            "decode_sync",
+            "decode_sync_collective",
         } and raw.get("cluster_type") is not None:
             cluster = _cluster_name(raw["cluster_type"])
         elif event_type in {
@@ -402,19 +465,43 @@ def _normalize_events(
             "batch_stage_arrival",
             "replica_stage_schedule",
             "batch_stage_end",
+            "prefill_sync",
+            "prefill_sync_collective",
+            "decode_sync",
+            "decode_sync_collective",
         }:
             assert cluster is not None
             event["replica_id"] = (
                 int(raw["replica_id"])
                 - replica_bases[cluster]
             )
-            event["dp_id"] = int(raw["dp_id"])
+            if "dp_id" in raw:
+                event["dp_id"] = int(raw["dp_id"])
         if event_type in {
             "batch_stage_arrival",
             "replica_stage_schedule",
             "batch_stage_end",
+            "prefill_sync",
+            "prefill_sync_collective",
+            "decode_sync",
+            "decode_sync_collective",
         }:
             event["stage_id"] = int(raw["stage_id"])
+        if event_type in {
+            "prefill_sync",
+            "prefill_sync_collective",
+            "decode_sync",
+            "decode_sync_collective",
+        }:
+            event["sync_stage"] = str(raw["sync_stage"])
+            event["layer_id"] = int(raw["layer_id"])
+        if event_type in {"prefill_sync", "decode_sync"}:
+            event["batch_id"] = int(raw["batch_id"])
+        if event_type in {
+            "prefill_sync_collective",
+            "decode_sync_collective",
+        }:
+            event["sync_group_id"] = int(raw["batch_global_id"])
         result.append(event)
     return result
 

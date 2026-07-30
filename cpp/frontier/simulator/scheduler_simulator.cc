@@ -64,7 +64,7 @@ metrics::SimulationOutput run_scheduler_simulation(
   const events::EventDispatcher dispatcher;
   while (!context.event_queue().empty()) {
     Event event = context.event_queue().pop();
-    context.output().event_trace.push_back(event);
+    context.metrics().record_event(event);
     dispatcher.dispatch(event, context);
   }
   context.finalize();

@@ -93,11 +93,21 @@ add_library(
   frontier/events/replica_schedule_event.cc
   frontier/events/replica_stage_schedule_event.cc
   frontier/events/request_arrival_event.cc
+  frontier/events/prefill_sync_event.cc
+  frontier/events/prefill_sync_collective_event.cc
+  frontier/events/decode_sync_event.cc
+  frontier/events/decode_sync_collective_event.cc
   frontier/execution_time_predictor/analytical_model.cc
   frontier/execution_time_predictor/batch_execution_model.cc
   frontier/kv_cache_transfer/analytical_transfer.cc
   frontier/metrics/output_contract.cc
+  frontier/metrics/metrics_store.cc
+  frontier/moe/parallel_domain.cc
+  frontier/moe/routing.cc
+  frontier/moe/analytical_model.cc
+  frontier/moe/barrier_coordinator.cc
   frontier/request_generator/workload.cc
+  frontier/scheduler/cluster_scheduler/base_cluster_scheduler.cc
   frontier/scheduler/cluster_scheduler/round_robin_cluster_scheduler.cc
   frontier/scheduler/global_scheduler/global_scheduler.cc
   frontier/scheduler/kv_block_accounting.cc
@@ -271,6 +281,17 @@ if(BUILD_TESTING)
   )
 
   add_executable(
+    frontier_moe_routing_test
+    tests/moe/routing_test.cc
+  )
+  target_link_libraries(frontier_moe_routing_test PRIVATE frontier_core)
+  frontier_enable_warnings(frontier_moe_routing_test)
+  add_test(
+    NAME frontier_moe.routing
+    COMMAND $<TARGET_FILE:frontier_moe_routing_test>
+  )
+
+  add_executable(
     frontier_kv_block_accounting_test
     tests/scheduler/kv_block_accounting_test.cc
   )
@@ -352,5 +373,26 @@ if(BUILD_TESTING)
   add_test(
     NAME frontier_simulator.sequential_pdd
     COMMAND $<TARGET_FILE:frontier_sequential_pdd_test>
+  )
+
+  add_executable(
+    frontier_moe_integration_test
+    tests/simulator/moe_integration_test.cc
+  )
+  target_compile_definitions(
+    frontier_moe_integration_test
+    PRIVATE
+      FRONTIER_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures"
+  )
+  target_link_libraries(
+    frontier_moe_integration_test
+    PRIVATE
+      frontier_core
+      nlohmann_json::nlohmann_json
+  )
+  frontier_enable_warnings(frontier_moe_integration_test)
+  add_test(
+    NAME frontier_simulator.moe_integration
+    COMMAND $<TARGET_FILE:frontier_moe_integration_test>
   )
 endif()

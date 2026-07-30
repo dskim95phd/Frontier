@@ -29,6 +29,8 @@ IDs and contiguous storage; the behavior is not independently redesigned.
 - `co-location` with one monolithic cluster.
 - Sequential `pd-disaggregation` with a `PREFILL` cluster, a unified `DECODE`
   cluster, and analytical KV-cache-transfer events.
+- Dense Llama-2-7B and the reference `Phi-tiny-MoE-instruct` model, including
+  shared-domain attention TP/DP and MoE TP/EP parity.
 - One vLLM-v1-style scheduler:
   - continuous batching;
   - chunked prefill where required by the current model;
@@ -292,6 +294,21 @@ queue both matches the release contract and removes synchronization overhead.
    - Follow the detailed
      [Step 3 dense sequential PDD plan](cpp-porting-step3-sequential-pdd.md).
 
+3.5. **MoE and Expert Parallelism (complete)**
+   - Extend the validated co-location and sequential PDD schedulers with the
+     reference Phi MoE model.
+   - Represent attention TP/DP and MoE TP/EP as two views of one shared
+     physical domain, enforcing
+     `attn_tp * attn_dp == moe_tp * moe_ep`.
+   - Add deterministic expert routing, per-lane expert ownership and timing,
+     critical-lane behavior, and MoE-specific analytical communication.
+   - Add typed prefill/decode sync and collective events, barrier state,
+     deterministic idle participants, and exact-once real request completion.
+   - Preserve PP, multiple replicas, chunked prefill, preemption, PDD transfer
+     ownership, and all dense parity gates.
+   - Follow the detailed
+     [Step 3.5 MoE and Expert-Parallel plan](cpp-porting-step3-5-moe-expert-parallelism.md).
+
 4. **Session prefix cache**
    - Add session affinity, complete-block GPU cache lookup, allocation,
      eviction, and metrics to the validated co-location and PDD paths.
@@ -350,7 +367,8 @@ The existing Python references for the session-cache behavior are primarily:
 - It supports only `prefix_caching_key_mode=session` and clearly rejects
   `block_hash`.
 - It rejects all excluded modes with clear errors.
-- It passes the agreed Python-vs-C++ parity suite for dense session-prefix
-  workloads, including multi-target affinity and PDD handoff cases.
+- It passes the agreed Python-vs-C++ parity suite for dense and reference-Phi
+  MoE session-prefix workloads, including multi-target affinity and PDD
+  handoff cases.
 - Profiling workflows continue to run from the existing Python code without a
   C++ dependency.
