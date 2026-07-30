@@ -17,7 +17,7 @@ class Batch;
 class BatchStage;
 class KVCacheTransferInfo;
 class Request;
-}
+} // namespace frontier::entities
 
 namespace frontier::execution_time_predictor {
 struct MoERoutingDiagnostic;
@@ -26,7 +26,7 @@ struct MoERoutingDiagnostic;
 namespace frontier::scheduler {
 struct ReplicaTarget;
 struct ScheduleResult;
-}
+} // namespace frontier::scheduler
 
 namespace frontier::metrics {
 
@@ -34,46 +34,38 @@ namespace frontier::metrics {
 // Event handlers report observations here; output serialization remains in
 // output_contract.
 class MetricsStore {
- public:
-  explicit MetricsStore(
-      const config::SimulationConfig& config,
-      std::size_t expected_request_count = 0);
+  public:
+    explicit MetricsStore(const config::SimulationConfig &config,
+                          std::size_t expected_request_count = 0);
 
-  void record_event(Event event);
-  void record_batch(
-      const entities::Batch& batch,
-      const std::vector<entities::Request>& requests,
-      double predicted_execution_ms,
-      const config::ClusterRuntimeConfig& runtime);
-  void record_batch_stage(
-      const entities::BatchStage& batch_stage,
-      const entities::Batch& batch,
-      const config::ClusterRuntimeConfig& runtime);
-  void record_scheduler_trace(
-      const scheduler::ScheduleResult& schedule,
-      scheduler::ReplicaTarget target,
-      ClusterType cluster_type);
-  void record_kv_cache_transfer(
-      const entities::KVCacheTransferInfo& transfer);
-  void record_analytical_diagnostic(
-      std::string name,
-      std::vector<std::pair<std::string, double>> values);
-  void record_moe_routing(
-      const entities::Batch& batch,
-      StageId stage_id,
-      const execution_time_predictor::MoERoutingDiagnostic&
-          diagnostic,
-      const config::ClusterRuntimeConfig& runtime);
+    void record_event(Event event);
+    void record_batch(const entities::Batch &batch,
+                      const std::vector<entities::Request> &requests,
+                      double predicted_execution_ms,
+                      const config::ClusterRuntimeConfig &runtime);
+    void record_batch_stage(const entities::BatchStage &batch_stage,
+                            const entities::Batch &batch,
+                            const config::ClusterRuntimeConfig &runtime);
+    void record_scheduler_trace(const scheduler::ScheduleResult &schedule,
+                                scheduler::ReplicaTarget target,
+                                ClusterType cluster_type);
+    void
+    record_kv_cache_transfer(const entities::KVCacheTransferInfo &transfer);
+    void record_analytical_diagnostic(
+        std::string name, std::vector<std::pair<std::string, double>> values);
+    void record_moe_routing(
+        const entities::Batch &batch, StageId stage_id,
+        const execution_time_predictor::MoERoutingDiagnostic &diagnostic,
+        const config::ClusterRuntimeConfig &runtime);
 
-  void collect_completed_requests(
-      const config::SimulationConfig& config,
-      const simulator::EntityArena& entities);
+    void collect_completed_requests(const config::SimulationConfig &config,
+                                    const simulator::EntityArena &entities);
 
-  [[nodiscard]] SimulationOutput take_output() noexcept;
+    [[nodiscard]] SimulationOutput take_output() noexcept;
 
- private:
-  void record_request(RequestMetricsRecord record);
-  SimulationOutput output_;
+  private:
+    void record_request(RequestMetricsRecord record);
+    SimulationOutput output_;
 };
 
-}  // namespace frontier::metrics
+} // namespace frontier::metrics

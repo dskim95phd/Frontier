@@ -5,8 +5,7 @@
 
 namespace frontier::events {
 
-[[nodiscard]] scheduler::ReplicaTarget make_target(
-    ReplicaId replica_id,
-    DataParallelId dp_id) noexcept;
+[[nodiscard]] scheduler::ReplicaTarget
+make_target(ReplicaId replica_id, DataParallelId dp_id) noexcept;
 
-}  // namespace frontier::events
+} // namespace frontier::events

@@ -5,11 +5,15 @@
 Implemented on the C++ port branch before Step 4.
 
 - [x] Runtime `Cluster` / `Replica` graph
-- [x] Cluster-owned shared predictor and communication backend
+- [x] Simulator-owned per-cluster predictors and cluster-owned communication backend
 - [x] `(batch.global_id, insertion_order)` stage priority
 - [x] Runtime `MetricsStore`
 - [x] KV-transfer and communication-backend interfaces
 - [x] Single concrete `GlobalScheduler`
+- [x] Python-aligned scheduler construction chain
+- [x] `SimulationContext` absorbed into `Simulator`
+- [x] Python-aligned `AnalyticalRooflineExecutionTimePredictor` responsibility
+- [x] MoE synchronization state returned to `BaseClusterScheduler`
 
 The default rule is to preserve the production Python ownership and class
 responsibility boundaries unless C++ requires a materially different design.
@@ -28,9 +32,9 @@ Simulator
      -> Replica
 ```
 
-The C++ `Cluster` and `Replica` classes currently exist but are not used by
-the simulation runtime. `SimulationContext` constructs replica schedulers
-directly from configuration.
+The C++ `Cluster` and `Replica` classes previously existed without being used
+by the simulation runtime. The old `SimulationContext` also constructed
+replica schedulers directly from configuration.
 
 ### Target
 
@@ -48,11 +52,14 @@ directly from configuration.
 - Cluster and replica identity/topology have one authoritative owner.
 - Existing dense and MoE differential suites remain unchanged.
 
-Implemented: `SimulationContext` owns cluster entities, clusters own replicas,
-and cluster/replica schedulers keep lifetime-safe references to those entities.
-The duplicate `cluster_parallelism_` map was removed.
+Implemented: `Simulator` owns cluster entities, clusters own replicas, and
+cluster/replica schedulers keep lifetime-safe references to those entities.
+`GlobalScheduler` constructs cluster schedulers, and `BaseClusterScheduler`
+constructs replica schedulers, matching the production Python chain. The
+duplicate `cluster_parallelism_` map and the separate `SimulationContext`
+facade were removed.
 
-## 2. Move Predictor and Backend Ownership to the Cluster
+## 2. Align Predictor and Backend Ownership
 
 ### Previous Difference
 
@@ -62,8 +69,9 @@ and clones it for pipeline stages.
 
 ### Target
 
-- Construct execution-time predictors at cluster initialization.
-- Let the cluster own or share the predictor and communication backend.
+- Construct one execution-time predictor per cluster in `Simulator`.
+- Let each cluster own its communication backend.
+- Inject each predictor through global → cluster → replica → stage schedulers.
 - Let replica and stage schedulers hold a lifetime-safe reference or
   `shared_ptr<const ...>` instead of independent clones.
 - Preserve immutable, thread-safe prediction interfaces where possible.
@@ -77,9 +85,15 @@ and clones it for pipeline stages.
 - PP stages do not silently duplicate stateful predictor caches.
 - Fixed and analytical parity remains unchanged.
 
-Implemented: each `Cluster` owns one immutable execution model and one
-communication backend. Replica and PP-stage schedulers share the model rather
-than cloning it.
+Implemented: `Simulator` owns the per-cluster predictor map, matching Python's
+`Simulator._predictors`, while each `Cluster` owns its communication backend.
+`GlobalScheduler` injects the matching predictor into each cluster scheduler;
+replica and PP-stage schedulers share it rather than cloning it.
+The former public `AnalyticalBatchExecutionModel` and `frontier/moe/`
+calculation modules were consolidated behind the Python-aligned
+`AnalyticalRooflineExecutionTimePredictor` entry point. Dense roofline, routing,
+EP ownership, and MoE timing source files are now implementation units of that
+predictor rather than a separate runtime subsystem.
 
 ## 3. Match `ReplicaStageScheduler` Queue Ordering
 
@@ -117,8 +131,8 @@ conflicts with global-ID order.
 ### Previous Difference
 
 Python records runtime metrics through `MetricsStore`. C++ event handlers and
-`SimulationContext::finalize()` currently append or reconstruct normalized
-output records directly.
+the former `SimulationContext::finalize()` previously appended or
+reconstructed normalized output records directly.
 
 ### Target
 
@@ -128,7 +142,7 @@ output records directly.
 - Keep JSON/CSV serialization in the output-contract layer.
 - Do not port pandas, Plotly, or presentation-only Python code into the
   simulator core.
-- Reduce `SimulationContext` to orchestration and simulation-wide ownership.
+- Keep orchestration and simulation-wide ownership in `Simulator`.
 
 ### Exit Gate
 
@@ -155,7 +169,7 @@ directly.
   path.
 - Keep analytical implementations first; add other backends only when their
   feature step requires them.
-- Avoid embedding backend selection inside `SimulationContext`.
+- Avoid embedding backend selection in event orchestration.
 
 ### Exit Gate
 
@@ -164,9 +178,9 @@ directly.
 - Adding another backend does not require changing event orchestration.
 
 Implemented with `BaseCCBackend` and `BaseKVCacheTransferPredictor`.
-`Cluster` owns the communication backend; the cross-cluster runtime owns the
-KV-transfer predictor. The analytical implementations preserve current
-behavior.
+`Cluster` owns the communication backend; `Simulator` owns the cross-cluster
+KV-transfer predictor and injects it through the scheduler hierarchy. The
+analytical implementations preserve current behavior.
 
 ## 6. Remove Unnecessary Global-Scheduler Double Abstraction
 
@@ -203,9 +217,9 @@ The following should remain unless evidence shows a correctness problem:
 - `std::variant` event payloads and typed event dispatch;
 - strong IDs with an invalid sentinel;
 - `EntityArena` for stable dynamic-entity storage;
-- `BarrierCoordinator` as a composed waiting-room component;
+- typed MoE waiting-room storage owned by `BaseClusterScheduler`;
 - structs and validation functions in place of Python dataclass mechanics;
-- pure analytical helper functions; and
+- predictor-internal analytical helper functions; and
 - compile-time factories where the supported implementation set is small.
 
 ## Deferred, Not Structural Refactoring
@@ -224,4 +238,5 @@ have not yet been ported:
 - non-analytical communication backends.
 
 When these features are implemented, their Python ownership boundaries should
-be the starting point rather than extending `SimulationContext`.
+be the starting point rather than adding another simulation-wide context
+facade.

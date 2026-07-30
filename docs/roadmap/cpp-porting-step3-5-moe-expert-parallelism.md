@@ -519,11 +519,11 @@ RoundRobinClusterScheduler
   implements only request-to-replica/DP selection
 ```
 
-`SimulationContext` owns only simulation-wide entity storage, the event queue,
-output, and the global scheduler. It does not own cluster-local MoE groups,
-barriers, batch ordinals, or synchronization state. Event handlers resolve the
-target cluster through the global scheduler and invoke the corresponding
-`BaseClusterScheduler`, matching the Python ownership chain.
+`Simulator` owns simulation-wide entity storage, predictors, the event queue,
+metrics, clusters, and the global scheduler. It does not own cluster-local MoE
+groups, barriers, batch ordinals, or synchronization state. Event handlers
+resolve the target cluster through the global scheduler and invoke the
+corresponding `BaseClusterScheduler`, matching the Python ownership chain.
 
 This keeps the scheduler hierarchy aligned with Python while allowing the
 waiting-room invariants to remain isolated in a small C++ value component.
@@ -821,11 +821,15 @@ Suggested additions:
 
 ```text
 cpp/frontier/
-  moe/
-    parallel_domain.h/.cc
-    routing.h/.cc
-    barrier_coordinator.h/.cc
-    analytical_model.h/.cc
+  execution_time_predictor/
+    analytical_roofline_execution_time_predictor.h/.cc
+    analytical_roofline_dense_model.cc
+    analytical_roofline_moe_domain.cc
+    analytical_roofline_moe_routing.cc
+    analytical_roofline_moe_model.cc
+  scheduler/cluster_scheduler/
+    base_cluster_scheduler.h/.cc
+    base_cluster_scheduler_moe_barrier.cc
   events/
     prefill_sync_event.cc
     prefill_sync_collective_event.cc
@@ -838,11 +842,11 @@ Existing files that require contract changes include:
 - `config/config.h`, parser, validator, and serializer;
 - `core/ids.h` and `core/event.h`;
 - `entities/batch.h`, `batch_stage.h`, `execution_time.h`, and `replica.h`;
-- `execution_time_predictor/batch_execution_model.*`;
+- `execution_time_predictor/analytical_roofline_execution_time_predictor.*`;
 - `scheduler/cluster_scheduler/*`;
 - `scheduler/replica_scheduler/*`;
 - `scheduler/replica_stage_scheduler/*`;
-- `simulator/entity_arena.*` and `simulation_context.*`;
+- `simulator/entity_arena.*` and `simulator.*`;
 - `kv_cache_transfer/analytical_transfer.*`; and
 - `metrics/output_contract.*`.
 

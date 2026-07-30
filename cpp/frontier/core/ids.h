@@ -1,44 +1,56 @@
 #pragma once
 
-#include <compare>
-#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <type_traits>
 
 namespace frontier {
 
-template <typename Tag>
-class StrongId {
- public:
-  using ValueType = std::int64_t;
-  static constexpr ValueType kInvalidValue = -1;
+template <typename Tag> class StrongId {
+  public:
+    using ValueType = std::int64_t;
+    static constexpr ValueType kInvalidValue = -1;
 
-  constexpr StrongId() noexcept = default;
-  template <std::integral Integer>
-  explicit constexpr StrongId(Integer value) noexcept
-      : value_(static_cast<ValueType>(value)) {}
+    constexpr StrongId() noexcept = default;
+    template <typename Integer,
+              typename = std::enable_if_t<std::is_integral_v<Integer>>>
+    explicit constexpr StrongId(Integer value) noexcept
+        : value_(static_cast<ValueType>(value)) {}
 
-  [[nodiscard]] constexpr ValueType value() const noexcept { return value_; }
-  [[nodiscard]] constexpr bool valid() const noexcept {
-    return value_ >= 0;
-  }
-  [[nodiscard]] constexpr std::size_t index() const noexcept {
-    return static_cast<std::size_t>(value_);
-  }
+    [[nodiscard]] constexpr ValueType value() const noexcept { return value_; }
+    [[nodiscard]] constexpr bool valid() const noexcept { return value_ >= 0; }
+    [[nodiscard]] constexpr std::size_t index() const noexcept {
+        return static_cast<std::size_t>(value_);
+    }
 
-  friend constexpr bool operator==(StrongId, StrongId) noexcept = default;
-  friend constexpr auto operator<=>(StrongId, StrongId) noexcept = default;
+    friend constexpr bool operator==(StrongId lhs, StrongId rhs) noexcept {
+        return lhs.value_ == rhs.value_;
+    }
+    friend constexpr bool operator!=(StrongId lhs, StrongId rhs) noexcept {
+        return !(lhs == rhs);
+    }
+    friend constexpr bool operator<(StrongId lhs, StrongId rhs) noexcept {
+        return lhs.value_ < rhs.value_;
+    }
+    friend constexpr bool operator<=(StrongId lhs, StrongId rhs) noexcept {
+        return !(rhs < lhs);
+    }
+    friend constexpr bool operator>(StrongId lhs, StrongId rhs) noexcept {
+        return rhs < lhs;
+    }
+    friend constexpr bool operator>=(StrongId lhs, StrongId rhs) noexcept {
+        return !(lhs < rhs);
+    }
 
- private:
-  ValueType value_ = kInvalidValue;
+  private:
+    ValueType value_ = kInvalidValue;
 };
 
-template <typename Id>
-struct StrongIdHash {
-  [[nodiscard]] std::size_t operator()(Id id) const noexcept {
-    return std::hash<typename Id::ValueType>{}(id.value());
-  }
+template <typename Id> struct StrongIdHash {
+    [[nodiscard]] std::size_t operator()(Id id) const noexcept {
+        return std::hash<typename Id::ValueType>{}(id.value());
+    }
 };
 
 struct EventSequenceTag;
@@ -71,4 +83,4 @@ using MoESyncGroupId = StrongId<MoESyncGroupIdTag>;
 using MoEParticipantId = StrongId<MoEParticipantIdTag>;
 using LayerId = StrongId<LayerIdTag>;
 
-}  // namespace frontier
+} // namespace frontier

@@ -8,19 +8,20 @@
 
 namespace frontier::scheduler {
 
-class RoundRobinClusterScheduler final
-    : public BaseClusterScheduler {
- public:
-  RoundRobinClusterScheduler(
-      std::vector<std::unique_ptr<BaseReplicaScheduler>>
-          replica_schedulers,
-      const entities::Cluster& cluster);
+class RoundRobinClusterScheduler final : public BaseClusterScheduler {
+  public:
+    RoundRobinClusterScheduler(
+        const entities::Cluster &cluster,
+        std::vector<entities::Request> &requests,
+        std::shared_ptr<const execution_time_predictor::BatchExecutionModel>
+            predictor,
+        std::shared_ptr<const kv_cache_transfer::BaseKVCacheTransferPredictor>
+            kv_cache_transfer_predictor);
 
-  [[nodiscard]] std::vector<ClusterRequestAssignment>
-  schedule() override;
+    [[nodiscard]] std::vector<ClusterRequestAssignment> schedule() override;
 
- private:
-  std::uint64_t request_counter_ = 0;
+  private:
+    std::uint64_t request_counter_ = 0;
 };
 
-}  // namespace frontier::scheduler
+} // namespace frontier::scheduler

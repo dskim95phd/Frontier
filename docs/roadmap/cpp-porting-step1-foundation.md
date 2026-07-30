@@ -29,7 +29,7 @@ behavior is implemented.
 - The source remains in the existing Windows worktree; it is not copied into a
   second WSL checkout.
 - Build artifacts live outside the worktree in the WSL filesystem.
-- The initial language level is C++20.
+- The language baseline is C++17.
 - Step 1 begins without third-party C++ dependencies.
 - Python remains the behavioral and numerical oracle.
 - Only session-derived prefix keys are in scope for the C++ MVP.
@@ -114,7 +114,7 @@ Directories are added only when their vertical slice begins.
 ### Build contract
 
 - Require CMake 3.24 or newer.
-- Set `CMAKE_CXX_STANDARD` to 20 and disable compiler extensions.
+- Set `CMAKE_CXX_STANDARD` to 17 and disable compiler extensions.
 - Build an executable named `frontier_sim`.
 - Implement `frontier_sim --version`.
 - Enable useful GCC/Clang/MSVC warnings without making compiler-specific

@@ -7,7 +7,7 @@ project(
   LANGUAGES CXX
 )
 
-set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -97,26 +97,24 @@ add_library(
   frontier/events/prefill_sync_collective_event.cc
   frontier/events/decode_sync_event.cc
   frontier/events/decode_sync_collective_event.cc
-  frontier/execution_time_predictor/analytical_model.cc
-  frontier/execution_time_predictor/batch_execution_model.cc
+  frontier/execution_time_predictor/analytical_roofline_dense_model.cc
+  frontier/execution_time_predictor/analytical_roofline_execution_time_predictor.cc
+  frontier/execution_time_predictor/analytical_roofline_moe_domain.cc
+  frontier/execution_time_predictor/analytical_roofline_moe_model.cc
+  frontier/execution_time_predictor/analytical_roofline_moe_routing.cc
   frontier/kv_cache_transfer/analytical_transfer.cc
   frontier/metrics/output_contract.cc
   frontier/metrics/metrics_store.cc
-  frontier/moe/parallel_domain.cc
-  frontier/moe/routing.cc
-  frontier/moe/analytical_model.cc
-  frontier/moe/barrier_coordinator.cc
   frontier/request_generator/workload.cc
   frontier/scheduler/cluster_scheduler/base_cluster_scheduler.cc
+  frontier/scheduler/cluster_scheduler/base_cluster_scheduler_moe_barrier.cc
   frontier/scheduler/cluster_scheduler/round_robin_cluster_scheduler.cc
   frontier/scheduler/global_scheduler/global_scheduler.cc
   frontier/scheduler/kv_block_accounting.cc
   frontier/scheduler/replica_scheduler/base_replica_scheduler.cc
   frontier/scheduler/replica_scheduler/vllm_v1_engine_replica_scheduler.cc
   frontier/scheduler/replica_stage_scheduler/replica_stage_scheduler.cc
-  frontier/simulator/scheduler_simulator.cc
   frontier/simulator/entity_arena.cc
-  frontier/simulator/simulation_context.cc
   frontier/simulator/simulator.cc
 )
 target_include_directories(frontier_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
@@ -281,14 +279,17 @@ if(BUILD_TESTING)
   )
 
   add_executable(
-    frontier_moe_routing_test
-    tests/moe/routing_test.cc
+    frontier_analytical_roofline_moe_test
+    tests/execution_time_predictor/analytical_roofline_execution_time_predictor_moe_test.cc
   )
-  target_link_libraries(frontier_moe_routing_test PRIVATE frontier_core)
-  frontier_enable_warnings(frontier_moe_routing_test)
+  target_link_libraries(
+    frontier_analytical_roofline_moe_test
+    PRIVATE frontier_core
+  )
+  frontier_enable_warnings(frontier_analytical_roofline_moe_test)
   add_test(
-    NAME frontier_moe.routing
-    COMMAND $<TARGET_FILE:frontier_moe_routing_test>
+    NAME frontier_analytical_roofline.moe
+    COMMAND $<TARGET_FILE:frontier_analytical_roofline_moe_test>
   )
 
   add_executable(

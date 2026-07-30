@@ -3,16 +3,14 @@
 #include "frontier/core/event.h"
 
 namespace frontier::simulator {
-class SimulationContext;
+class Simulator;
 }
 
 namespace frontier::events {
 
 class EventDispatcher {
- public:
-  void dispatch(
-      const Event& event,
-      simulator::SimulationContext& context) const;
+  public:
+    void dispatch(const Event &event, simulator::Simulator &simulator) const;
 };
 
-}  // namespace frontier::events
+} // namespace frontier::events

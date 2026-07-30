@@ -293,10 +293,8 @@ cpp/frontier/
     kv_block_accounting.h
     kv_block_accounting.cc
   execution_time_predictor/
-    batch_execution_model.h
-    batch_execution_model.cc
-    analytical_model.h
-    analytical_model.cc
+    analytical_roofline_execution_time_predictor.h
+    analytical_roofline_execution_time_predictor.cc
   metrics/
     output_contract.h
     output_contract.cc
@@ -692,10 +690,10 @@ Introduce a small execution-model interface:
 ```text
 BatchExecutionModel
   FixedBatchExecutionModel
-  AnalyticalBatchExecutionModel
+  AnalyticalRooflineExecutionTimePredictor
 ```
 
-The analytical model converts each immutable batch snapshot into:
+The analytical predictor converts each immutable batch snapshot into:
 
 - prefill attention slices with scheduled query tokens and prior context;
 - decode attention slices with one query token and current context;

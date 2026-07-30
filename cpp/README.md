@@ -40,7 +40,7 @@ ctest \
   --output-on-failure
 ```
 
-The baseline is C++20, GCC 11+ or Clang 14+, CMake 3.24+, and Ninja 1.10+.
+The baseline is C++17, GCC 11+ or Clang 14+, CMake 3.24+, and Ninja 1.10+.
 
 ## Core value contract
 

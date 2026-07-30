@@ -2,13 +2,14 @@
 
 namespace frontier::events {
 
-scheduler::ReplicaTarget make_target(
-    ReplicaId replica_id,
-    DataParallelId dp_id) noexcept {
-  return scheduler::ReplicaTarget{
-      .replica_id = replica_id,
-      .dp_id = dp_id,
-  };
+scheduler::ReplicaTarget make_target(ReplicaId replica_id,
+                                     DataParallelId dp_id) noexcept {
+    return [&]() {
+        scheduler::ReplicaTarget value{};
+        value.replica_id = replica_id;
+        value.dp_id = dp_id;
+        return value;
+    }();
 }
 
-}  // namespace frontier::events
+} // namespace frontier::events
