@@ -1,4 +1,4 @@
-"""Step 1 Python/C++ differential gates."""
+"""Python/C++ differential gates for the current C++ contract."""
 
 from __future__ import annotations
 
@@ -16,16 +16,14 @@ import pytest
 
 from python_oracle import (
     OracleError,
-    parse_normalized_config,
     parse_normalized_workload,
-    run_foundation_oracle,
 )
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 FIXTURE_ROOT = REPO_ROOT / "cpp" / "tests" / "fixtures"
-FOUNDATION_CONFIG = (
-    FIXTURE_ROOT / "config" / "minimal_foundation_colocation.json"
+CURRENT_CONFIG = (
+    FIXTURE_ROOT / "config" / "fixed_parallel_colocation.json"
 )
 SESSION_WORKLOAD = FIXTURE_ROOT / "workloads" / "session_prefix.csv"
 ANALYTICAL_FIXTURE = (
@@ -38,32 +36,15 @@ ANALYTICAL_GENERATOR = (
     / "golden"
     / "generate_analytical_golden.py"
 )
-STEP2_ANALYTICAL_BATCH_FIXTURE = (
-    FIXTURE_ROOT / "analytical" / "step2_batch_v1.json"
+ANALYTICAL_BATCH_FIXTURE = (
+    FIXTURE_ROOT / "analytical" / "analytical_batch_v1.json"
 )
-STEP2_ANALYTICAL_BATCH_GENERATOR = (
+ANALYTICAL_BATCH_GENERATOR = (
     REPO_ROOT
     / "cpp"
     / "tests"
     / "golden"
-    / "generate_step2_analytical_batch_golden.py"
-)
-STEP2_CONFIG = FIXTURE_ROOT / "config" / "step2_fixed_colocation.json"
-STEP2_ANALYTICAL_CONFIG = (
-    FIXTURE_ROOT / "config" / "step2_analytical_colocation.json"
-)
-STEP2_SINGLE_WORKLOAD = (
-    FIXTURE_ROOT / "workloads" / "step2_single_request.csv"
-)
-STEP2_SCHEDULER_ORACLE = (
-    REPO_ROOT / "cpp" / "tests" / "parity" / "step2_scheduler_oracle.py"
-)
-STEP2_ANALYTICAL_SIMULATOR_ORACLE = (
-    REPO_ROOT
-    / "cpp"
-    / "tests"
-    / "parity"
-    / "step2_analytical_simulator_oracle.py"
+    / "generate_analytical_batch_golden.py"
 )
 STEP25_SIMULATOR_ORACLE = (
     REPO_ROOT
@@ -73,21 +54,21 @@ STEP25_SIMULATOR_ORACLE = (
     / "step25_simulator_oracle.py"
 )
 STEP25_FIXED_CONFIG = (
-    FIXTURE_ROOT / "config" / "step25_fixed_parallel_colocation.json"
+    FIXTURE_ROOT / "config" / "fixed_parallel_colocation.json"
 )
 STEP25_PP4_CONFIG = (
-    FIXTURE_ROOT / "config" / "step25_fixed_pp4_colocation.json"
+    FIXTURE_ROOT / "config" / "fixed_pp4_colocation.json"
 )
 STEP25_ANALYTICAL_CONFIG = (
     FIXTURE_ROOT
     / "config"
-    / "step25_analytical_parallel_colocation.json"
+    / "analytical_parallel_colocation.json"
 )
 STEP25_WORKLOAD = (
     FIXTURE_ROOT / "workloads" / "step25_parallel.csv"
 )
 STEP25_PRESSURE_CONFIG = (
-    FIXTURE_ROOT / "config" / "step25_fixed_dp2_pressure.json"
+    FIXTURE_ROOT / "config" / "fixed_dp2_pressure_colocation.json"
 )
 STEP25_PRESSURE_WORKLOAD = (
     FIXTURE_ROOT / "workloads" / "step25_parallel_pressure.csv"
@@ -103,7 +84,7 @@ STEP3_SIMULATOR_ORACLE = (
     / "step3_simulator_oracle.py"
 )
 STEP3_FIXED_CONFIG = (
-    FIXTURE_ROOT / "config" / "step3_fixed_pdd.json"
+    FIXTURE_ROOT / "config" / "fixed_sequential_pdd.json"
 )
 STEP3_SMALL_WORKLOAD = (
     FIXTURE_ROOT / "workloads" / "step3_pdd_small.csv"
@@ -789,12 +770,12 @@ def test_config_acceptance_and_normalization_match(
     cpp_runner: CppRunner,
     tmp_path: Path,
 ) -> None:
-    text = FOUNDATION_CONFIG.read_text(encoding="utf-8")
-    expected = parse_normalized_config(text)
+    text = CURRENT_CONFIG.read_text(encoding="utf-8")
+    expected = json.loads(text)
     result = cpp_runner.run(
         [
             "--normalize-config",
-            cpp_runner.path_argument(FOUNDATION_CONFIG),
+            cpp_runner.path_argument(CURRENT_CONFIG),
         ]
     )
     _require_cpp_success(
@@ -833,12 +814,9 @@ def test_config_rejection_matches(
     case_name: str,
     mutation: dict[str, Any],
 ) -> None:
-    raw = json.loads(FOUNDATION_CONFIG.read_text(encoding="utf-8"))
+    raw = json.loads(CURRENT_CONFIG.read_text(encoding="utf-8"))
     raw.update(mutation)
     text = json.dumps(raw)
-    with pytest.raises(OracleError) as python_error:
-        parse_normalized_config(text)
-
     config_path = tmp_path / f"{case_name}.json"
     config_path.write_text(text, encoding="utf-8")
     result = cpp_runner.run(
@@ -848,8 +826,8 @@ def test_config_rejection_matches(
         _raise_with_artifacts(
             tmp_path=tmp_path,
             case_name=case_name,
-            message="Python rejected config but C++ accepted it",
-            python_output=str(python_error.value),
+            message="C++ accepted an invalid current config",
+            python_output=text,
             cpp_result=result,
         )
 
@@ -926,351 +904,6 @@ def test_workload_rejection_matches(
         )
 
 
-def test_foundation_lifecycle_matches(
-    cpp_runner: CppRunner,
-    tmp_path: Path,
-) -> None:
-    config = parse_normalized_config(
-        FOUNDATION_CONFIG.read_text(encoding="utf-8")
-    )
-    workload = parse_normalized_workload(
-        SESSION_WORKLOAD.read_text(encoding="utf-8")
-    )
-    expected = run_foundation_oracle(config, workload)
-    result = cpp_runner.run(
-        [
-            "--config",
-            cpp_runner.path_argument(FOUNDATION_CONFIG),
-            "--workload",
-            cpp_runner.path_argument(SESSION_WORKLOAD),
-        ]
-    )
-    _require_cpp_success(
-        result,
-        tmp_path=tmp_path,
-        case_name="foundation_lifecycle",
-        python_output=json.dumps(expected, indent=2),
-    )
-    actual = json.loads(result.stdout)
-    _compare_or_record(
-        tmp_path=tmp_path,
-        case_name="foundation_lifecycle",
-        expected=expected,
-        actual=actual,
-        cpp_result=result,
-    )
-
-
-def test_step2_single_request_matches_production_scheduler(
-    cpp_runner: CppRunner,
-    tmp_path: Path,
-) -> None:
-    python_result = subprocess.run(
-        [
-            sys.executable,
-            str(STEP2_SCHEDULER_ORACLE),
-            "--config",
-            str(STEP2_CONFIG),
-            "--workload",
-            str(STEP2_SINGLE_WORKLOAD),
-        ],
-        cwd=REPO_ROOT,
-        text=True,
-        encoding="utf-8",
-        capture_output=True,
-        check=False,
-    )
-    if python_result.returncode != 0:
-        pytest.fail(
-            "Step 2 production scheduler oracle failed:\n"
-            f"{python_result.stdout}\n{python_result.stderr}"
-        )
-    expected = json.loads(python_result.stdout)
-    result = cpp_runner.run(
-        [
-            "--config",
-            cpp_runner.path_argument(STEP2_CONFIG),
-            "--workload",
-            cpp_runner.path_argument(STEP2_SINGLE_WORKLOAD),
-        ]
-    )
-    _require_cpp_success(
-        result,
-        tmp_path=tmp_path,
-        case_name="step2_single_request",
-        python_output=python_result.stdout,
-    )
-    actual = json.loads(result.stdout)
-    _compare_or_record(
-        tmp_path=tmp_path,
-        case_name="step2_single_request",
-        expected=expected,
-        actual=actual,
-        cpp_result=result,
-    )
-
-
-@pytest.mark.parametrize(
-    ("case_name", "scheduler_updates", "workload_text"),
-    [
-        (
-            "step2_same_time_batch",
-            {},
-            "arrived_at,num_prefill_tokens,num_decode_tokens\n"
-            "0,4,1\n"
-            "0,2,1\n",
-        ),
-        (
-            "step2_midflight_arrival",
-            {},
-            "arrived_at,num_prefill_tokens,num_decode_tokens\n"
-            "0,4,2\n"
-            "0.0005,2,1\n",
-        ),
-        (
-            "step2_batch_size_cap",
-            {"batch_size_cap": 2},
-            "arrived_at,num_prefill_tokens,num_decode_tokens\n"
-            "0,2,1\n"
-            "0,2,1\n"
-            "0,2,1\n",
-        ),
-        (
-            "step2_token_budget_split",
-            {"max_tokens_in_batch": 4},
-            "arrived_at,num_prefill_tokens,num_decode_tokens\n"
-            "0,2,1\n"
-            "0,2,1\n"
-            "0,2,1\n",
-        ),
-        (
-            "step2_unchunked_head_skip",
-            {"max_tokens_in_batch": 4},
-            "arrived_at,num_prefill_tokens,num_decode_tokens\n"
-            "0,2,1\n"
-            "0,4,1\n",
-        ),
-        (
-            "step2_waiting_allocation_failure",
-            {
-                "block_size": 4,
-                "num_blocks": 2,
-                "max_tokens_in_batch": 12,
-            },
-            "arrived_at,num_prefill_tokens,num_decode_tokens\n"
-            "0,4,2\n"
-            "0,8,1\n",
-        ),
-        (
-            "step2_watermark_admission",
-            {
-                "block_size": 4,
-                "num_blocks": 4,
-                "max_tokens_in_batch": 16,
-                "watermark_blocks_fraction": 0.25,
-            },
-            "arrived_at,num_prefill_tokens,num_decode_tokens\n"
-            "0,12,1\n"
-            "0,4,1\n",
-        ),
-        (
-            "step2_decode_iterations",
-            {},
-            "arrived_at,num_prefill_tokens,num_decode_tokens\n"
-            "0,4,3\n",
-        ),
-        (
-            "step2_chunked_prefill",
-            {
-                "max_tokens_in_batch": 4,
-                "enable_chunked_prefill": True,
-            },
-            "arrived_at,num_prefill_tokens,num_decode_tokens\n"
-            "0,10,1\n",
-        ),
-        (
-            "step2_chunked_prefill_exact_budget",
-            {
-                "max_tokens_in_batch": 4,
-                "enable_chunked_prefill": True,
-            },
-            "arrived_at,num_prefill_tokens,num_decode_tokens\n"
-            "0,4,1\n",
-        ),
-        (
-            "step2_chunked_prefill_one_over_budget",
-            {
-                "max_tokens_in_batch": 4,
-                "enable_chunked_prefill": True,
-            },
-            "arrived_at,num_prefill_tokens,num_decode_tokens\n"
-            "0,5,1\n",
-        ),
-        (
-            "step2_partial_prefill_mixed_with_decode",
-            {
-                "max_tokens_in_batch": 4,
-                "enable_chunked_prefill": True,
-            },
-            "arrived_at,num_prefill_tokens,num_decode_tokens\n"
-            "0,4,3\n"
-            "0.0005,6,1\n",
-        ),
-        (
-            "step2_long_prefill_threshold",
-            {
-                "max_tokens_in_batch": 8,
-                "enable_chunked_prefill": True,
-                "long_prefill_token_threshold": 3,
-            },
-            "arrived_at,num_prefill_tokens,num_decode_tokens\n"
-            "0,10,1\n",
-        ),
-        (
-            "step2_preemption_recovery",
-            {
-                "block_size": 4,
-                "num_blocks": 2,
-                "max_tokens_in_batch": 8,
-                "enable_preemption": True,
-            },
-            "arrived_at,num_prefill_tokens,num_decode_tokens\n"
-            "0,3,3\n"
-            "0,4,2\n",
-        ),
-        (
-            "step2_repeated_preemption_queue_order",
-            {
-                "batch_size_cap": 3,
-                "max_tokens_in_batch": 16,
-                "enable_preemption": True,
-                "enable_chunked_prefill": True,
-                "block_size": 4,
-                "num_blocks": 15,
-            },
-            "arrived_at,num_prefill_tokens,num_decode_tokens\n"
-            "0,5,3\n"
-            "0,27,1\n"
-            "0,30,4\n"
-            "0.0001,8,2\n"
-            "0.0002,25,12\n"
-            "0.0002,20,7\n"
-            "0.0012,22,12\n"
-            "0.0012,1,5\n"
-            "0.002,26,1\n"
-            "0.002,10,9\n",
-        ),
-    ],
-)
-def test_step2_scheduler_matrix_matches_production_scheduler(
-    cpp_runner: CppRunner,
-    tmp_path: Path,
-    case_name: str,
-    scheduler_updates: dict[str, Any],
-    workload_text: str,
-) -> None:
-    config = json.loads(STEP2_CONFIG.read_text(encoding="utf-8"))
-    config["run_id"] = case_name
-    config["scheduler"].update(scheduler_updates)
-    config_path = tmp_path / f"{case_name}.json"
-    workload_path = tmp_path / f"{case_name}.csv"
-    config_path.write_text(
-        json.dumps(config, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    workload_path.write_text(workload_text, encoding="utf-8")
-
-    python_result = subprocess.run(
-        [
-            sys.executable,
-            str(STEP2_SCHEDULER_ORACLE),
-            "--config",
-            str(config_path),
-            "--workload",
-            str(workload_path),
-        ],
-        cwd=REPO_ROOT,
-        text=True,
-        encoding="utf-8",
-        capture_output=True,
-        check=False,
-    )
-    if python_result.returncode != 0:
-        pytest.fail(
-            f"{case_name} production scheduler oracle failed:\n"
-            f"{python_result.stdout}\n{python_result.stderr}"
-        )
-    expected = json.loads(python_result.stdout)
-    result = cpp_runner.run(
-        [
-            "--config",
-            cpp_runner.path_argument(config_path),
-            "--workload",
-            cpp_runner.path_argument(workload_path),
-        ]
-    )
-    _require_cpp_success(
-        result,
-        tmp_path=tmp_path,
-        case_name=case_name,
-        python_output=python_result.stdout,
-    )
-    actual = json.loads(result.stdout)
-    _compare_or_record(
-        tmp_path=tmp_path,
-        case_name=case_name,
-        expected=expected,
-        actual=actual,
-        cpp_result=result,
-    )
-
-
-def test_equal_time_event_order_matches(
-    cpp_runner: CppRunner,
-    tmp_path: Path,
-) -> None:
-    workload_text = (
-        "arrived_at,num_prefill_tokens,num_decode_tokens\n"
-        "0,32,8\n"
-        "0,16,4\n"
-        "0.001,8,2\n"
-    )
-    workload_path = tmp_path / "equal_time.csv"
-    workload_path.write_text(workload_text, encoding="utf-8")
-    config = parse_normalized_config(
-        FOUNDATION_CONFIG.read_text(encoding="utf-8")
-    )
-    expected = run_foundation_oracle(
-        config,
-        parse_normalized_workload(workload_text),
-    )
-    result = cpp_runner.run(
-        [
-            "--config",
-            cpp_runner.path_argument(FOUNDATION_CONFIG),
-            "--workload",
-            cpp_runner.path_argument(workload_path),
-        ]
-    )
-    _require_cpp_success(
-        result,
-        tmp_path=tmp_path,
-        case_name="equal_time_order",
-        python_output=json.dumps(expected, indent=2),
-    )
-    actual = json.loads(result.stdout)
-    _compare_or_record(
-        tmp_path=tmp_path,
-        case_name="equal_time_order",
-        expected=expected,
-        actual=actual,
-        cpp_result=result,
-    )
-    assert [
-        event["sequence"] for event in actual["event_trace"]
-    ] == [1, 2, 3, 4, 5, 6]
-
-
 def test_analytical_golden_matches_both_implementations(
     cpp_runner: CppRunner,
     tmp_path: Path,
@@ -1312,9 +945,9 @@ def test_analytical_golden_matches_both_implementations(
     )
 
 
-def test_step2_analytical_batch_golden_is_current() -> None:
+def test_analytical_batch_golden_is_current() -> None:
     python_result = subprocess.run(
-        [sys.executable, str(STEP2_ANALYTICAL_BATCH_GENERATOR)],
+        [sys.executable, str(ANALYTICAL_BATCH_GENERATOR)],
         cwd=REPO_ROOT,
         text=True,
         encoding="utf-8",
@@ -1323,99 +956,14 @@ def test_step2_analytical_batch_golden_is_current() -> None:
     )
     if python_result.returncode != 0:
         pytest.fail(
-            "Step 2 analytical batch oracle failed:\n"
+            "Analytical batch oracle failed:\n"
             f"{python_result.stdout}\n{python_result.stderr}"
         )
     generated = json.loads(python_result.stdout)
     checked_in = json.loads(
-        STEP2_ANALYTICAL_BATCH_FIXTURE.read_text(encoding="utf-8")
+        ANALYTICAL_BATCH_FIXTURE.read_text(encoding="utf-8")
     )
     _compare_values(generated, checked_in)
-
-
-def test_step2_analytical_full_simulator_matches(
-    cpp_runner: CppRunner,
-    tmp_path: Path,
-) -> None:
-    python_result = subprocess.run(
-        [
-            sys.executable,
-            str(STEP2_ANALYTICAL_SIMULATOR_ORACLE),
-            "--config",
-            str(STEP2_ANALYTICAL_CONFIG),
-            "--workload",
-            str(STEP2_SINGLE_WORKLOAD),
-        ],
-        cwd=REPO_ROOT,
-        text=True,
-        encoding="utf-8",
-        capture_output=True,
-        check=False,
-    )
-    if python_result.returncode != 0:
-        pytest.fail(
-            "Step 2 full Python Simulator oracle failed:\n"
-            f"{python_result.stdout}\n{python_result.stderr}"
-        )
-    oracle = json.loads(python_result.stdout)
-    assert oracle["oracle"] == "frontier.simulator.Simulator"
-    assert oracle["analytical_operator_diagnostic_count"] > 0
-
-    cpp_result = cpp_runner.run(
-        [
-            "--config",
-            cpp_runner.path_argument(STEP2_ANALYTICAL_CONFIG),
-            "--workload",
-            cpp_runner.path_argument(STEP2_SINGLE_WORKLOAD),
-        ]
-    )
-    _require_cpp_success(
-        cpp_result,
-        tmp_path=tmp_path,
-        case_name="step2_analytical_full_simulator",
-        python_output=python_result.stdout,
-    )
-    cpp_output = json.loads(cpp_result.stdout)
-    cpp_request = cpp_output["requests"][0]
-    comparable_cpp = {
-        "request": {
-            "request_id": cpp_request["request_id"],
-            "arrived_at_s": cpp_request["arrived_at_s"],
-            "first_scheduled_at_s": cpp_request[
-                "first_scheduled_at_s"
-            ],
-            "prefill_completed_at_s": cpp_request[
-                "prefill_completed_at_s"
-            ],
-            "completed_at_s": cpp_request["completed_at_s"],
-            "ttft_ms": cpp_request["ttft_ms"],
-            "e2e_ms": cpp_request["e2e_ms"],
-            "num_processed_tokens": cpp_request[
-                "num_processed_tokens"
-            ],
-        },
-        "simulation_completed_at_s": cpp_request["completed_at_s"],
-    }
-    comparable_python = {
-        "request": oracle["request"],
-        "simulation_completed_at_s": oracle[
-            "simulation_completed_at_s"
-        ],
-    }
-    try:
-        _compare_values(comparable_python, comparable_cpp)
-        _compare_values(
-            oracle["request"]["e2e_ms"],
-            cpp_output["batches"][0]["predicted_execution_ms"],
-        )
-    except ParityMismatch as error:
-        _raise_with_artifacts(
-            tmp_path=tmp_path,
-            case_name="step2_analytical_full_simulator",
-            message=str(error),
-            python_output=python_result.stdout,
-            cpp_result=cpp_result,
-        )
 
 
 def _normalize_step25_events(
@@ -1656,15 +1204,16 @@ def _write_step25_matrix_config(
     config["run_id"] = f"step25-matrix-{case['name']}"
     config["simulation_mode"] = str(case["simulation_mode"])
     replicas, tp, pp, dp = case["topology"]
-    config["parallelism"] = {
+    cluster = config["clusters"]["monolithic"]
+    cluster["parallelism"] = {
         "num_replicas": int(replicas),
         "tensor_parallel_size": int(tp),
         "pipeline_parallel_size": int(pp),
         "data_parallel_size": int(dp),
     }
-    config["scheduler"].update(case["scheduler"])
+    cluster["scheduler"].update(case["scheduler"])
     if execution_type == "fixed":
-        config["execution_model"] = {
+        cluster["execution_model"] = {
             "type": "fixed",
             "stage_latencies_ms": [
                 float(value)

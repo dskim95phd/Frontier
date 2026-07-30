@@ -18,7 +18,7 @@ struct WorkloadRequest {
   SimTime arrived_at;
   std::uint64_t num_prefill_tokens;
   std::uint64_t num_decode_tokens;
-  std::optional<SessionId> session_id;
+  SessionId session_id;
   std::optional<std::uint64_t> session_turn_index;
 
   friend bool operator==(

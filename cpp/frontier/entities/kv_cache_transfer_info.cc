@@ -41,9 +41,9 @@ void KVCacheTransferInfo::mark_started(SimTime time) {
 
 void KVCacheTransferInfo::mark_completed(SimTime time) {
   if (state_ != KVCacheTransferState::kInFlight ||
-      !started_at_.has_value() ||
+      !started_at_.valid() ||
       !std::isfinite(time.seconds()) ||
-      time.seconds() < started_at_->seconds()) {
+      time.seconds() < started_at_.seconds()) {
     throw KVCacheTransferError("invalid KV transfer completion");
   }
   completed_at_ = time;

@@ -1,18 +1,17 @@
 #include "frontier/core/event_queue.h"
 
-#include <cmath>
 #include <limits>
 #include <stdexcept>
 #include <utility>
 
 namespace frontier {
 
-EventSequence EventQueue::push(
+EventSequence EventQueue::push_payload(
     SimTime time,
-    EventType type,
     EventPayload payload) {
-  if (!std::isfinite(time.seconds())) {
-    throw std::invalid_argument("event time must be finite");
+  if (!time.valid()) {
+    throw std::invalid_argument(
+        "event time must be finite and nonnegative");
   }
   if (next_sequence_ == std::numeric_limits<std::uint64_t>::max()) {
     throw std::overflow_error("event sequence exhausted");
@@ -21,10 +20,9 @@ EventSequence EventQueue::push(
   const EventSequence sequence{next_sequence_};
   ++next_sequence_;
   events_.push(Event{
-      .time = time,
-      .sequence = sequence,
-      .type = type,
-      .payload = std::move(payload),
+      time,
+      sequence,
+      std::move(payload),
   });
   return sequence;
 }

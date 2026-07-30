@@ -1,4 +1,4 @@
-"""Generate Step 2 analytical batch fixtures from production Python models."""
+"""Generate analytical batch fixtures from production Python models."""
 
 from __future__ import annotations
 

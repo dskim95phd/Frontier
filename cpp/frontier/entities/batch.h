@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cstdint>
-#include <optional>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -61,8 +60,7 @@ class Batch {
   [[nodiscard]] SimTime scheduled_at() const noexcept {
     return scheduled_at_;
   }
-  [[nodiscard]] const std::optional<SimTime>& completed_at()
-      const noexcept {
+  [[nodiscard]] SimTime completed_at() const noexcept {
     return completed_at_;
   }
   [[nodiscard]] Generation schedule_epoch() const noexcept {
@@ -82,7 +80,7 @@ class Batch {
   }
   [[nodiscard]] std::uint64_t total_scheduled_tokens() const noexcept;
   [[nodiscard]] bool completed() const noexcept {
-    return completed_at_.has_value();
+    return completed_at_.valid();
   }
 
   void mark_completed(SimTime time);
@@ -92,7 +90,7 @@ class Batch {
   IterationId iteration_id_;
   std::vector<RequestBatchSnapshot> requests_;
   SimTime scheduled_at_;
-  std::optional<SimTime> completed_at_;
+  SimTime completed_at_;
   Generation schedule_epoch_;
   ReplicaId replica_id_{0};
   DataParallelId dp_id_{0};

@@ -134,6 +134,8 @@ class VllmV1Scheduler final : public BaseReplicaScheduler {
       std::vector<ScheduledRequest>& running_scheduled,
       std::uint64_t& token_budget,
       ScheduleResult& result);
+  [[nodiscard]] std::deque<RequestId> take_admission_queue();
+  void restore_admission_queue(std::deque<RequestId> queue);
   void validate_state() const;
 
   config::SchedulerConfig config_;

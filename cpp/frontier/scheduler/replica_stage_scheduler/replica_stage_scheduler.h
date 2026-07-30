@@ -57,7 +57,7 @@ class ReplicaStageScheduler {
     return is_last_stage_;
   }
   [[nodiscard]] bool is_busy() const noexcept {
-    return active_batch_id_.has_value();
+    return active_batch_id_.valid();
   }
   [[nodiscard]] bool empty() const noexcept {
     return queue_.empty();
@@ -72,7 +72,7 @@ class ReplicaStageScheduler {
       execution_time_predictor::BatchExecutionModel>
       execution_model_;
   std::deque<StageBatchTicket> queue_;
-  std::optional<BatchId> active_batch_id_;
+  BatchId active_batch_id_;
 };
 
 }  // namespace frontier::scheduler

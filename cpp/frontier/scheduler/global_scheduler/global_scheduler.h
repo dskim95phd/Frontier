@@ -8,12 +8,12 @@
 
 namespace frontier::scheduler {
 
-class CoLocationGlobalScheduler final
+class GlobalScheduler final
     : public BaseGlobalScheduler {
  public:
-  explicit CoLocationGlobalScheduler(
+  explicit GlobalScheduler(
       std::unique_ptr<BaseClusterScheduler> cluster_scheduler);
-  explicit CoLocationGlobalScheduler(
+  explicit GlobalScheduler(
       std::vector<std::unique_ptr<BaseClusterScheduler>>
           cluster_schedulers);
 

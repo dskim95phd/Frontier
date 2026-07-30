@@ -15,16 +15,10 @@ namespace frontier::metrics {
 
 inline constexpr int kOutputSchemaVersion = 1;
 
-enum class MetricsSemantics {
-  kCanonical,
-  kFoundationPlaceholder,
-};
-
 struct RunMetadata {
   std::string run_id;
   config::SimulationMode simulation_mode;
   config::SystemArchitecture system_architecture;
-  MetricsSemantics metrics_semantics = MetricsSemantics::kCanonical;
 };
 
 struct RequestMetricsRecord {
@@ -32,21 +26,21 @@ struct RequestMetricsRecord {
   SimTime arrived_at;
   SimTime prefill_completed_at;
   SimTime completed_at;
-  std::optional<SimTime> first_scheduled_at;
-  std::optional<SimTime> first_token_completed_at;
+  SimTime first_scheduled_at;
+  SimTime first_token_completed_at;
   std::uint64_t num_processed_tokens = 0;
   std::uint64_t preemption_count = 0;
   std::vector<std::uint64_t> tokens_at_preemption;
   ReplicaId replica_id{0};
   DataParallelId dp_id{0};
-  std::optional<ReplicaId> prefill_replica_id;
-  std::optional<DataParallelId> prefill_dp_id;
-  std::optional<ReplicaId> decode_replica_id;
-  std::optional<DataParallelId> decode_dp_id;
-  std::optional<TransferId> transfer_id;
-  std::optional<SimTime> kv_cache_transfer_start_time;
-  std::optional<SimTime> kv_cache_transfer_end_time;
-  std::optional<SimTime> decode_arrived_at;
+  ReplicaId prefill_replica_id;
+  DataParallelId prefill_dp_id;
+  ReplicaId decode_replica_id;
+  DataParallelId decode_dp_id;
+  TransferId transfer_id;
+  SimTime kv_cache_transfer_start_time;
+  SimTime kv_cache_transfer_end_time;
+  SimTime decode_arrived_at;
   std::uint64_t kv_cache_transfer_size_bytes = 0;
 };
 
@@ -139,12 +133,11 @@ struct SimulationOutput {
 };
 
 [[nodiscard]] std::string_view to_string(EventType event_type) noexcept;
-[[nodiscard]] std::string_view to_string(
-    MetricsSemantics semantics) noexcept;
 [[nodiscard]] std::string serialize_simulation_output_json(
     const SimulationOutput& output);
 [[nodiscard]] std::string serialize_request_metrics_csv(
     const std::vector<RequestMetricsRecord>& requests,
-    int schema_version = kOutputSchemaVersion);
+    config::SystemArchitecture architecture =
+        config::SystemArchitecture::kCoLocation);
 
 }  // namespace frontier::metrics

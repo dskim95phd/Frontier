@@ -249,6 +249,14 @@ std::vector<WorkloadRequest> parse_workload_csv(
           "session_turn_index requires session_id at line " +
           std::to_string(line_number));
     }
+    if (session_id.has_value() &&
+        session_id.value() >
+            static_cast<std::uint64_t>(
+                std::numeric_limits<SessionId::ValueType>::max())) {
+      throw WorkloadError(
+          "session_id is outside the supported range at line " +
+          std::to_string(line_number));
+    }
 
     requests.push_back(WorkloadRequest{
         .request_id = RequestId{
@@ -263,8 +271,9 @@ std::vector<WorkloadRequest> parse_workload_csv(
             kNumDecodeTokens,
             line_number),
         .session_id = session_id.has_value()
-            ? std::optional<SessionId>{SessionId{session_id.value()}}
-            : std::nullopt,
+            ? SessionId{static_cast<SessionId::ValueType>(
+                  session_id.value())}
+            : SessionId{},
         .session_turn_index = session_turn_index,
     });
   }
@@ -283,7 +292,8 @@ std::string serialize_workload_csv(
 
   for (std::size_t index = 0; index < requests.size(); ++index) {
     const WorkloadRequest& request = requests[index];
-    if (request.request_id.value() != index) {
+    if (!request.request_id.valid() ||
+        request.request_id.index() != index) {
       throw WorkloadError(
           "workload request IDs must be contiguous and start at zero");
     }
@@ -298,7 +308,7 @@ std::string serialize_workload_csv(
           "cannot serialize nonpositive token counts");
     }
     if (request.session_turn_index.has_value() &&
-        !request.session_id.has_value()) {
+        !request.session_id.valid()) {
       throw WorkloadError(
           "session_turn_index requires session_id");
     }
@@ -306,8 +316,8 @@ std::string serialize_workload_csv(
     output << request.arrived_at.seconds() << ','
            << request.num_prefill_tokens << ','
            << request.num_decode_tokens << ',';
-    if (request.session_id.has_value()) {
-      output << request.session_id->value();
+    if (request.session_id.valid()) {
+      output << request.session_id.value();
     }
     output << ',';
     if (request.session_turn_index.has_value()) {
@@ -325,17 +335,20 @@ void validate_workload_for_config(
     return;
   }
 
-  std::unordered_map<std::uint64_t, double> last_arrival_by_session;
-  std::unordered_map<std::uint64_t, std::uint64_t> last_turn_by_session;
+  std::unordered_map<SessionId::ValueType, double>
+      last_arrival_by_session;
+  std::unordered_map<SessionId::ValueType, std::uint64_t>
+      last_turn_by_session;
   for (const WorkloadRequest& request : requests) {
-    if (!request.session_id.has_value()) {
+    if (!request.session_id.valid()) {
       throw WorkloadError(
           "session_id is required when session prefix caching is enabled; "
           "request_id=" +
           std::to_string(request.request_id.value()));
     }
 
-    const std::uint64_t session_id = request.session_id->value();
+    const SessionId::ValueType session_id =
+        request.session_id.value();
     const auto last_arrival = last_arrival_by_session.find(session_id);
     if (last_arrival != last_arrival_by_session.end() &&
         request.arrived_at.seconds() < last_arrival->second) {

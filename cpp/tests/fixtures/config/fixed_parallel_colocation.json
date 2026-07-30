@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "run_id": "fixed-parallel-colocation",
+  "simulation_mode": "online",
+  "system_architecture": "co-location",
+  "enable_parallel_clusters": false,
+  "cluster_scheduler": {
+    "type": "round_robin"
+  },
+  "prefix_cache": {
+    "enabled": false,
+    "key_mode": "session"
+  },
+  "clusters": {
+    "monolithic": {
+      "parallelism": {
+        "num_replicas": 2,
+        "tensor_parallel_size": 2,
+        "pipeline_parallel_size": 2,
+        "data_parallel_size": 2
+      },
+      "scheduler": {
+        "type": "vllm_v1",
+        "scheduling_policy": "fcfs",
+        "batch_size_cap": 4,
+        "max_tokens_in_batch": 8,
+        "enable_preemption": true,
+        "enable_chunked_prefill": true,
+        "long_prefill_token_threshold": 0,
+        "block_size": 4,
+        "num_blocks": 16,
+        "watermark_blocks_fraction": 0.0,
+        "num_preallocate_tokens": 0
+      },
+      "execution_model": {
+        "type": "fixed",
+        "stage_latencies_ms": [
+          1.0,
+          3.0
+        ]
+      }
+    }
+  }
+}

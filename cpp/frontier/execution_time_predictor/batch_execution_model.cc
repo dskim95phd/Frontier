@@ -14,12 +14,13 @@ namespace {
 const entities::Request& get_request(
     const std::vector<entities::Request>& requests,
     RequestId request_id) {
-  if (request_id.value() >= requests.size()) {
+  if (!request_id.valid() ||
+      request_id.index() >= requests.size()) {
     throw BatchExecutionModelError(
         "batch execution references an unknown request");
   }
   const entities::Request& request =
-      requests.at(static_cast<std::size_t>(request_id.value()));
+      requests.at(request_id.index());
   if (request.id() != request_id) {
     throw BatchExecutionModelError(
         "batch execution request arena invariant failed");
@@ -53,12 +54,13 @@ BatchExecutionPrediction FixedBatchExecutionModel::predict(
   static_cast<void>(requests);
   double latency = config_.batch_latency_ms;
   if (!config_.stage_latencies_ms.empty()) {
-    if (stage_id.value() >= config_.stage_latencies_ms.size()) {
+    if (!stage_id.valid() ||
+        stage_id.index() >= config_.stage_latencies_ms.size()) {
       throw BatchExecutionModelError(
           "fixed stage latency does not cover stage ID");
     }
     latency = config_.stage_latencies_ms.at(
-        static_cast<std::size_t>(stage_id.value()));
+        stage_id.index());
   }
   return BatchExecutionPrediction{
       .duration_ms = latency,
@@ -112,7 +114,8 @@ BatchExecutionPrediction AnalyticalBatchExecutionModel::predict(
     const entities::Batch& batch,
     const std::vector<entities::Request>& requests,
     StageId stage_id) const {
-  if (stage_id.value() >=
+  if (!stage_id.valid() ||
+      stage_id.index() >=
       parallelism_.pipeline_parallel_size) {
     throw BatchExecutionModelError(
         "analytical stage ID exceeds pipeline size");
@@ -185,7 +188,7 @@ BatchExecutionPrediction AnalyticalBatchExecutionModel::predict(
       static_cast<double>(layers_per_stage) *
       tp_layer_ms;
   const double pp_communication_ms =
-      stage_id.value() + 1 <
+      stage_id.index() + 1 <
               parallelism_.pipeline_parallel_size
       ? communication.point_to_point_ms(
             activation_bytes, true)

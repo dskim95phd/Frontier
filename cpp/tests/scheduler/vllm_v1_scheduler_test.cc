@@ -41,7 +41,7 @@ std::vector<Request> make_requests(
         .arrived_at = SimTime::from_seconds(0.0),
         .num_prefill_tokens = tokens[index].first,
         .num_decode_tokens = tokens[index].second,
-        .session_id = std::nullopt,
+        .session_id = frontier::SessionId{},
         .session_turn_index = std::nullopt,
     });
   }

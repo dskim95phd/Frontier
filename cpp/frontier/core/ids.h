@@ -1,6 +1,8 @@
 #pragma once
 
 #include <compare>
+#include <concepts>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 
@@ -9,17 +11,27 @@ namespace frontier {
 template <typename Tag>
 class StrongId {
  public:
-  using ValueType = std::uint64_t;
+  using ValueType = std::int64_t;
+  static constexpr ValueType kInvalidValue = -1;
 
-  explicit constexpr StrongId(ValueType value) noexcept : value_(value) {}
+  constexpr StrongId() noexcept = default;
+  template <std::integral Integer>
+  explicit constexpr StrongId(Integer value) noexcept
+      : value_(static_cast<ValueType>(value)) {}
 
   [[nodiscard]] constexpr ValueType value() const noexcept { return value_; }
+  [[nodiscard]] constexpr bool valid() const noexcept {
+    return value_ >= 0;
+  }
+  [[nodiscard]] constexpr std::size_t index() const noexcept {
+    return static_cast<std::size_t>(value_);
+  }
 
   friend constexpr bool operator==(StrongId, StrongId) noexcept = default;
   friend constexpr auto operator<=>(StrongId, StrongId) noexcept = default;
 
  private:
-  ValueType value_;
+  ValueType value_ = kInvalidValue;
 };
 
 template <typename Id>

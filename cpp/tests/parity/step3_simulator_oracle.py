@@ -46,8 +46,8 @@ class Step3OracleError(RuntimeError):
 
 def _read_config(path: Path) -> dict[str, Any]:
     config = json.loads(path.read_text(encoding="utf-8"))
-    if config.get("schema_version") != 4:
-        raise Step3OracleError("schema_version=4 is required")
+    if config.get("schema_version") != 1:
+        raise Step3OracleError("schema_version=1 is required")
     if config.get("system_architecture") != "pd-disaggregation":
         raise Step3OracleError("pd-disaggregation is required")
     if config.get("enable_parallel_clusters") is not False:

@@ -22,7 +22,7 @@ Request make_request(
       .arrived_at = SimTime::from_seconds(0.0),
       .num_prefill_tokens = prefill,
       .num_decode_tokens = decode,
-      .session_id = std::nullopt,
+      .session_id = frontier::SessionId{},
       .session_turn_index = std::nullopt,
   }};
 }

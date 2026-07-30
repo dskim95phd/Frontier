@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cstdint>
-#include <optional>
 #include <stdexcept>
 
 #include "frontier/core/cluster_type.h"
@@ -66,12 +65,10 @@ class KVCacheTransferInfo {
   [[nodiscard]] KVCacheTransferState state() const noexcept {
     return state_;
   }
-  [[nodiscard]] const std::optional<SimTime>& started_at()
-      const noexcept {
+  [[nodiscard]] SimTime started_at() const noexcept {
     return started_at_;
   }
-  [[nodiscard]] const std::optional<SimTime>& completed_at()
-      const noexcept {
+  [[nodiscard]] SimTime completed_at() const noexcept {
     return completed_at_;
   }
 
@@ -88,8 +85,8 @@ class KVCacheTransferInfo {
   double predicted_time_ms_;
   Generation source_generation_;
   KVCacheTransferState state_ = KVCacheTransferState::kPending;
-  std::optional<SimTime> started_at_;
-  std::optional<SimTime> completed_at_;
+  SimTime started_at_;
+  SimTime completed_at_;
 };
 
 }  // namespace frontier::entities

@@ -1,5 +1,5 @@
-#include "frontier/scheduler/cluster_scheduler/co_location_cluster_scheduler.h"
-#include "frontier/scheduler/global_scheduler/co_location_global_scheduler.h"
+#include "frontier/scheduler/cluster_scheduler/round_robin_cluster_scheduler.h"
+#include "frontier/scheduler/global_scheduler/global_scheduler.h"
 #include "frontier/scheduler/replica_scheduler/vllm_v1_engine_replica_scheduler.h"
 #include "tests/test_support.h"
 
@@ -27,8 +27,8 @@ using frontier::scheduler::BaseClusterScheduler;
 using frontier::scheduler::BaseReplicaScheduler;
 using frontier::scheduler::ClusterSchedulerError;
 using frontier::scheduler::ClusterType;
-using frontier::scheduler::CoLocationClusterScheduler;
-using frontier::scheduler::CoLocationGlobalScheduler;
+using frontier::scheduler::GlobalScheduler;
+using frontier::scheduler::RoundRobinClusterScheduler;
 using frontier::scheduler::GlobalSchedulerError;
 using frontier::scheduler::ReplicaStageScheduler;
 using frontier::scheduler::SchedulerError;
@@ -52,7 +52,7 @@ void test_colocation_scheduler_hierarchy_routes_and_executes() {
       .arrived_at = SimTime::from_seconds(0.0),
       .num_prefill_tokens = 2,
       .num_decode_tokens = 1,
-      .session_id = std::nullopt,
+      .session_id = frontier::SessionId{},
       .session_turn_index = std::nullopt,
   });
 
@@ -64,9 +64,9 @@ void test_colocation_scheduler_hierarchy_routes_and_executes() {
               .batch_latency_ms = 2.5,
               .stage_latencies_ms = {},
           }));
-  auto cluster = std::make_unique<CoLocationClusterScheduler>(
+  auto cluster = std::make_unique<RoundRobinClusterScheduler>(
       std::move(replica));
-  CoLocationGlobalScheduler global{std::move(cluster)};
+  GlobalScheduler global{std::move(cluster)};
 
   requests[0].on_arrival(SimTime::from_seconds(0.0));
   global.add_request(RequestId{0}, ClusterType::kMonolithic);
@@ -148,14 +148,14 @@ void test_colocation_hierarchy_rejects_unknown_targets() {
       .arrived_at = SimTime::from_seconds(0.0),
       .num_prefill_tokens = 2,
       .num_decode_tokens = 1,
-      .session_id = std::nullopt,
+      .session_id = frontier::SessionId{},
       .session_turn_index = std::nullopt,
   });
   auto replica = std::make_unique<VllmV1Scheduler>(
       scheduler_config(), requests);
-  auto cluster = std::make_unique<CoLocationClusterScheduler>(
+  auto cluster = std::make_unique<RoundRobinClusterScheduler>(
       std::move(replica));
-  CoLocationGlobalScheduler global{std::move(cluster)};
+  GlobalScheduler global{std::move(cluster)};
 
   expect_throws<GlobalSchedulerError>(
       [&global] {

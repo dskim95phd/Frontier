@@ -56,23 +56,25 @@ BaseReplicaScheduler::BaseReplicaScheduler(
 ReplicaStageScheduler&
 BaseReplicaScheduler::get_replica_stage_scheduler(
     StageId stage_id) {
-  if (stage_id.value() >= stage_schedulers_.size()) {
+  if (!stage_id.valid() ||
+      stage_id.index() >= stage_schedulers_.size()) {
     throw SchedulerError(
-        "co-location baseline exposes only pipeline stage zero");
+        "single-stage scheduler exposes only pipeline stage zero");
   }
   return stage_schedulers_.at(
-      static_cast<std::size_t>(stage_id.value()));
+      stage_id.index());
 }
 
 const ReplicaStageScheduler&
 BaseReplicaScheduler::get_replica_stage_scheduler(
     StageId stage_id) const {
-  if (stage_id.value() >= stage_schedulers_.size()) {
+  if (!stage_id.valid() ||
+      stage_id.index() >= stage_schedulers_.size()) {
     throw SchedulerError(
-        "co-location baseline exposes only pipeline stage zero");
+        "single-stage scheduler exposes only pipeline stage zero");
   }
   return stage_schedulers_.at(
-      static_cast<std::size_t>(stage_id.value()));
+      stage_id.index());
 }
 
 }  // namespace frontier::scheduler

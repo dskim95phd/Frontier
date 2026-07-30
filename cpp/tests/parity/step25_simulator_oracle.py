@@ -1,6 +1,6 @@
-"""Step 2.5 oracle backed by Frontier's production Python Simulator.
+"""Co-location oracle backed by Frontier's production Python Simulator.
 
-The adapter translates normalized C++ schema v3 into Python dataclasses and
+The adapter translates the normalized C++ cluster schema into Python dataclasses and
 normalizes the production event, routing, batch-stage, and request results.
 Routing, batching, pipeline execution, and request mutation are never
 reimplemented here.
@@ -51,8 +51,8 @@ class Step25OracleError(RuntimeError):
 
 def _read_config(path: Path) -> dict[str, Any]:
     config = json.loads(path.read_text(encoding="utf-8"))
-    if config.get("schema_version") != 3:
-        raise Step25OracleError("schema_version=3 is required")
+    if config.get("schema_version") != 1:
+        raise Step25OracleError("schema_version=1 is required")
     if config.get("system_architecture") != "co-location":
         raise Step25OracleError("co-location is required")
     if config.get("enable_parallel_clusters") is not False:
@@ -67,9 +67,10 @@ def _build_python_config(
     workload_path: Path,
     output_dir: str,
 ) -> SimulationConfig:
-    topology = config["parallelism"]
-    scheduler = config["scheduler"]
-    execution = config["execution_model"]
+    cluster_config = config["clusters"]["monolithic"]
+    topology = cluster_config["parallelism"]
+    scheduler = cluster_config["scheduler"]
+    execution = cluster_config["execution_model"]
     replica_scheduler = VllmV1SchedulerConfig(
         batch_size_cap=int(scheduler["batch_size_cap"]),
         block_size=int(scheduler["block_size"]),
@@ -540,6 +541,7 @@ def run_oracle(
     workload_path: Path,
 ) -> dict[str, Any]:
     config = _read_config(config_path)
+    execution = config["clusters"]["monolithic"]["execution_model"]
     Request._id = -1
     Batch._id = -1
     BatchStage._id = -1
@@ -560,12 +562,12 @@ def run_oracle(
                     output_dir,
                 )
             )
-            if config["execution_model"]["type"] == "fixed":
+            if execution["type"] == "fixed":
                 _install_fixed_predictor(
                     simulator,
                     [
                         float(value)
-                        for value in config["execution_model"][
+                        for value in execution[
                             "stage_latencies_ms"
                         ]
                     ],
@@ -585,7 +587,7 @@ def run_oracle(
             simulator,
             predictions,
             include_components=(
-                config["execution_model"]["type"] == "analytical"
+                execution["type"] == "analytical"
             ),
         ),
         "simulation_completed_at_s": float(simulator._time),

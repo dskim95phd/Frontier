@@ -9,24 +9,61 @@
 namespace {
 
 using frontier::Event;
-using frontier::EventPayload;
 using frontier::EventQueue;
 using frontier::EventSequence;
 using frontier::EventType;
+using frontier::BatchId;
+using frontier::ClusterBatchEndPayload;
+using frontier::ClusterType;
+using frontier::DataParallelId;
 using frontier::Generation;
+using frontier::GlobalSchedulePayload;
+using frontier::RequestArrivalPayload;
 using frontier::RequestId;
+using frontier::ReplicaId;
 using frontier::SimTime;
 using frontier::test::expect;
 using frontier::test::expect_throws;
+
+void test_default_ids_and_times_are_invalid() {
+  const RequestId request_id;
+  const SimTime time;
+  expect(
+      request_id.value() == -1 && !request_id.valid(),
+      "default StrongId must use the -1 invalid sentinel");
+  expect(
+      time.seconds() == -1.0 && !time.valid(),
+      "default SimTime must use the -1 second invalid sentinel");
+  expect(
+      RequestId{0}.valid() &&
+          SimTime::from_seconds(0.0).valid(),
+      "zero IDs and times must remain valid");
+
+  EventQueue queue;
+  expect_throws<std::invalid_argument>(
+      [&queue] {
+        queue.push(
+            SimTime{},
+            RequestArrivalPayload{
+                .request_id = RequestId{0},
+                .cluster_type = ClusterType::kMonolithic,
+            });
+      },
+      "invalid sentinel time must not enter the event queue");
+}
 
 void test_earlier_time_precedes_later_time() {
   EventQueue queue;
   const EventSequence later = queue.push(
       SimTime::from_seconds(2.0),
-      EventType::kFoundationCompletion);
+      GlobalSchedulePayload{
+          .cluster_type = ClusterType::kMonolithic});
   const EventSequence earlier = queue.push(
       SimTime::from_seconds(1.0),
-      EventType::kRequestArrival);
+      RequestArrivalPayload{
+          .request_id = RequestId{0},
+          .cluster_type = ClusterType::kMonolithic,
+      });
 
   expect(queue.size() == 2, "queue size must reflect inserted events");
   expect(queue.pop().sequence == earlier, "earlier time must pop first");
@@ -38,10 +75,14 @@ void test_equal_times_preserve_creation_sequence() {
   EventQueue queue;
   const EventSequence first = queue.push(
       SimTime::from_seconds(3.0),
-      EventType::kFoundationCompletion);
+      GlobalSchedulePayload{
+          .cluster_type = ClusterType::kMonolithic});
   const EventSequence second = queue.push(
       SimTime::from_seconds(3.0),
-      EventType::kRequestArrival);
+      RequestArrivalPayload{
+          .request_id = RequestId{0},
+          .cluster_type = ClusterType::kMonolithic,
+      });
 
   expect(
       queue.pop().sequence == first,
@@ -58,7 +99,10 @@ void test_nonfinite_times_are_rejected() {
         queue.push(
             SimTime::from_seconds(
                 std::numeric_limits<double>::quiet_NaN()),
-            EventType::kRequestArrival);
+            RequestArrivalPayload{
+                .request_id = RequestId{0},
+                .cluster_type = ClusterType::kMonolithic,
+            });
       },
       "NaN event time must be rejected");
   expect_throws<std::invalid_argument>(
@@ -66,7 +110,10 @@ void test_nonfinite_times_are_rejected() {
         queue.push(
             SimTime::from_seconds(
                 std::numeric_limits<double>::infinity()),
-            EventType::kRequestArrival);
+            RequestArrivalPayload{
+                .request_id = RequestId{0},
+                .cluster_type = ClusterType::kMonolithic,
+            });
       },
       "infinite event time must be rejected");
   expect(queue.empty(), "invalid events must not enter the queue");
@@ -84,13 +131,15 @@ void test_empty_queue_access_is_explicit() {
 
 void test_generation_staleness_uses_ids() {
   EventQueue queue;
-  EventPayload payload;
-  payload.request_id = RequestId{7};
-  payload.generation = Generation{3};
   queue.push(
       SimTime::from_seconds(0.0),
-      EventType::kRequestArrival,
-      payload);
+      ClusterBatchEndPayload{
+          .batch_id = BatchId{7},
+          .replica_id = ReplicaId{0},
+          .dp_id = DataParallelId{0},
+          .generation = Generation{3},
+          .cluster_type = ClusterType::kMonolithic,
+      });
 
   const Event event = queue.pop();
   expect(
@@ -107,16 +156,24 @@ std::vector<TraceEntry> make_deterministic_trace() {
   EventQueue queue;
   queue.push(
       SimTime::from_seconds(2.0),
-      EventType::kFoundationCompletion);
+      GlobalSchedulePayload{
+          .cluster_type = ClusterType::kMonolithic});
   queue.push(
       SimTime::from_seconds(1.0),
-      EventType::kFoundationCompletion);
+      GlobalSchedulePayload{
+          .cluster_type = ClusterType::kMonolithic});
   queue.push(
       SimTime::from_seconds(1.0),
-      EventType::kRequestArrival);
+      RequestArrivalPayload{
+          .request_id = RequestId{2},
+          .cluster_type = ClusterType::kMonolithic,
+      });
   queue.push(
       SimTime::from_seconds(4.0),
-      EventType::kRequestArrival);
+      RequestArrivalPayload{
+          .request_id = RequestId{3},
+          .cluster_type = ClusterType::kMonolithic,
+      });
 
   std::vector<TraceEntry> trace;
   while (!queue.empty()) {
@@ -124,7 +181,7 @@ std::vector<TraceEntry> make_deterministic_trace() {
     trace.emplace_back(
         event.time.seconds(),
         event.sequence.value(),
-        event.type);
+        event.type());
   }
   return trace;
 }
@@ -142,6 +199,9 @@ void test_repeated_fixture_is_deterministic() {
 
 int main() {
   int failures = 0;
+  failures += frontier::test::run(
+      "default IDs and times are invalid",
+      test_default_ids_and_times_are_invalid);
   failures += frontier::test::run(
       "earlier time precedes later time",
       test_earlier_time_precedes_later_time);

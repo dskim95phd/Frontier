@@ -1,6 +1,6 @@
 {
-  "schema_version": 4,
-  "run_id": "step3-fixed-pdd",
+  "schema_version": 1,
+  "run_id": "fixed-sequential-pdd",
   "simulation_mode": "online",
   "system_architecture": "pd-disaggregation",
   "enable_parallel_clusters": false,

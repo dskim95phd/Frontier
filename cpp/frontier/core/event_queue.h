@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <queue>
+#include <utility>
 #include <vector>
 
 #include "frontier/core/event.h"
@@ -13,10 +14,11 @@ class EventQueue {
  public:
   EventQueue() = default;
 
-  EventSequence push(
-      SimTime time,
-      EventType type,
-      EventPayload payload = {});
+  template <typename Payload>
+  EventSequence push(SimTime time, Payload payload) {
+    return push_payload(
+        time, EventPayload{std::move(payload)});
+  }
 
   [[nodiscard]] bool empty() const noexcept { return events_.empty(); }
   [[nodiscard]] std::size_t size() const noexcept { return events_.size(); }
@@ -24,6 +26,10 @@ class EventQueue {
   Event pop();
 
  private:
+  EventSequence push_payload(
+      SimTime time,
+      EventPayload payload);
+
   struct LaterEvent {
     [[nodiscard]] bool operator()(
         const Event& left,

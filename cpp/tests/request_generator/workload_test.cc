@@ -21,19 +21,13 @@ using frontier::test::expect;
 using frontier::test::expect_throws;
 using frontier::test::read_text_file;
 
-constexpr std::string_view kPrefixConfig = R"json(
-{
-  "schema_version": 1,
-  "run_id": "workload-contract",
-  "simulation_mode": "offline",
-  "system_architecture": "co-location",
-  "enable_parallel_clusters": false,
-  "prefix_cache": {
-    "enabled": true,
-    "key_mode": "session"
-  }
+auto load_config() {
+  const std::filesystem::path fixture_root{
+      FRONTIER_TEST_FIXTURE_DIR};
+  return parse_simulation_config_json(read_text_file(
+      fixture_root /
+      "config/fixed_parallel_colocation.json"));
 }
-)json";
 
 void test_valid_workload_round_trip() {
   const auto requests = parse_workload_csv(
@@ -50,10 +44,10 @@ void test_valid_workload_round_trip() {
       requests[1].arrived_at.seconds() == 1.5,
       "arrival time must parse in seconds");
   expect(
-      requests[1].session_id->value() == 7,
+      requests[1].session_id.value() == 7,
       "session ID must parse");
   expect(
-      !requests[2].session_id.has_value(),
+      !requests[2].session_id.valid(),
       "empty optional session ID must remain absent");
 
   const std::string serialized = serialize_workload_csv(requests);
@@ -65,8 +59,8 @@ void test_valid_workload_round_trip() {
 void test_checked_in_workload_fixture() {
   const std::filesystem::path fixture_root{
       FRONTIER_TEST_FIXTURE_DIR};
-  const auto config = parse_simulation_config_json(
-      read_text_file(fixture_root / "config/minimal_colocation.json"));
+  auto config = load_config();
+  config.prefix_cache.enabled = true;
   const auto requests = parse_workload_csv(
       read_text_file(
           fixture_root / "workloads/session_prefix.csv"));
@@ -138,7 +132,8 @@ void test_invalid_values_are_rejected() {
 }
 
 void test_session_prefix_sequence_validation() {
-  const auto config = parse_simulation_config_json(kPrefixConfig);
+  auto config = load_config();
+  config.prefix_cache.enabled = true;
   const auto valid = parse_workload_csv(
       "arrived_at,num_prefill_tokens,num_decode_tokens,session_id,"
       "session_turn_index\n"

@@ -70,6 +70,8 @@ add_library(
   frontier_core
   STATIC
   frontier/config/config.cc
+  frontier/config/config_parse.cc
+  frontier/config/config_serialize.cc
   frontier/cc_backend/analytical_model.cc
   frontier/core/event_queue.cc
   frontier/entities/request.cc
@@ -78,19 +80,32 @@ add_library(
   frontier/entities/cluster.cc
   frontier/entities/replica.cc
   frontier/entities/kv_cache_transfer_info.cc
-  frontier/events/co_location_events.cc
+  frontier/events/batch_stage_arrival_event.cc
+  frontier/events/batch_stage_end_event.cc
+  frontier/events/cluster_batch_end_event.cc
+  frontier/events/cluster_schedule_event.cc
+  frontier/events/event_dispatcher.cc
+  frontier/events/event_helpers.cc
+  frontier/events/global_batch_end_event.cc
+  frontier/events/global_schedule_event.cc
+  frontier/events/kv_cache_transfer_end_event.cc
+  frontier/events/kv_cache_transfer_start_event.cc
+  frontier/events/replica_schedule_event.cc
+  frontier/events/replica_stage_schedule_event.cc
+  frontier/events/request_arrival_event.cc
   frontier/execution_time_predictor/analytical_model.cc
   frontier/execution_time_predictor/batch_execution_model.cc
   frontier/kv_cache_transfer/analytical_transfer.cc
   frontier/metrics/output_contract.cc
   frontier/request_generator/workload.cc
-  frontier/scheduler/cluster_scheduler/co_location_cluster_scheduler.cc
-  frontier/scheduler/global_scheduler/co_location_global_scheduler.cc
+  frontier/scheduler/cluster_scheduler/round_robin_cluster_scheduler.cc
+  frontier/scheduler/global_scheduler/global_scheduler.cc
   frontier/scheduler/kv_block_accounting.cc
   frontier/scheduler/replica_scheduler/base_replica_scheduler.cc
   frontier/scheduler/replica_scheduler/vllm_v1_engine_replica_scheduler.cc
   frontier/scheduler/replica_stage_scheduler/replica_stage_scheduler.cc
-  frontier/simulator/co_location_simulator.cc
+  frontier/simulator/scheduler_simulator.cc
+  frontier/simulator/entity_arena.cc
   frontier/simulator/simulation_context.cc
   frontier/simulator/simulator.cc
 )
@@ -118,24 +133,24 @@ if(BUILD_TESTING)
     PROPERTIES PASS_REGULAR_EXPRESSION "^frontier_sim 0\\.1\\.0"
   )
   add_test(
-    NAME frontier_sim.foundation_cli
+    NAME frontier_sim.cli
     COMMAND
       $<TARGET_FILE:frontier_sim>
       --config
-      "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/config/minimal_foundation_colocation.json"
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/config/fixed_parallel_colocation.json"
       --workload
-      "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/workloads/session_prefix.csv"
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/workloads/step25_parallel.csv"
   )
   set_tests_properties(
-    frontier_sim.foundation_cli
-    PROPERTIES PASS_REGULAR_EXPRESSION "foundation_completion"
+    frontier_sim.cli
+    PROPERTIES PASS_REGULAR_EXPRESSION "global_batch_end"
   )
   add_test(
     NAME frontier_sim.normalize_config
     COMMAND
       $<TARGET_FILE:frontier_sim>
       --normalize-config
-      "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/config/minimal_foundation_colocation.json"
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/config/fixed_parallel_colocation.json"
   )
   set_tests_properties(
     frontier_sim.normalize_config
@@ -200,27 +215,16 @@ if(BUILD_TESTING)
     frontier_output_contract_test
     tests/metrics/output_contract_test.cc
   )
-  target_link_libraries(frontier_output_contract_test PRIVATE frontier_core)
-  frontier_enable_warnings(frontier_output_contract_test)
-  add_test(
-    NAME frontier_contract.output
-    COMMAND $<TARGET_FILE:frontier_output_contract_test>
-  )
-
-  add_executable(
-    frontier_output_v2_contract_test
-    tests/metrics/output_v2_test.cc
-  )
   target_link_libraries(
-    frontier_output_v2_contract_test
+    frontier_output_contract_test
     PRIVATE
       frontier_core
       nlohmann_json::nlohmann_json
   )
-  frontier_enable_warnings(frontier_output_v2_contract_test)
+  frontier_enable_warnings(frontier_output_contract_test)
   add_test(
-    NAME frontier_contract.output_v2
-    COMMAND $<TARGET_FILE:frontier_output_v2_contract_test>
+    NAME frontier_contract.output
+    COMMAND $<TARGET_FILE:frontier_output_contract_test>
   )
 
   add_executable(
@@ -242,27 +246,6 @@ if(BUILD_TESTING)
   add_test(
     NAME frontier_analytical.model
     COMMAND $<TARGET_FILE:frontier_analytical_model_test>
-  )
-
-  add_executable(
-    frontier_foundation_simulator_test
-    tests/simulator/simulator_test.cc
-  )
-  target_compile_definitions(
-    frontier_foundation_simulator_test
-    PRIVATE
-      FRONTIER_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures"
-  )
-  target_link_libraries(
-    frontier_foundation_simulator_test
-    PRIVATE
-      frontier_core
-      nlohmann_json::nlohmann_json
-  )
-  frontier_enable_warnings(frontier_foundation_simulator_test)
-  add_test(
-    NAME frontier_simulator.foundation_lifecycle
-    COMMAND $<TARGET_FILE:frontier_foundation_simulator_test>
   )
 
   add_executable(
@@ -327,27 +310,6 @@ if(BUILD_TESTING)
   add_test(
     NAME frontier_scheduler.hierarchy
     COMMAND $<TARGET_FILE:frontier_scheduler_hierarchy_test>
-  )
-
-  add_executable(
-    frontier_colocation_simulator_test
-    tests/simulator/co_location_simulator_test.cc
-  )
-  target_compile_definitions(
-    frontier_colocation_simulator_test
-    PRIVATE
-      FRONTIER_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures"
-  )
-  target_link_libraries(
-    frontier_colocation_simulator_test
-    PRIVATE
-      frontier_core
-      nlohmann_json::nlohmann_json
-  )
-  frontier_enable_warnings(frontier_colocation_simulator_test)
-  add_test(
-    NAME frontier_simulator.colocation
-    COMMAND $<TARGET_FILE:frontier_colocation_simulator_test>
   )
 
   add_executable(

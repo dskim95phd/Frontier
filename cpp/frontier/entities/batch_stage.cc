@@ -45,7 +45,7 @@ BatchStage::BatchStage(
 }
 
 void BatchStage::mark_started(SimTime time) {
-  if (started_at_.has_value()) {
+  if (started_at_.valid()) {
     throw BatchStageError("batch stage started more than once");
   }
   require_time_at_or_after(time, arrived_at_, "stage start");
@@ -53,13 +53,13 @@ void BatchStage::mark_started(SimTime time) {
 }
 
 void BatchStage::mark_completed(SimTime time) {
-  if (!started_at_.has_value()) {
+  if (!started_at_.valid()) {
     throw BatchStageError("batch stage completed before start");
   }
-  if (completed_at_.has_value()) {
+  if (completed_at_.valid()) {
     throw BatchStageError("batch stage completed more than once");
   }
-  require_time_at_or_after(time, started_at_.value(), "stage completion");
+  require_time_at_or_after(time, started_at_, "stage completion");
   completed_at_ = time;
 }
 

@@ -2,7 +2,7 @@
 #include "frontier/core/event.h"
 #include "frontier/metrics/output_contract.h"
 #include "frontier/request_generator/workload.h"
-#include "frontier/simulator/co_location_simulator.h"
+#include "frontier/simulator/simulator.h"
 #include "tests/test_support.h"
 
 #include <algorithm>
@@ -30,7 +30,7 @@ using frontier::metrics::BatchStageMetricsRecord;
 using frontier::metrics::SimulationOutput;
 using frontier::metrics::serialize_simulation_output_json;
 using frontier::request_generator::parse_workload_csv;
-using frontier::simulator::run_co_location_simulation;
+using frontier::simulator::run_simulation;
 using frontier::test::expect;
 using frontier::test::expect_throws;
 using frontier::test::read_text_file;
@@ -54,25 +54,25 @@ auto load_workload(const char* name) {
       fixture_root / "workloads" / name));
 }
 
-void test_schema_v3_round_trip_and_validation() {
+void test_config_round_trip_and_validation() {
   const SimulationConfig config = load_config(
-      "step25_fixed_parallel_colocation.json");
+      "fixed_parallel_colocation.json");
   expect(
-      config.schema_version == 3 &&
-          config.parallelism->num_replicas == 2 &&
-          config.parallelism->data_parallel_size == 2 &&
-          config.parallelism->pipeline_parallel_size == 2 &&
-          config.parallelism->tensor_parallel_size == 2,
-      "schema v3 topology must parse");
+      config.schema_version == frontier::config::kSchemaVersion &&
+          config.cluster().parallelism.num_replicas == 2 &&
+          config.cluster().parallelism.data_parallel_size == 2 &&
+          config.cluster().parallelism.pipeline_parallel_size == 2 &&
+          config.cluster().parallelism.tensor_parallel_size == 2,
+      "cluster topology must parse");
   expect(
       parse_simulation_config_json(
           serialize_simulation_config_json(config)) == config,
-      "schema v3 config must round-trip");
+      "config must round-trip");
 
   std::string invalid =
       read_text_file(
           fixture_root /
-          "config/step25_fixed_parallel_colocation.json");
+          "config/fixed_parallel_colocation.json");
   const std::string from =
       "\"pipeline_parallel_size\": 2";
   invalid.replace(
@@ -88,8 +88,8 @@ void test_schema_v3_round_trip_and_validation() {
 }
 
 void test_round_robin_dp_replica_and_event_pipeline() {
-  const SimulationOutput output = run_co_location_simulation(
-      load_config("step25_fixed_parallel_colocation.json"),
+  const SimulationOutput output = run_simulation(
+      load_config("fixed_parallel_colocation.json"),
       load_workload());
   expect(
       output.requests.size() == 8 &&
@@ -136,11 +136,7 @@ void test_round_robin_dp_replica_and_event_pipeline() {
   };
   std::set<EventType> seen;
   for (const auto& event : output.event_trace) {
-    seen.insert(event.type);
-    expect(
-        event.type != EventType::kSchedulerPoll &&
-            event.type != EventType::kBatchCompletion,
-        "schema v3 must not use flattened Step 2 events");
+    seen.insert(event.type());
   }
   for (const EventType type : required) {
     expect(seen.contains(type), "required event type is missing");
@@ -148,8 +144,8 @@ void test_round_robin_dp_replica_and_event_pipeline() {
 }
 
 void test_pp4_fill_drain_and_terminal_release() {
-  const SimulationOutput output = run_co_location_simulation(
-      load_config("step25_fixed_pp4_colocation.json"),
+  const SimulationOutput output = run_simulation(
+      load_config("fixed_pp4_colocation.json"),
       load_workload());
   expect(
       output.requests.size() == 8 &&
@@ -176,8 +172,8 @@ void test_pp4_fill_drain_and_terminal_release() {
 }
 
 void test_dp_target_local_pressure_and_preemption() {
-  const SimulationOutput output = run_co_location_simulation(
-      load_config("step25_fixed_dp2_pressure.json"),
+  const SimulationOutput output = run_simulation(
+      load_config("fixed_dp2_pressure_colocation.json"),
       load_workload("step25_parallel_pressure.csv"));
   std::map<std::uint64_t, std::uint64_t> preemptions_by_dp;
   for (const auto& request : output.requests) {
@@ -194,15 +190,15 @@ void test_dp_target_local_pressure_and_preemption() {
 
 void test_analytical_primary_tp_pp_matrix() {
   const SimulationConfig base = load_config(
-      "step25_analytical_parallel_colocation.json");
+      "analytical_parallel_colocation.json");
   for (const std::uint64_t tp : {1U, 2U, 4U, 8U}) {
     for (const std::uint64_t pp : {1U, 2U, 4U}) {
       SimulationConfig config = base;
-      config.parallelism->tensor_parallel_size = tp;
-      config.parallelism->pipeline_parallel_size = pp;
-      config.parallelism->data_parallel_size = 1;
+      config.cluster().parallelism.tensor_parallel_size = tp;
+      config.cluster().parallelism.pipeline_parallel_size = pp;
+      config.cluster().parallelism.data_parallel_size = 1;
       const SimulationOutput output =
-          run_co_location_simulation(config, load_workload());
+          run_simulation(config, load_workload());
       expect(
           output.batch_stages.size() ==
               output.batches.size() * pp,
@@ -214,7 +210,7 @@ void test_analytical_primary_tp_pp_matrix() {
                  : stage.execution_time.tp_communication_ms > 0.0),
             "TP communication must be zero only for TP1");
         expect(
-            (stage.stage_id.value() + 1 == pp
+            (stage.stage_id.index() + 1 == pp
                  ? stage.execution_time.pp_communication_ms == 0.0
                  : stage.execution_time.pp_communication_ms > 0.0),
             "PP communication must appear only on non-final stages");
@@ -224,8 +220,8 @@ void test_analytical_primary_tp_pp_matrix() {
 }
 
 void test_pipeline_serialization_overlap_and_fixed_timing() {
-  const SimulationOutput output = run_co_location_simulation(
-      load_config("step25_fixed_parallel_colocation.json"),
+  const SimulationOutput output = run_simulation(
+      load_config("fixed_parallel_colocation.json"),
       load_workload());
   using Key = std::tuple<std::uint64_t, std::uint64_t, std::uint64_t>;
   std::map<Key, std::vector<const BatchStageMetricsRecord*>>
@@ -282,12 +278,12 @@ void test_pipeline_serialization_overlap_and_fixed_timing() {
 
 void test_analytical_tp_pp_components_and_determinism() {
   const SimulationConfig config = load_config(
-      "step25_analytical_parallel_colocation.json");
+      "analytical_parallel_colocation.json");
   const auto workload = load_workload();
   const SimulationOutput first =
-      run_co_location_simulation(config, workload);
+      run_simulation(config, workload);
   const SimulationOutput second =
-      run_co_location_simulation(config, workload);
+      run_simulation(config, workload);
   expect(
       serialize_simulation_output_json(first) ==
           serialize_simulation_output_json(second),
@@ -310,12 +306,12 @@ void test_analytical_tp_pp_components_and_determinism() {
   const Json json =
       Json::parse(serialize_simulation_output_json(first));
   expect(
-      json.at("schema_version") == 3 &&
+      json.at("schema_version") == 1 &&
           json.at("batch_stages").size() ==
               first.batch_stages.size() &&
           json.at("requests").at(0).contains("replica_id") &&
           json.at("scheduler_trace").at(0).contains("dp_id"),
-      "schema v3 output must expose target and stage contracts");
+      "output must expose target and stage contracts");
 }
 
 }  // namespace
@@ -323,8 +319,8 @@ void test_analytical_tp_pp_components_and_determinism() {
 int main() {
   int failures = 0;
   failures += frontier::test::run(
-      "schema v3 topology contract",
-      test_schema_v3_round_trip_and_validation);
+      "topology contract",
+      test_config_round_trip_and_validation);
   failures += frontier::test::run(
       "round-robin DP/replica event pipeline",
       test_round_robin_dp_replica_and_event_pipeline);

@@ -4,6 +4,7 @@
 #include <cmath>
 #include <limits>
 #include <unordered_set>
+#include <utility>
 
 namespace frontier::scheduler {
 namespace {
@@ -52,7 +53,7 @@ VllmV1Scheduler::VllmV1Scheduler(
       pipeline_parallel_size_(pipeline_parallel_size) {
   if (config_.type != config::SchedulerType::kVllmV1 ||
       config_.scheduling_policy != config::SchedulingPolicy::kFcfs) {
-    throw SchedulerError("Step 2 requires the FCFS vLLM V1 scheduler");
+    throw SchedulerError("the C++ port requires the FCFS vLLM V1 scheduler");
   }
   if (config_.batch_size_cap == 0 ||
       config_.max_tokens_in_batch == 0 ||
@@ -62,11 +63,12 @@ VllmV1Scheduler::VllmV1Scheduler(
 }
 
 entities::Request& VllmV1Scheduler::request(RequestId request_id) {
-  if (request_id.value() >= requests_->size()) {
+  if (!request_id.valid() ||
+      request_id.index() >= requests_->size()) {
     throw SchedulerError("scheduler references an unknown request ID");
   }
   entities::Request& value =
-      requests_->at(static_cast<std::size_t>(request_id.value()));
+      requests_->at(request_id.index());
   if (value.id() != request_id) {
     throw SchedulerError("request arena ID/index invariant failed");
   }
@@ -75,11 +77,12 @@ entities::Request& VllmV1Scheduler::request(RequestId request_id) {
 
 const entities::Request& VllmV1Scheduler::request(
     RequestId request_id) const {
-  if (request_id.value() >= requests_->size()) {
+  if (!request_id.valid() ||
+      request_id.index() >= requests_->size()) {
     throw SchedulerError("scheduler references an unknown request ID");
   }
   const entities::Request& value =
-      requests_->at(static_cast<std::size_t>(request_id.value()));
+      requests_->at(request_id.index());
   if (value.id() != request_id) {
     throw SchedulerError("request arena ID/index invariant failed");
   }
@@ -383,6 +386,33 @@ bool VllmV1Scheduler::try_reserve_with_preemption(
   }
 }
 
+std::deque<RequestId> VllmV1Scheduler::take_admission_queue() {
+  if (cluster_type() == ClusterType::kDecode) {
+    // Python's unified DECODE scheduler has one waiting queue. Newly
+    // preempted requests are inserted at its front and keep that order.
+    return std::exchange(waiting_, {});
+  }
+
+  // MONOLITHIC and PREFILL retain Python's two-list priority:
+  // preempted requests before newly arrived requests.
+  std::deque<RequestId> queue = std::exchange(preempted_, {});
+  queue.insert(queue.end(), waiting_.begin(), waiting_.end());
+  waiting_.clear();
+  return queue;
+}
+
+void VllmV1Scheduler::restore_admission_queue(
+    std::deque<RequestId> queue) {
+  for (const RequestId request_id : queue) {
+    if (cluster_type() != ClusterType::kDecode &&
+        request(request_id).preempted()) {
+      preempted_.push_back(request_id);
+    } else {
+      waiting_.push_back(request_id);
+    }
+  }
+}
+
 ScheduleResult VllmV1Scheduler::schedule(SimTime time) {
   if (!std::isfinite(time.seconds()) || time.seconds() < 0.0) {
     throw SchedulerError("schedule time must be finite and nonnegative");
@@ -490,23 +520,7 @@ ScheduleResult VllmV1Scheduler::schedule(SimTime time) {
   std::vector<ScheduledRequest> waiting_scheduled;
   if (preempted_requests.empty() &&
       pending_terminal_release_iterations_.empty()) {
-    std::deque<RequestId> queue;
-    if (cluster_type() == ClusterType::kDecode) {
-      // Python's unified DECODE scheduler has one waiting queue. A newly
-      // preempted request is inserted at its front and must stay ahead of
-      // older preempted requests already waiting for readmission.
-      queue = std::move(waiting_);
-    } else {
-      // MONOLITHIC and PREFILL retain Python's two-list priority:
-      // _preempted_requests before newly arrived _request_queue entries.
-      queue = std::move(preempted_);
-      queue.insert(
-          queue.end(),
-          waiting_.begin(),
-          waiting_.end());
-    }
-    preempted_.clear();
-    waiting_.clear();
+    std::deque<RequestId> queue = take_admission_queue();
     std::deque<RequestId> skipped;
 
     while (!queue.empty() && token_budget > 0) {
@@ -566,14 +580,7 @@ ScheduleResult VllmV1Scheduler::schedule(SimTime time) {
     }
 
     queue.insert(queue.end(), skipped.begin(), skipped.end());
-    for (const RequestId request_id : queue) {
-      if (cluster_type() != ClusterType::kDecode &&
-          request(request_id).preempted()) {
-        preempted_.push_back(request_id);
-      } else {
-        waiting_.push_back(request_id);
-      }
-    }
+    restore_admission_queue(std::move(queue));
   }
 
   result.scheduled_requests.reserve(

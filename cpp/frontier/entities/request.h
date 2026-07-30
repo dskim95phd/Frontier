@@ -42,7 +42,7 @@ class Request {
   [[nodiscard]] std::uint64_t total_tokens() const noexcept {
     return num_prefill_tokens_ + num_decode_tokens_;
   }
-  [[nodiscard]] const std::optional<SessionId>& session_id() const noexcept {
+  [[nodiscard]] SessionId session_id() const noexcept {
     return session_id_;
   }
   [[nodiscard]] const std::optional<std::uint64_t>&
@@ -81,31 +81,25 @@ class Request {
     return tokens_at_preemption_;
   }
 
-  [[nodiscard]] const std::optional<SimTime>& first_scheduled_at()
-      const noexcept {
+  [[nodiscard]] SimTime first_scheduled_at() const noexcept {
     return first_scheduled_at_;
   }
-  [[nodiscard]] const std::optional<SimTime>& prefill_completed_at()
-      const noexcept {
+  [[nodiscard]] SimTime prefill_completed_at() const noexcept {
     return prefill_completed_at_;
   }
-  [[nodiscard]] const std::optional<SimTime>&
-  first_token_completed_at() const noexcept {
+  [[nodiscard]] SimTime first_token_completed_at() const noexcept {
     return first_token_completed_at_;
   }
-  [[nodiscard]] const std::optional<SimTime>& completed_at() const noexcept {
+  [[nodiscard]] SimTime completed_at() const noexcept {
     return completed_at_;
   }
-  [[nodiscard]] const std::optional<SimTime>&
-  kv_cache_transfer_start_time() const noexcept {
+  [[nodiscard]] SimTime kv_cache_transfer_start_time() const noexcept {
     return kv_cache_transfer_start_time_;
   }
-  [[nodiscard]] const std::optional<SimTime>&
-  kv_cache_transfer_end_time() const noexcept {
+  [[nodiscard]] SimTime kv_cache_transfer_end_time() const noexcept {
     return kv_cache_transfer_end_time_;
   }
-  [[nodiscard]] const std::optional<SimTime>&
-  decode_arrived_at() const noexcept {
+  [[nodiscard]] SimTime decode_arrived_at() const noexcept {
     return decode_arrived_at_;
   }
   [[nodiscard]] std::uint64_t kv_cache_transfer_size_bytes()
@@ -147,7 +141,7 @@ class Request {
   SimTime arrived_at_;
   std::uint64_t num_prefill_tokens_;
   std::uint64_t num_decode_tokens_;
-  std::optional<SessionId> session_id_;
+  SessionId session_id_;
   std::optional<std::uint64_t> session_turn_index_;
 
   RequestState state_ = RequestState::kPending;
@@ -160,16 +154,16 @@ class Request {
   std::uint64_t preemption_count_ = 0;
   std::vector<std::uint64_t> tokens_at_preemption_;
 
-  std::optional<SimTime> first_scheduled_at_;
-  std::optional<SimTime> prefill_completed_at_;
-  std::optional<SimTime> first_token_completed_at_;
-  std::optional<SimTime> completed_at_;
-  std::optional<SimTime> kv_cache_transfer_start_time_;
-  std::optional<SimTime> kv_cache_transfer_end_time_;
-  std::optional<SimTime> decode_arrived_at_;
+  SimTime first_scheduled_at_;
+  SimTime prefill_completed_at_;
+  SimTime first_token_completed_at_;
+  SimTime completed_at_;
+  SimTime kv_cache_transfer_start_time_;
+  SimTime kv_cache_transfer_end_time_;
+  SimTime decode_arrived_at_;
   std::uint64_t kv_cache_transfer_size_bytes_ = 0;
   double kv_cache_transfer_time_s_ = 0.0;
-  std::optional<SimTime> waiting_since_;
+  SimTime waiting_since_;
   double cumulative_waiting_time_s_ = 0.0;
 };
 

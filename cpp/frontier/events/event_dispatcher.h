@@ -8,13 +8,11 @@ class SimulationContext;
 
 namespace frontier::events {
 
-class BaseEventHandler {
+class EventDispatcher {
  public:
-  virtual ~BaseEventHandler() = default;
-  [[nodiscard]] virtual EventType type() const noexcept = 0;
-  virtual void handle(
+  void dispatch(
       const Event& event,
-      simulator::SimulationContext& context) const = 0;
+      simulator::SimulationContext& context) const;
 };
 
 }  // namespace frontier::events

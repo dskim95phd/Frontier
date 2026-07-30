@@ -14,11 +14,12 @@ Cluster::Cluster(const config::ParallelismConfig& parallelism) {
 }
 
 const Replica& Cluster::replica(ReplicaId replica_id) const {
-  if (replica_id.value() >= replicas_.size()) {
+  if (!replica_id.valid() ||
+      replica_id.index() >= replicas_.size()) {
     throw std::out_of_range("unknown replica ID");
   }
   return replicas_.at(
-      static_cast<std::size_t>(replica_id.value()));
+      replica_id.index());
 }
 
 }  // namespace frontier::entities

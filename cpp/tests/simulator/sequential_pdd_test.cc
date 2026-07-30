@@ -33,7 +33,7 @@ SimulationConfig load_config() {
   const std::filesystem::path fixture_root{
       FRONTIER_TEST_FIXTURE_DIR};
   return parse_simulation_config_json(read_text_file(
-      fixture_root / "config/step3_fixed_pdd.json"));
+      fixture_root / "config/fixed_sequential_pdd.json"));
 }
 
 std::string load_small_workload() {
@@ -49,29 +49,29 @@ void test_online_prefill_transfer_decode_lifecycle() {
       config, parse_workload_csv(load_small_workload()));
 
   expect(
-      output.schema_version == 4 &&
+      output.schema_version == frontier::config::kSchemaVersion &&
           output.requests.size() == 2 &&
           output.kv_cache_transfers.size() == 2,
-      "schema v4 must complete one transfer per request");
+      "PDD must complete one transfer per request");
   for (const auto& request : output.requests) {
     expect(
-        request.prefill_replica_id.has_value() &&
-            request.prefill_dp_id.has_value() &&
-            request.decode_replica_id.has_value() &&
-            request.decode_dp_id.has_value() &&
-            request.transfer_id.has_value() &&
-            request.kv_cache_transfer_start_time.has_value() &&
-            request.kv_cache_transfer_end_time.has_value() &&
-            request.decode_arrived_at.has_value(),
+        request.prefill_replica_id.valid() &&
+            request.prefill_dp_id.valid() &&
+            request.decode_replica_id.valid() &&
+            request.decode_dp_id.valid() &&
+            request.transfer_id.valid() &&
+            request.kv_cache_transfer_start_time.valid() &&
+            request.kv_cache_transfer_end_time.valid() &&
+            request.decode_arrived_at.valid(),
         "PDD request metrics must expose both owners and transfer times");
     expect(
         request.prefill_completed_at <=
-                request.kv_cache_transfer_start_time.value() &&
-            request.kv_cache_transfer_start_time.value() <
-                request.kv_cache_transfer_end_time.value() &&
-            request.kv_cache_transfer_end_time.value() ==
-                request.decode_arrived_at.value() &&
-            request.decode_arrived_at.value() <
+                request.kv_cache_transfer_start_time &&
+            request.kv_cache_transfer_start_time <
+                request.kv_cache_transfer_end_time &&
+            request.kv_cache_transfer_end_time ==
+                request.decode_arrived_at &&
+            request.decode_arrived_at <
                 request.completed_at,
         "request lifecycle must be PREFILL -> transfer -> DECODE");
   }
@@ -108,9 +108,11 @@ void test_offline_barrier_and_deterministic_drain() {
       output.event_trace.begin(),
       output.event_trace.end(),
       [](const auto& event) {
-        return event.type == EventType::kClusterSchedule &&
-               event.payload.cluster_type.has_value() &&
-               event.payload.cluster_type.value() ==
+        return event.type() == EventType::kClusterSchedule &&
+               event
+                       .template as<
+                           frontier::ClusterSchedulePayload>()
+                       .cluster_type ==
                    ClusterType::kDecode;
       });
   expect(
@@ -123,7 +125,7 @@ void test_offline_barrier_and_deterministic_drain() {
           output.event_trace.begin(),
           output.event_trace.end(),
           [](const auto& event) {
-            return event.type == EventType::kRequestArrival;
+            return event.type() == EventType::kRequestArrival;
           }),
       "offline mode must preload requests instead of replaying arrivals");
 
@@ -138,8 +140,8 @@ void test_offline_barrier_and_deterministic_drain() {
 
 void test_prefill_and_decode_use_independent_topologies() {
   SimulationConfig config = load_config();
-  auto& prefill = config.clusters->prefill;
-  auto& decode = config.clusters->decode;
+  auto& prefill = config.pdd().clusters.prefill;
+  auto& decode = config.pdd().clusters.decode;
   prefill.parallelism = ParallelismConfig{
       .num_replicas = 2,
       .tensor_parallel_size = 2,
@@ -176,11 +178,11 @@ void test_prefill_and_decode_use_independent_topologies() {
   std::set<std::uint64_t> decode_dps;
   for (const auto& request : output.requests) {
     prefill_replicas.insert(
-        request.prefill_replica_id.value().value());
-    prefill_dps.insert(request.prefill_dp_id.value().value());
+        request.prefill_replica_id.value());
+    prefill_dps.insert(request.prefill_dp_id.value());
     decode_replicas.insert(
-        request.decode_replica_id.value().value());
-    decode_dps.insert(request.decode_dp_id.value().value());
+        request.decode_replica_id.value());
+    decode_dps.insert(request.decode_dp_id.value());
   }
   expect(
       prefill_replicas == std::set<std::uint64_t>{0, 1} &&
@@ -208,7 +210,7 @@ void test_prefill_and_decode_use_independent_topologies() {
 
 void test_decode_preemption_recovers_to_quiescence() {
   SimulationConfig config = load_config();
-  config.clusters->decode.scheduler.num_blocks = 3;
+  config.pdd().clusters.decode.scheduler.num_blocks = 3;
   const auto output = run_simulation(
       config,
       parse_workload_csv(

@@ -30,8 +30,8 @@ void ReplicaStageScheduler::add_batch(
       [&batch](const StageBatchTicket& ticket) {
         return ticket.batch_id == batch.id();
       };
-  if ((active_batch_id_.has_value() &&
-       active_batch_id_.value() == batch.id()) ||
+  if ((active_batch_id_.valid() &&
+       active_batch_id_ == batch.id()) ||
       std::find_if(queue_.begin(), queue_.end(), has_batch_id) !=
           queue_.end()) {
     throw ReplicaStageSchedulerError(
@@ -45,7 +45,7 @@ void ReplicaStageScheduler::add_batch(
 
 std::optional<StageBatchTicket>
 ReplicaStageScheduler::pop_batch_if_not_busy() {
-  if (active_batch_id_.has_value() || queue_.empty()) {
+  if (active_batch_id_.valid() || queue_.empty()) {
     return std::nullopt;
   }
   const StageBatchTicket ticket = queue_.front();
@@ -58,8 +58,8 @@ execution_time_predictor::BatchExecutionPrediction
 ReplicaStageScheduler::predict(
     const entities::Batch& batch,
     const std::vector<entities::Request>& requests) const {
-  if (!active_batch_id_.has_value() ||
-      active_batch_id_.value() != batch.id()) {
+  if (!active_batch_id_.valid() ||
+      active_batch_id_ != batch.id()) {
     throw ReplicaStageSchedulerError(
         "only the active stage batch can be predicted");
   }
@@ -67,12 +67,12 @@ ReplicaStageScheduler::predict(
 }
 
 void ReplicaStageScheduler::on_stage_end(BatchId batch_id) {
-  if (!active_batch_id_.has_value() ||
-      active_batch_id_.value() != batch_id) {
+  if (!active_batch_id_.valid() ||
+      active_batch_id_ != batch_id) {
     throw ReplicaStageSchedulerError(
         "stage completion does not match the active batch");
   }
-  active_batch_id_.reset();
+  active_batch_id_ = BatchId{};
 }
 
 }  // namespace frontier::scheduler

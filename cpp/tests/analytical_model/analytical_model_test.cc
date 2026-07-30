@@ -72,10 +72,10 @@ Json load_golden() {
   return Json::parse(read_text_file(path));
 }
 
-Json load_step2_batch_golden() {
+Json load_batch_golden() {
   const std::filesystem::path path =
       std::filesystem::path{FRONTIER_TEST_FIXTURE_DIR} /
-      "analytical/step2_batch_v1.json";
+      "analytical/analytical_batch_v1.json";
   return Json::parse(read_text_file(path));
 }
 
@@ -247,11 +247,11 @@ double diagnostic_value(
   return iterator->second;
 }
 
-void test_step2_batch_model_matches_python_golden() {
-  const Json golden = load_step2_batch_golden();
+void test_batch_model_matches_python_golden() {
+  const Json golden = load_batch_golden();
   expect(
       golden.at("schema_version").get<int>() == 1,
-      "Step 2 analytical batch golden schema must be version 1");
+      "analytical batch golden schema must be version 1");
   const analytical::AnalyticalBatchExecutionModel model{
       frontier::config::AnalyticalExecutionModelConfig{}};
 
@@ -275,7 +275,7 @@ void test_step2_batch_model_matches_python_golden() {
           .arrived_at = SimTime::from_seconds(0.0),
           .num_prefill_tokens = prefill_tokens,
           .num_decode_tokens = 2,
-          .session_id = std::nullopt,
+          .session_id = frontier::SessionId{},
           .session_turn_index = std::nullopt,
       });
       Request& request = requests.back();
@@ -493,8 +493,8 @@ int main() {
       "long-context decode cost increases",
       test_long_context_decode_cost_increases);
   failures += frontier::test::run(
-      "Step 2 batch model matches Python golden",
-      test_step2_batch_model_matches_python_golden);
+      "batch model matches Python golden",
+      test_batch_model_matches_python_golden);
   failures += frontier::test::run(
       "communication matches Python golden",
       test_communication_matches_python_golden);

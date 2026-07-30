@@ -1,4 +1,4 @@
-#include "frontier/scheduler/cluster_scheduler/co_location_cluster_scheduler.h"
+#include "frontier/scheduler/cluster_scheduler/round_robin_cluster_scheduler.h"
 
 #include <algorithm>
 #include <limits>
@@ -6,9 +6,9 @@
 
 namespace frontier::scheduler {
 
-CoLocationClusterScheduler::CoLocationClusterScheduler(
+RoundRobinClusterScheduler::RoundRobinClusterScheduler(
     std::unique_ptr<BaseReplicaScheduler> replica_scheduler)
-    : CoLocationClusterScheduler(
+    : RoundRobinClusterScheduler(
           [&replica_scheduler] {
             std::vector<std::unique_ptr<BaseReplicaScheduler>> result;
             result.push_back(std::move(replica_scheduler));
@@ -17,7 +17,7 @@ CoLocationClusterScheduler::CoLocationClusterScheduler(
           1,
           1) {}
 
-CoLocationClusterScheduler::CoLocationClusterScheduler(
+RoundRobinClusterScheduler::RoundRobinClusterScheduler(
     std::vector<std::unique_ptr<BaseReplicaScheduler>>
         replica_schedulers,
     std::uint64_t num_replicas,
@@ -34,7 +34,7 @@ CoLocationClusterScheduler::CoLocationClusterScheduler(
       replica_schedulers_.size() !=
           num_replicas_ * data_parallel_size_) {
     throw ClusterSchedulerError(
-        "co-location cluster target matrix is invalid");
+        "cluster target matrix is invalid");
   }
   for (std::uint64_t replica = 0; replica < num_replicas_;
        ++replica) {
@@ -46,13 +46,13 @@ CoLocationClusterScheduler::CoLocationClusterScheduler(
           scheduler->replica_id() != ReplicaId{replica} ||
           scheduler->dp_id() != DataParallelId{dp}) {
         throw ClusterSchedulerError(
-            "co-location cluster scheduler target identity mismatch");
+            "cluster scheduler target identity mismatch");
       }
     }
   }
 }
 
-void CoLocationClusterScheduler::add_request(
+void RoundRobinClusterScheduler::add_request(
     RequestId request_id,
     SimTime arrived_at) {
   request_queue_.push_back(QueuedRequest{
@@ -62,7 +62,7 @@ void CoLocationClusterScheduler::add_request(
 }
 
 std::vector<ClusterRequestAssignment>
-CoLocationClusterScheduler::schedule() {
+RoundRobinClusterScheduler::schedule() {
   // Python's BaseClusterScheduler sorts the pending queue by the request's
   // original arrival time before every routing pass. std::stable_sort also
   // preserves event insertion order when arrival times are equal.
@@ -161,7 +161,7 @@ CoLocationClusterScheduler::schedule() {
 }
 
 std::vector<std::pair<ReplicaId, DataParallelId>>
-CoLocationClusterScheduler::targets() const {
+RoundRobinClusterScheduler::targets() const {
   std::vector<std::pair<ReplicaId, DataParallelId>> result;
   result.reserve(replica_schedulers_.size());
   for (const auto& scheduler : replica_schedulers_) {
@@ -171,21 +171,22 @@ CoLocationClusterScheduler::targets() const {
   return result;
 }
 
-std::size_t CoLocationClusterScheduler::target_index(
+std::size_t RoundRobinClusterScheduler::target_index(
     ReplicaId replica_id,
     DataParallelId dp_id) const {
-  if (replica_id.value() >= num_replicas_ ||
-      dp_id.value() >= data_parallel_size_) {
+  if (!replica_id.valid() || !dp_id.valid() ||
+      replica_id.index() >= num_replicas_ ||
+      dp_id.index() >= data_parallel_size_) {
     throw ClusterSchedulerError(
-        "co-location cluster references an unknown replica target");
+        "cluster references an unknown replica target");
   }
   return static_cast<std::size_t>(
-      replica_id.value() * data_parallel_size_ +
-      dp_id.value());
+      replica_id.index() * data_parallel_size_ +
+      dp_id.index());
 }
 
 BaseReplicaScheduler&
-CoLocationClusterScheduler::get_replica_scheduler(
+RoundRobinClusterScheduler::get_replica_scheduler(
     ReplicaId replica_id,
     DataParallelId dp_id) {
   return *replica_schedulers_.at(
@@ -193,7 +194,7 @@ CoLocationClusterScheduler::get_replica_scheduler(
 }
 
 const BaseReplicaScheduler&
-CoLocationClusterScheduler::get_replica_scheduler(
+RoundRobinClusterScheduler::get_replica_scheduler(
     ReplicaId replica_id,
     DataParallelId dp_id) const {
   return *replica_schedulers_.at(

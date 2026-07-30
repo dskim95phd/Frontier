@@ -9,48 +9,12 @@
 
 #include "frontier/execution_time_predictor/batch_execution_model.h"
 #include "frontier/kv_cache_transfer/analytical_transfer.h"
-#include "frontier/scheduler/cluster_scheduler/co_location_cluster_scheduler.h"
+#include "frontier/scheduler/cluster_scheduler/round_robin_cluster_scheduler.h"
+#include "frontier/scheduler/global_scheduler/global_scheduler.h"
 #include "frontier/scheduler/replica_scheduler/vllm_v1_engine_replica_scheduler.h"
 
 namespace frontier::simulator {
 namespace {
-
-config::ParallelismConfig resolve_parallelism(
-    const config::SimulationConfig& config) {
-  if (config.parallelism.has_value()) {
-    return config.parallelism.value();
-  }
-  config::ParallelismConfig result;
-  if (config.execution_model.has_value() &&
-      config.execution_model->type ==
-          config::ExecutionModelType::kAnalytical) {
-    result.tensor_parallel_size =
-        config.execution_model->analytical.tensor_parallel_size;
-  }
-  return result;
-}
-
-std::vector<entities::RequestBatchSnapshot> make_snapshots(
-    const scheduler::ScheduleResult& schedule,
-    const std::vector<entities::Request>& requests) {
-  std::vector<entities::RequestBatchSnapshot> result;
-  result.reserve(schedule.scheduled_requests.size());
-  for (const scheduler::ScheduledRequest& scheduled :
-       schedule.scheduled_requests) {
-    const entities::Request& request = requests.at(
-        static_cast<std::size_t>(scheduled.request_id.value()));
-    result.push_back(entities::RequestBatchSnapshot{
-        .request_id = scheduled.request_id,
-        .scheduled_tokens = scheduled.num_tokens,
-        .runtime_epoch = request.runtime_epoch(),
-        .execution_epoch = request.execution_epoch(),
-        .processed_tokens = request.num_processed_tokens(),
-        .scheduler_frontier =
-            request.scheduler_num_computed_tokens(),
-    });
-  }
-  return result;
-}
 
 std::unique_ptr<scheduler::BaseClusterScheduler>
 make_cluster_scheduler(
@@ -82,7 +46,7 @@ make_cluster_scheduler(
     }
   }
   return std::make_unique<
-      scheduler::CoLocationClusterScheduler>(
+      scheduler::RoundRobinClusterScheduler>(
           std::move(replica_schedulers),
           runtime.parallelism.num_replicas,
           runtime.parallelism.data_parallel_size,
@@ -95,17 +59,13 @@ SimulationContext::SimulationContext(
     const config::SimulationConfig& config,
     const std::vector<request_generator::WorkloadRequest>& workload)
     : config_(config),
-      parallelism_(resolve_parallelism(config_)),
-      cluster_(parallelism_),
-      completion_recorded_(workload.size(), false),
+      entities_(workload, config.simulation_mode),
       output_{
           .schema_version = config.schema_version,
           .run = metrics::RunMetadata{
               .run_id = config.run_id,
               .simulation_mode = config.simulation_mode,
               .system_architecture = config.system_architecture,
-              .metrics_semantics =
-                  metrics::MetricsSemantics::kCanonical,
           },
           .requests = {},
           .batches = {},
@@ -116,66 +76,44 @@ SimulationContext::SimulationContext(
           .kv_cache_transfers = {},
       } {
   const bool is_pdd =
-      config_.schema_version == config::kPddSchemaVersion;
-  if ((!is_pdd &&
-       (!config_.scheduler.has_value() ||
-        !config_.execution_model.has_value())) ||
-      (is_pdd &&
-       (!config_.clusters.has_value() ||
-        !config_.kv_cache_transfer.has_value()))) {
-    throw std::invalid_argument(
-        "simulation context is missing runtime configuration");
-  }
-  requests_.reserve(workload.size());
-  for (const auto& request : workload) {
-    request_generator::WorkloadRequest normalized = request;
-    if (config_.simulation_mode ==
-        config::SimulationMode::kOffline) {
-      normalized.arrived_at = SimTime::from_seconds(0.0);
-    }
-    requests_.emplace_back(normalized);
-  }
-  request_transfer_ids_.resize(workload.size());
+      config_.system_architecture ==
+      config::SystemArchitecture::kPdDisaggregation;
 
   std::vector<std::unique_ptr<scheduler::BaseClusterScheduler>>
       cluster_schedulers;
   if (is_pdd) {
     const config::PddClustersConfig& clusters =
-        config_.clusters.value();
+        config_.pdd().clusters;
     cluster_parallelism_.emplace(
         ClusterType::kPrefill,
         clusters.prefill.parallelism);
     cluster_parallelism_.emplace(
         ClusterType::kDecode,
         clusters.decode.parallelism);
-    request_targets_[ClusterType::kPrefill].resize(workload.size());
-    request_targets_[ClusterType::kDecode].resize(workload.size());
+    entities_.add_target_domain(ClusterType::kPrefill);
+    entities_.add_target_domain(ClusterType::kDecode);
     cluster_schedulers.push_back(make_cluster_scheduler(
-        clusters.prefill, requests_, ClusterType::kPrefill));
+        clusters.prefill, entities_.requests(), ClusterType::kPrefill));
     cluster_schedulers.push_back(make_cluster_scheduler(
-        clusters.decode, requests_, ClusterType::kDecode));
+        clusters.decode, entities_.requests(), ClusterType::kDecode));
     expected_decode_arrivals_ = workload.size();
   } else {
+    const config::ClusterRuntimeConfig& runtime = config_.cluster();
     cluster_parallelism_.emplace(
-        ClusterType::kMonolithic, parallelism_);
-    request_targets_[ClusterType::kMonolithic].resize(workload.size());
-    const config::ClusterRuntimeConfig runtime{
-        .parallelism = parallelism_,
-        .scheduler = config_.scheduler.value(),
-        .execution_model = config_.execution_model.value(),
-    };
+        ClusterType::kMonolithic, runtime.parallelism);
+    entities_.add_target_domain(ClusterType::kMonolithic);
     cluster_schedulers.push_back(make_cluster_scheduler(
-        runtime, requests_, ClusterType::kMonolithic));
+        runtime, entities_.requests(), ClusterType::kMonolithic));
   }
   global_scheduler_ =
-      std::make_unique<scheduler::CoLocationGlobalScheduler>(
+      std::make_unique<scheduler::GlobalScheduler>(
           std::move(cluster_schedulers));
 
   output_.event_trace.reserve(workload.size() * 12);
   if (config_.simulation_mode ==
       config::SimulationMode::kOffline) {
     const SimTime start = SimTime::from_seconds(0.0);
-    for (entities::Request& request : requests_) {
+    for (entities::Request& request : entities_.requests()) {
       request.on_arrival(start);
       global_scheduler_->add_request(
           request.id(),
@@ -183,28 +121,27 @@ SimulationContext::SimulationContext(
               ? ClusterType::kPrefill
               : ClusterType::kMonolithic);
     }
-    EventPayload payload;
-    payload.cluster_type =
-        is_pdd ? ClusterType::kPrefill : ClusterType::kMonolithic;
     event_queue_.push(
-        start, EventType::kGlobalSchedule, std::move(payload));
+        start,
+        GlobalSchedulePayload{
+            .cluster_type =
+                is_pdd
+                ? ClusterType::kPrefill
+                : ClusterType::kMonolithic,
+        });
   } else {
     for (const auto& request : workload) {
-      EventPayload payload;
-      payload.request_id = request.request_id;
-      payload.cluster_type =
-          is_pdd ? ClusterType::kPrefill : ClusterType::kMonolithic;
       event_queue_.push(
           request.arrived_at,
-          EventType::kRequestArrival,
-          std::move(payload));
+          RequestArrivalPayload{
+              .request_id = request.request_id,
+              .cluster_type =
+                  is_pdd
+                  ? ClusterType::kPrefill
+                  : ClusterType::kMonolithic,
+          });
     }
   }
-}
-
-scheduler::BaseClusterScheduler&
-SimulationContext::monolithic_cluster() {
-  return cluster(ClusterType::kMonolithic);
 }
 
 scheduler::BaseClusterScheduler& SimulationContext::cluster(
@@ -230,99 +167,61 @@ const config::ParallelismConfig& SimulationContext::parallelism(
 const config::ExecutionModelConfig&
 SimulationContext::execution_model(
     ClusterType cluster_type) const {
-  if (config_.schema_version == config::kPddSchemaVersion) {
+  if (config_.system_architecture ==
+      config::SystemArchitecture::kPdDisaggregation) {
+    const config::PddClustersConfig& clusters =
+        config_.pdd().clusters;
     if (cluster_type == ClusterType::kPrefill) {
-      return config_.clusters->prefill.execution_model;
+      return clusters.prefill.execution_model;
     }
     if (cluster_type == ClusterType::kDecode) {
-      return config_.clusters->decode.execution_model;
+      return clusters.decode.execution_model;
     }
     throw std::out_of_range(
         "PDD execution model references unknown cluster");
   }
-  if (cluster_type != ClusterType::kMonolithic ||
-      !config_.execution_model.has_value()) {
+  if (cluster_type != ClusterType::kMonolithic) {
     throw std::out_of_range(
-        "co-location execution model references unknown cluster");
+        "single-cluster execution model references unknown cluster");
   }
-  return config_.execution_model.value();
+  return config_.cluster().execution_model;
 }
 
 entities::Request& SimulationContext::request(
     RequestId request_id) {
-  if (request_id.value() >= requests_.size()) {
-    throw std::out_of_range("event references unknown request");
-  }
-  entities::Request& result = requests_.at(
-      static_cast<std::size_t>(request_id.value()));
-  if (result.id() != request_id) {
-    throw std::logic_error("request arena invariant failed");
-  }
-  return result;
+  return entities_.request(request_id);
 }
 
 const entities::Request& SimulationContext::request(
     RequestId request_id) const {
-  return const_cast<SimulationContext*>(this)->request(request_id);
+  return entities_.request(request_id);
 }
 
 entities::Batch& SimulationContext::batch(BatchId batch_id) {
-  if (batch_id.value() >= batches_.size()) {
-    throw std::out_of_range("event references unknown batch");
-  }
-  entities::Batch& result = batches_.at(
-      static_cast<std::size_t>(batch_id.value()));
-  if (result.id() != batch_id) {
-    throw std::logic_error("batch arena invariant failed");
-  }
-  return result;
+  return entities_.batch(batch_id);
 }
 
 const entities::Batch& SimulationContext::batch(
     BatchId batch_id) const {
-  return const_cast<SimulationContext*>(this)->batch(batch_id);
+  return entities_.batch(batch_id);
 }
 
 BatchId SimulationContext::create_batch(
     const scheduler::ScheduleResult& schedule,
     scheduler::ReplicaTarget target,
     ClusterType cluster_type) {
-  const BatchId batch_id{
-      static_cast<BatchId::ValueType>(batches_.size())};
-  const Generation generation{
-      static_cast<Generation::ValueType>(batches_.size() + 1)};
-  batches_.emplace_back(
-      batch_id,
-      schedule.iteration_id,
-      make_snapshots(schedule, requests_),
-      schedule.simulation_time,
-      generation,
-      target.replica_id,
-      target.dp_id,
-      parallelism(cluster_type).pipeline_parallel_size,
-      cluster_type);
-  stage_arrival_times_.emplace_back(
-      static_cast<std::size_t>(
-          parallelism(cluster_type).pipeline_parallel_size));
-  stage_record_indices_.emplace_back(
-      static_cast<std::size_t>(
-          parallelism(cluster_type).pipeline_parallel_size));
-  predicted_batch_ms_.push_back(0.0);
-  return batch_id;
+  return entities_.create_batch(
+      schedule,
+      target,
+      cluster_type,
+      parallelism(cluster_type).pipeline_parallel_size);
 }
 
 void SimulationContext::record_stage_arrival(
     BatchId batch_id,
     StageId stage_id,
     SimTime time) {
-  auto& arrivals = stage_arrival_times_.at(
-      static_cast<std::size_t>(batch_id.value()));
-  std::optional<SimTime>& arrival = arrivals.at(
-      static_cast<std::size_t>(stage_id.value()));
-  if (arrival.has_value()) {
-    throw std::logic_error("batch stage arrived more than once");
-  }
-  arrival = time;
+  entities_.record_stage_arrival(batch_id, stage_id, time);
 }
 
 entities::BatchStage& SimulationContext::create_batch_stage(
@@ -331,97 +230,48 @@ entities::BatchStage& SimulationContext::create_batch_stage(
     SimTime started_at,
     const execution_time_predictor::BatchExecutionPrediction&
         prediction) {
-  const std::size_t batch_index =
-      static_cast<std::size_t>(batch_id.value());
-  const std::size_t stage_index =
-      static_cast<std::size_t>(stage_id.value());
-  const std::optional<SimTime>& arrival =
-      stage_arrival_times_.at(batch_index).at(stage_index);
-  if (!arrival.has_value()) {
-    throw std::logic_error("batch stage schedule has no arrival");
-  }
-  std::optional<std::size_t>& record_index =
-      stage_record_indices_.at(batch_index).at(stage_index);
-  if (record_index.has_value()) {
-    throw std::logic_error("batch stage record already exists");
-  }
-  batch_stages_.emplace_back(
-      batch_id,
-      batch(batch_id).replica_id(),
-      batch(batch_id).dp_id(),
-      stage_id,
-      arrival.value(),
-      prediction.execution_time);
-  record_index = batch_stages_.size() - 1;
-  entities::BatchStage& stage =
-      batch_stages_.back();
-  stage.mark_started(started_at);
-  predicted_batch_ms_.at(batch_index) +=
-      prediction.duration_ms;
-  return stage;
+  return entities_.create_batch_stage(
+      batch_id, stage_id, started_at, prediction);
 }
 
 entities::BatchStage& SimulationContext::batch_stage(
     BatchId batch_id,
     StageId stage_id) {
-  const std::optional<std::size_t>& index =
-      stage_record_indices_
-          .at(static_cast<std::size_t>(batch_id.value()))
-          .at(static_cast<std::size_t>(stage_id.value()));
-  if (!index.has_value()) {
-    throw std::logic_error("batch stage record does not exist");
-  }
-  return batch_stages_.at(index.value());
+  return entities_.batch_stage(batch_id, stage_id);
 }
 
 double SimulationContext::predicted_batch_ms(
     BatchId batch_id) const {
-  return predicted_batch_ms_.at(
-      static_cast<std::size_t>(batch_id.value()));
+  return entities_.predicted_batch_ms(batch_id);
 }
 
 void SimulationContext::assign_request_target(
     RequestId request_id,
     scheduler::ReplicaTarget target,
     ClusterType cluster_type) {
-  std::optional<scheduler::ReplicaTarget>& current =
-      request_targets_.at(cluster_type).at(
-          static_cast<std::size_t>(request_id.value()));
-  if (current.has_value() && current.value() != target) {
-    throw std::logic_error(
-        "request was routed to more than one target");
-  }
-  current = target;
+  entities_.assign_request_target(
+      request_id, target, cluster_type);
 }
 
 scheduler::ReplicaTarget SimulationContext::request_target(
     RequestId request_id,
     ClusterType cluster_type) const {
-  const auto& target = request_targets_.at(cluster_type).at(
-      static_cast<std::size_t>(request_id.value()));
-  if (!target.has_value()) {
-    throw std::logic_error("request has no replica target");
-  }
-  return target.value();
+  return entities_.request_target(request_id, cluster_type);
 }
 
 TransferId SimulationContext::create_kv_cache_transfer(
     RequestId request_id,
     BatchId source_batch_id,
     scheduler::ReplicaTarget source_target) {
-  if (config_.schema_version != config::kPddSchemaVersion ||
-      !config_.kv_cache_transfer.has_value()) {
+  if (config_.system_architecture !=
+          config::SystemArchitecture::kPdDisaggregation ||
+      !std::holds_alternative<config::PddRuntimeConfig>(
+          config_.runtime)) {
     throw std::logic_error(
-        "KV transfers require schema v4");
-  }
-  const std::size_t request_index =
-      static_cast<std::size_t>(request_id.value());
-  if (request_transfer_ids_.at(request_index).has_value()) {
-    throw std::logic_error(
-        "request already owns a KV transfer");
+        "KV transfers require pd-disaggregation");
   }
   const config::KvCacheTransferConfig& transfer =
-      config_.kv_cache_transfer.value();
+      config_.pdd().kv_cache_transfer;
   const std::uint64_t size_bytes =
       frontier::kv_cache_transfer::dense_kv_cache_size_bytes(
           request(request_id).num_prefill_tokens(),
@@ -444,56 +294,29 @@ TransferId SimulationContext::create_kv_cache_transfer(
               .enable_compression = false,
               .compression_ratio = 1.0,
           });
-  const TransferId transfer_id{
-      static_cast<TransferId::ValueType>(
-          kv_cache_transfers_.size())};
-  const entities::Batch& source_batch = batch(source_batch_id);
-  kv_cache_transfers_.emplace_back(
-      transfer_id,
+  return entities_.create_kv_cache_transfer(
       request_id,
       source_batch_id,
-      source_target.replica_id,
-      source_target.dp_id,
+      source_target,
       prediction.size_bytes,
-      prediction.transfer_time_ms,
-      source_batch.schedule_epoch());
-  request_transfer_ids_.at(request_index) = transfer_id;
-  return transfer_id;
+      prediction.transfer_time_ms);
 }
 
 entities::KVCacheTransferInfo&
 SimulationContext::kv_cache_transfer(
     TransferId transfer_id) {
-  if (transfer_id.value() >= kv_cache_transfers_.size()) {
-    throw std::out_of_range(
-        "event references unknown KV transfer");
-  }
-  entities::KVCacheTransferInfo& transfer =
-      kv_cache_transfers_.at(
-          static_cast<std::size_t>(transfer_id.value()));
-  if (transfer.id() != transfer_id) {
-    throw std::logic_error(
-        "KV transfer arena invariant failed");
-  }
-  return transfer;
+  return entities_.kv_cache_transfer(transfer_id);
 }
 
 const entities::KVCacheTransferInfo&
 SimulationContext::kv_cache_transfer(
     TransferId transfer_id) const {
-  return const_cast<SimulationContext*>(this)
-      ->kv_cache_transfer(transfer_id);
+  return entities_.kv_cache_transfer(transfer_id);
 }
 
 TransferId SimulationContext::request_transfer_id(
     RequestId request_id) const {
-  const auto& transfer = request_transfer_ids_.at(
-      static_cast<std::size_t>(request_id.value()));
-  if (!transfer.has_value()) {
-    throw std::logic_error(
-        "request has no KV transfer");
-  }
-  return transfer.value();
+  return entities_.request_transfer_id(request_id);
 }
 
 bool SimulationContext::on_decode_kv_arrival() {
@@ -508,23 +331,18 @@ bool SimulationContext::on_decode_kv_arrival() {
 
 void SimulationContext::record_request_completion(
     RequestId request_id) {
-  const std::size_t index =
-      static_cast<std::size_t>(request_id.value());
-  if (!completion_recorded_.at(index)) {
-    completion_recorded_[index] = true;
-    completion_order_.push_back(request_id);
-  }
+  entities_.record_request_completion(request_id);
 }
 
 bool SimulationContext::request_completion_recorded(
     RequestId request_id) const {
-  return completion_recorded_.at(
-      static_cast<std::size_t>(request_id.value()));
+  return entities_.request_completion_recorded(request_id);
 }
 
 void SimulationContext::finalize() {
   if (!global_scheduler_->empty() ||
-      completion_order_.size() != requests_.size()) {
+      entities_.completion_order().size() !=
+          entities_.request_count()) {
     throw std::runtime_error(
         "simulation quiesced with incomplete global or request state");
   }
@@ -560,12 +378,14 @@ void SimulationContext::finalize() {
       }
     }
   }
-  if (config_.schema_version == config::kPddSchemaVersion) {
+  if (config_.system_architecture ==
+      config::SystemArchitecture::kPdDisaggregation) {
+    const auto& transfers = entities_.kv_cache_transfers();
     if (decode_arrivals_ != expected_decode_arrivals_ ||
-        kv_cache_transfers_.size() != requests_.size() ||
+        transfers.size() != entities_.request_count() ||
         std::any_of(
-            kv_cache_transfers_.begin(),
-            kv_cache_transfers_.end(),
+            transfers.begin(),
+            transfers.end(),
             [](const entities::KVCacheTransferInfo& transfer) {
               return transfer.state() !=
                   entities::KVCacheTransferState::kCompleted;
@@ -574,19 +394,21 @@ void SimulationContext::finalize() {
           "simulation quiesced with incomplete PDD transfer state");
     }
   }
-  output_.requests.reserve(completion_order_.size());
-  for (const RequestId request_id : completion_order_) {
+  output_.requests.reserve(entities_.completion_order().size());
+  for (const RequestId request_id :
+       entities_.completion_order()) {
     const entities::Request& value = request(request_id);
     if (!value.completed() ||
-        !value.first_scheduled_at().has_value() ||
-        !value.prefill_completed_at().has_value() ||
-        !value.first_token_completed_at().has_value() ||
-        !value.completed_at().has_value()) {
+        !value.first_scheduled_at().valid() ||
+        !value.prefill_completed_at().valid() ||
+        !value.first_token_completed_at().valid() ||
+        !value.completed_at().valid()) {
       throw std::runtime_error(
           "completed request is missing canonical metrics");
     }
     const bool is_pdd =
-        config_.schema_version == config::kPddSchemaVersion;
+        config_.system_architecture ==
+        config::SystemArchitecture::kPdDisaggregation;
     const scheduler::ReplicaTarget target = request_target(
         request_id,
         is_pdd
@@ -596,8 +418,8 @@ void SimulationContext::finalize() {
         .request_id = request_id,
         .arrived_at = value.arrived_at(),
         .prefill_completed_at =
-            value.prefill_completed_at().value(),
-        .completed_at = value.completed_at().value(),
+            value.prefill_completed_at(),
+        .completed_at = value.completed_at(),
         .first_scheduled_at = value.first_scheduled_at(),
         .first_token_completed_at =
             value.first_token_completed_at(),
@@ -607,14 +429,14 @@ void SimulationContext::finalize() {
         .tokens_at_preemption = {},
         .replica_id = target.replica_id,
         .dp_id = target.dp_id,
-        .prefill_replica_id = std::nullopt,
-        .prefill_dp_id = std::nullopt,
-        .decode_replica_id = std::nullopt,
-        .decode_dp_id = std::nullopt,
-        .transfer_id = std::nullopt,
-        .kv_cache_transfer_start_time = std::nullopt,
-        .kv_cache_transfer_end_time = std::nullopt,
-        .decode_arrived_at = std::nullopt,
+        .prefill_replica_id = ReplicaId{},
+        .prefill_dp_id = DataParallelId{},
+        .decode_replica_id = ReplicaId{},
+        .decode_dp_id = DataParallelId{},
+        .transfer_id = TransferId{},
+        .kv_cache_transfer_start_time = SimTime{},
+        .kv_cache_transfer_end_time = SimTime{},
+        .decode_arrived_at = SimTime{},
         .kv_cache_transfer_size_bytes = 0,
     };
     if (is_pdd) {

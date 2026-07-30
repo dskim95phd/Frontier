@@ -78,7 +78,7 @@ std::uint64_t Batch::total_scheduled_tokens() const noexcept {
 }
 
 void Batch::mark_completed(SimTime time) {
-  if (completed_at_.has_value()) {
+  if (completed_at_.valid()) {
     throw BatchError("batch completed more than once");
   }
   if (!std::isfinite(time.seconds()) ||

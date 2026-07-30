@@ -7,12 +7,12 @@
 
 namespace frontier::scheduler {
 
-class CoLocationClusterScheduler final
+class RoundRobinClusterScheduler final
     : public BaseClusterScheduler {
  public:
-  explicit CoLocationClusterScheduler(
+  explicit RoundRobinClusterScheduler(
       std::unique_ptr<BaseReplicaScheduler> replica_scheduler);
-  CoLocationClusterScheduler(
+  RoundRobinClusterScheduler(
       std::vector<std::unique_ptr<BaseReplicaScheduler>>
           replica_schedulers,
       std::uint64_t num_replicas,

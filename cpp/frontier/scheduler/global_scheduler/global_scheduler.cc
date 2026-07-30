@@ -1,19 +1,19 @@
-#include "frontier/scheduler/global_scheduler/co_location_global_scheduler.h"
+#include "frontier/scheduler/global_scheduler/global_scheduler.h"
 
 #include <utility>
 
 namespace frontier::scheduler {
 
-CoLocationGlobalScheduler::CoLocationGlobalScheduler(
+GlobalScheduler::GlobalScheduler(
     std::unique_ptr<BaseClusterScheduler> cluster_scheduler)
-    : CoLocationGlobalScheduler(
+    : GlobalScheduler(
           [&cluster_scheduler] {
             std::vector<std::unique_ptr<BaseClusterScheduler>> result;
             result.push_back(std::move(cluster_scheduler));
             return result;
           }()) {}
 
-CoLocationGlobalScheduler::CoLocationGlobalScheduler(
+GlobalScheduler::GlobalScheduler(
     std::vector<std::unique_ptr<BaseClusterScheduler>>
         cluster_schedulers) {
   if (cluster_schedulers.empty()) {
@@ -33,7 +33,7 @@ CoLocationGlobalScheduler::CoLocationGlobalScheduler(
   }
 }
 
-void CoLocationGlobalScheduler::add_request(
+void GlobalScheduler::add_request(
     RequestId request_id,
     ClusterType cluster_type) {
   static_cast<void>(get_cluster_scheduler(cluster_type));
@@ -44,7 +44,7 @@ void CoLocationGlobalScheduler::add_request(
 }
 
 std::vector<GlobalRequestAssignment>
-CoLocationGlobalScheduler::schedule() {
+GlobalScheduler::schedule() {
   std::vector<GlobalRequestAssignment> result =
       std::move(request_queue_);
   request_queue_.clear();
@@ -52,7 +52,7 @@ CoLocationGlobalScheduler::schedule() {
 }
 
 BaseClusterScheduler&
-CoLocationGlobalScheduler::get_cluster_scheduler(
+GlobalScheduler::get_cluster_scheduler(
     ClusterType cluster_type) {
   const auto position = cluster_schedulers_.find(cluster_type);
   if (position == cluster_schedulers_.end()) {
@@ -63,7 +63,7 @@ CoLocationGlobalScheduler::get_cluster_scheduler(
 }
 
 const BaseClusterScheduler&
-CoLocationGlobalScheduler::get_cluster_scheduler(
+GlobalScheduler::get_cluster_scheduler(
     ClusterType cluster_type) const {
   const auto position = cluster_schedulers_.find(cluster_type);
   if (position == cluster_schedulers_.end()) {

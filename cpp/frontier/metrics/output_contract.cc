@@ -17,15 +17,9 @@ namespace {
 
 using OrderedJson = nlohmann::ordered_json;
 
-bool has_scheduler_contract(int schema_version) {
-  return schema_version == config::kSchedulerSchemaVersion ||
-      schema_version == config::kParallelSchemaVersion ||
-      schema_version == config::kPddSchemaVersion;
-}
-
-bool has_parallel_contract(int schema_version) {
-  return schema_version == config::kParallelSchemaVersion ||
-      schema_version == config::kPddSchemaVersion;
+bool is_pdd(config::SystemArchitecture architecture) {
+  return architecture ==
+      config::SystemArchitecture::kPdDisaggregation;
 }
 
 void require_valid_time(SimTime time, std::string_view field) {
@@ -50,7 +44,7 @@ double milliseconds_between(
 
 void validate_request_metrics(
     const std::vector<RequestMetricsRecord>& requests,
-    int schema_version) {
+    config::SystemArchitecture architecture) {
   std::unordered_set<std::uint64_t> request_ids;
   request_ids.reserve(requests.size());
   for (const RequestMetricsRecord& request : requests) {
@@ -72,46 +66,44 @@ void validate_request_metrics(
       throw std::invalid_argument(
           "completed_at must not precede prefill_completed_at");
     }
-    if (has_scheduler_contract(schema_version)) {
-      if (!request.first_scheduled_at.has_value() ||
-          !request.first_token_completed_at.has_value()) {
-        throw std::invalid_argument(
-            "schema v2 request metrics require canonical scheduling and "
-            "first-token timestamps");
-      }
-      static_cast<void>(milliseconds_between(
-          request.first_scheduled_at.value(),
-          request.arrived_at,
-          "first_scheduled_at"));
-      static_cast<void>(milliseconds_between(
-          request.first_token_completed_at.value(),
-          request.arrived_at,
-          "first_token_completed_at"));
-      if (request.first_token_completed_at->seconds() <
-          request.prefill_completed_at.seconds()) {
-        throw std::invalid_argument(
-            "first token completion must not precede prefill completion");
-      }
+    if (!request.first_scheduled_at.valid() ||
+        !request.first_token_completed_at.valid()) {
+      throw std::invalid_argument(
+          "request metrics require canonical scheduling and "
+          "first-token timestamps");
     }
-    if (schema_version == config::kPddSchemaVersion) {
-      if (!request.prefill_replica_id.has_value() ||
-          !request.prefill_dp_id.has_value() ||
-          !request.decode_replica_id.has_value() ||
-          !request.decode_dp_id.has_value() ||
-          !request.transfer_id.has_value() ||
-          !request.kv_cache_transfer_start_time.has_value() ||
-          !request.kv_cache_transfer_end_time.has_value() ||
-          !request.decode_arrived_at.has_value() ||
+    static_cast<void>(milliseconds_between(
+        request.first_scheduled_at,
+        request.arrived_at,
+        "first_scheduled_at"));
+    static_cast<void>(milliseconds_between(
+        request.first_token_completed_at,
+        request.arrived_at,
+        "first_token_completed_at"));
+    if (request.first_token_completed_at.seconds() <
+        request.prefill_completed_at.seconds()) {
+      throw std::invalid_argument(
+          "first token completion must not precede prefill completion");
+    }
+    if (is_pdd(architecture)) {
+      if (!request.prefill_replica_id.valid() ||
+          !request.prefill_dp_id.valid() ||
+          !request.decode_replica_id.valid() ||
+          !request.decode_dp_id.valid() ||
+          !request.transfer_id.valid() ||
+          !request.kv_cache_transfer_start_time.valid() ||
+          !request.kv_cache_transfer_end_time.valid() ||
+          !request.decode_arrived_at.valid() ||
           request.kv_cache_transfer_size_bytes == 0) {
         throw std::invalid_argument(
-            "schema v4 request metrics require complete PDD ownership");
+            "PDD request metrics require complete ownership");
       }
       const SimTime transfer_start =
-          request.kv_cache_transfer_start_time.value();
+          request.kv_cache_transfer_start_time;
       const SimTime transfer_end =
-          request.kv_cache_transfer_end_time.value();
+          request.kv_cache_transfer_end_time;
       const SimTime decode_arrival =
-          request.decode_arrived_at.value();
+          request.decode_arrived_at;
       require_valid_time(transfer_start, "kv transfer start");
       require_valid_time(transfer_end, "kv transfer end");
       require_valid_time(decode_arrival, "decode arrival");
@@ -120,7 +112,7 @@ void validate_request_metrics(
           transfer_end.seconds() < transfer_start.seconds() ||
           decode_arrival != transfer_end) {
         throw std::invalid_argument(
-            "schema v4 transfer timestamps are out of order");
+            "PDD transfer timestamps are out of order");
       }
     }
   }
@@ -128,27 +120,21 @@ void validate_request_metrics(
 
 OrderedJson serialize_request(
     const RequestMetricsRecord& request,
-    int schema_version) {
+    config::SystemArchitecture architecture) {
   OrderedJson json = OrderedJson::object();
   json["request_id"] = request.request_id.value();
   json["arrived_at_s"] = request.arrived_at.seconds();
-  if (has_scheduler_contract(schema_version)) {
-    json["first_scheduled_at_s"] =
-        request.first_scheduled_at->seconds();
-  }
+  json["first_scheduled_at_s"] =
+      request.first_scheduled_at.seconds();
   json["prefill_completed_at_s"] =
       request.prefill_completed_at.seconds();
-  if (has_scheduler_contract(schema_version)) {
-    json["first_token_completed_at_s"] =
-        request.first_token_completed_at->seconds();
-  }
+  json["first_token_completed_at_s"] =
+      request.first_token_completed_at.seconds();
   json["completed_at_s"] = request.completed_at.seconds();
-  if (has_scheduler_contract(schema_version)) {
-    json["scheduling_delay_ms"] = milliseconds_between(
-        request.first_scheduled_at.value(),
-        request.arrived_at,
-        "first_scheduled_at");
-  }
+  json["scheduling_delay_ms"] = milliseconds_between(
+      request.first_scheduled_at,
+      request.arrived_at,
+      "first_scheduled_at");
   json["ttft_ms"] = milliseconds_between(
       request.prefill_completed_at,
       request.arrived_at,
@@ -157,47 +143,45 @@ OrderedJson serialize_request(
       request.completed_at,
       request.arrived_at,
       "completed_at");
-  if (has_scheduler_contract(schema_version)) {
-    json["num_processed_tokens"] = request.num_processed_tokens;
-    json["preemption_count"] = request.preemption_count;
-    json["tokens_at_preemption"] = request.tokens_at_preemption;
-  }
-  if (schema_version == config::kParallelSchemaVersion) {
+  json["num_processed_tokens"] = request.num_processed_tokens;
+  json["preemption_count"] = request.preemption_count;
+  json["tokens_at_preemption"] = request.tokens_at_preemption;
+  if (!is_pdd(architecture)) {
     json["replica_id"] = request.replica_id.value();
     json["dp_id"] = request.dp_id.value();
-  } else if (schema_version == config::kPddSchemaVersion) {
-    if (!request.prefill_replica_id.has_value() ||
-        !request.prefill_dp_id.has_value() ||
-        !request.decode_replica_id.has_value() ||
-        !request.decode_dp_id.has_value() ||
-        !request.transfer_id.has_value() ||
-        !request.kv_cache_transfer_start_time.has_value() ||
-        !request.kv_cache_transfer_end_time.has_value() ||
-        !request.decode_arrived_at.has_value() ||
+  } else {
+    if (!request.prefill_replica_id.valid() ||
+        !request.prefill_dp_id.valid() ||
+        !request.decode_replica_id.valid() ||
+        !request.decode_dp_id.valid() ||
+        !request.transfer_id.valid() ||
+        !request.kv_cache_transfer_start_time.valid() ||
+        !request.kv_cache_transfer_end_time.valid() ||
+        !request.decode_arrived_at.valid() ||
         request.kv_cache_transfer_size_bytes == 0) {
       throw std::invalid_argument(
-          "schema v4 request metrics require complete PDD ownership");
+          "PDD request metrics require complete ownership");
     }
     json["prefill_replica_id"] =
-        request.prefill_replica_id->value();
-    json["prefill_dp_id"] = request.prefill_dp_id->value();
+        request.prefill_replica_id.value();
+    json["prefill_dp_id"] = request.prefill_dp_id.value();
     json["decode_replica_id"] =
-        request.decode_replica_id->value();
-    json["decode_dp_id"] = request.decode_dp_id->value();
-    json["transfer_id"] = request.transfer_id->value();
+        request.decode_replica_id.value();
+    json["decode_dp_id"] = request.decode_dp_id.value();
+    json["transfer_id"] = request.transfer_id.value();
     json["kv_cache_transfer_start_time_s"] =
-        request.kv_cache_transfer_start_time->seconds();
+        request.kv_cache_transfer_start_time.seconds();
     json["kv_cache_transfer_end_time_s"] =
-        request.kv_cache_transfer_end_time->seconds();
+        request.kv_cache_transfer_end_time.seconds();
     json["kv_cache_transfer_time_ms"] =
         milliseconds_between(
-            request.kv_cache_transfer_end_time.value(),
-            request.kv_cache_transfer_start_time.value(),
+            request.kv_cache_transfer_end_time,
+            request.kv_cache_transfer_start_time,
             "kv_cache_transfer_end_time");
     json["kv_cache_transfer_size_bytes"] =
         request.kv_cache_transfer_size_bytes;
     json["decode_arrived_at_s"] =
-        request.decode_arrived_at->seconds();
+        request.decode_arrived_at.seconds();
   }
   return json;
 }
@@ -208,39 +192,41 @@ OrderedJson serialize_event(const Event& event) {
   OrderedJson json = OrderedJson::object();
   json["time_s"] = event.time.seconds();
   json["sequence"] = event.sequence.value();
-  json["type"] = to_string(event.type);
-  if (event.payload.request_id.has_value()) {
-    json["request_id"] = event.payload.request_id->value();
-  }
-  if (event.payload.batch_id.has_value()) {
-    json["batch_id"] = event.payload.batch_id->value();
-  }
-  if (event.payload.replica_id.has_value()) {
-    json["replica_id"] = event.payload.replica_id->value();
-  }
-  if (event.payload.dp_id.has_value()) {
-    json["dp_id"] = event.payload.dp_id->value();
-  }
-  if (event.payload.stage_id.has_value()) {
-    json["stage_id"] = event.payload.stage_id->value();
-  }
-  if (event.payload.generation.has_value()) {
-    json["generation"] = event.payload.generation->value();
-  }
-  if (event.payload.cluster_type.has_value()) {
-    json["cluster_type"] =
-        to_string(event.payload.cluster_type.value());
-  }
-  if (event.payload.transfer_id.has_value()) {
-    json["transfer_id"] =
-        event.payload.transfer_id->value();
-  }
+  json["type"] = to_string(event.type());
+  std::visit(
+      [&json](const auto& payload) {
+        if constexpr (requires { payload.request_id; }) {
+          json["request_id"] = payload.request_id.value();
+        }
+        if constexpr (requires { payload.batch_id; }) {
+          json["batch_id"] = payload.batch_id.value();
+        }
+        if constexpr (requires { payload.replica_id; }) {
+          json["replica_id"] = payload.replica_id.value();
+        }
+        if constexpr (requires { payload.dp_id; }) {
+          json["dp_id"] = payload.dp_id.value();
+        }
+        if constexpr (requires { payload.stage_id; }) {
+          json["stage_id"] = payload.stage_id.value();
+        }
+        if constexpr (requires { payload.generation; }) {
+          json["generation"] = payload.generation.value();
+        }
+        if constexpr (requires { payload.cluster_type; }) {
+          json["cluster_type"] = to_string(payload.cluster_type);
+        }
+        if constexpr (requires { payload.transfer_id; }) {
+          json["transfer_id"] = payload.transfer_id.value();
+        }
+      },
+      event.payload);
   return json;
 }
 
 OrderedJson serialize_batch(
     const BatchMetricsRecord& batch,
-    int schema_version) {
+    config::SystemArchitecture architecture) {
   require_valid_time(batch.scheduled_at, "batch.scheduled_at");
   require_valid_time(batch.completed_at, "batch.completed_at");
   if (batch.completed_at.seconds() < batch.scheduled_at.seconds()) {
@@ -285,14 +271,12 @@ OrderedJson serialize_batch(
   json["num_prefill_tokens"] = batch.num_prefill_tokens;
   json["num_decode_tokens"] = batch.num_decode_tokens;
   json["predicted_execution_ms"] = batch.predicted_execution_ms;
-  if (has_parallel_contract(schema_version)) {
-    json["replica_id"] = batch.replica_id.value();
-    json["dp_id"] = batch.dp_id.value();
-    json["num_pipeline_stages"] =
-        batch.num_pipeline_stages;
-    if (schema_version == config::kPddSchemaVersion) {
-      json["cluster_type"] = to_string(batch.cluster_type);
-    }
+  json["replica_id"] = batch.replica_id.value();
+  json["dp_id"] = batch.dp_id.value();
+  json["num_pipeline_stages"] =
+      batch.num_pipeline_stages;
+  if (is_pdd(architecture)) {
+    json["cluster_type"] = to_string(batch.cluster_type);
   }
   return json;
 }
@@ -339,7 +323,7 @@ OrderedJson serialize_batch_stage(
 
 OrderedJson serialize_scheduler_trace(
     const SchedulerTraceRecord& trace,
-    int schema_version) {
+    config::SystemArchitecture architecture) {
   require_valid_time(trace.simulation_time, "scheduler simulation_time");
   if (trace.token_budget_after > trace.token_budget_before) {
     throw std::invalid_argument("invalid scheduler trace counters");
@@ -377,12 +361,10 @@ OrderedJson serialize_scheduler_trace(
     json["batch_request_ids"].push_back(request_id.value());
   }
   json["request_num_tokens"] = trace.request_num_tokens;
-  if (has_parallel_contract(schema_version)) {
-    json["replica_id"] = trace.replica_id.value();
-    json["dp_id"] = trace.dp_id.value();
-    if (schema_version == config::kPddSchemaVersion) {
-      json["cluster_type"] = to_string(trace.cluster_type);
-    }
+  json["replica_id"] = trace.replica_id.value();
+  json["dp_id"] = trace.dp_id.value();
+  if (is_pdd(architecture)) {
+    json["cluster_type"] = to_string(trace.cluster_type);
   }
   return json;
 }
@@ -456,12 +438,6 @@ std::string_view to_string(EventType event_type) noexcept {
   switch (event_type) {
     case EventType::kRequestArrival:
       return "request_arrival";
-    case EventType::kFoundationCompletion:
-      return "foundation_completion";
-    case EventType::kSchedulerPoll:
-      return "scheduler_poll";
-    case EventType::kBatchCompletion:
-      return "batch_completion";
     case EventType::kGlobalSchedule:
       return "global_schedule";
     case EventType::kClusterSchedule:
@@ -486,34 +462,17 @@ std::string_view to_string(EventType event_type) noexcept {
   return "unknown";
 }
 
-std::string_view to_string(MetricsSemantics semantics) noexcept {
-  switch (semantics) {
-    case MetricsSemantics::kCanonical:
-      return "canonical";
-    case MetricsSemantics::kFoundationPlaceholder:
-      return "foundation-placeholder";
-  }
-  return "unknown";
-}
-
 std::string serialize_simulation_output_json(
     const SimulationOutput& output) {
-  if (output.schema_version != config::kFoundationSchemaVersion &&
-      output.schema_version != config::kSchedulerSchemaVersion &&
-      output.schema_version != config::kParallelSchemaVersion &&
-      output.schema_version != config::kPddSchemaVersion) {
+  if (output.schema_version != config::kSchemaVersion) {
     throw std::invalid_argument(
-        "output schema_version must be 1, 2, 3, or 4");
+        "output schema_version must be 1");
   }
   if (output.run.run_id.empty()) {
     throw std::invalid_argument("output run_id must not be empty");
   }
-  validate_request_metrics(output.requests, output.schema_version);
-  if (output.schema_version == config::kFoundationSchemaVersion &&
-      (!output.batches.empty() || !output.scheduler_trace.empty())) {
-    throw std::invalid_argument(
-        "output schema v1 cannot contain scheduler records");
-  }
+  validate_request_metrics(
+      output.requests, output.run.system_architecture);
 
   OrderedJson root = OrderedJson::object();
   root["schema_version"] = output.schema_version;
@@ -532,7 +491,7 @@ std::string serialize_simulation_output_json(
       {"latency_unit", "milliseconds"},
       {
           "metrics_semantics",
-          std::string{to_string(output.run.metrics_semantics)},
+          "canonical",
       },
   });
 
@@ -541,32 +500,29 @@ std::string serialize_simulation_output_json(
   for (const RequestMetricsRecord& request : output.requests) {
     root["completed_request_ids"].push_back(request.request_id.value());
     root["requests"].push_back(
-        serialize_request(request, output.schema_version));
+        serialize_request(
+            request, output.run.system_architecture));
   }
 
-  if (has_scheduler_contract(output.schema_version)) {
-    root["batches"] = OrderedJson::array();
-    for (const BatchMetricsRecord& batch : output.batches) {
-      root["batches"].push_back(
-          serialize_batch(batch, output.schema_version));
-    }
-    root["scheduler_trace"] = OrderedJson::array();
-    for (const SchedulerTraceRecord& trace : output.scheduler_trace) {
-      root["scheduler_trace"].push_back(
-          serialize_scheduler_trace(
-              trace, output.schema_version));
-    }
+  root["batches"] = OrderedJson::array();
+  for (const BatchMetricsRecord& batch : output.batches) {
+    root["batches"].push_back(
+        serialize_batch(batch, output.run.system_architecture));
   }
-  if (has_parallel_contract(output.schema_version)) {
-    root["batch_stages"] = OrderedJson::array();
-    for (const BatchStageMetricsRecord& stage :
-         output.batch_stages) {
-      root["batch_stages"].push_back(
-          serialize_batch_stage(stage));
-    }
+  root["scheduler_trace"] = OrderedJson::array();
+  for (const SchedulerTraceRecord& trace : output.scheduler_trace) {
+    root["scheduler_trace"].push_back(
+        serialize_scheduler_trace(
+            trace, output.run.system_architecture));
+  }
+  root["batch_stages"] = OrderedJson::array();
+  for (const BatchStageMetricsRecord& stage :
+       output.batch_stages) {
+    root["batch_stages"].push_back(
+        serialize_batch_stage(stage));
   }
 
-  if (output.schema_version == config::kPddSchemaVersion) {
+  if (is_pdd(output.run.system_architecture)) {
     root["kv_cache_transfers"] = OrderedJson::array();
     for (const KVCacheTransferMetricsRecord& transfer :
          output.kv_cache_transfers) {
@@ -592,29 +548,19 @@ std::string serialize_simulation_output_json(
 
 std::string serialize_request_metrics_csv(
     const std::vector<RequestMetricsRecord>& requests,
-    int schema_version) {
-  validate_request_metrics(requests, schema_version);
+    config::SystemArchitecture architecture) {
+  validate_request_metrics(requests, architecture);
 
   std::ostringstream output;
   output.imbue(std::locale::classic());
   output << std::setprecision(std::numeric_limits<double>::max_digits10);
-  if (schema_version == config::kFoundationSchemaVersion) {
-    output
-        << "request_id,arrived_at_s,prefill_completed_at_s,completed_at_s,"
-           "ttft_ms,e2e_ms\n";
-  } else if (schema_version == config::kSchedulerSchemaVersion) {
-    output
-        << "request_id,arrived_at_s,first_scheduled_at_s,"
-           "prefill_completed_at_s,first_token_completed_at_s,"
-           "completed_at_s,scheduling_delay_ms,ttft_ms,e2e_ms,"
-           "num_processed_tokens,preemption_count\n";
-  } else if (schema_version == config::kParallelSchemaVersion) {
+  if (!is_pdd(architecture)) {
     output
         << "request_id,arrived_at_s,first_scheduled_at_s,"
            "prefill_completed_at_s,first_token_completed_at_s,"
            "completed_at_s,scheduling_delay_ms,ttft_ms,e2e_ms,"
            "num_processed_tokens,preemption_count,replica_id,dp_id\n";
-  } else if (schema_version == config::kPddSchemaVersion) {
+  } else {
     output
         << "request_id,arrived_at_s,first_scheduled_at_s,"
            "prefill_completed_at_s,first_token_completed_at_s,"
@@ -624,29 +570,20 @@ std::string serialize_request_metrics_csv(
            "transfer_id,kv_cache_transfer_start_time_s,"
            "kv_cache_transfer_end_time_s,kv_cache_transfer_time_ms,"
            "kv_cache_transfer_size_bytes,decode_arrived_at_s\n";
-  } else {
-    throw std::invalid_argument(
-        "request CSV schema_version must be 1, 2, 3, or 4");
   }
 
   for (const RequestMetricsRecord& request : requests) {
     output << request.request_id.value() << ','
            << request.arrived_at.seconds() << ',';
-    if (has_scheduler_contract(schema_version)) {
-      output << request.first_scheduled_at->seconds() << ',';
-    }
+    output << request.first_scheduled_at.seconds() << ',';
     output << request.prefill_completed_at.seconds() << ',';
-    if (has_scheduler_contract(schema_version)) {
-      output << request.first_token_completed_at->seconds() << ',';
-    }
+    output << request.first_token_completed_at.seconds() << ',';
     output << request.completed_at.seconds() << ',';
-    if (has_scheduler_contract(schema_version)) {
-      output << milliseconds_between(
-                    request.first_scheduled_at.value(),
-                    request.arrived_at,
-                    "first_scheduled_at")
-             << ',';
-    }
+    output << milliseconds_between(
+                  request.first_scheduled_at,
+                  request.arrived_at,
+                  "first_scheduled_at")
+           << ',';
     output << milliseconds_between(
                   request.prefill_completed_at,
                   request.arrived_at,
@@ -656,30 +593,28 @@ std::string serialize_request_metrics_csv(
                   request.completed_at,
                   request.arrived_at,
                   "completed_at");
-    if (has_scheduler_contract(schema_version)) {
-      output << ',' << request.num_processed_tokens << ','
-             << request.preemption_count;
-      if (schema_version == config::kParallelSchemaVersion) {
-        output << ',' << request.replica_id.value() << ','
-               << request.dp_id.value();
-      } else if (schema_version == config::kPddSchemaVersion) {
-        output << ',' << request.prefill_replica_id->value()
-               << ',' << request.prefill_dp_id->value()
-               << ',' << request.decode_replica_id->value()
-               << ',' << request.decode_dp_id->value()
-               << ',' << request.transfer_id->value()
+    output << ',' << request.num_processed_tokens << ','
+           << request.preemption_count;
+    if (!is_pdd(architecture)) {
+      output << ',' << request.replica_id.value() << ','
+             << request.dp_id.value();
+    } else {
+        output << ',' << request.prefill_replica_id.value()
+               << ',' << request.prefill_dp_id.value()
+               << ',' << request.decode_replica_id.value()
+               << ',' << request.decode_dp_id.value()
+               << ',' << request.transfer_id.value()
                << ','
-               << request.kv_cache_transfer_start_time->seconds()
+               << request.kv_cache_transfer_start_time.seconds()
                << ','
-               << request.kv_cache_transfer_end_time->seconds()
+               << request.kv_cache_transfer_end_time.seconds()
                << ','
                << (
-                      request.kv_cache_transfer_end_time->seconds() -
-                      request.kv_cache_transfer_start_time->seconds()) *
+                      request.kv_cache_transfer_end_time.seconds() -
+                      request.kv_cache_transfer_start_time.seconds()) *
                       1e3
                << ',' << request.kv_cache_transfer_size_bytes
-               << ',' << request.decode_arrived_at->seconds();
-      }
+               << ',' << request.decode_arrived_at.seconds();
     }
     output << '\n';
   }

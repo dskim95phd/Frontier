@@ -1,20 +1,15 @@
 #pragma once
 
 #include <cstdint>
-#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <variant>
 #include <vector>
 
 namespace frontier::config {
 
-inline constexpr int kFoundationSchemaVersion = 1;
-inline constexpr int kSchedulerSchemaVersion = 2;
-inline constexpr int kParallelSchemaVersion = 3;
-inline constexpr int kPddSchemaVersion = 4;
-// Kept for Step 1 callers that use the original constant.
-inline constexpr int kSchemaVersion = kFoundationSchemaVersion;
+inline constexpr int kSchemaVersion = 1;
 
 enum class SimulationMode {
   kOffline,
@@ -157,6 +152,24 @@ struct KvCacheTransferConfig {
       const KvCacheTransferConfig&) = default;
 };
 
+struct PddRuntimeConfig {
+  PddClustersConfig clusters;
+  KvCacheTransferConfig kv_cache_transfer;
+
+  friend bool operator==(
+      const PddRuntimeConfig&,
+      const PddRuntimeConfig&) = default;
+};
+
+using RuntimeConfig = std::variant<
+    ClusterRuntimeConfig,
+    PddRuntimeConfig>;
+
+class ConfigError : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
+};
+
 struct SimulationConfig {
   int schema_version;
   std::string run_id;
@@ -164,21 +177,17 @@ struct SimulationConfig {
   SystemArchitecture system_architecture;
   bool enable_parallel_clusters;
   PrefixCacheConfig prefix_cache;
-  std::optional<ParallelismConfig> parallelism;
-  std::optional<ClusterSchedulerConfig> cluster_scheduler;
-  std::optional<SchedulerConfig> scheduler;
-  std::optional<ExecutionModelConfig> execution_model;
-  std::optional<PddClustersConfig> clusters;
-  std::optional<KvCacheTransferConfig> kv_cache_transfer;
+  ClusterSchedulerConfig cluster_scheduler;
+  RuntimeConfig runtime;
+
+  [[nodiscard]] ClusterRuntimeConfig& cluster();
+  [[nodiscard]] const ClusterRuntimeConfig& cluster() const;
+  [[nodiscard]] PddRuntimeConfig& pdd();
+  [[nodiscard]] const PddRuntimeConfig& pdd() const;
 
   friend bool operator==(
       const SimulationConfig&,
       const SimulationConfig&) = default;
-};
-
-class ConfigError : public std::runtime_error {
- public:
-  using std::runtime_error::runtime_error;
 };
 
 [[nodiscard]] std::string_view to_string(SimulationMode mode) noexcept;
