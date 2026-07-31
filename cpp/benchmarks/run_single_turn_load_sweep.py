@@ -1,0 +1,943 @@
+#!/usr/bin/env python3
+"""Run a single-turn load, batch-size, and KV-capacity sweep.
+
+Request sizes follow the first-turn distribution from main's
+generate_kimi_k2_probabilistic_workload.py. The model remains the C++ port's
+validated Llama-2-7B Rubin analytical model; this is not a Kimi K2 model study.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import csv
+from dataclasses import asdict, dataclass
+import json
+import math
+from pathlib import Path
+import statistics
+import subprocess
+import time
+from typing import Iterable, Sequence
+
+import numpy as np
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+BASE_CONFIG = (
+    REPO_ROOT
+    / "cpp"
+    / "tests"
+    / "fixtures"
+    / "config"
+    / "analytical_parallel_colocation.json"
+)
+DEFAULT_OUTPUT = REPO_ROOT / "outputs" / "cpp_single_turn_load_sweep"
+BLOCK_SIZE = 16
+GIB = 1024**3
+
+
+@dataclass(frozen=True)
+class TopologyConfig:
+    name: str
+    system_architecture: str
+    tensor_parallel_size: int
+    pipeline_parallel_size: int
+    data_parallel_size: int = 2
+    num_replicas: int = 1
+    cluster_count: int = 1
+
+    @property
+    def gpu_count_per_cluster(self) -> int:
+        return (
+            self.num_replicas
+            * self.tensor_parallel_size
+            * self.pipeline_parallel_size
+            * self.data_parallel_size
+        )
+
+    @property
+    def physical_gpu_count(self) -> int:
+        return self.gpu_count_per_cluster * self.cluster_count
+
+    @property
+    def kv_bytes_per_token_per_gpu(self) -> int:
+        # Llama-2-7B: 32 layers, 32 KV heads, head_dim 128, K+V, FP16.
+        return (
+            (32 // self.pipeline_parallel_size)
+            * (32 // self.tensor_parallel_size)
+            * 128
+            * 2
+            * 2
+        )
+
+
+TOPOLOGIES = {
+    "colocation": TopologyConfig(
+        name="colocation",
+        system_architecture="co-location",
+        tensor_parallel_size=8,
+        pipeline_parallel_size=4,
+    ),
+    "pdd-pp-half": TopologyConfig(
+        name="pdd-pp-half",
+        system_architecture="pd-disaggregation",
+        tensor_parallel_size=8,
+        pipeline_parallel_size=2,
+        cluster_count=2,
+    ),
+    "pdd-tp-half": TopologyConfig(
+        name="pdd-tp-half",
+        system_architecture="pd-disaggregation",
+        tensor_parallel_size=4,
+        pipeline_parallel_size=4,
+        cluster_count=2,
+    ),
+}
+
+
+@dataclass(frozen=True)
+class WorkloadConfig:
+    requests: int = 64
+    seed: int = 20260728
+    prompt_median: int = 8_192
+    prompt_sigma: float = 0.8
+    prompt_min: int = 2_048
+    prompt_max: int = 32_768
+    output_median: int = 1_024
+    output_sigma: float = 0.7
+    output_min: int = 256
+    output_max: int = 4_096
+
+
+@dataclass(frozen=True)
+class WorkloadProfile:
+    name: str
+    output_median: int
+    output_sigma: float
+    output_min: int
+    output_max: int
+
+
+WORKLOAD_PROFILES = {
+    "kimi-short": WorkloadProfile(
+        name="kimi-short",
+        output_median=8,
+        output_sigma=0.7,
+        output_min=4,
+        output_max=16,
+    ),
+    "prefill-heavy": WorkloadProfile(
+        name="prefill-heavy",
+        output_median=256,
+        output_sigma=0.7,
+        output_min=64,
+        output_max=1_024,
+    ),
+    "balanced-8k-1k": WorkloadProfile(
+        name="balanced-8k-1k",
+        output_median=1_024,
+        output_sigma=0.7,
+        output_min=256,
+        output_max=4_096,
+    ),
+}
+
+
+@dataclass(frozen=True)
+class RequestShape:
+    prompt_tokens: int
+    output_tokens: int
+    unit_exponential_gap: float
+
+
+def bounded_lognormal(
+    rng: np.random.Generator,
+    *,
+    median: float,
+    sigma: float,
+    lower: int,
+    upper: int,
+) -> int:
+    sample = math.exp(rng.normal(math.log(median), sigma))
+    return int(min(upper, max(lower, round(sample))))
+
+
+def generate_shapes(config: WorkloadConfig) -> list[RequestShape]:
+    if config.requests <= 0:
+        raise ValueError("requests must be positive")
+    rng = np.random.default_rng(config.seed)
+    shapes: list[RequestShape] = []
+    for _ in range(config.requests):
+        shapes.append(
+            RequestShape(
+                prompt_tokens=bounded_lognormal(
+                    rng,
+                    median=config.prompt_median,
+                    sigma=config.prompt_sigma,
+                    lower=config.prompt_min,
+                    upper=config.prompt_max,
+                ),
+                output_tokens=bounded_lognormal(
+                    rng,
+                    median=config.output_median,
+                    sigma=config.output_sigma,
+                    lower=config.output_min,
+                    upper=config.output_max,
+                ),
+                unit_exponential_gap=float(rng.exponential(1.0)),
+            )
+        )
+    return shapes
+
+
+def percentile(values: Sequence[float], quantile: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * quantile
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return float(ordered[lower])
+    fraction = position - lower
+    return float(
+        ordered[lower] * (1.0 - fraction) + ordered[upper] * fraction
+    )
+
+
+def parse_int_list(value: str) -> list[int]:
+    try:
+        parsed = [int(item.strip()) for item in value.split(",") if item.strip()]
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "expected comma-separated integers"
+        ) from error
+    if not parsed or any(item <= 0 for item in parsed):
+        raise argparse.ArgumentTypeError("all values must be positive")
+    if len(parsed) != len(set(parsed)):
+        raise argparse.ArgumentTypeError("values must be unique")
+    return parsed
+
+
+def parse_float_list(value: str) -> list[float]:
+    try:
+        parsed = [
+            float(item.strip()) for item in value.split(",") if item.strip()
+        ]
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "expected comma-separated numbers"
+        ) from error
+    if not parsed or any(not math.isfinite(item) or item <= 0 for item in parsed):
+        raise argparse.ArgumentTypeError("all values must be finite and positive")
+    if len(parsed) != len(set(parsed)):
+        raise argparse.ArgumentTypeError("values must be unique")
+    return parsed
+
+
+def write_workload(
+    path: Path,
+    shapes: Sequence[RequestShape],
+    *,
+    arrival_rate: float | None,
+    isolated_gap_seconds: float = 10.0,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    arrived_at = 0.0
+    with path.open("w", encoding="utf-8", newline="") as output:
+        writer = csv.writer(output, lineterminator="\n")
+        writer.writerow(
+            ("arrived_at", "num_prefill_tokens", "num_decode_tokens")
+        )
+        for index, shape in enumerate(shapes):
+            if index > 0:
+                arrived_at += (
+                    isolated_gap_seconds
+                    if arrival_rate is None
+                    else shape.unit_exponential_gap / arrival_rate
+                )
+            writer.writerow(
+                (
+                    f"{arrived_at:.12f}",
+                    shape.prompt_tokens,
+                    shape.output_tokens,
+                )
+            )
+
+
+def write_config(
+    path: Path,
+    *,
+    run_id: str,
+    batch_size_cap: int,
+    max_tokens_in_batch: int,
+    prefill_chunk_tokens: int,
+    num_blocks: int,
+    topology: TopologyConfig,
+) -> None:
+    config = json.loads(BASE_CONFIG.read_text(encoding="utf-8"))
+    config["run_id"] = run_id
+    config["simulation_mode"] = "online"
+    base_cluster = config["clusters"]["monolithic"]
+
+    def make_cluster(*, decode: bool) -> dict:
+        cluster = copy.deepcopy(base_cluster)
+        cluster["parallelism"].update(
+            {
+                "num_replicas": topology.num_replicas,
+                "tensor_parallel_size": topology.tensor_parallel_size,
+                "pipeline_parallel_size": topology.pipeline_parallel_size,
+                "data_parallel_size": topology.data_parallel_size,
+                "moe_tensor_parallel_size": 1,
+                "moe_expert_parallel_size": 1,
+            }
+        )
+        cluster["scheduler"].update(
+            {
+                "batch_size_cap": batch_size_cap,
+                "max_tokens_in_batch": max_tokens_in_batch,
+                "enable_preemption": True,
+                "enable_chunked_prefill": not decode,
+                "long_prefill_token_threshold": (
+                    0 if decode else prefill_chunk_tokens
+                ),
+                "block_size": BLOCK_SIZE,
+                "num_blocks": num_blocks,
+                "watermark_blocks_fraction": 0.0,
+                "num_preallocate_tokens": 0,
+            }
+        )
+        return cluster
+
+    config["system_architecture"] = topology.system_architecture
+    if topology.system_architecture == "co-location":
+        config["clusters"] = {"monolithic": make_cluster(decode=False)}
+    else:
+        config["clusters"] = {
+            "prefill": make_cluster(decode=False),
+            "decode": make_cluster(decode=True),
+        }
+        # Match the high-bandwidth NVL12 assumption used by main's Kimi K2
+        # sweep so that the experiment measures the compute split instead of
+        # an arbitrary low-bandwidth transfer bottleneck.
+        config["kv_cache_transfer"] = {
+            "type": "analytical",
+            "network_bandwidth_gbps": 38_400.0,
+            "network_latency_ms": 0.02,
+            "kv_cache_dtype_size_bytes": 2,
+            "enable_compression": False,
+        }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+
+
+def run_simulator(
+    binary: Path,
+    config_path: Path,
+    workload_path: Path,
+    *,
+    timeout_seconds: float,
+) -> tuple[dict, float]:
+    started_at = time.perf_counter()
+    summary_path = config_path.with_suffix(".summary.json")
+    summary_path.unlink(missing_ok=True)
+    completed = subprocess.run(
+        [
+            str(binary),
+            "--config",
+            str(config_path),
+            "--workload",
+            str(workload_path),
+            "--output",
+            str(summary_path),
+        ],
+        cwd=REPO_ROOT,
+        text=True,
+        encoding="utf-8",
+        capture_output=True,
+        timeout=timeout_seconds,
+        check=False,
+    )
+    process_seconds = time.perf_counter() - started_at
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"simulator failed ({completed.returncode}): "
+            f"{completed.stderr.strip()}"
+        )
+    if not summary_path.is_file():
+        raise RuntimeError("simulator did not write its summary output")
+    try:
+        return (
+            json.loads(summary_path.read_text(encoding="utf-8")),
+            process_seconds,
+        )
+    finally:
+        summary_path.unlink(missing_ok=True)
+
+
+def summarize_case(
+    output: dict,
+    shapes: Sequence[RequestShape],
+    *,
+    offered_concurrency: float,
+    arrival_rate: float,
+    batch_size_cap: int,
+    max_tokens_in_batch: int,
+    prefill_chunk_tokens: int,
+    measurement_trim_fraction: float,
+    num_blocks: int,
+    topology: TopologyConfig,
+    process_seconds: float,
+) -> dict[str, float | int | str]:
+    requests = output["requests"]
+    batch_sizes = [
+        int(batch_size)
+        for batch_size, count in output["batch_size_histogram"].items()
+        for _ in range(int(count))
+    ]
+    transfers = output.get("kv_cache_transfers", [])
+    if len(requests) != len(shapes):
+        raise RuntimeError(
+            f"expected {len(shapes)} requests, got {len(requests)}"
+        )
+    ordered_requests = sorted(
+        requests,
+        key=lambda row: int(row["request_id"]),
+    )
+    trim_count = int(len(ordered_requests) * measurement_trim_fraction)
+    measurement_requests = ordered_requests[
+        trim_count : len(ordered_requests) - trim_count
+    ]
+    if not measurement_requests:
+        raise RuntimeError("measurement window contains no requests")
+
+    first_arrival = min(float(row["arrived_at_s"]) for row in requests)
+    last_completion = max(float(row["completed_at_s"]) for row in requests)
+    simulation_window = last_completion - first_arrival
+    if simulation_window <= 0.0:
+        raise RuntimeError("simulation window must be positive")
+
+    ttft = [float(row["ttft_ms"]) for row in requests]
+    measurement_ttft = [
+        float(row["ttft_ms"]) for row in measurement_requests
+    ]
+    first_token_latency = [
+        (
+            float(row["first_token_completed_at_s"])
+            - float(row["arrived_at_s"])
+        )
+        * 1_000.0
+        for row in requests
+    ]
+    prefill_service = [
+        (
+            float(row["prefill_completed_at_s"])
+            - float(row["first_scheduled_at_s"])
+        )
+        * 1_000.0
+        for row in requests
+    ]
+    tpot = []
+    for row in requests:
+        request_id = int(row["request_id"])
+        output_tokens = shapes[request_id].output_tokens
+        if output_tokens <= 1:
+            continue
+        decode_tail_ms = (
+            float(row["completed_at_s"])
+            - float(row["first_token_completed_at_s"])
+        ) * 1_000.0
+        tpot.append(decode_tail_ms / (output_tokens - 1))
+    e2e_seconds = [float(row["e2e_ms"]) / 1_000.0 for row in requests]
+    scheduling = [float(row["scheduling_delay_ms"]) for row in requests]
+    total_prompt = sum(shape.prompt_tokens for shape in shapes)
+    total_decode = sum(shape.output_tokens for shape in shapes)
+    total_tokens = total_prompt + total_decode
+    total_preemptions = sum(
+        int(row["preemption_count"]) for row in requests
+    )
+    transfer_times = [
+        (
+            float(row["completed_at_s"])
+            - float(row["started_at_s"])
+        )
+        * 1_000.0
+        for row in transfers
+    ]
+
+    # Integral of the in-flight request count divided by the total window.
+    realized_mean_concurrency = sum(e2e_seconds) / simulation_window
+    kv_token_capacity_per_target = num_blocks * BLOCK_SIZE
+    kv_gib_per_gpu = (
+        kv_token_capacity_per_target
+        * topology.kv_bytes_per_token_per_gpu
+        / GIB
+    )
+
+    return {
+        "status": "ok",
+        "topology": topology.name,
+        "offered_concurrency": offered_concurrency,
+        "arrival_rate_rps": arrival_rate,
+        "realized_mean_concurrency": realized_mean_concurrency,
+        "batch_size_cap": batch_size_cap,
+        "max_tokens_in_batch": max_tokens_in_batch,
+        "prefill_chunk_tokens": prefill_chunk_tokens,
+        "measurement_trim_fraction": measurement_trim_fraction,
+        "measurement_requests": len(measurement_requests),
+        "num_blocks_per_dp_target": num_blocks,
+        "kv_token_capacity_per_dp_target": kv_token_capacity_per_target,
+        "kv_capacity_gib_per_gpu": kv_gib_per_gpu,
+        "requests": len(requests),
+        "simulation_window_s": simulation_window,
+        "throughput_requests_per_s": len(requests) / simulation_window,
+        "total_tokens_per_s": total_tokens / simulation_window,
+        "prompt_tokens_per_s": total_prompt / simulation_window,
+        "decode_tokens_per_s": total_decode / simulation_window,
+        "ttft_mean_ms": statistics.fmean(ttft),
+        "ttft_p50_ms": percentile(ttft, 0.50),
+        "ttft_p90_ms": percentile(ttft, 0.90),
+        "ttft_p99_ms": percentile(ttft, 0.99),
+        "measurement_ttft_mean_ms": statistics.fmean(measurement_ttft),
+        "measurement_ttft_p50_ms": percentile(measurement_ttft, 0.50),
+        "measurement_ttft_p90_ms": percentile(measurement_ttft, 0.90),
+        "measurement_ttft_p99_ms": percentile(measurement_ttft, 0.99),
+        "first_token_latency_mean_ms": statistics.fmean(first_token_latency),
+        "first_token_latency_p50_ms": percentile(first_token_latency, 0.50),
+        "first_token_latency_p90_ms": percentile(first_token_latency, 0.90),
+        "first_token_latency_p99_ms": percentile(first_token_latency, 0.99),
+        "prefill_service_mean_ms": statistics.fmean(prefill_service),
+        "prefill_service_p90_ms": percentile(prefill_service, 0.90),
+        "tpot_mean_ms": statistics.fmean(tpot) if tpot else 0.0,
+        "tpot_p50_ms": percentile(tpot, 0.50),
+        "tpot_p90_ms": percentile(tpot, 0.90),
+        "tpot_p99_ms": percentile(tpot, 0.99),
+        "e2e_mean_ms": statistics.fmean(e2e_seconds) * 1_000.0,
+        "scheduling_delay_mean_ms": statistics.fmean(scheduling),
+        "preemptions": total_preemptions,
+        "requests_preempted": sum(
+            int(int(row["preemption_count"]) > 0) for row in requests
+        ),
+        "kv_transfers": len(transfers),
+        "kv_transfer_total_gib": (
+            sum(int(row["size_bytes"]) for row in transfers) / GIB
+        ),
+        "kv_transfer_mean_ms": (
+            statistics.fmean(transfer_times) if transfer_times else 0.0
+        ),
+        "kv_transfer_p90_ms": percentile(transfer_times, 0.90),
+        "batches": len(batch_sizes),
+        "mean_realized_batch_size": (
+            statistics.fmean(batch_sizes) if batch_sizes else 0.0
+        ),
+        "batch_size_p90": percentile(batch_sizes, 0.90),
+        "events": int(output["counts"]["events"]),
+        "batch_stages": int(output["counts"]["batch_stages"]),
+        "simulator_core_wall_s": float(output["wall_clock_seconds"]),
+        "process_wall_s": process_seconds,
+    }
+
+
+def write_csv(path: Path, rows: Sequence[dict]) -> None:
+    if not rows:
+        return
+    fieldnames: list[str] = []
+    for row in rows:
+        for key in row:
+            if key not in fieldnames:
+                fieldnames.append(key)
+    with path.open("w", encoding="utf-8", newline="") as output:
+        writer = csv.DictWriter(output, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def distribution(values: Iterable[int]) -> dict[str, float | int]:
+    materialized = list(values)
+    return {
+        "count": len(materialized),
+        "mean": statistics.fmean(materialized),
+        "p50": percentile(materialized, 0.50),
+        "p90": percentile(materialized, 0.90),
+        "p99": percentile(materialized, 0.99),
+        "max": max(materialized),
+    }
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--binary", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path)
+    parser.add_argument(
+        "--topology",
+        choices=tuple(TOPOLOGIES),
+        default="colocation",
+    )
+    parser.add_argument(
+        "--workload-profile",
+        choices=tuple(WORKLOAD_PROFILES),
+        default="balanced-8k-1k",
+    )
+    parser.add_argument("--requests", type=int, default=64)
+    parser.add_argument("--seed", type=int, default=20260728)
+    parser.add_argument(
+        "--offered-concurrency",
+        type=parse_float_list,
+        default=parse_float_list("1,2,4,8,16,32"),
+    )
+    parser.add_argument(
+        "--batch-sizes",
+        type=parse_int_list,
+        default=parse_int_list("1,4,8,16,32"),
+    )
+    parser.add_argument(
+        "--prefill-chunk-tokens",
+        type=int,
+        default=8_192,
+        help=(
+            "Maximum prefill tokens scheduled per request and iteration."
+        ),
+    )
+    parser.add_argument(
+        "--max-tokens-in-batch",
+        type=int,
+        default=8_192,
+        help="Maximum total scheduled tokens in one batch.",
+    )
+    parser.add_argument(
+        "--measurement-trim-fraction",
+        type=float,
+        default=0.0,
+        help=(
+            "Exclude this fraction of request IDs from both the beginning "
+            "and end when calculating measurement_ttft_* fields."
+        ),
+    )
+    capacity_group = parser.add_mutually_exclusive_group()
+    capacity_group.add_argument(
+        "--kv-capacities-gib",
+        type=parse_float_list,
+    )
+    capacity_group.add_argument(
+        "--num-blocks",
+        type=parse_int_list,
+    )
+    parser.add_argument("--timeout-seconds", type=float, default=180.0)
+    parser.add_argument(
+        "--arrival-reference-service-seconds",
+        type=float,
+        help=(
+            "Use this isolated service time to convert offered concurrency "
+            "to arrival rate. Set the same value across topologies for a "
+            "paired load comparison."
+        ),
+    )
+    parser.add_argument("--resume", action="store_true")
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    topology = TOPOLOGIES[args.topology]
+    workload_profile = WORKLOAD_PROFILES[args.workload_profile]
+    binary = args.binary.resolve()
+    if not binary.is_file():
+        raise SystemExit(f"binary not found: {binary}")
+    if args.requests <= 0:
+        raise SystemExit("--requests must be positive")
+    if args.timeout_seconds <= 0:
+        raise SystemExit("--timeout-seconds must be positive")
+    if args.prefill_chunk_tokens <= 0:
+        raise SystemExit("--prefill-chunk-tokens must be positive")
+    if args.max_tokens_in_batch <= 0:
+        raise SystemExit("--max-tokens-in-batch must be positive")
+    if args.prefill_chunk_tokens > args.max_tokens_in_batch:
+        raise SystemExit(
+            "--prefill-chunk-tokens cannot exceed --max-tokens-in-batch"
+        )
+    if (
+        not math.isfinite(args.measurement_trim_fraction)
+        or args.measurement_trim_fraction < 0.0
+        or args.measurement_trim_fraction >= 0.5
+    ):
+        raise SystemExit(
+            "--measurement-trim-fraction must be finite and in [0, 0.5)"
+        )
+    if (
+        args.arrival_reference_service_seconds is not None
+        and (
+            not math.isfinite(args.arrival_reference_service_seconds)
+            or args.arrival_reference_service_seconds <= 0.0
+        )
+    ):
+        raise SystemExit(
+            "--arrival-reference-service-seconds must be finite and positive"
+        )
+
+    output_dir = (
+        args.output_dir
+        if args.output_dir is not None
+        else DEFAULT_OUTPUT.with_name(
+            f"{DEFAULT_OUTPUT.name}_{topology.name}_"
+            f"{workload_profile.name}"
+        )
+    ).resolve()
+    if args.num_blocks is not None:
+        num_blocks_values = args.num_blocks
+    else:
+        kv_capacities_gib = (
+            args.kv_capacities_gib
+            if args.kv_capacities_gib is not None
+            else [4.0, 16.0]
+        )
+        num_blocks_values = []
+        for capacity_gib in kv_capacities_gib:
+            blocks = capacity_gib * GIB / (
+                BLOCK_SIZE * topology.kv_bytes_per_token_per_gpu
+            )
+            rounded_blocks = round(blocks)
+            if not math.isclose(blocks, rounded_blocks):
+                raise SystemExit(
+                    "KV capacity cannot be represented by an integral block "
+                    f"count: {capacity_gib:g} GiB"
+                )
+            num_blocks_values.append(rounded_blocks)
+    inputs_dir = output_dir / "inputs"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    workload_config = WorkloadConfig(
+        requests=args.requests,
+        seed=args.seed,
+        output_median=workload_profile.output_median,
+        output_sigma=workload_profile.output_sigma,
+        output_min=workload_profile.output_min,
+        output_max=workload_profile.output_max,
+    )
+    shapes = generate_shapes(workload_config)
+
+    calibration_workload = inputs_dir / "calibration.csv"
+    calibration_config = inputs_dir / "calibration.json"
+    write_workload(calibration_workload, shapes, arrival_rate=None)
+    write_config(
+        calibration_config,
+        run_id="single-turn-load-calibration",
+        batch_size_cap=1,
+        max_tokens_in_batch=args.max_tokens_in_batch,
+        prefill_chunk_tokens=args.prefill_chunk_tokens,
+        num_blocks=max(num_blocks_values),
+        topology=topology,
+    )
+    print("calibration start", flush=True)
+    calibration, calibration_process_seconds = run_simulator(
+        binary,
+        calibration_config,
+        calibration_workload,
+        timeout_seconds=args.timeout_seconds,
+    )
+    isolated_service_seconds = statistics.fmean(
+        float(row["e2e_ms"]) / 1_000.0
+        for row in calibration["requests"]
+    )
+    if isolated_service_seconds <= 0.0:
+        raise RuntimeError("isolated mean service time must be positive")
+    print(
+        f"calibration mean_service_s={isolated_service_seconds:.9f} "
+        f"process_s={calibration_process_seconds:.3f}",
+        flush=True,
+    )
+    arrival_reference_service_seconds = (
+        args.arrival_reference_service_seconds
+        if args.arrival_reference_service_seconds is not None
+        else isolated_service_seconds
+    )
+    print(
+        "arrival reference_service_s="
+        f"{arrival_reference_service_seconds:.9f}",
+        flush=True,
+    )
+
+    workloads: dict[float, Path] = {}
+    arrival_rates: dict[float, float] = {}
+    for offered_concurrency in args.offered_concurrency:
+        arrival_rate = (
+            offered_concurrency / arrival_reference_service_seconds
+        )
+        workload_path = (
+            inputs_dir / f"load_c{offered_concurrency:g}.csv"
+        )
+        write_workload(
+            workload_path,
+            shapes,
+            arrival_rate=arrival_rate,
+        )
+        workloads[offered_concurrency] = workload_path
+        arrival_rates[offered_concurrency] = arrival_rate
+
+    results_path = output_dir / "sweep_results.json"
+    rows: list[dict] = []
+    completed_keys: set[tuple[float, int, int]] = set()
+    if args.resume and results_path.is_file():
+        rows = json.loads(results_path.read_text(encoding="utf-8"))
+        completed_keys = {
+            (
+                float(row["offered_concurrency"]),
+                int(row["batch_size_cap"]),
+                int(row["num_blocks_per_dp_target"]),
+            )
+            for row in rows
+        }
+
+    total_cases = (
+        len(args.offered_concurrency)
+        * len(args.batch_sizes)
+        * len(num_blocks_values)
+    )
+    case_index = 0
+    for num_blocks in num_blocks_values:
+        for batch_size in args.batch_sizes:
+            for offered_concurrency in args.offered_concurrency:
+                case_index += 1
+                key = (offered_concurrency, batch_size, num_blocks)
+                if key in completed_keys:
+                    print(
+                        f"[{case_index}/{total_cases}] resume skip {key}",
+                        flush=True,
+                    )
+                    continue
+                run_id = (
+                    f"single-turn-{topology.name}-{workload_profile.name}-"
+                    f"c{offered_concurrency:g}-"
+                    f"b{batch_size}-kv{num_blocks}"
+                )
+                config_path = inputs_dir / f"{run_id}.json"
+                write_config(
+                    config_path,
+                    run_id=run_id,
+                    batch_size_cap=batch_size,
+                    max_tokens_in_batch=args.max_tokens_in_batch,
+                    prefill_chunk_tokens=args.prefill_chunk_tokens,
+                    num_blocks=num_blocks,
+                    topology=topology,
+                )
+                print(
+                    f"[{case_index}/{total_cases}] {run_id}",
+                    flush=True,
+                )
+                try:
+                    output, process_seconds = run_simulator(
+                        binary,
+                        config_path,
+                        workloads[offered_concurrency],
+                        timeout_seconds=args.timeout_seconds,
+                    )
+                    row = summarize_case(
+                        output,
+                        shapes,
+                        offered_concurrency=offered_concurrency,
+                        arrival_rate=arrival_rates[offered_concurrency],
+                        batch_size_cap=batch_size,
+                        max_tokens_in_batch=args.max_tokens_in_batch,
+                        prefill_chunk_tokens=args.prefill_chunk_tokens,
+                        measurement_trim_fraction=(
+                            args.measurement_trim_fraction
+                        ),
+                        num_blocks=num_blocks,
+                        topology=topology,
+                        process_seconds=process_seconds,
+                    )
+                    print(
+                        "  "
+                        f"actual_c={row['realized_mean_concurrency']:.3f} "
+                        f"rps={row['throughput_requests_per_s']:.3f} "
+                        f"ttft_p90={row['ttft_p90_ms']:.3f}ms "
+                        f"preemptions={row['preemptions']}",
+                        flush=True,
+                    )
+                except (RuntimeError, subprocess.TimeoutExpired) as error:
+                    row = {
+                        "status": "failed",
+                        "error": str(error),
+                        "topology": topology.name,
+                        "offered_concurrency": offered_concurrency,
+                        "arrival_rate_rps": arrival_rates[offered_concurrency],
+                        "batch_size_cap": batch_size,
+                        "max_tokens_in_batch": args.max_tokens_in_batch,
+                        "prefill_chunk_tokens": args.prefill_chunk_tokens,
+                        "num_blocks_per_dp_target": num_blocks,
+                        "kv_token_capacity_per_dp_target": (
+                            num_blocks * BLOCK_SIZE
+                        ),
+                        "kv_capacity_gib_per_gpu": (
+                            num_blocks
+                            * BLOCK_SIZE
+                            * topology.kv_bytes_per_token_per_gpu
+                            / GIB
+                        ),
+                    }
+                    print(f"  failed: {error}", flush=True)
+                rows.append(row)
+                results_path.write_text(
+                    json.dumps(rows, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                write_csv(output_dir / "sweep_results.csv", rows)
+
+    manifest = {
+        "description": (
+            "Single-turn Poisson load sweep using the first-turn Kimi K2 "
+            "workload distribution with the Llama-2-7B Rubin analytical model."
+        ),
+        "workload": asdict(
+            workload_config
+        ),
+        "workload_profile": workload_profile.name,
+        "realized_workload": {
+            "prompt_tokens": distribution(
+                shape.prompt_tokens for shape in shapes
+            ),
+            "output_tokens": distribution(
+                shape.output_tokens for shape in shapes
+            ),
+        },
+        "isolated_mean_service_seconds": isolated_service_seconds,
+        "arrival_reference_service_seconds": (
+            arrival_reference_service_seconds
+        ),
+        "offered_concurrency": args.offered_concurrency,
+        "arrival_rates_rps": arrival_rates,
+        "batch_sizes": args.batch_sizes,
+        "max_tokens_in_batch": args.max_tokens_in_batch,
+        "prefill_chunk_tokens": args.prefill_chunk_tokens,
+        "measurement_trim_fraction": args.measurement_trim_fraction,
+        "num_blocks_per_dp_target": num_blocks_values,
+        "topology": {
+            "name": topology.name,
+            "system_architecture": topology.system_architecture,
+            "model": "llama2-7b",
+            "device": "rubin",
+            "precision": "fp16",
+            "cluster_count": topology.cluster_count,
+            "num_replicas_per_cluster": topology.num_replicas,
+            "tensor_parallel_size": topology.tensor_parallel_size,
+            "pipeline_parallel_size": topology.pipeline_parallel_size,
+            "data_parallel_size": topology.data_parallel_size,
+            "gpu_count_per_cluster": topology.gpu_count_per_cluster,
+            "physical_gpu_count": topology.physical_gpu_count,
+            "kv_bytes_per_token_per_gpu": (
+                topology.kv_bytes_per_token_per_gpu
+            ),
+            "max_tokens_in_batch": args.max_tokens_in_batch,
+            "prefill_chunk_tokens": args.prefill_chunk_tokens,
+            "block_size": BLOCK_SIZE,
+        },
+    }
+    (output_dir / "manifest.json").write_text(
+        json.dumps(manifest, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    print(f"wrote {output_dir / 'sweep_results.csv'}", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -127,6 +127,18 @@ target_compile_definitions(
 target_link_libraries(frontier_sim PRIVATE frontier_core)
 frontier_enable_warnings(frontier_sim)
 
+add_executable(
+  frontier_load_benchmark_summary
+  frontier/load_benchmark_main.cc
+)
+target_link_libraries(
+  frontier_load_benchmark_summary
+  PRIVATE
+    frontier_core
+    nlohmann_json::nlohmann_json
+)
+frontier_enable_warnings(frontier_load_benchmark_summary)
+
 include(CTest)
 
 if(BUILD_TESTING)
@@ -150,6 +162,32 @@ if(BUILD_TESTING)
   set_tests_properties(
     frontier_sim.cli
     PROPERTIES PASS_REGULAR_EXPRESSION "global_batch_end"
+  )
+  add_test(
+    NAME frontier_load_benchmark.summary
+    COMMAND
+      $<TARGET_FILE:frontier_load_benchmark_summary>
+      --config
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/config/fixed_parallel_colocation.json"
+      --workload
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/workloads/step25_parallel.csv"
+  )
+  set_tests_properties(
+    frontier_load_benchmark.summary
+    PROPERTIES PASS_REGULAR_EXPRESSION "\"requests\": 8"
+  )
+  add_test(
+    NAME frontier_load_benchmark.pdd_summary
+    COMMAND
+      $<TARGET_FILE:frontier_load_benchmark_summary>
+      --config
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/config/fixed_sequential_pdd.json"
+      --workload
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/workloads/step3_pdd_small.csv"
+  )
+  set_tests_properties(
+    frontier_load_benchmark.pdd_summary
+    PROPERTIES PASS_REGULAR_EXPRESSION "\"kv_cache_transfers\": 2"
   )
   add_test(
     NAME frontier_sim.normalize_config
