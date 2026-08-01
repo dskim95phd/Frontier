@@ -17,13 +17,24 @@ import math
 from pathlib import Path
 import statistics
 import subprocess
+import sys
 import time
 from typing import Iterable, Sequence
 
-import numpy as np
-
-
 REPO_ROOT = Path(__file__).resolve().parents[2]
+REQUEST_GENERATOR_DIR = REPO_ROOT / "cpp" / "frontier" / "request_generator"
+sys.path.insert(0, str(REQUEST_GENERATOR_DIR))
+
+from workload_generator import (  # noqa: E402
+    BoundedLognormalLengthDistribution,
+    PoissonIntervalDistribution,
+    RequestShape,
+    generate_request_shapes,
+    materialize_requests,
+    write_workload_csv,
+)
+
+
 BASE_CONFIG = (
     REPO_ROOT
     / "cpp"
@@ -46,19 +57,44 @@ class TopologyConfig:
     data_parallel_size: int = 2
     num_replicas: int = 1
     cluster_count: int = 1
+    prefill_tensor_parallel_size: int | None = None
+    prefill_pipeline_parallel_size: int | None = None
+    prefill_data_parallel_size: int | None = None
 
-    @property
-    def gpu_count_per_cluster(self) -> int:
+    def parallelism(self, *, decode: bool) -> tuple[int, int, int, int]:
+        if decode or self.system_architecture == "co-location":
+            return (
+                self.num_replicas,
+                self.tensor_parallel_size,
+                self.pipeline_parallel_size,
+                self.data_parallel_size,
+            )
         return (
-            self.num_replicas
-            * self.tensor_parallel_size
-            * self.pipeline_parallel_size
-            * self.data_parallel_size
+            self.num_replicas,
+            self.prefill_tensor_parallel_size or self.tensor_parallel_size,
+            self.prefill_pipeline_parallel_size or self.pipeline_parallel_size,
+            self.prefill_data_parallel_size or self.data_parallel_size,
         )
 
     @property
+    def gpu_count_per_cluster(self) -> int:
+        return math.prod(self.parallelism(decode=True))
+
+    @property
+    def decode_gpu_count(self) -> int:
+        return math.prod(self.parallelism(decode=True))
+
+    @property
+    def prefill_gpu_count(self) -> int:
+        if self.system_architecture == "co-location":
+            return 0
+        return math.prod(self.parallelism(decode=False))
+
+    @property
     def physical_gpu_count(self) -> int:
-        return self.gpu_count_per_cluster * self.cluster_count
+        if self.system_architecture == "co-location":
+            return self.decode_gpu_count
+        return self.prefill_gpu_count + self.decode_gpu_count
 
     @property
     def kv_bytes_per_token_per_gpu(self) -> int:
@@ -92,6 +128,17 @@ TOPOLOGIES = {
         tensor_parallel_size=4,
         pipeline_parallel_size=4,
         cluster_count=2,
+    ),
+    "pdd-decode-tradeoff": TopologyConfig(
+        name="pdd-decode-tradeoff",
+        system_architecture="pd-disaggregation",
+        tensor_parallel_size=4,
+        pipeline_parallel_size=4,
+        data_parallel_size=2,
+        cluster_count=2,
+        prefill_tensor_parallel_size=4,
+        prefill_pipeline_parallel_size=4,
+        prefill_data_parallel_size=8,
     ),
 }
 
@@ -144,51 +191,22 @@ WORKLOAD_PROFILES = {
 }
 
 
-@dataclass(frozen=True)
-class RequestShape:
-    prompt_tokens: int
-    output_tokens: int
-    unit_exponential_gap: float
-
-
-def bounded_lognormal(
-    rng: np.random.Generator,
-    *,
-    median: float,
-    sigma: float,
-    lower: int,
-    upper: int,
-) -> int:
-    sample = math.exp(rng.normal(math.log(median), sigma))
-    return int(min(upper, max(lower, round(sample))))
-
-
 def generate_shapes(config: WorkloadConfig) -> list[RequestShape]:
-    if config.requests <= 0:
-        raise ValueError("requests must be positive")
-    rng = np.random.default_rng(config.seed)
-    shapes: list[RequestShape] = []
-    for _ in range(config.requests):
-        shapes.append(
-            RequestShape(
-                prompt_tokens=bounded_lognormal(
-                    rng,
-                    median=config.prompt_median,
-                    sigma=config.prompt_sigma,
-                    lower=config.prompt_min,
-                    upper=config.prompt_max,
-                ),
-                output_tokens=bounded_lognormal(
-                    rng,
-                    median=config.output_median,
-                    sigma=config.output_sigma,
-                    lower=config.output_min,
-                    upper=config.output_max,
-                ),
-                unit_exponential_gap=float(rng.exponential(1.0)),
-            )
-        )
-    return shapes
+    return generate_request_shapes(
+        num_requests=config.requests,
+        seed=config.seed,
+        length_distribution=BoundedLognormalLengthDistribution(
+            prefill_median=config.prompt_median,
+            prefill_sigma=config.prompt_sigma,
+            prefill_min=config.prompt_min,
+            prefill_max=config.prompt_max,
+            decode_median=config.output_median,
+            decode_sigma=config.output_sigma,
+            decode_min=config.output_min,
+            decode_max=config.output_max,
+        ),
+        interval_distribution=PoissonIntervalDistribution(qps=1.0),
+    )
 
 
 def percentile(values: Sequence[float], quantile: float) -> float:
@@ -243,34 +261,22 @@ def write_workload(
     arrival_rate: float | None,
     isolated_gap_seconds: float = 10.0,
 ) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    arrived_at = 0.0
-    with path.open("w", encoding="utf-8", newline="") as output:
-        writer = csv.writer(output, lineterminator="\n")
-        writer.writerow(
-            ("arrived_at", "num_prefill_tokens", "num_decode_tokens")
-        )
-        for index, shape in enumerate(shapes):
-            if index > 0:
-                arrived_at += (
-                    isolated_gap_seconds
-                    if arrival_rate is None
-                    else shape.unit_exponential_gap / arrival_rate
-                )
-            writer.writerow(
-                (
-                    f"{arrived_at:.12f}",
-                    shape.prompt_tokens,
-                    shape.output_tokens,
-                )
-            )
+    requests = materialize_requests(
+        shapes,
+        interval_scale=1.0 if arrival_rate is None else 1.0 / arrival_rate,
+        fixed_interval_seconds=(
+            isolated_gap_seconds if arrival_rate is None else None
+        ),
+    )
+    write_workload_csv(path, requests, arrival_decimal_places=12)
 
 
 def write_config(
     path: Path,
     *,
     run_id: str,
-    batch_size_cap: int,
+    prefill_batch_size_cap: int,
+    decode_batch_size_cap: int,
     max_tokens_in_batch: int,
     prefill_chunk_tokens: int,
     num_blocks: int,
@@ -283,19 +289,26 @@ def write_config(
 
     def make_cluster(*, decode: bool) -> dict:
         cluster = copy.deepcopy(base_cluster)
+        replicas, tensor_parallel, pipeline_parallel, data_parallel = (
+            topology.parallelism(decode=decode)
+        )
         cluster["parallelism"].update(
             {
-                "num_replicas": topology.num_replicas,
-                "tensor_parallel_size": topology.tensor_parallel_size,
-                "pipeline_parallel_size": topology.pipeline_parallel_size,
-                "data_parallel_size": topology.data_parallel_size,
+                "num_replicas": replicas,
+                "tensor_parallel_size": tensor_parallel,
+                "pipeline_parallel_size": pipeline_parallel,
+                "data_parallel_size": data_parallel,
                 "moe_tensor_parallel_size": 1,
                 "moe_expert_parallel_size": 1,
             }
         )
         cluster["scheduler"].update(
             {
-                "batch_size_cap": batch_size_cap,
+                "batch_size_cap": (
+                    decode_batch_size_cap
+                    if decode or topology.system_architecture == "co-location"
+                    else prefill_batch_size_cap
+                ),
                 "max_tokens_in_batch": max_tokens_in_batch,
                 "enable_preemption": True,
                 "enable_chunked_prefill": not decode,
@@ -382,7 +395,9 @@ def summarize_case(
     *,
     offered_concurrency: float,
     arrival_rate: float,
-    batch_size_cap: int,
+    prefill_batch_size_cap: int,
+    decode_batch_size_cap: int,
+    decode_batch_cap_enabled: bool,
     max_tokens_in_batch: int,
     prefill_chunk_tokens: int,
     measurement_trim_fraction: float,
@@ -396,6 +411,20 @@ def summarize_case(
         for batch_size, count in output["batch_size_histogram"].items()
         for _ in range(int(count))
     ]
+    batch_histograms = output.get("batch_size_histogram_by_cluster", {})
+
+    def materialize_batch_sizes(cluster_type: str) -> list[int]:
+        return [
+            int(batch_size)
+            for batch_size, count in batch_histograms.get(
+                cluster_type, {}
+            ).items()
+            for _ in range(int(count))
+        ]
+
+    prefill_batch_sizes = materialize_batch_sizes("PREFILL")
+    decode_batch_sizes = materialize_batch_sizes("DECODE")
+    batch_summaries = output.get("batch_summary_by_cluster", {})
     transfers = output.get("kv_cache_transfers", [])
     if len(requests) != len(shapes):
         raise RuntimeError(
@@ -439,6 +468,7 @@ def summarize_case(
         for row in requests
     ]
     tpot = []
+    user_decode_tps = []
     for row in requests:
         request_id = int(row["request_id"])
         output_tokens = shapes[request_id].output_tokens
@@ -449,6 +479,16 @@ def summarize_case(
             - float(row["first_token_completed_at_s"])
         ) * 1_000.0
         tpot.append(decode_tail_ms / (output_tokens - 1))
+    for row in measurement_requests:
+        request_id = int(row["request_id"])
+        output_tokens = shapes[request_id].output_tokens
+        decode_tail_seconds = float(row["completed_at_s"]) - float(
+            row["first_token_completed_at_s"]
+        )
+        if output_tokens > 1 and decode_tail_seconds > 0.0:
+            user_decode_tps.append(
+                (output_tokens - 1) / decode_tail_seconds
+            )
     e2e_seconds = [float(row["e2e_ms"]) / 1_000.0 for row in requests]
     scheduling = [float(row["scheduling_delay_ms"]) for row in requests]
     total_prompt = sum(shape.prompt_tokens for shape in shapes)
@@ -481,7 +521,10 @@ def summarize_case(
         "offered_concurrency": offered_concurrency,
         "arrival_rate_rps": arrival_rate,
         "realized_mean_concurrency": realized_mean_concurrency,
-        "batch_size_cap": batch_size_cap,
+        "batch_size_cap": decode_batch_size_cap,
+        "prefill_batch_size_cap": prefill_batch_size_cap,
+        "decode_batch_size_cap": decode_batch_size_cap,
+        "decode_batch_cap_enabled": decode_batch_cap_enabled,
         "max_tokens_in_batch": max_tokens_in_batch,
         "prefill_chunk_tokens": prefill_chunk_tokens,
         "measurement_trim_fraction": measurement_trim_fraction,
@@ -495,6 +538,9 @@ def summarize_case(
         "total_tokens_per_s": total_tokens / simulation_window,
         "prompt_tokens_per_s": total_prompt / simulation_window,
         "decode_tokens_per_s": total_decode / simulation_window,
+        "decode_tokens_per_gpu_s": (
+            total_decode / simulation_window / topology.decode_gpu_count
+        ),
         "ttft_mean_ms": statistics.fmean(ttft),
         "ttft_p50_ms": percentile(ttft, 0.50),
         "ttft_p90_ms": percentile(ttft, 0.90),
@@ -513,6 +559,11 @@ def summarize_case(
         "tpot_p50_ms": percentile(tpot, 0.50),
         "tpot_p90_ms": percentile(tpot, 0.90),
         "tpot_p99_ms": percentile(tpot, 0.99),
+        "user_decode_tps_mean": (
+            statistics.fmean(user_decode_tps) if user_decode_tps else 0.0
+        ),
+        "user_decode_tps_p50": percentile(user_decode_tps, 0.50),
+        "user_decode_tps_p10": percentile(user_decode_tps, 0.10),
         "e2e_mean_ms": statistics.fmean(e2e_seconds) * 1_000.0,
         "scheduling_delay_mean_ms": statistics.fmean(scheduling),
         "preemptions": total_preemptions,
@@ -532,6 +583,26 @@ def summarize_case(
             statistics.fmean(batch_sizes) if batch_sizes else 0.0
         ),
         "batch_size_p90": percentile(batch_sizes, 0.90),
+        "prefill_batches": len(prefill_batch_sizes),
+        "mean_prefill_batch_size": (
+            statistics.fmean(prefill_batch_sizes)
+            if prefill_batch_sizes
+            else 0.0
+        ),
+        "prefill_batch_size_p90": percentile(prefill_batch_sizes, 0.90),
+        "decode_batches": len(decode_batch_sizes),
+        "mean_decode_batch_size": (
+            statistics.fmean(decode_batch_sizes)
+            if decode_batch_sizes
+            else 0.0
+        ),
+        "decode_batch_size_p50": percentile(decode_batch_sizes, 0.50),
+        "decode_batch_size_p90": percentile(decode_batch_sizes, 0.90),
+        "decode_time_weighted_mean_batch_size": float(
+            batch_summaries.get("DECODE", {}).get(
+                "execution_time_weighted_mean_batch_size", 0.0
+            )
+        ),
         "events": int(output["counts"]["events"]),
         "batch_stages": int(output["counts"]["batch_stages"]),
         "simulator_core_wall_s": float(output["wall_clock_seconds"]),
@@ -551,6 +622,94 @@ def write_csv(path: Path, rows: Sequence[dict]) -> None:
         writer = csv.DictWriter(output, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
+
+
+def write_tradeoff_html(path: Path, rows: Sequence[dict]) -> None:
+    successful = sorted(
+        (
+            row
+            for row in rows
+            if row.get("status") == "ok"
+            and "mean_decode_batch_size" in row
+        ),
+        key=lambda row: float(row["mean_decode_batch_size"]),
+    )
+    if not successful:
+        return
+
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
+    decode_batch = [float(row["mean_decode_batch_size"]) for row in successful]
+    offered = [float(row["offered_concurrency"]) for row in successful]
+    customdata = [
+        [
+            float(row["offered_concurrency"]),
+            float(row["realized_mean_concurrency"]),
+            float(row["decode_batch_size_p90"]),
+        ]
+        for row in successful
+    ]
+    figure = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.12,
+        subplot_titles=("User decode throughput", "Decode GPU throughput"),
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=decode_batch,
+            y=[float(row["user_decode_tps_mean"]) for row in successful],
+            mode="lines+markers+text",
+            text=[f"c={value:g}" for value in offered],
+            textposition="top center",
+            customdata=customdata,
+            name="User TPS",
+            hovertemplate=(
+                "Mean decode batch %{x:.2f}<br>"
+                "User TPS %{y:.2f}<br>"
+                "Offered concurrency %{customdata[0]:g}<br>"
+                "Realized concurrency %{customdata[1]:.2f}<br>"
+                "Decode batch p90 %{customdata[2]:.1f}<extra></extra>"
+            ),
+        ),
+        row=1,
+        col=1,
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=decode_batch,
+            y=[
+                float(row["decode_tokens_per_gpu_s"])
+                for row in successful
+            ],
+            mode="lines+markers+text",
+            text=[f"c={value:g}" for value in offered],
+            textposition="top center",
+            customdata=customdata,
+            name="Decode tokens/s/GPU",
+            hovertemplate=(
+                "Mean decode batch %{x:.2f}<br>"
+                "Decode tokens/s/GPU %{y:.2f}<br>"
+                "Offered concurrency %{customdata[0]:g}<br>"
+                "Realized concurrency %{customdata[1]:.2f}<extra></extra>"
+            ),
+        ),
+        row=2,
+        col=1,
+    )
+    figure.update_xaxes(title_text="Mean realized Decode batch size", row=2, col=1)
+    figure.update_yaxes(title_text="tokens/s/user", row=1, col=1)
+    figure.update_yaxes(title_text="tokens/s/GPU", row=2, col=1)
+    figure.update_layout(
+        title="Decode batching tradeoff under increasing offered load",
+        height=760,
+        showlegend=False,
+        template="plotly_white",
+        hovermode="closest",
+    )
+    figure.write_html(path, include_plotlyjs=True, full_html=True)
 
 
 def distribution(values: Iterable[int]) -> dict[str, float | int]:
@@ -590,6 +749,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--batch-sizes",
         type=parse_int_list,
         default=parse_int_list("1,4,8,16,32"),
+    )
+    parser.add_argument(
+        "--unbounded-decode-batch",
+        action="store_true",
+        help=(
+            "Do not sweep Decode batch caps. Use the request count as a "
+            "non-binding safety cap and let offered load determine batch size."
+        ),
+    )
+    parser.add_argument(
+        "--prefill-batch-size-cap",
+        type=int,
+        default=64,
+        help="Fixed Prefill batch-size cap for PDD runs.",
     )
     parser.add_argument(
         "--prefill-chunk-tokens",
@@ -652,6 +825,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise SystemExit("--prefill-chunk-tokens must be positive")
     if args.max_tokens_in_batch <= 0:
         raise SystemExit("--max-tokens-in-batch must be positive")
+    if args.prefill_batch_size_cap <= 0:
+        raise SystemExit("--prefill-batch-size-cap must be positive")
     if args.prefill_chunk_tokens > args.max_tokens_in_batch:
         raise SystemExit(
             "--prefill-chunk-tokens cannot exceed --max-tokens-in-batch"
@@ -721,7 +896,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     write_config(
         calibration_config,
         run_id="single-turn-load-calibration",
-        batch_size_cap=1,
+        prefill_batch_size_cap=1,
+        decode_batch_size_cap=1,
         max_tokens_in_batch=args.max_tokens_in_batch,
         prefill_chunk_tokens=args.prefill_chunk_tokens,
         num_blocks=max(num_blocks_values),
@@ -775,13 +951,20 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     results_path = output_dir / "sweep_results.json"
     rows: list[dict] = []
-    completed_keys: set[tuple[float, int, int]] = set()
+    batch_size_values: list[int | None] = (
+        [None] if args.unbounded_decode_batch else list(args.batch_sizes)
+    )
+    completed_keys: set[tuple[float, str, int]] = set()
     if args.resume and results_path.is_file():
         rows = json.loads(results_path.read_text(encoding="utf-8"))
         completed_keys = {
             (
                 float(row["offered_concurrency"]),
-                int(row["batch_size_cap"]),
+                (
+                    "unbounded"
+                    if not bool(row.get("decode_batch_cap_enabled", True))
+                    else str(int(row["decode_batch_size_cap"]))
+                ),
                 int(row["num_blocks_per_dp_target"]),
             )
             for row in rows
@@ -789,15 +972,16 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     total_cases = (
         len(args.offered_concurrency)
-        * len(args.batch_sizes)
+        * len(batch_size_values)
         * len(num_blocks_values)
     )
     case_index = 0
     for num_blocks in num_blocks_values:
-        for batch_size in args.batch_sizes:
+        for batch_size in batch_size_values:
             for offered_concurrency in args.offered_concurrency:
                 case_index += 1
-                key = (offered_concurrency, batch_size, num_blocks)
+                batch_key = "unbounded" if batch_size is None else str(batch_size)
+                key = (offered_concurrency, batch_key, num_blocks)
                 if key in completed_keys:
                     print(
                         f"[{case_index}/{total_cases}] resume skip {key}",
@@ -807,13 +991,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                 run_id = (
                     f"single-turn-{topology.name}-{workload_profile.name}-"
                     f"c{offered_concurrency:g}-"
-                    f"b{batch_size}-kv{num_blocks}"
+                    f"b{batch_key}-kv{num_blocks}"
                 )
                 config_path = inputs_dir / f"{run_id}.json"
+                decode_batch_size_cap = (
+                    args.requests if batch_size is None else batch_size
+                )
                 write_config(
                     config_path,
                     run_id=run_id,
-                    batch_size_cap=batch_size,
+                    prefill_batch_size_cap=args.prefill_batch_size_cap,
+                    decode_batch_size_cap=decode_batch_size_cap,
                     max_tokens_in_batch=args.max_tokens_in_batch,
                     prefill_chunk_tokens=args.prefill_chunk_tokens,
                     num_blocks=num_blocks,
@@ -835,7 +1023,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                         shapes,
                         offered_concurrency=offered_concurrency,
                         arrival_rate=arrival_rates[offered_concurrency],
-                        batch_size_cap=batch_size,
+                        prefill_batch_size_cap=args.prefill_batch_size_cap,
+                        decode_batch_size_cap=decode_batch_size_cap,
+                        decode_batch_cap_enabled=batch_size is not None,
                         max_tokens_in_batch=args.max_tokens_in_batch,
                         prefill_chunk_tokens=args.prefill_chunk_tokens,
                         measurement_trim_fraction=(
@@ -848,6 +1038,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     print(
                         "  "
                         f"actual_c={row['realized_mean_concurrency']:.3f} "
+                        f"decode_b={row['mean_decode_batch_size']:.2f} "
                         f"rps={row['throughput_requests_per_s']:.3f} "
                         f"ttft_p90={row['ttft_p90_ms']:.3f}ms "
                         f"preemptions={row['preemptions']}",
@@ -860,7 +1051,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "topology": topology.name,
                         "offered_concurrency": offered_concurrency,
                         "arrival_rate_rps": arrival_rates[offered_concurrency],
-                        "batch_size_cap": batch_size,
+                        "batch_size_cap": decode_batch_size_cap,
+                        "prefill_batch_size_cap": args.prefill_batch_size_cap,
+                        "decode_batch_size_cap": decode_batch_size_cap,
+                        "decode_batch_cap_enabled": batch_size is not None,
                         "max_tokens_in_batch": args.max_tokens_in_batch,
                         "prefill_chunk_tokens": args.prefill_chunk_tokens,
                         "num_blocks_per_dp_target": num_blocks,
@@ -905,7 +1099,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
         "offered_concurrency": args.offered_concurrency,
         "arrival_rates_rps": arrival_rates,
-        "batch_sizes": args.batch_sizes,
+        "batch_sizes": (
+            [] if args.unbounded_decode_batch else args.batch_sizes
+        ),
+        "decode_batch_cap_mode": (
+            "unbounded" if args.unbounded_decode_batch else "sweep"
+        ),
+        "prefill_batch_size_cap": args.prefill_batch_size_cap,
         "max_tokens_in_batch": args.max_tokens_in_batch,
         "prefill_chunk_tokens": args.prefill_chunk_tokens,
         "measurement_trim_fraction": args.measurement_trim_fraction,
@@ -922,6 +1122,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             "pipeline_parallel_size": topology.pipeline_parallel_size,
             "data_parallel_size": topology.data_parallel_size,
             "gpu_count_per_cluster": topology.gpu_count_per_cluster,
+            "prefill_parallelism": topology.parallelism(decode=False),
+            "decode_parallelism": topology.parallelism(decode=True),
+            "prefill_gpu_count": topology.prefill_gpu_count,
+            "decode_gpu_count": topology.decode_gpu_count,
             "physical_gpu_count": topology.physical_gpu_count,
             "kv_bytes_per_token_per_gpu": (
                 topology.kv_bytes_per_token_per_gpu
@@ -935,7 +1139,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         json.dumps(manifest, indent=2) + "\n",
         encoding="utf-8",
     )
+    tradeoff_path = output_dir / "decode_batch_tradeoff.html"
+    write_tradeoff_html(tradeoff_path, rows)
     print(f"wrote {output_dir / 'sweep_results.csv'}", flush=True)
+    if tradeoff_path.is_file():
+        print(f"wrote {tradeoff_path}", flush=True)
     return 0
 
 

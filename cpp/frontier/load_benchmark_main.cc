@@ -81,13 +81,15 @@ OrderedJson summarize(const frontier::metrics::SimulationOutput &output,
     root["wall_clock_seconds"] = wall_clock_seconds;
     root["counts"] = {
         {"requests", output.requests.size()},
-        {"batches", output.batches.size()},
-        {"batch_stages", output.batch_stages.size()},
-        {"scheduler_iterations", output.scheduler_trace.size()},
-        {"events", output.event_trace.size()},
-        {"analytical_diagnostics", output.analytical_diagnostics.size()},
-        {"moe_routing_records", output.moe_routing.size()},
-        {"kv_cache_transfers", output.kv_cache_transfers.size()},
+        {"batches", output.aggregate.batch_count},
+        {"batch_stages", output.aggregate.batch_stage_count},
+        {"scheduler_iterations",
+         output.aggregate.scheduler_iteration_count},
+        {"events", output.aggregate.event_count},
+        {"analytical_diagnostics",
+         output.aggregate.analytical_diagnostic_count},
+        {"moe_routing_records", output.aggregate.moe_routing_count},
+        {"kv_cache_transfers", output.aggregate.kv_cache_transfer_count},
     };
 
     root["requests"] = OrderedJson::array();
@@ -116,13 +118,46 @@ OrderedJson summarize(const frontier::metrics::SimulationOutput &output,
         });
     }
 
-    std::map<std::size_t, std::size_t> batch_size_histogram;
-    for (const frontier::metrics::BatchMetricsRecord &batch : output.batches) {
-        ++batch_size_histogram[batch.request_ids.size()];
+    std::map<std::size_t, std::uint64_t> batch_size_histogram;
+    for (const auto &[cluster_type, aggregate] :
+         output.aggregate.batches_by_cluster) {
+        static_cast<void>(cluster_type);
+        for (const auto &[batch_size, count] :
+             aggregate.batch_size_histogram) {
+            batch_size_histogram[batch_size] += count;
+        }
     }
     root["batch_size_histogram"] = OrderedJson::object();
     for (const auto &[batch_size, count] : batch_size_histogram) {
         root["batch_size_histogram"][std::to_string(batch_size)] = count;
+    }
+    root["batch_size_histogram_by_cluster"] = OrderedJson::object();
+    root["batch_summary_by_cluster"] = OrderedJson::object();
+    for (const auto &[cluster_type_value, aggregate] :
+         output.aggregate.batches_by_cluster) {
+        const std::string cluster_type{
+            frontier::to_string(cluster_type_value)};
+        OrderedJson cluster_histogram = OrderedJson::object();
+        for (const auto &[batch_size, count] :
+             aggregate.batch_size_histogram) {
+            cluster_histogram[std::to_string(batch_size)] = count;
+        }
+        root["batch_size_histogram_by_cluster"][cluster_type] =
+            std::move(cluster_histogram);
+        const double execution_ms = aggregate.predicted_execution_ms;
+        root["batch_summary_by_cluster"][cluster_type] = {
+            {"batches", aggregate.batch_count},
+            {"mean_batch_size",
+             aggregate.batch_count == 0
+                 ? 0.0
+                 : static_cast<double>(aggregate.request_slots) /
+                       static_cast<double>(aggregate.batch_count)},
+            {"execution_time_weighted_mean_batch_size",
+             execution_ms == 0.0
+                 ? 0.0
+                 : aggregate.batch_size_execution_ms / execution_ms},
+            {"predicted_execution_ms", execution_ms},
+        };
     }
 
     root["kv_cache_transfers"] = OrderedJson::array();
@@ -165,6 +200,8 @@ int main(int argc, char *argv[]) {
 
         const auto started_at = std::chrono::steady_clock::now();
         frontier::simulator::Simulator simulator{config, workload};
+        simulator.metrics().set_detailed_traces_enabled(false);
+        simulator.set_runtime_validation_enabled(false);
         const frontier::metrics::SimulationOutput output = simulator.run();
         const double wall_clock_seconds =
             std::chrono::duration<double>(std::chrono::steady_clock::now() -

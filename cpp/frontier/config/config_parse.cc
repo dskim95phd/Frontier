@@ -490,11 +490,7 @@ ParallelismConfig parse_parallelism(const Json &root,
                                     "config.parallelism accelerator count");
     accelerators = checked_multiply(accelerators, parsed.tensor_parallel_size,
                                     "config.parallelism accelerator count");
-    if (accelerators > 72) {
-        throw ConfigError(
-            "config.parallelism requires more than the supported 72 Rubin "
-            "accelerators");
-    }
+    static_cast<void>(accelerators);
     return parsed;
 }
 

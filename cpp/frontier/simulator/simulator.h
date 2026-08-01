@@ -36,6 +36,7 @@ class Simulator {
     }
     [[nodiscard]] EventQueue &event_queue() noexcept { return event_queue_; }
     [[nodiscard]] metrics::MetricsStore &metrics() noexcept { return metrics_; }
+    void set_runtime_validation_enabled(bool enabled);
     [[nodiscard]] scheduler::GlobalScheduler &global_scheduler() noexcept {
         return *global_scheduler_;
     }
@@ -79,6 +80,7 @@ class Simulator {
     [[nodiscard]] entities::BatchStage &batch_stage(BatchId batch_id,
                                                     StageId stage_id);
     [[nodiscard]] double predicted_batch_ms(BatchId batch_id) const;
+    void release_batch(BatchId batch_id);
 
     void
     assign_request_target(RequestId request_id, scheduler::ReplicaTarget target,

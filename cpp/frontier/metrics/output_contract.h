@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <string>
 #include <utility>
@@ -149,6 +150,25 @@ struct MoERoutingMetricsRecord {
     double critical_lane_time_ms = 0.0;
 };
 
+struct BatchMetricsAggregate {
+    std::uint64_t batch_count = 0;
+    std::uint64_t request_slots = 0;
+    double predicted_execution_ms = 0.0;
+    double batch_size_execution_ms = 0.0;
+    std::map<std::size_t, std::uint64_t> batch_size_histogram;
+};
+
+struct MetricsAggregate {
+    std::uint64_t event_count = 0;
+    std::uint64_t batch_count = 0;
+    std::uint64_t batch_stage_count = 0;
+    std::uint64_t scheduler_iteration_count = 0;
+    std::uint64_t analytical_diagnostic_count = 0;
+    std::uint64_t moe_routing_count = 0;
+    std::uint64_t kv_cache_transfer_count = 0;
+    std::map<ClusterType, BatchMetricsAggregate> batches_by_cluster;
+};
+
 struct SimulationOutput {
     int schema_version = kOutputSchemaVersion;
     RunMetadata run;
@@ -160,6 +180,7 @@ struct SimulationOutput {
     std::vector<AnalyticalDiagnostic> analytical_diagnostics;
     std::vector<MoERoutingMetricsRecord> moe_routing;
     std::vector<KVCacheTransferMetricsRecord> kv_cache_transfers;
+    MetricsAggregate aggregate;
 };
 
 [[nodiscard]] std::string_view to_string(EventType event_type) noexcept;

@@ -2,7 +2,9 @@
 
 #include <cstddef>
 #include <map>
+#include <memory>
 #include <optional>
+#include <unordered_map>
 #include <vector>
 
 #include "frontier/config/config.h"
@@ -58,6 +60,7 @@ class EntityArena {
     [[nodiscard]] entities::BatchStage &batch_stage(BatchId batch_id,
                                                     StageId stage_id);
     [[nodiscard]] double predicted_batch_ms(BatchId batch_id) const;
+    void release_batch(BatchId batch_id);
 
     void add_target_domain(ClusterType cluster_type);
     void assign_request_target(RequestId request_id,
@@ -89,12 +92,16 @@ class EntityArena {
     }
 
   private:
+    struct BatchRuntimeState {
+        std::unique_ptr<entities::Batch> batch;
+        std::vector<SimTime> stage_arrival_times;
+        std::vector<std::optional<entities::BatchStage>> batch_stages;
+        double predicted_batch_ms = 0.0;
+    };
+
     std::vector<entities::Request> requests_;
-    std::vector<entities::Batch> batches_;
-    std::vector<entities::BatchStage> batch_stages_;
-    std::vector<std::vector<SimTime>> stage_arrival_times_;
-    std::vector<std::vector<std::optional<std::size_t>>> stage_record_indices_;
-    std::vector<double> predicted_batch_ms_;
+    std::unordered_map<BatchId::ValueType, BatchRuntimeState> batches_;
+    BatchId::ValueType next_batch_id_ = 0;
     std::map<ClusterType, std::vector<scheduler::ReplicaTarget>>
         request_targets_;
     std::vector<entities::KVCacheTransferInfo> kv_cache_transfers_;

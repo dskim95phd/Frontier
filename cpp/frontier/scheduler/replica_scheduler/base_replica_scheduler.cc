@@ -155,6 +155,9 @@ bool BaseReplicaScheduler::on_batch_completed(entities::Batch &batch,
 }
 
 void BaseReplicaScheduler::validate_lifecycle_state() const {
+    if (!runtime_validation_enabled_) {
+        return;
+    }
     if (pipeline_parallel_size_ == 0 ||
         in_flight_batch_count_ != in_flight_batches_.size() ||
         in_flight_batch_count_ > pipeline_parallel_size_) {

@@ -133,6 +133,25 @@ Simulator::cluster(ClusterType cluster_type) const {
     return global_scheduler_->get_cluster_scheduler(cluster_type);
 }
 
+void Simulator::set_runtime_validation_enabled(bool enabled) {
+    for (const auto &[cluster_type, cluster_entity] : clusters_) {
+        const config::ParallelismConfig &parallelism =
+            cluster_entity.parallelism();
+        scheduler::BaseClusterScheduler &cluster_scheduler =
+            cluster(cluster_type);
+        for (std::uint64_t replica = 0;
+             replica < parallelism.num_replicas; ++replica) {
+            for (std::uint64_t dp = 0;
+                 dp < parallelism.data_parallel_size; ++dp) {
+                cluster_scheduler
+                    .get_replica_scheduler(ReplicaId{replica},
+                                           DataParallelId{dp})
+                    .set_runtime_validation_enabled(enabled);
+            }
+        }
+    }
+}
+
 const config::ParallelismConfig &
 Simulator::parallelism(ClusterType cluster_type) const {
     return cluster_entity(cluster_type).parallelism();
@@ -218,6 +237,10 @@ entities::BatchStage &Simulator::batch_stage(BatchId batch_id,
 
 double Simulator::predicted_batch_ms(BatchId batch_id) const {
     return entities_.predicted_batch_ms(batch_id);
+}
+
+void Simulator::release_batch(BatchId batch_id) {
+    entities_.release_batch(batch_id);
 }
 
 void Simulator::assign_request_target(RequestId request_id,

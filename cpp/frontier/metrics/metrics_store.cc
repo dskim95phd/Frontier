@@ -34,7 +34,10 @@ MetricsStore::MetricsStore(const config::SimulationConfig &config,
 }
 
 void MetricsStore::record_event(Event event) {
-    output_.event_trace.push_back(std::move(event));
+    ++output_.aggregate.event_count;
+    if (detailed_traces_enabled_) {
+        output_.event_trace.push_back(std::move(event));
+    }
 }
 
 void MetricsStore::record_request(RequestMetricsRecord record) {
@@ -47,6 +50,19 @@ void MetricsStore::record_batch(const entities::Batch &batch,
                                 const config::ClusterRuntimeConfig &runtime) {
     if (!batch.completed_at().valid()) {
         throw std::logic_error("cannot emit metrics for incomplete batch");
+    }
+    const std::size_t batch_size = batch.requests().size();
+    BatchMetricsAggregate &aggregate =
+        output_.aggregate.batches_by_cluster[batch.cluster_type()];
+    ++output_.aggregate.batch_count;
+    ++aggregate.batch_count;
+    aggregate.request_slots += batch_size;
+    aggregate.predicted_execution_ms += predicted_execution_ms;
+    aggregate.batch_size_execution_ms +=
+        static_cast<double>(batch_size) * predicted_execution_ms;
+    ++aggregate.batch_size_histogram[batch_size];
+    if (!detailed_traces_enabled_) {
+        return;
     }
     BatchMetricsRecord record = [&]() {
         BatchMetricsRecord value{};
@@ -88,6 +104,10 @@ void MetricsStore::record_batch(const entities::Batch &batch,
 void MetricsStore::record_batch_stage(
     const entities::BatchStage &batch_stage, const entities::Batch &batch,
     const config::ClusterRuntimeConfig &runtime) {
+    ++output_.aggregate.batch_stage_count;
+    if (!detailed_traces_enabled_) {
+        return;
+    }
     BatchStageMetricsRecord record = [&]() {
         BatchStageMetricsRecord value{};
         value.batch_id = batch_stage.batch_id();
@@ -112,6 +132,10 @@ void MetricsStore::record_batch_stage(
 void MetricsStore::record_scheduler_trace(
     const scheduler::ScheduleResult &schedule, scheduler::ReplicaTarget target,
     ClusterType cluster_type) {
+    ++output_.aggregate.scheduler_iteration_count;
+    if (!detailed_traces_enabled_) {
+        return;
+    }
     SchedulerTraceRecord trace = [&]() {
         SchedulerTraceRecord value{};
         value.iteration_id = schedule.iteration_id;
@@ -155,6 +179,7 @@ void MetricsStore::record_scheduler_trace(
 
 void MetricsStore::record_kv_cache_transfer(
     const entities::KVCacheTransferInfo &transfer) {
+    ++output_.aggregate.kv_cache_transfer_count;
     KVCacheTransferMetricsRecord record = [&]() {
         KVCacheTransferMetricsRecord value{};
         value.transfer_id = transfer.id();
@@ -175,6 +200,10 @@ void MetricsStore::record_kv_cache_transfer(
 
 void MetricsStore::record_analytical_diagnostic(
     std::string name, std::vector<std::pair<std::string, double>> values) {
+    ++output_.aggregate.analytical_diagnostic_count;
+    if (!detailed_traces_enabled_) {
+        return;
+    }
     output_.analytical_diagnostics.push_back([&]() {
         AnalyticalDiagnostic value{};
         value.name = std::move(name);
@@ -187,6 +216,10 @@ void MetricsStore::record_moe_routing(
     const entities::Batch &batch, StageId stage_id,
     const execution_time_predictor::MoERoutingDiagnostic &diagnostic,
     const config::ClusterRuntimeConfig &runtime) {
+    ++output_.aggregate.moe_routing_count;
+    if (!detailed_traces_enabled_) {
+        return;
+    }
     output_.moe_routing.push_back([&]() {
         MoERoutingMetricsRecord value{};
         value.batch_id = batch.id();

@@ -33,6 +33,7 @@ void handle_event(const GlobalBatchEndPayload &payload, SimTime time,
         value.cluster_type = payload.cluster_type;
         return value;
     }());
+    simulator.release_batch(payload.batch_id);
 }
 
 } // namespace frontier::events

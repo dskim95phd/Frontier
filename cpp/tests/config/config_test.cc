@@ -322,6 +322,24 @@ void test_model_runtime_overrides_are_optional() {
         "unknown model names without matching JSON assets must fail fast");
 }
 
+void test_cluster_parallelism_is_not_limited_to_one_nvl72_domain() {
+    std::string text =
+        read_text_file(fixture("analytical_parallel_colocation.json"));
+    const std::string original = "\"data_parallel_size\": 2";
+    const std::size_t position = text.find(original);
+    expect(position != std::string::npos,
+           "analytical fixture must expose data parallelism");
+    text.replace(position, original.size(), "\"data_parallel_size\": 16");
+
+    const auto parsed = parse_simulation_config_json(text);
+    const auto &parallelism = parsed.cluster().parallelism;
+    expect(parallelism.num_replicas * parallelism.tensor_parallel_size *
+                   parallelism.pipeline_parallel_size *
+                   parallelism.data_parallel_size ==
+               128,
+           "cluster parallelism above 72 accelerators must parse");
+}
+
 } // namespace
 
 int main() {
@@ -351,5 +369,8 @@ int main() {
     failures += frontier::test::run(
         "model runtime overrides are optional",
         test_model_runtime_overrides_are_optional);
+    failures += frontier::test::run(
+        "cluster parallelism above NVL72 parses",
+        test_cluster_parallelism_is_not_limited_to_one_nvl72_domain);
     return failures == 0 ? 0 : 1;
 }

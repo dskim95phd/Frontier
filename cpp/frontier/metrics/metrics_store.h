@@ -38,6 +38,10 @@ class MetricsStore {
     explicit MetricsStore(const config::SimulationConfig &config,
                           std::size_t expected_request_count = 0);
 
+    void set_detailed_traces_enabled(bool enabled) noexcept {
+        detailed_traces_enabled_ = enabled;
+    }
+
     void record_event(Event event);
     void record_batch(const entities::Batch &batch,
                       const std::vector<entities::Request> &requests,
@@ -66,6 +70,7 @@ class MetricsStore {
   private:
     void record_request(RequestMetricsRecord record);
     SimulationOutput output_;
+    bool detailed_traces_enabled_ = true;
 };
 
 } // namespace frontier::metrics

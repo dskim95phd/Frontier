@@ -249,6 +249,18 @@ Request IDs follow row order from zero. Arrival times must be finite and
 nonnegative; token counts must be positive integers. Duplicate, missing,
 unknown, quoted, and block-hash columns are rejected.
 
+Generate a workload without importing the Python simulator:
+
+```powershell
+python cpp/frontier/request_generator/generate_workload.py `
+  --config cpp/frontier/request_generator/example_workload.json `
+  --output outputs/workload.csv
+```
+
+The generator implements fixed, uniform, Zipf, and bounded log-normal request
+lengths plus static, Poisson, and Gamma arrival intervals. Its output uses the
+same normalized CSV contract parsed by `frontier_sim`.
+
 ## Output contract
 
 The single output schema is also version 1. It always contains canonical

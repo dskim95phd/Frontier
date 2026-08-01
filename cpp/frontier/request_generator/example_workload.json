@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "num_requests": 64,
+  "seed": 20260728,
+  "first_arrival_at_zero": true,
+  "length": {
+    "type": "bounded_lognormal",
+    "prefill_median": 8192,
+    "prefill_sigma": 0.8,
+    "prefill_min": 2048,
+    "prefill_max": 32768,
+    "decode_median": 1024,
+    "decode_sigma": 0.7,
+    "decode_min": 256,
+    "decode_max": 4096
+  },
+  "interval": {
+    "type": "poisson",
+    "qps": 1.0
+  }
+}

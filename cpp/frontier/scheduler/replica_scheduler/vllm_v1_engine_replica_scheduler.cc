@@ -611,6 +611,9 @@ bool VllmV1Scheduler::consume_terminal_release_followup_poll() noexcept {
 }
 
 void VllmV1Scheduler::validate_policy_state() const {
+    if (!runtime_validation_enabled()) {
+        return;
+    }
     if (cluster_type() == ClusterType::kDecode && !preempted_.empty()) {
         throw SchedulerError(
             "DECODE scheduler must retain preempted requests in waiting order");

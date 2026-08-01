@@ -106,6 +106,9 @@ class BaseReplicaScheduler {
     [[nodiscard]] std::uint64_t pipeline_parallel_size() const noexcept {
         return pipeline_parallel_size_;
     }
+    void set_runtime_validation_enabled(bool enabled) noexcept {
+        runtime_validation_enabled_ = enabled;
+    }
     [[nodiscard]] virtual bool has_pending_work() const noexcept = 0;
     [[nodiscard]] virtual bool idle() const noexcept = 0;
     [[nodiscard]] virtual std::size_t waiting_count() const noexcept = 0;
@@ -132,6 +135,9 @@ class BaseReplicaScheduler {
     [[nodiscard]] entities::Request &request(RequestId request_id);
     [[nodiscard]] const entities::Request &request(RequestId request_id) const;
     [[nodiscard]] bool request_is_active(RequestId request_id) const;
+    [[nodiscard]] bool runtime_validation_enabled() const noexcept {
+        return runtime_validation_enabled_;
+    }
 
     [[nodiscard]] virtual bool contains_request(RequestId request_id) const = 0;
     [[nodiscard]] virtual ScheduleResult schedule_requests(SimTime time) = 0;
@@ -149,6 +155,7 @@ class BaseReplicaScheduler {
         in_flight_batches_;
     std::unordered_map<RequestId, std::uint64_t, StrongIdHash<RequestId>>
         active_requests_;
+    bool runtime_validation_enabled_ = true;
 
   private:
     void validate_lifecycle_state() const;

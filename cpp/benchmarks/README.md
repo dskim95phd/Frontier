@@ -17,6 +17,10 @@ Every configuration reuses the same request lengths and unit arrival gaps. This
 makes comparisons paired and deterministic. Multi-turn/session behavior is
 intentionally excluded.
 
+The distribution and CSV-writing implementation lives in
+`cpp/frontier/request_generator/workload_generator.py`. The benchmark imports
+that standalone C++-input tool instead of maintaining a separate generator.
+
 Three output-length profiles are available:
 
 | Profile | OSL median | OSL range | Purpose |
@@ -81,6 +85,31 @@ python cpp/benchmarks/run_single_turn_load_sweep.py `
   --binary .build-step35-release/frontier_load_benchmark_summary.exe `
   --prefill-chunk-tokens 256
 ```
+
+## Decode batching tradeoff
+
+The `pdd-decode-tradeoff` topology overprovisions Prefill with TP4/PP4/DP8
+(128 GPUs) and holds Decode at TP4/PP4/DP2 (32 GPUs). In unbounded Decode mode,
+the request count is used only as a non-binding safety cap; offered load, the
+token budget, and KV capacity determine the realized Decode batch size.
+
+```powershell
+python cpp/benchmarks/run_single_turn_load_sweep.py `
+  --binary .build-step35-release/frontier_load_benchmark_summary.exe `
+  --output-dir outputs/cpp_decode_batch_tradeoff_pdd_balanced `
+  --topology pdd-decode-tradeoff `
+  --workload-profile balanced-8k-1k `
+  --requests 256 `
+  --offered-concurrency 1,2,4,8,16,32,64,128,256,512 `
+  --unbounded-decode-batch `
+  --prefill-batch-size-cap 64 `
+  --kv-capacities-gib 64 `
+  --measurement-trim-fraction 0.1
+```
+
+The result includes cluster-specific batch distributions,
+`user_decode_tps_*`, `decode_tokens_per_gpu_s`, and an interactive
+`decode_batch_tradeoff.html` plot.
 
 To run one high-load tail-TTFT case instead of a grid, provide one value for
 the offered concurrency, batch cap, and KV capacity:
