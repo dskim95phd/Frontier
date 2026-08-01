@@ -122,7 +122,9 @@ Co-location has exactly one `monolithic` cluster:
         "num_replicas": 2,
         "tensor_parallel_size": 2,
         "pipeline_parallel_size": 2,
-        "data_parallel_size": 2
+        "data_parallel_size": 2,
+        "moe_tensor_parallel_size": 1,
+        "moe_expert_parallel_size": 1
       },
       "scheduler": {
         "type": "vllm_v1",
@@ -140,6 +142,14 @@ Co-location has exactly one `monolithic` cluster:
       "execution_model": {
         "type": "fixed",
         "stage_latencies_ms": [1.0, 3.0]
+      },
+      "model_name": "meta-llama/Llama-2-7b-hf",
+      "total_expert_num": 1,
+      "router_topk": 1,
+      "moe_routing": {
+        "mode": "simulation",
+        "distribution": "balanced",
+        "seed": 42
       }
     }
   }
@@ -148,6 +158,17 @@ Co-location has exactly one `monolithic` cluster:
 
 The number of fixed stage latencies must equal
 `pipeline_parallel_size`.
+
+`model_name` follows Python's `ReplicaConfig.model_name` contract. C++ first
+looks in the same built-in model registry as Python, then falls back to
+`data/config/models/<model-name-with-slashes-replaced-by-__>.json`. For
+example, `moonshotai/Kimi-K2-Instruct` resolves to
+`data/config/models/moonshotai__Kimi-K2-Instruct.json`. Set
+`FRONTIER_MODEL_CONFIG_DIR` to use an additional model-asset directory.
+
+For MoE models, `total_expert_num` and `router_topk` default to the model
+asset's `num_experts` and `num_experts_per_tok`. They may be provided at the
+cluster level as runtime overrides. Dense models always use `1` for both.
 
 ### Sequential PDD clusters
 
@@ -161,12 +182,16 @@ model:
     "prefill": {
       "parallelism": {},
       "scheduler": {},
-      "execution_model": {}
+      "execution_model": {},
+      "model_name": "meta-llama/Llama-2-7b-hf",
+      "moe_routing": {}
     },
     "decode": {
       "parallelism": {},
       "scheduler": {},
-      "execution_model": {}
+      "execution_model": {},
+      "model_name": "meta-llama/Llama-2-7b-hf",
+      "moe_routing": {}
     }
   },
   "kv_cache_transfer": {
@@ -190,17 +215,21 @@ An analytical cluster replaces its fixed execution model with:
 {
   "type": "analytical",
   "device": "rubin",
-  "model": "llama2-7b",
   "precision": "fp16",
-  "num_layers": 32,
   "network_bandwidth_gbps": 400.0,
   "network_latency_us": 1.0,
   "intra_node_bandwidth_gbps": 14400.0
 }
 ```
 
-TP comes from the cluster's `parallelism` object. The current model validates
-TP 1/2/4/8 and requires the 32 layers to divide evenly across PP stages.
+The analytical predictor derives the model and layer count from the cluster's
+`model_name`; they are not repeated in `execution_model`. TP comes from the
+cluster's `parallelism` object. The current model validates TP 1/2/4/8,
+requires model layers to divide evenly across PP stages, and supports the
+dense-KV attention family (MHA/GQA/MQA), Step3Text MFA's shared-Q projection
+path, and latent-cache MLA. MLA uses the latent KV-cache width for context IO;
+MFA accounts separately for its replicated QKV projection, shared-Q norm, and
+WQ projection. Frozen DSA remains unsupported.
 
 ## Workload contract
 

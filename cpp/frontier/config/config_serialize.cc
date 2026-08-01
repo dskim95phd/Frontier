@@ -74,14 +74,6 @@ OrderedJson serialize_parallelism(const ParallelismConfig &parallelism) {
     });
 }
 
-OrderedJson serialize_model(const ModelConfig &model) {
-    return OrderedJson::object({
-        {"name", model.name},
-        {"runtime_total_experts", model.runtime_total_experts},
-        {"router_topk", model.router_topk},
-    });
-}
-
 OrderedJson serialize_moe_routing(const MoeRoutingConfig &routing) {
     return OrderedJson::object({
         {"mode", to_string(routing.mode)},
@@ -107,9 +99,7 @@ OrderedJson serialize_execution_model(const ExecutionModelConfig &execution) {
     OrderedJson result = OrderedJson::object({
         {"type", to_string(execution.type)},
         {"device", execution.analytical.device},
-        {"model", execution.analytical.model},
         {"precision", execution.analytical.precision},
-        {"num_layers", execution.analytical.num_layers},
         {
             "network_bandwidth_gbps",
             execution.analytical.network_bandwidth_gbps,
@@ -131,7 +121,9 @@ OrderedJson serialize_cluster_runtime(const ClusterRuntimeConfig &cluster) {
             "execution_model",
             serialize_execution_model(cluster.execution_model),
         },
-        {"model", serialize_model(cluster.model)},
+        {"model_name", cluster.model.name},
+        {"total_expert_num", cluster.model.total_expert_num},
+        {"router_topk", cluster.model.router_topk},
         {"moe_routing", serialize_moe_routing(cluster.moe_routing)},
     });
 }

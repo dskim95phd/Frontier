@@ -71,14 +71,6 @@ def _build_python_config(
     topology = cluster_config["parallelism"]
     scheduler = cluster_config["scheduler"]
     execution = cluster_config["execution_model"]
-    model = cluster_config.get(
-        "model",
-        {
-            "name": "llama2-7b",
-            "runtime_total_experts": 1,
-            "router_topk": 1,
-        },
-    )
     routing = cluster_config.get(
         "moe_routing",
         {
@@ -87,10 +79,8 @@ def _build_python_config(
             "seed": 42,
         },
     )
-    model_name = (
-        "meta-llama/Llama-2-7b-hf"
-        if model["name"] == "llama2-7b"
-        else str(model["name"])
+    model_name = str(
+        cluster_config.get("model_name", "meta-llama/Llama-2-7b-hf")
     )
     replica_scheduler = VllmV1SchedulerConfig(
         batch_size_cap=int(scheduler["batch_size_cap"]),
@@ -136,9 +126,9 @@ def _build_python_config(
             topology.get("moe_expert_parallel_size", 1)
         ),
         total_expert_num=int(
-            model.get("runtime_total_experts", 1)
+            cluster_config.get("total_expert_num", 1)
         ),
-        router_topk=int(model.get("router_topk", 1)),
+        router_topk=int(cluster_config.get("router_topk", 1)),
         moe_routing_mode=str(routing.get("mode", "simulation")),
         moe_routing_distribution_type=str(
             routing.get("distribution", "balanced")

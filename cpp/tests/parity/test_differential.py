@@ -46,6 +46,18 @@ ANALYTICAL_BATCH_GENERATOR = (
     / "golden"
     / "generate_analytical_batch_golden.py"
 )
+ANALYTICAL_ATTENTION_FAMILY_FIXTURE = (
+    FIXTURE_ROOT
+    / "analytical"
+    / "analytical_attention_families_v1.json"
+)
+ANALYTICAL_ATTENTION_FAMILY_GENERATOR = (
+    REPO_ROOT
+    / "cpp"
+    / "tests"
+    / "golden"
+    / "generate_analytical_attention_family_golden.py"
+)
 STEP25_SIMULATOR_ORACLE = (
     REPO_ROOT
     / "cpp"
@@ -966,6 +978,33 @@ def test_analytical_batch_golden_is_current() -> None:
     _compare_values(generated, checked_in)
 
 
+def test_analytical_attention_family_golden_is_current() -> None:
+    environment = os.environ.copy()
+    existing_pythonpath = environment.get("PYTHONPATH")
+    environment["PYTHONPATH"] = str(REPO_ROOT) + (
+        os.pathsep + existing_pythonpath if existing_pythonpath else ""
+    )
+    python_result = subprocess.run(
+        [sys.executable, str(ANALYTICAL_ATTENTION_FAMILY_GENERATOR)],
+        cwd=REPO_ROOT,
+        env=environment,
+        text=True,
+        encoding="utf-8",
+        capture_output=True,
+        check=False,
+    )
+    if python_result.returncode != 0:
+        pytest.fail(
+            "Analytical attention-family oracle failed:\n"
+            f"{python_result.stdout}\n{python_result.stderr}"
+        )
+    generated = json.loads(python_result.stdout)
+    checked_in = json.loads(
+        ANALYTICAL_ATTENTION_FAMILY_FIXTURE.read_text(encoding="utf-8")
+    )
+    _compare_values(generated, checked_in)
+
+
 def _normalize_step25_events(
     events: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -1335,9 +1374,7 @@ def _write_step3_matrix_config(
             cluster["execution_model"] = {
                 "type": "analytical",
                 "device": "rubin",
-                "model": "llama2-7b",
                 "precision": "fp16",
-                "num_layers": 32,
                 "network_bandwidth_gbps": 400.0,
                 "network_latency_us": 1.0,
                 "intra_node_bandwidth_gbps": 14400.0,

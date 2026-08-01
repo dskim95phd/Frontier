@@ -95,7 +95,7 @@ FixedExecutionTimePredictor::predict_stage_execution_time(
              ++local_layer) {
             const detail::RoutingAllocation allocation = detail::route_tokens(
                 batch.total_scheduled_tokens(), model_.router_topk,
-                model_.runtime_total_experts,
+                model_.total_expert_num,
                 parallelism_.moe_expert_parallel_size, routing_, local_layer);
             routing_diagnostics.push_back([&]() {
                 MoERoutingDiagnostic value{};

@@ -111,6 +111,25 @@ def _moe_predictor(
     )
 
 
+def _family_predictor(model_name: str, *, attn_tp: int):
+    replica_config = ReplicaConfig(
+        model_name=model_name,
+        device="rubin",
+        network_device="vera_rubin_nvl72_domain",
+        attn_tensor_parallel_size=attn_tp,
+        moe_tensor_parallel_size=1,
+        moe_expert_parallel_size=1,
+    )
+    return AnalyticalRooflineExecutionTimePredictor(
+        AnalyticalRooflineExecutionTimePredictorConfig(),
+        replica_config,
+        VllmV1SchedulerConfig(),
+        MetricsConfig(),
+        cluster_type=ClusterType.MONOLITHIC,
+        cc_backend=_NoCommunicationBackend(),
+    )
+
+
 def test_rubin_and_nvl72_logical_skus_publish_analytical_ceilings():
     device = BaseDeviceSKUConfig.create_from_type_string("rubin")
     node = BaseNodeSKUConfig.create_from_type_string(
@@ -191,6 +210,67 @@ def test_long_context_decode_attention_increases_runtime_and_is_auditable():
         if item["operator_name"] == "attn_decode"
     ]
     assert decode_records[-1]["hbm_bytes"] > decode_records[-2]["hbm_bytes"]
+
+
+def test_analytical_roofline_supports_kimi_k2_latent_mla():
+    predictor = _family_predictor(
+        "moonshotai/Kimi-K2-Instruct",
+        attn_tp=4,
+    )
+    short = predictor.predict_attention_layer_time(
+        _Batch(scheduled_tokens=1, processed_tokens=128, prefill=False),
+        layer_id=0,
+        cluster_type=ClusterType.MONOLITHIC,
+    )
+    long = predictor.predict_attention_layer_time(
+        _Batch(scheduled_tokens=1, processed_tokens=8192, prefill=False),
+        layer_id=0,
+        cluster_type=ClusterType.MONOLITHIC,
+    )
+
+    assert predictor._model_config.get_runtime_num_kv_heads() == 1
+    assert predictor._model_config.get_runtime_head_size() == 576
+    assert long.attention_decode_execution_time > short.attention_decode_execution_time
+    assert long.attention_layer_pre_proj_execution_time > 0.0
+    decode = [
+        item
+        for item in predictor.get_diagnostics()
+        if item["operator_name"] == "attn_decode"
+    ][-1]
+    assert "mla=576" in decode["local_shape"]
+
+
+def test_analytical_roofline_models_step3_mfa_shared_q_path():
+    predictor = _family_predictor("step-moe-noquant-small", attn_tp=4)
+    batch = _Batch(scheduled_tokens=32, processed_tokens=256, prefill=True)
+    attention = predictor.predict_attention_layer_time(
+        batch,
+        layer_id=0,
+        cluster_type=ClusterType.MONOLITHIC,
+    )
+
+    assert attention.attn_inter_norm_time > 0.0
+    assert attention.attn_wq_proj_time > 0.0
+    diagnostics = predictor.get_diagnostics()
+    inter_norm = [
+        item for item in diagnostics if item["operator_name"] == "attn_inter_norm"
+    ][-1]
+    wq_proj = [
+        item for item in diagnostics if item["operator_name"] == "attn_wq_proj"
+    ][-1]
+    assert "read_elements=65536" in inter_norm["local_shape"]
+    assert "K=2048,N=4096" in wq_proj["local_shape"]
+
+    stage = predictor.predict_stage_execution_time(
+        batch,
+        stage_id=0,
+        cluster_type=ClusterType.MONOLITHIC,
+        num_layers=1,
+    )
+    assert stage.attn_inter_norm_time == pytest.approx(
+        attention.attn_inter_norm_time
+    )
+    assert stage.attn_wq_proj_time == pytest.approx(attention.attn_wq_proj_time)
 
 
 def test_stage_prediction_is_profile_free_and_scales_layers_once():

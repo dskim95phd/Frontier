@@ -1,0 +1,27 @@
+{
+  "mfa_prefill_32_past_256": {
+    "attention_inter_norm_ms": 0.005015887515151515,
+    "attention_norm_ms": 0.005083409454545455,
+    "attention_post_projection_ms": 0.010442641671757576,
+    "attention_pre_projection_ms": 0.008414683772121212,
+    "attention_wq_projection_ms": 0.006569225759030303,
+    "decode_attention_ms": 0.0,
+    "kv_cache_save_ms": 0.005003971878787879,
+    "prefill_attention_ms": 0.005076397560839161,
+    "rope_ms": 0.005033760969696969
+  },
+  "mla_decode_1_past_8192": {
+    "attention_inter_norm_ms": 0.0,
+    "attention_norm_ms": 0.005002606545454546,
+    "attention_post_projection_ms": 0.007240328548848486,
+    "attention_pre_projection_ms": 0.02335229152969697,
+    "attention_wq_projection_ms": 0.0,
+    "decode_attention_ms": 0.0057682364121212125,
+    "kv_cache_save_ms": 0.005000139636363636,
+    "prefill_attention_ms": 0.0,
+    "rope_ms": 0.005000263757575758
+  },
+  "precision": "fp16",
+  "schema_version": 1,
+  "tensor_parallel_size": 4
+}

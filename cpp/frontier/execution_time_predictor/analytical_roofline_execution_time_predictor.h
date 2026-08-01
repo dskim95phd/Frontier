@@ -103,6 +103,15 @@ struct DenseModel {
     std::uint64_t tensor_parallel_size;
     bool gated_mlp;
     bool fused_add_norm;
+    bool use_mla = false;
+    bool use_mfa = false;
+    std::uint64_t q_lora_rank = 0;
+    std::uint64_t kv_lora_rank = 0;
+    std::uint64_t qk_nope_head_dim = 0;
+    std::uint64_t qk_rope_head_dim = 0;
+    std::uint64_t qk_head_dim = 0;
+    std::uint64_t v_head_dim = 0;
+    std::uint64_t share_q_dim = 0;
 
     [[nodiscard]] static constexpr DenseModel llama2_7b_tp8() noexcept {
         return llama2_7b(8);
@@ -122,6 +131,8 @@ struct DenseLayerTimes {
     double rope_ms;
     double kv_cache_save_ms;
     double attention_norm_ms;
+    double attention_inter_norm_ms;
+    double attention_wq_projection_ms;
     double prefill_attention_ms;
     double decode_attention_ms;
     double mlp_up_projection_ms;
@@ -157,6 +168,12 @@ attention_context_work(const std::vector<AttentionRequestSlice> &requests,
                        std::uint64_t local_query_heads,
                        std::uint64_t local_kv_heads, std::uint64_t head_dim,
                        double element_bytes);
+[[nodiscard]] KernelWork
+mla_attention_context_work(
+    const std::vector<AttentionRequestSlice> &requests,
+    std::uint64_t local_query_heads, std::uint64_t qk_head_dim,
+    std::uint64_t v_head_dim, std::uint64_t latent_dim,
+    double element_bytes);
 [[nodiscard]] DenseLayerTimes
 predict_dense_layer(const DeviceCeilings &device,
                     const AnalyticalConfig &config, const DenseModel &model,

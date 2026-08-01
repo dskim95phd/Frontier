@@ -38,11 +38,9 @@
         "type": "fixed",
         "stage_latencies_ms": [0.01, 0.01]
       },
-      "model": {
-        "name": "Phi-tiny-MoE-instruct",
-        "runtime_total_experts": 8,
-        "router_topk": 2
-      },
+      "model_name": "Phi-tiny-MoE-instruct",
+      "total_expert_num": 8,
+      "router_topk": 2,
       "moe_routing": {
         "mode": "uniform_legacy",
         "distribution": "balanced",

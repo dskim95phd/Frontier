@@ -89,6 +89,8 @@ class ExecutionTime(BaseEntity):
         attn_mla_decode_q_latent_proj_time: float = 0.0,
         attn_mla_decode_time: float = 0.0,
         attn_mla_v_up_proj_time: float = 0.0,
+        attn_inter_norm_time: float = 0.0,
+        attn_wq_proj_time: float = 0.0,
         attention_operator_times: AttentionOperatorTimes | None = None,
         communication_operator_times: CommunicationOperatorTimes | None = None,
         mlp_operator_times: MLPOperatorTimes | None = None,
@@ -290,6 +292,8 @@ class ExecutionTime(BaseEntity):
             attn_mla_decode_time=attn_mla_decode_time,
             attn_mla_v_up_proj_time=attn_mla_v_up_proj_time,
             attn_norm_time=attn_norm_time,
+            attn_inter_norm_time=attn_inter_norm_time,
+            attn_wq_proj_time=attn_wq_proj_time,
             operator_times=attention_operator_times,
         )
 
@@ -368,6 +372,8 @@ class ExecutionTime(BaseEntity):
         self._attn_mla_decode_q_latent_proj_time = attn_mla_decode_q_latent_proj_time
         self._attn_mla_decode_time = attn_mla_decode_time
         self._attn_mla_v_up_proj_time = attn_mla_v_up_proj_time
+        self._attn_inter_norm_time = attn_inter_norm_time
+        self._attn_wq_proj_time = attn_wq_proj_time
         self._attention_layer_pre_proj_execution_time = attention_layer_pre_proj_execution_time
         self._attention_layer_post_proj_execution_time = attention_layer_post_proj_execution_time
         self._mlp_layer_up_proj_execution_time = mlp_layer_up_proj_execution_time
@@ -1106,6 +1112,22 @@ class ExecutionTime(BaseEntity):
         return self._scaled_time_attr_value(
             "attn_mla_v_up_proj_time",
             self._attention_time.attn_mla_v_up_proj_time,
+        )
+
+    @property
+    def attn_inter_norm_time(self) -> float:
+        """MFA shared-Q normalization time (aggregated across all layers)."""
+        return self._scaled_time_attr_value(
+            "attn_inter_norm_time",
+            self._attention_time.attn_inter_norm_time,
+        )
+
+    @property
+    def attn_wq_proj_time(self) -> float:
+        """MFA WQ projection time (aggregated across all layers)."""
+        return self._scaled_time_attr_value(
+            "attn_wq_proj_time",
+            self._attention_time.attn_wq_proj_time,
         )
 
     @property

@@ -76,9 +76,9 @@ TransferPrediction AnalyticalKVCacheTransferPredictor::predict(
         dense_kv_cache_size_bytes(num_tokens, [&]() {
             DenseKvLayout value{};
             value.num_layers = model.num_layers;
-            value.num_kv_heads_per_worker = model.num_kv_heads;
-            value.head_dim = model.head_dim;
-            value.kv_factor = 2;
+            value.num_kv_heads_per_worker = model.runtime_num_kv_heads();
+            value.head_dim = model.runtime_head_size();
+            value.kv_factor = model.kv_factor();
             value.dtype_size_bytes = config_.kv_cache_dtype_size_bytes;
             return value;
         }());

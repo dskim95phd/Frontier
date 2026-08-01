@@ -2,7 +2,12 @@
 #include "tests/test_support.h"
 
 #include <filesystem>
+#include <cstdint>
+#include <stdexcept>
 #include <string>
+#include <utility>
+
+#include "frontier/attention/ops.h"
 
 #ifndef FRONTIER_TEST_FIXTURE_DIR
 #error "FRONTIER_TEST_FIXTURE_DIR must be defined for contract tests"
@@ -74,6 +79,47 @@ void test_analytical_contract_round_trip() {
             static_cast<void>(parse_simulation_config_json(unsupported));
         },
         "unsupported analytical hardware must fail fast");
+}
+
+void test_analytical_attention_family_configs_parse() {
+    const auto with_model = [](std::string model_name,
+                               std::uint64_t experts,
+                               std::uint64_t topk) {
+        std::string text =
+            read_text_file(fixture("analytical_parallel_colocation.json"));
+        const auto replace_once = [&text](std::string_view from,
+                                          std::string replacement) {
+            const auto position = text.find(from);
+            if (position == std::string::npos) {
+                throw std::runtime_error("analytical fixture mutation failed");
+            }
+            text.replace(position, from.size(), std::move(replacement));
+        };
+        replace_once("\"pipeline_parallel_size\": 2",
+                     "\"pipeline_parallel_size\": 1");
+        replace_once("\"moe_expert_parallel_size\": 1",
+                     "\"moe_expert_parallel_size\": 8");
+        replace_once("\"meta-llama/Llama-2-7b-hf\"",
+                     "\"" + model_name + "\"");
+        replace_once("\"total_expert_num\": 1",
+                     "\"total_expert_num\": " +
+                         std::to_string(experts));
+        replace_once("\"router_topk\": 1",
+                     "\"router_topk\": " + std::to_string(topk));
+        return parse_simulation_config_json(text);
+    };
+
+    const auto kimi =
+        with_model("moonshotai/Kimi-K2-Instruct", 384, 8);
+    expect(kimi.cluster().model.attention.memory_layout ==
+               frontier::attention::AttentionMemoryLayout::kLatentMla,
+           "analytical config must accept latent MLA models");
+
+    const auto step = with_model("step-moe-noquant-small", 24, 3);
+    expect(step.cluster().model.use_mfa &&
+               step.cluster().model.attention.memory_layout ==
+                   frontier::attention::AttentionMemoryLayout::kDenseKv,
+           "analytical config must accept Step3Text MFA models");
 }
 
 void test_legacy_schemas_and_shapes_are_rejected() {
@@ -148,8 +194,8 @@ void test_schema_version_range_is_checked_before_conversion() {
 void test_moe_contract_and_invalid_topologies() {
     const auto moe = load("analytical_moe_ep4_colocation.json");
     expect(moe.cluster().model.is_moe() &&
-               moe.cluster().model.model_num_experts == 16 &&
-               moe.cluster().model.runtime_total_experts == 8 &&
+               moe.cluster().model.num_experts == 16 &&
+               moe.cluster().model.total_expert_num == 8 &&
                moe.cluster().model.router_topk == 2 &&
                moe.cluster().parallelism.attention_parallel_size() == 4 &&
                moe.cluster().parallelism.moe_parallel_size() == 4,
@@ -168,7 +214,7 @@ void test_moe_contract_and_invalid_topologies() {
         "attention and MoE physical domains must match");
 
     auto bad_expert_partition = moe;
-    bad_expert_partition.cluster().model.runtime_total_experts = 6;
+    bad_expert_partition.cluster().model.total_expert_num = 6;
     expect_throws<ConfigError>(
         [&bad_expert_partition] {
             static_cast<void>(parse_simulation_config_json(
@@ -195,6 +241,87 @@ void test_moe_contract_and_invalid_topologies() {
         "PDD clusters must share the same MoE model contract");
 }
 
+void test_model_registry_and_attention_binding() {
+    const auto llama = frontier::config::load_model_config(
+        "meta-llama/Llama-2-7b-hf");
+    expect(!llama.is_moe() && llama.num_layers == 32 &&
+               llama.hidden_size == 4'096 &&
+               llama.attention.variant ==
+                   frontier::attention::AttentionVariant::kMha &&
+               llama.runtime_num_kv_heads() == 32 &&
+               llama.kv_factor() == 2,
+           "registered Llama model must bind dense MHA semantics");
+
+    const auto llama3 = frontier::config::load_model_config(
+        "meta-llama/Meta-Llama-3-8B");
+    expect(llama3.num_layers == 32 && llama3.num_kv_heads == 8 &&
+               llama3.attention.variant ==
+                   frontier::attention::AttentionVariant::kGqa,
+           "Python-registered model names must resolve without a JSON asset");
+
+    const auto phi =
+        frontier::config::load_model_config("Phi-tiny-MoE-instruct");
+    expect(phi.is_moe() && phi.num_experts == 16 &&
+               phi.num_experts_per_token == 2 &&
+               phi.attention.variant ==
+                   frontier::attention::AttentionVariant::kGqa,
+           "HF-style model JSON must load MoE and GQA structure");
+
+    const auto deepseek =
+        frontier::config::load_model_config("deepseek-v3");
+    expect(deepseek.is_moe() && deepseek.use_mla &&
+               deepseek.attention.memory_layout ==
+                   frontier::attention::AttentionMemoryLayout::kLatentMla &&
+               deepseek.runtime_num_kv_heads() == 1 &&
+               deepseek.runtime_head_size() == 576 &&
+               deepseek.kv_factor() == 1,
+           "MLA model assets must bind latent cache semantics");
+
+    const auto kimi = frontier::config::load_model_config(
+        "moonshotai/Kimi-K2-Instruct");
+    expect(kimi.is_moe() && kimi.num_experts == 384 &&
+               kimi.num_experts_per_token == 8 && kimi.use_mla &&
+               kimi.runtime_num_kv_heads() == 1 &&
+               kimi.runtime_head_size() == 576,
+           "Kimi K2 asset must expose Python-equivalent MoE and MLA fields");
+
+    const auto step = frontier::config::load_model_config("step-moe");
+    expect(step.is_moe() && step.use_mfa && step.share_q_dim == 2'048 &&
+               step.attention.variant ==
+                   frontier::attention::AttentionVariant::kMqa,
+           "MFA model assets must validate shared-Q dense-KV structure");
+}
+
+void test_model_runtime_overrides_are_optional() {
+    std::string text = read_text_file(fixture("fixed_parallel_colocation.json"));
+    const auto erase_field = [&text](std::string_view field) {
+        const std::string marker = "\"" + std::string{field} + "\"";
+        const std::size_t marker_pos = text.find(marker);
+        expect(marker_pos != std::string::npos,
+               "optional model field must exist in source fixture");
+        const std::size_t line_start = text.rfind('\n', marker_pos);
+        const std::size_t line_end = text.find('\n', marker_pos);
+        expect(line_start != std::string::npos &&
+                   line_end != std::string::npos,
+               "optional model field must occupy one JSON line");
+        text.erase(line_start + 1, line_end - line_start);
+    };
+    erase_field("total_expert_num");
+    erase_field("router_topk");
+
+    const auto parsed = parse_simulation_config_json(text);
+    expect(parsed.cluster().model.total_expert_num == 1 &&
+               parsed.cluster().model.router_topk == 1,
+           "dense model runtime values must default from the selected model");
+
+    expect_throws<ConfigError>(
+        [] {
+            static_cast<void>(frontier::config::load_model_config(
+                "not-a-real/model"));
+        },
+        "unknown model names without matching JSON assets must fail fast");
+}
+
 } // namespace
 
 int main() {
@@ -205,6 +332,9 @@ int main() {
                                     test_pdd_contract_round_trip);
     failures += frontier::test::run("analytical contract round trip",
                                     test_analytical_contract_round_trip);
+    failures += frontier::test::run(
+        "analytical attention family configs parse",
+        test_analytical_attention_family_configs_parse);
     failures +=
         frontier::test::run("legacy schemas and shapes are rejected",
                             test_legacy_schemas_and_shapes_are_rejected);
@@ -215,5 +345,11 @@ int main() {
         test_schema_version_range_is_checked_before_conversion);
     failures += frontier::test::run("MoE contract and invalid topologies",
                                     test_moe_contract_and_invalid_topologies);
+    failures += frontier::test::run(
+        "model registry and attention binding",
+        test_model_registry_and_attention_binding);
+    failures += frontier::test::run(
+        "model runtime overrides are optional",
+        test_model_runtime_overrides_are_optional);
     return failures == 0 ? 0 : 1;
 }

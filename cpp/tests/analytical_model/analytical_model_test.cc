@@ -74,6 +74,13 @@ Json load_batch_golden() {
     return Json::parse(read_text_file(path));
 }
 
+Json load_attention_family_golden() {
+    const std::filesystem::path path =
+        std::filesystem::path{FRONTIER_TEST_FIXTURE_DIR} /
+        "analytical/analytical_attention_families_v1.json";
+    return Json::parse(read_text_file(path));
+}
+
 void test_roofline_matches_python_golden() {
     const Json golden = load_golden();
     expect(golden.at("schema_version").get<int>() == 1,
@@ -131,6 +138,28 @@ void check_dense_fields(const analytical::DenseLayerTimes &actual,
              std::pair{"mlp_down_projection_ms", actual.mlp_down_projection_ms},
              std::pair{"mlp_norm_ms", actual.mlp_norm_ms},
              std::pair{"residual_add_ms", actual.residual_add_ms},
+         }) {
+        expect_approximately_equal(value, expected.at(name).get<double>(),
+                                   name);
+    }
+}
+
+void check_attention_fields(const analytical::DenseLayerTimes &actual,
+                            const Json &expected) {
+    for (const auto &[name, value] : {
+             std::pair{"attention_pre_projection_ms",
+                       actual.attention_pre_projection_ms},
+             std::pair{"attention_post_projection_ms",
+                       actual.attention_post_projection_ms},
+             std::pair{"rope_ms", actual.rope_ms},
+             std::pair{"kv_cache_save_ms", actual.kv_cache_save_ms},
+             std::pair{"attention_norm_ms", actual.attention_norm_ms},
+             std::pair{"attention_inter_norm_ms",
+                       actual.attention_inter_norm_ms},
+             std::pair{"attention_wq_projection_ms",
+                       actual.attention_wq_projection_ms},
+             std::pair{"prefill_attention_ms", actual.prefill_attention_ms},
+             std::pair{"decode_attention_ms", actual.decode_attention_ms},
          }) {
         expect_approximately_equal(value, expected.at(name).get<double>(),
                                    name);
@@ -204,6 +233,87 @@ void test_long_context_decode_cost_increases() {
     expect(predict(4'096).decode_attention_ms >
                predict(128).decode_attention_ms,
            "long-context decode attention must cost more");
+}
+
+void test_mla_uses_latent_cache_context_costs() {
+    const Json golden = load_attention_family_golden();
+    analytical::DenseModel model{};
+    model.hidden_size = 7'168;
+    model.intermediate_size = 18'432;
+    model.num_query_heads = 64;
+    model.num_kv_heads = 64;
+    model.head_dim = 128;
+    model.tensor_parallel_size = 4;
+    model.gated_mlp = true;
+    model.fused_add_norm = true;
+    model.use_mla = true;
+    model.q_lora_rank = 1'536;
+    model.kv_lora_rank = 512;
+    model.qk_nope_head_dim = 128;
+    model.qk_rope_head_dim = 64;
+    model.qk_head_dim = 192;
+    model.v_head_dim = 128;
+
+    const auto predict = [&](std::uint64_t past_context) {
+        analytical::DenseBatch batch{};
+        batch.total_tokens = 1;
+        batch.decode_requests = {{1, past_context}};
+        return analytical::predict_dense_layer(
+            analytical::DeviceCeilings::rubin(),
+            analytical::AnalyticalConfig{}, model, batch,
+            analytical::Precision::kFp16);
+    };
+
+    const auto short_context = predict(128);
+    const auto long_context = predict(8'192);
+    expect(long_context.decode_attention_ms >
+               short_context.decode_attention_ms,
+           "MLA decode must scale with latent-cache context length");
+    expect(short_context.attention_pre_projection_ms > 0.0 &&
+               short_context.attention_post_projection_ms > 0.0,
+           "MLA projections must be included in analytical timing");
+    expect(short_context.attention_inter_norm_ms == 0.0 &&
+               short_context.attention_wq_projection_ms == 0.0,
+           "MLA must not use MFA shared-Q operators");
+    check_attention_fields(
+        long_context, golden.at("mla_decode_1_past_8192"));
+}
+
+void test_mfa_models_shared_q_projection_path() {
+    const Json golden = load_attention_family_golden();
+    analytical::DenseModel model{};
+    model.hidden_size = 7'168;
+    model.intermediate_size = 18'432;
+    model.num_query_heads = 64;
+    model.num_kv_heads = 1;
+    model.head_dim = 256;
+    model.tensor_parallel_size = 4;
+    model.gated_mlp = true;
+    model.fused_add_norm = true;
+    model.use_mfa = true;
+    model.share_q_dim = 2'048;
+
+    analytical::DenseBatch batch{};
+    batch.total_tokens = 32;
+    batch.prefill_requests = {{32, 256}};
+    const auto result = analytical::predict_dense_layer(
+        analytical::DeviceCeilings::rubin(),
+        analytical::AnalyticalConfig{}, model, batch,
+        analytical::Precision::kFp16);
+
+    const auto expected_inter_norm = analytical::predict_roofline(
+        analytical::DeviceCeilings::rubin(), analytical::Precision::kFp16,
+        analytical::streaming_work(65'536.0, 65'536.0, 327'680.0, 2.0),
+        analytical::AnalyticalConfig{}.streaming,
+        analytical::AnalyticalConfig{}.kernel_launch_latency_us);
+    expect_approximately_equal(result.attention_inter_norm_ms,
+                               expected_inter_norm.predicted_time_ms,
+                               "MFA inter_norm");
+    expect(result.attention_wq_projection_ms > 0.0,
+           "MFA WQ projection must be timed separately");
+    expect(result.prefill_attention_ms > 0.0,
+           "MFA must retain dense-KV attention context timing");
+    check_attention_fields(result, golden.at("mfa_prefill_32_past_256"));
 }
 
 double diagnostic_value(const predictor::ExecutionTimePrediction &prediction,
@@ -440,6 +550,10 @@ int main() {
                                     test_dense_layer_matches_python_golden);
     failures += frontier::test::run("long-context decode cost increases",
                                     test_long_context_decode_cost_increases);
+    failures += frontier::test::run("MLA uses latent-cache context costs",
+                                    test_mla_uses_latent_cache_context_costs);
+    failures += frontier::test::run("MFA models shared-Q projection path",
+                                    test_mfa_models_shared_q_projection_path);
     failures += frontier::test::run("batch model matches Python golden",
                                     test_batch_model_matches_python_golden);
     failures += frontier::test::run("communication matches Python golden",

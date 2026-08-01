@@ -116,6 +116,14 @@ matching the production runtime path. This workaround is isolated to the test
 harness; the configuration contract should eventually be aligned on both
 sides.
 
+An analytical Step3Text MFA end-to-end parity probe also reaches an existing
+Python mixed-layer limitation before attention timing can be compared:
+`layer_id=0` is a dense layer, but the analytical predictor returns a model-wide
+`is_moe=True` result and the prefill correction path rejects it. MLA/MFA
+operator-level Python/C++ golden tests therefore remain the parity authority
+until mixed dense/MoE-layer execution is implemented; C++ should not imitate
+this Python failure.
+
 ## Why This Is a Separate Step
 
 MoE support is not an execution-predictor-only change. Expert parallelism adds
@@ -266,7 +274,7 @@ details are non-obvious:
 - Step3Text/Step2Mini architecture-specific operations;
 - architecture-specific EP all-gather versus all-to-all selection beyond the
   reference Phi analytical path;
-- MLA, MFA, latent KV layouts, and linear attention;
+- DSA and linear attention;
 - speculative decoding/MTP;
 - Thinking Mode;
 - CUDA Graph timing;

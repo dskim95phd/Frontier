@@ -85,14 +85,6 @@ def _replica_config(
 ) -> ReplicaConfig:
     topology = cluster["parallelism"]
     execution = cluster["execution_model"]
-    model = cluster.get(
-        "model",
-        {
-            "name": "llama2-7b",
-            "runtime_total_experts": 1,
-            "router_topk": 1,
-        },
-    )
     routing = cluster.get(
         "moe_routing",
         {
@@ -101,10 +93,8 @@ def _replica_config(
             "seed": 42,
         },
     )
-    model_name = (
-        "meta-llama/Llama-2-7b-hf"
-        if model["name"] == "llama2-7b"
-        else str(model["name"])
+    model_name = str(
+        cluster.get("model_name", "meta-llama/Llama-2-7b-hf")
     )
     return ReplicaConfig(
         model_name=model_name,
@@ -129,9 +119,9 @@ def _replica_config(
             topology.get("moe_expert_parallel_size", 1)
         ),
         total_expert_num=int(
-            model.get("runtime_total_experts", 1)
+            cluster.get("total_expert_num", 1)
         ),
-        router_topk=int(model.get("router_topk", 1)),
+        router_topk=int(cluster.get("router_topk", 1)),
         moe_routing_mode=str(routing.get("mode", "simulation")),
         moe_routing_distribution_type=str(
             routing.get("distribution", "balanced")
@@ -206,7 +196,7 @@ def _build_python_config(
             prefill["parallelism"]["moe_expert_parallel_size"]
         ),
         prefill_replica_config_total_expert_num=int(
-            prefill["model"]["runtime_total_experts"]
+            prefill.get("total_expert_num", 1)
         ),
         prefill_replica_config_device=str(
             prefill["execution_model"].get("device", "rubin")
@@ -232,7 +222,7 @@ def _build_python_config(
             decode["parallelism"]["moe_expert_parallel_size"]
         ),
         decode_replica_config_total_expert_num=int(
-            decode["model"]["runtime_total_experts"]
+            decode.get("total_expert_num", 1)
         ),
         decode_replica_config_device=str(
             decode["execution_model"].get("device", "rubin")

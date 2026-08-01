@@ -69,7 +69,9 @@ endfunction()
 add_library(
   frontier_core
   STATIC
+  frontier/attention/model_binding.cc
   frontier/config/config.cc
+  frontier/config/model_config.cc
   frontier/config/config_parse.cc
   frontier/config/config_serialize.cc
   frontier/cc_backend/analytical_model.cc
@@ -117,6 +119,10 @@ add_library(
 )
 target_include_directories(frontier_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(frontier_core PRIVATE nlohmann_json::nlohmann_json)
+target_compile_definitions(
+  frontier_core
+  PRIVATE FRONTIER_MODEL_CONFIG_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../data/config/models"
+)
 frontier_enable_warnings(frontier_core)
 
 add_executable(frontier_sim frontier/main.cc)

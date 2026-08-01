@@ -215,9 +215,7 @@ def _analytical_execution() -> dict:
     return {
         "type": "analytical",
         "device": "rubin",
-        "model": "Phi-tiny-MoE-instruct",
         "precision": "bf16",
-        "num_layers": 32,
         "network_bandwidth_gbps": 400.0,
         "network_latency_us": 1.0,
         "intra_node_bandwidth_gbps": 14_400.0,
@@ -239,7 +237,7 @@ def _assert_routing_allocations(
         expected = _python_global_route(
             total=record["routed_tokens"],
             layer=record["layer_id"],
-            model=cluster["model"],
+            total_expert_num=cluster["total_expert_num"],
             routing=cluster["moe_routing"],
         )
         assert record["global_expert_tokens"] == expected
@@ -388,12 +386,12 @@ def _python_global_route(
     *,
     total: int,
     layer: int,
-    model: dict,
+    total_expert_num: int,
     routing: dict,
 ) -> list[int]:
     predictor = object.__new__(AnalyticalRooflineExecutionTimePredictor)
     predictor._replica_config = SimpleNamespace(
-        total_expert_num=model["runtime_total_experts"]
+        total_expert_num=total_expert_num
     )
     predictor._moe_routing_mode = routing["mode"]
     predictor._moe_routing_distribution_type = routing["distribution"]
@@ -405,12 +403,11 @@ def _python_global_route(
 def _python_analytical_predictor(
     cluster: dict,
 ) -> AnalyticalRooflineExecutionTimePredictor:
-    model = cluster["model"]
     parallelism = cluster["parallelism"]
     routing = cluster["moe_routing"]
     execution = cluster["execution_model"]
     replica = ReplicaConfig(
-        model_name=model["name"],
+        model_name=cluster["model_name"],
         device=execution["device"],
         network_device="vera_rubin_nvl72_domain",
         attn_tensor_parallel_size=parallelism[
@@ -429,8 +426,8 @@ def _python_analytical_predictor(
         moe_expert_parallel_size=parallelism[
             "moe_expert_parallel_size"
         ],
-        total_expert_num=model["runtime_total_experts"],
-        router_topk=model["router_topk"],
+        total_expert_num=cluster["total_expert_num"],
+        router_topk=cluster["router_topk"],
         moe_routing_mode=routing["mode"],
         moe_routing_distribution_type=routing["distribution"],
         moe_routing_seed=routing["seed"],
@@ -493,7 +490,7 @@ def test_moe_integer_routing_matches_production_python(
         expected = _python_global_route(
             total=record["routed_tokens"],
             layer=record["layer_id"],
-            model=cluster["model"],
+            total_expert_num=cluster["total_expert_num"],
             routing=cluster["moe_routing"],
         )
         assert record["global_expert_tokens"] == expected
@@ -578,9 +575,7 @@ def test_analytical_pdd_matches_full_production_simulator(
         config["clusters"][cluster_name]["execution_model"] = {
             "type": "analytical",
             "device": "rubin",
-            "model": "Phi-tiny-MoE-instruct",
             "precision": "bf16",
-            "num_layers": 32,
             "network_bandwidth_gbps": 400.0,
             "network_latency_us": 1.0,
             "intra_node_bandwidth_gbps": 14_400.0,
@@ -754,7 +749,7 @@ def test_colocation_production_configuration_workload_matrix(
             "seed": seed,
         }
     )
-    cluster["model"]["router_topk"] = case["topk"]
+    cluster["router_topk"] = case["topk"]
     config_path = tmp_path / f"{case['name']}.json"
     config_path.write_text(
         json.dumps(config, indent=2) + "\n",
@@ -935,7 +930,7 @@ def test_pdd_production_configuration_workload_matrix(
                 "seed": seed,
             }
         )
-        cluster["model"]["router_topk"] = case["topk"]
+        cluster["router_topk"] = case["topk"]
     config_path = tmp_path / f"{case['name']}.json"
     config_path.write_text(
         json.dumps(config, indent=2) + "\n",
@@ -1019,7 +1014,7 @@ def test_moe_topology_and_distribution_matrix(
             "seed": 100 + attn_tp + 10 * moe_ep,
         }
     )
-    cluster["model"]["router_topk"] = topk
+    cluster["router_topk"] = topk
     config_path = tmp_path / f"{name}.json"
     config_path.write_text(
         json.dumps(config, indent=2),
@@ -1036,7 +1031,7 @@ def test_moe_topology_and_distribution_matrix(
         expected = _python_global_route(
             total=record["routed_tokens"],
             layer=record["layer_id"],
-            model=cluster["model"],
+            total_expert_num=cluster["total_expert_num"],
             routing=cluster["moe_routing"],
         )
         assert record["global_expert_tokens"] == expected

@@ -37,18 +37,14 @@
       "execution_model": {
         "type": "analytical",
         "device": "rubin",
-        "model": "llama2-7b",
         "precision": "fp16",
-        "num_layers": 32,
         "network_bandwidth_gbps": 400.0,
         "network_latency_us": 1.0,
         "intra_node_bandwidth_gbps": 14400.0
       },
-      "model": {
-        "name": "llama2-7b",
-        "runtime_total_experts": 1,
-        "router_topk": 1
-      },
+      "model_name": "meta-llama/Llama-2-7b-hf",
+      "total_expert_num": 1,
+      "router_topk": 1,
       "moe_routing": {
         "mode": "simulation",
         "distribution": "balanced",

@@ -41,11 +41,9 @@
           2.0
         ]
       },
-      "model": {
-        "name": "llama2-7b",
-        "runtime_total_experts": 1,
-        "router_topk": 1
-      },
+      "model_name": "meta-llama/Llama-2-7b-hf",
+      "total_expert_num": 1,
+      "router_topk": 1,
       "moe_routing": {
         "mode": "simulation",
         "distribution": "balanced",

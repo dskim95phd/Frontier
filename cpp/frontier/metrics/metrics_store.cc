@@ -65,7 +65,7 @@ void MetricsStore::record_batch(const entities::Batch &batch,
         value.num_pipeline_stages = batch.num_pipeline_stages();
         value.cluster_type = batch.cluster_type();
         value.model_kind = batch.model_kind();
-        value.runtime_total_experts = runtime.model.runtime_total_experts;
+        value.runtime_total_experts = runtime.model.total_expert_num;
         value.router_topk = runtime.model.router_topk;
         value.moe_sync_group_id = batch.moe_sync_group_id();
         value.parallelism = runtime.parallelism;
@@ -100,7 +100,7 @@ void MetricsStore::record_batch_stage(
         value.execution_time = batch_stage.execution_time();
         value.cluster_type = batch.cluster_type();
         value.model_kind = batch.model_kind();
-        value.runtime_total_experts = runtime.model.runtime_total_experts;
+        value.runtime_total_experts = runtime.model.total_expert_num;
         value.router_topk = runtime.model.router_topk;
         value.moe_sync_group_id = batch.moe_sync_group_id();
         value.parallelism = runtime.parallelism;

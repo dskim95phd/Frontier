@@ -47,6 +47,33 @@ void require_exact_keys(const Json &object,
     }
 }
 
+void require_keys(const Json &object,
+                  std::initializer_list<std::string_view> required_keys,
+                  std::initializer_list<std::string_view> optional_keys,
+                  std::string_view context) {
+    require_object(object, context);
+    std::unordered_set<std::string> allowed;
+    allowed.reserve(required_keys.size() + optional_keys.size());
+    for (const std::string_view key : required_keys) {
+        allowed.emplace(key);
+        if (!object.contains(key)) {
+            throw ConfigError(std::string{context} +
+                              " is missing required field '" +
+                              std::string{key} + "'");
+        }
+    }
+    for (const std::string_view key : optional_keys) {
+        allowed.emplace(key);
+    }
+    for (const auto &[key, value] : object.items()) {
+        static_cast<void>(value);
+        if (allowed.find(key) == allowed.end()) {
+            throw ConfigError(std::string{context} +
+                              " contains unknown field '" + key + "'");
+        }
+    }
+}
+
 std::string require_string(const Json &object, std::string_view field,
                            std::string_view context) {
     const Json &value = object.at(field);
@@ -245,75 +272,36 @@ MoeRoutingDistribution parse_moe_routing_distribution(std::string_view value) {
                       std::string{value} + "'");
 }
 
-ModelConfig parse_model(const Json &root) {
-    const Json &model = root.at("model");
-    require_exact_keys(model, {"name", "runtime_total_experts", "router_topk"},
-                       "config.model");
-    const std::string name = require_string(model, "name", "config.model");
-    const std::uint64_t runtime_total_experts =
-        require_uint64(model, "runtime_total_experts", "config.model");
-    const std::uint64_t router_topk =
-        require_uint64(model, "router_topk", "config.model");
-
-    ModelConfig parsed;
-    if (name == "llama2-7b") {
-        parsed = [&]() {
-            ModelConfig value{};
-            value.name = name;
-            value.kind = ModelKind::kDense;
-            value.num_layers = 32;
-            value.hidden_size = 4'096;
-            value.intermediate_size = 11'008;
-            value.num_query_heads = 32;
-            value.num_kv_heads = 32;
-            value.head_dim = 128;
-            value.gated_mlp = true;
-            value.fused_add_norm = true;
-            value.model_num_experts = 1;
-            value.runtime_total_experts = runtime_total_experts;
-            value.router_topk = router_topk;
-            return value;
-        }();
-        if (runtime_total_experts != 1 || router_topk != 1) {
-            throw ConfigError(
-                "dense llama2-7b requires runtime_total_experts=1 and "
-                "router_topk=1");
+ModelConfig parse_model(const Json &cluster, std::string_view context) {
+    ModelConfig parsed = load_model_config(
+        require_string(cluster, "model_name", context));
+    if (cluster.contains("total_expert_num")) {
+        parsed.total_expert_num =
+            require_uint64(cluster, "total_expert_num", context);
+    }
+    if (cluster.contains("router_topk")) {
+        parsed.router_topk = require_uint64(cluster, "router_topk", context);
+    }
+    if (!parsed.is_moe()) {
+        if (parsed.total_expert_num != 1 || parsed.router_topk != 1) {
+            throw ConfigError(std::string{context} +
+                              " dense model requires total_expert_num=1 and "
+                              "router_topk=1");
         }
         return parsed;
     }
-
-    if (name == "Phi-tiny-MoE-instruct") {
-        parsed = [&]() {
-            ModelConfig value{};
-            value.name = name;
-            value.kind = ModelKind::kMoe;
-            value.num_layers = 32;
-            value.hidden_size = 4'096;
-            value.intermediate_size = 448;
-            value.num_query_heads = 16;
-            value.num_kv_heads = 4;
-            value.head_dim = 128;
-            value.gated_mlp = true;
-            value.fused_add_norm = false;
-            value.model_num_experts = 16;
-            value.runtime_total_experts = runtime_total_experts;
-            value.router_topk = router_topk;
-            return value;
-        }();
-        if (runtime_total_experts < 2) {
-            throw ConfigError(
-                "Phi-tiny-MoE-instruct requires at least two runtime experts");
-        }
-        if (router_topk == 0 || router_topk > runtime_total_experts) {
-            throw ConfigError(
-                "MoE router_topk must be in [1, runtime_total_experts]");
-        }
-        return parsed;
+    if (parsed.total_expert_num < 2 ||
+        parsed.total_expert_num > parsed.num_experts) {
+        throw ConfigError(std::string{context} +
+                          ".total_expert_num must be in [2, model "
+                          "num_experts]");
     }
-
-    throw ConfigError("config.model.name must be 'llama2-7b' or "
-                      "'Phi-tiny-MoE-instruct', got '" +
-                      name + "'");
+    if (parsed.router_topk == 0 ||
+        parsed.router_topk > parsed.total_expert_num) {
+        throw ConfigError(std::string{context} +
+                          ".router_topk must be in [1, total_expert_num]");
+    }
+    return parsed;
 }
 
 MoeRoutingConfig parse_moe_routing(const Json &root) {
@@ -474,9 +462,9 @@ ParallelismConfig parse_parallelism(const Json &root,
                 "tensor_parallel_size*data_parallel_size == "
                 "moe_tensor_parallel_size*moe_expert_parallel_size");
         }
-        if (model.runtime_total_experts % parsed.moe_expert_parallel_size !=
+        if (model.total_expert_num % parsed.moe_expert_parallel_size !=
             0) {
-            throw ConfigError("runtime_total_experts must be divisible by "
+            throw ConfigError("total_expert_num must be divisible by "
                               "moe_expert_parallel_size");
         }
         if (model.intermediate_size % parsed.moe_tensor_parallel_size != 0) {
@@ -597,9 +585,7 @@ ExecutionModelConfig parse_execution_model(const Json &root,
                            {
                                "type",
                                "device",
-                               "model",
                                "precision",
-                               "num_layers",
                                "network_bandwidth_gbps",
                                "network_latency_us",
                                "intra_node_bandwidth_gbps",
@@ -609,13 +595,9 @@ ExecutionModelConfig parse_execution_model(const Json &root,
             AnalyticalExecutionModelConfig value{};
             value.device =
                 require_string(execution, "device", "config.execution_model");
-            value.model =
-                require_string(execution, "model", "config.execution_model");
             value.precision = require_string(execution, "precision",
                                              "config.execution_model");
             value.tensor_parallel_size = parallelism.tensor_parallel_size;
-            value.num_layers = require_uint64(execution, "num_layers",
-                                              "config.execution_model");
             value.network_bandwidth_gbps = require_finite_number(
                 execution, "network_bandwidth_gbps", "config.execution_model");
             value.network_latency_us = require_finite_number(
@@ -625,13 +607,18 @@ ExecutionModelConfig parse_execution_model(const Json &root,
                                       "config.execution_model");
             return value;
         }();
-        if (analytical.device != "rubin" || analytical.model != model.name ||
+        if (analytical.device != "rubin" ||
             (analytical.precision != "fp16" &&
-             analytical.precision != "bf16") ||
-            analytical.num_layers != model.num_layers) {
+             analytical.precision != "bf16")) {
             throw ConfigError(
-                "analytical execution requires the selected model on Rubin "
-                "with fp16 or bf16 precision and matching layer count");
+                "analytical execution requires Rubin with fp16 or bf16 "
+                "precision");
+        }
+        if (!model.attention.execution_enabled ||
+            model.attention.memory_layout ==
+                attention::AttentionMemoryLayout::kFrozenDsa) {
+            throw ConfigError(
+                "analytical execution does not support frozen DSA attention");
         }
         if (analytical.network_bandwidth_gbps <= 0.0 ||
             analytical.intra_node_bandwidth_gbps <= 0.0 ||
@@ -662,16 +649,16 @@ ClusterRuntimeConfig parse_cluster_runtime(const Json &clusters,
                           std::string{name} + "'");
     }
     const Json &cluster = clusters.at(name);
-    require_exact_keys(cluster,
-                       {
-                           "parallelism",
-                           "scheduler",
-                           "execution_model",
-                           "model",
-                           "moe_routing",
-                       },
-                       context);
-    const ModelConfig model = parse_model(cluster);
+    require_keys(cluster,
+                 {
+                     "parallelism",
+                     "scheduler",
+                     "execution_model",
+                     "model_name",
+                     "moe_routing",
+                 },
+                 {"total_expert_num", "router_topk"}, context);
+    const ModelConfig model = parse_model(cluster, context);
     const ParallelismConfig parallelism = parse_parallelism(cluster, model);
     return [&]() {
         ClusterRuntimeConfig value{};

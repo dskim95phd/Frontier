@@ -37,18 +37,14 @@
       "execution_model": {
         "type": "analytical",
         "device": "rubin",
-        "model": "Phi-tiny-MoE-instruct",
         "precision": "bf16",
-        "num_layers": 32,
         "network_bandwidth_gbps": 400.0,
         "network_latency_us": 1.0,
         "intra_node_bandwidth_gbps": 14400.0
       },
-      "model": {
-        "name": "Phi-tiny-MoE-instruct",
-        "runtime_total_experts": 8,
-        "router_topk": 2
-      },
+      "model_name": "Phi-tiny-MoE-instruct",
+      "total_expert_num": 8,
+      "router_topk": 2,
       "moe_routing": {
         "mode": "simulation",
         "distribution": "zipf",

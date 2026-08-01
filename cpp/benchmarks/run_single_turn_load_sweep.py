@@ -913,7 +913,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "topology": {
             "name": topology.name,
             "system_architecture": topology.system_architecture,
-            "model": "llama2-7b",
+            "model": "meta-llama/Llama-2-7b-hf",
             "device": "rubin",
             "precision": "fp16",
             "cluster_count": topology.cluster_count,

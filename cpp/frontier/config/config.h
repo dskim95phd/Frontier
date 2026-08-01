@@ -8,6 +8,8 @@
 #include <variant>
 #include <vector>
 
+#include "frontier/attention/ops.h"
+
 namespace frontier::config {
 
 inline constexpr int kSchemaVersion = 1;
@@ -55,7 +57,8 @@ enum class ModelKind {
 };
 
 struct ModelConfig {
-    std::string name = "llama2-7b";
+    std::string name = "meta-llama/Llama-2-7b-hf";
+    std::string model_type = "llama";
     ModelKind kind = ModelKind::kDense;
     std::uint64_t num_layers = 32;
     std::uint64_t hidden_size = 4'096;
@@ -65,25 +68,73 @@ struct ModelConfig {
     std::uint64_t head_dim = 128;
     bool gated_mlp = true;
     bool fused_add_norm = true;
-    std::uint64_t model_num_experts = 1;
-    std::uint64_t runtime_total_experts = 1;
+    std::uint64_t num_experts = 1;
+    std::uint64_t num_experts_per_token = 1;
+    std::uint64_t total_expert_num = 1;
     std::uint64_t router_topk = 1;
+    bool use_mla = false;
+    bool use_mfa = false;
+    std::uint64_t q_lora_rank = 0;
+    std::uint64_t kv_lora_rank = 0;
+    std::uint64_t qk_nope_head_dim = 0;
+    std::uint64_t qk_rope_head_dim = 0;
+    std::uint64_t qk_head_dim = 0;
+    std::uint64_t v_head_dim = 0;
+    std::uint64_t share_q_dim = 0;
+    bool has_dsa_marker = false;
+    std::vector<std::string> exotic_attention_fields;
+    attention::AttentionFamilyBinding attention;
 
     [[nodiscard]] bool is_moe() const noexcept {
         return kind == ModelKind::kMoe;
     }
 
+    [[nodiscard]] std::uint64_t runtime_num_kv_heads() const noexcept {
+        return attention.memory_layout ==
+                       attention::AttentionMemoryLayout::kLatentMla
+                   ? 1
+                   : num_kv_heads;
+    }
+
+    [[nodiscard]] std::uint64_t runtime_head_size() const noexcept {
+        return attention.memory_layout ==
+                       attention::AttentionMemoryLayout::kLatentMla
+                   ? kv_lora_rank + qk_rope_head_dim
+                   : head_dim;
+    }
+
+    [[nodiscard]] std::uint64_t kv_factor() const noexcept {
+        return attention.memory_layout ==
+                       attention::AttentionMemoryLayout::kLatentMla
+                   ? 1
+                   : 2;
+    }
+
     friend bool operator==(const ModelConfig &lhs, const ModelConfig &rhs) {
-        return std::tie(lhs.name, lhs.kind, lhs.num_layers, lhs.hidden_size,
+        return std::tie(lhs.name, lhs.model_type, lhs.kind, lhs.num_layers,
+                        lhs.hidden_size,
                         lhs.intermediate_size, lhs.num_query_heads,
                         lhs.num_kv_heads, lhs.head_dim, lhs.gated_mlp,
-                        lhs.fused_add_norm, lhs.model_num_experts,
-                        lhs.runtime_total_experts, lhs.router_topk) ==
-               std::tie(rhs.name, rhs.kind, rhs.num_layers, rhs.hidden_size,
+                        lhs.fused_add_norm, lhs.num_experts,
+                        lhs.num_experts_per_token, lhs.total_expert_num,
+                        lhs.router_topk, lhs.use_mla, lhs.use_mfa,
+                        lhs.q_lora_rank, lhs.kv_lora_rank,
+                        lhs.qk_nope_head_dim, lhs.qk_rope_head_dim,
+                        lhs.qk_head_dim, lhs.v_head_dim, lhs.share_q_dim,
+                        lhs.has_dsa_marker, lhs.exotic_attention_fields,
+                        lhs.attention) ==
+               std::tie(rhs.name, rhs.model_type, rhs.kind, rhs.num_layers,
+                        rhs.hidden_size,
                         rhs.intermediate_size, rhs.num_query_heads,
                         rhs.num_kv_heads, rhs.head_dim, rhs.gated_mlp,
-                        rhs.fused_add_norm, rhs.model_num_experts,
-                        rhs.runtime_total_experts, rhs.router_topk);
+                        rhs.fused_add_norm, rhs.num_experts,
+                        rhs.num_experts_per_token, rhs.total_expert_num,
+                        rhs.router_topk, rhs.use_mla, rhs.use_mfa,
+                        rhs.q_lora_rank, rhs.kv_lora_rank,
+                        rhs.qk_nope_head_dim, rhs.qk_rope_head_dim,
+                        rhs.qk_head_dim, rhs.v_head_dim, rhs.share_q_dim,
+                        rhs.has_dsa_marker, rhs.exotic_attention_fields,
+                        rhs.attention);
     }
     friend bool operator!=(const ModelConfig &lhs, const ModelConfig &rhs) {
         return !(lhs == rhs);
@@ -200,22 +251,18 @@ struct FixedExecutionModelConfig {
 
 struct AnalyticalExecutionModelConfig {
     std::string device = "rubin";
-    std::string model = "llama2-7b";
     std::string precision = "fp16";
     std::uint64_t tensor_parallel_size = 8;
-    std::uint64_t num_layers = 32;
     double network_bandwidth_gbps = 400.0;
     double network_latency_us = 1.0;
     double intra_node_bandwidth_gbps = 14'400.0;
 
     friend bool operator==(const AnalyticalExecutionModelConfig &lhs,
                            const AnalyticalExecutionModelConfig &rhs) {
-        return std::tie(lhs.device, lhs.model, lhs.precision,
-                        lhs.tensor_parallel_size, lhs.num_layers,
+        return std::tie(lhs.device, lhs.precision, lhs.tensor_parallel_size,
                         lhs.network_bandwidth_gbps, lhs.network_latency_us,
                         lhs.intra_node_bandwidth_gbps) ==
-               std::tie(rhs.device, rhs.model, rhs.precision,
-                        rhs.tensor_parallel_size, rhs.num_layers,
+               std::tie(rhs.device, rhs.precision, rhs.tensor_parallel_size,
                         rhs.network_bandwidth_gbps, rhs.network_latency_us,
                         rhs.intra_node_bandwidth_gbps);
     }
@@ -336,6 +383,8 @@ to_string(MoeRoutingDistribution distribution) noexcept;
 
 [[nodiscard]] SimulationConfig
 parse_simulation_config_json(std::string_view json_text);
+
+[[nodiscard]] ModelConfig load_model_config(std::string_view model_name);
 [[nodiscard]] std::string
 serialize_simulation_config_json(const SimulationConfig &config);
 

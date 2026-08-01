@@ -25,9 +25,10 @@ Three output-length profiles are available:
 | `prefill-heavy` | 256 | 64-1,024 | Prefill-dominant serving |
 | `kimi-short` | 8 | 4-16 | Original Kimi script compatibility |
 
-This is **not** a Kimi K2 model-performance study. The current C++ predictor
-does not yet represent Kimi K2's MLA and expert layout. The execution model is
-the validated analytical Llama-2-7B FP16 model on Rubin:
+This default sweep is **not** a Kimi K2 model-performance study. C++ can load
+Kimi K2's Python-compatible asset and analytically model its latent MLA cache,
+but the checked-in sweep deliberately retains the established Llama-2-7B FP16
+baseline on Rubin so historical results remain comparable:
 
 - one replica
 - TP8, PP4, DP2 (64 simulated GPUs)
