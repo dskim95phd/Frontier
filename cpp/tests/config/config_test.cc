@@ -1,8 +1,8 @@
 #include "frontier/config/config.h"
 #include "tests/test_support.h"
 
-#include <filesystem>
 #include <cstdint>
+#include <filesystem>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -81,9 +81,87 @@ void test_analytical_contract_round_trip() {
         "unsupported analytical hardware must fail fast");
 }
 
+void test_operator_precision_contract_round_trip() {
+    auto config = load("analytical_parallel_colocation.json");
+    auto &analytical = config.cluster().execution_model.analytical;
+    analytical.operator_precisions.attention = "fp8";
+    analytical.operator_precisions.dense = "fp8";
+    analytical.operator_precisions.moe_expert = "fp4";
+    analytical.operator_precisions.moe_router = "fp8";
+    analytical.operator_precisions.kv_cache = "fp8";
+    analytical.operator_precisions.communication = "fp8";
+
+    const std::string serialized = serialize_simulation_config_json(config);
+    const auto parsed = parse_simulation_config_json(serialized);
+    const auto &resolved = parsed.cluster().execution_model.analytical;
+    expect(parsed == config && resolved.attention_precision() == "fp8" &&
+               resolved.dense_precision() == "fp8" &&
+               resolved.moe_expert_precision() == "fp4" &&
+               resolved.moe_router_precision() == "fp8" &&
+               resolved.kv_cache_precision() == "fp8" &&
+               resolved.communication_precision() == "fp8",
+           "operator precision overrides must round-trip and resolve");
+
+    std::string invalid = serialized;
+    const std::string valid_precision = "\"moe_expert\": \"fp4\"";
+    const auto position = invalid.find(valid_precision);
+    expect(position != std::string::npos,
+           "serialized operator precision must be present");
+    invalid.replace(position, valid_precision.size(),
+                    "\"moe_expert\": \"fp3\"");
+    expect_throws<ConfigError>(
+        [&invalid] {
+            static_cast<void>(parse_simulation_config_json(invalid));
+        },
+        "unsupported operator precision must fail fast");
+
+    std::string unknown = serialized;
+    const std::string object_marker = "\"operator_precisions\": {";
+    const auto object_position = unknown.find(object_marker);
+    expect(object_position != std::string::npos,
+           "serialized operator precision object must be present");
+    unknown.insert(object_position + object_marker.size(),
+                   "\n          \"unknown_operator\": \"fp8\",");
+    expect_throws<ConfigError>(
+        [&unknown] {
+            static_cast<void>(parse_simulation_config_json(unknown));
+        },
+        "unknown operator precision keys must fail fast");
+}
+
+void test_pdd_kv_precision_matches_transfer_dtype() {
+    auto config = load("fixed_sequential_pdd.json");
+    auto &runtime = config.pdd();
+    for (auto *cluster :
+         {&runtime.clusters.prefill, &runtime.clusters.decode}) {
+        cluster->execution_model.type = ExecutionModelType::kAnalytical;
+        cluster->execution_model.analytical.tensor_parallel_size =
+            cluster->parallelism.tensor_parallel_size;
+        cluster->execution_model.analytical.operator_precisions.kv_cache =
+            "fp8";
+    }
+    runtime.kv_cache_transfer.kv_cache_dtype_size_bytes = 1.0;
+    const auto parsed =
+        parse_simulation_config_json(serialize_simulation_config_json(config));
+    expect(parsed.pdd().clusters.prefill.execution_model.analytical
+                       .kv_cache_precision() == "fp8" &&
+               parsed.pdd()
+                       .clusters.decode.execution_model.analytical
+                       .kv_cache_precision() == "fp8" &&
+               parsed.pdd().kv_cache_transfer.kv_cache_dtype_size_bytes == 1.0,
+           "PDD FP8 KV precision must accept one-byte transfer elements");
+
+    runtime.kv_cache_transfer.kv_cache_dtype_size_bytes = 2.0;
+    const std::string mismatched = serialize_simulation_config_json(config);
+    expect_throws<ConfigError>(
+        [&mismatched] {
+            static_cast<void>(parse_simulation_config_json(mismatched));
+        },
+        "PDD KV precision and transfer dtype mismatch must fail fast");
+}
+
 void test_analytical_attention_family_configs_parse() {
-    const auto with_model = [](std::string model_name,
-                               std::uint64_t experts,
+    const auto with_model = [](std::string model_name, std::uint64_t experts,
                                std::uint64_t topk) {
         std::string text =
             read_text_file(fixture("analytical_parallel_colocation.json"));
@@ -99,18 +177,15 @@ void test_analytical_attention_family_configs_parse() {
                      "\"pipeline_parallel_size\": 1");
         replace_once("\"moe_expert_parallel_size\": 1",
                      "\"moe_expert_parallel_size\": 8");
-        replace_once("\"meta-llama/Llama-2-7b-hf\"",
-                     "\"" + model_name + "\"");
+        replace_once("\"meta-llama/Llama-2-7b-hf\"", "\"" + model_name + "\"");
         replace_once("\"total_expert_num\": 1",
-                     "\"total_expert_num\": " +
-                         std::to_string(experts));
+                     "\"total_expert_num\": " + std::to_string(experts));
         replace_once("\"router_topk\": 1",
                      "\"router_topk\": " + std::to_string(topk));
         return parse_simulation_config_json(text);
     };
 
-    const auto kimi =
-        with_model("moonshotai/Kimi-K2-Instruct", 384, 8);
+    const auto kimi = with_model("moonshotai/Kimi-K2-Instruct", 384, 8);
     expect(kimi.cluster().model.attention.memory_layout ==
                frontier::attention::AttentionMemoryLayout::kLatentMla,
            "analytical config must accept latent MLA models");
@@ -242,18 +317,17 @@ void test_moe_contract_and_invalid_topologies() {
 }
 
 void test_model_registry_and_attention_binding() {
-    const auto llama = frontier::config::load_model_config(
-        "meta-llama/Llama-2-7b-hf");
+    const auto llama =
+        frontier::config::load_model_config("meta-llama/Llama-2-7b-hf");
     expect(!llama.is_moe() && llama.num_layers == 32 &&
                llama.hidden_size == 4'096 &&
                llama.attention.variant ==
                    frontier::attention::AttentionVariant::kMha &&
-               llama.runtime_num_kv_heads() == 32 &&
-               llama.kv_factor() == 2,
+               llama.runtime_num_kv_heads() == 32 && llama.kv_factor() == 2,
            "registered Llama model must bind dense MHA semantics");
 
-    const auto llama3 = frontier::config::load_model_config(
-        "meta-llama/Meta-Llama-3-8B");
+    const auto llama3 =
+        frontier::config::load_model_config("meta-llama/Meta-Llama-3-8B");
     expect(llama3.num_layers == 32 && llama3.num_kv_heads == 8 &&
                llama3.attention.variant ==
                    frontier::attention::AttentionVariant::kGqa,
@@ -267,18 +341,16 @@ void test_model_registry_and_attention_binding() {
                    frontier::attention::AttentionVariant::kGqa,
            "HF-style model JSON must load MoE and GQA structure");
 
-    const auto deepseek =
-        frontier::config::load_model_config("deepseek-v3");
+    const auto deepseek = frontier::config::load_model_config("deepseek-v3");
     expect(deepseek.is_moe() && deepseek.use_mla &&
                deepseek.attention.memory_layout ==
                    frontier::attention::AttentionMemoryLayout::kLatentMla &&
                deepseek.runtime_num_kv_heads() == 1 &&
-               deepseek.runtime_head_size() == 576 &&
-               deepseek.kv_factor() == 1,
+               deepseek.runtime_head_size() == 576 && deepseek.kv_factor() == 1,
            "MLA model assets must bind latent cache semantics");
 
-    const auto kimi = frontier::config::load_model_config(
-        "moonshotai/Kimi-K2-Instruct");
+    const auto kimi =
+        frontier::config::load_model_config("moonshotai/Kimi-K2-Instruct");
     expect(kimi.is_moe() && kimi.num_experts == 384 &&
                kimi.num_experts_per_token == 8 && kimi.use_mla &&
                kimi.runtime_num_kv_heads() == 1 &&
@@ -293,7 +365,8 @@ void test_model_registry_and_attention_binding() {
 }
 
 void test_model_runtime_overrides_are_optional() {
-    std::string text = read_text_file(fixture("fixed_parallel_colocation.json"));
+    std::string text =
+        read_text_file(fixture("fixed_parallel_colocation.json"));
     const auto erase_field = [&text](std::string_view field) {
         const std::string marker = "\"" + std::string{field} + "\"";
         const std::size_t marker_pos = text.find(marker);
@@ -301,8 +374,7 @@ void test_model_runtime_overrides_are_optional() {
                "optional model field must exist in source fixture");
         const std::size_t line_start = text.rfind('\n', marker_pos);
         const std::size_t line_end = text.find('\n', marker_pos);
-        expect(line_start != std::string::npos &&
-                   line_end != std::string::npos,
+        expect(line_start != std::string::npos && line_end != std::string::npos,
                "optional model field must occupy one JSON line");
         text.erase(line_start + 1, line_end - line_start);
     };
@@ -316,8 +388,8 @@ void test_model_runtime_overrides_are_optional() {
 
     expect_throws<ConfigError>(
         [] {
-            static_cast<void>(frontier::config::load_model_config(
-                "not-a-real/model"));
+            static_cast<void>(
+                frontier::config::load_model_config("not-a-real/model"));
         },
         "unknown model names without matching JSON assets must fail fast");
 }
@@ -350,9 +422,15 @@ int main() {
                                     test_pdd_contract_round_trip);
     failures += frontier::test::run("analytical contract round trip",
                                     test_analytical_contract_round_trip);
-    failures += frontier::test::run(
-        "analytical attention family configs parse",
-        test_analytical_attention_family_configs_parse);
+    failures +=
+        frontier::test::run("operator precision contract round trip",
+                            test_operator_precision_contract_round_trip);
+    failures +=
+        frontier::test::run("PDD KV precision matches transfer dtype",
+                            test_pdd_kv_precision_matches_transfer_dtype);
+    failures +=
+        frontier::test::run("analytical attention family configs parse",
+                            test_analytical_attention_family_configs_parse);
     failures +=
         frontier::test::run("legacy schemas and shapes are rejected",
                             test_legacy_schemas_and_shapes_are_rejected);
@@ -363,12 +441,10 @@ int main() {
         test_schema_version_range_is_checked_before_conversion);
     failures += frontier::test::run("MoE contract and invalid topologies",
                                     test_moe_contract_and_invalid_topologies);
-    failures += frontier::test::run(
-        "model registry and attention binding",
-        test_model_registry_and_attention_binding);
-    failures += frontier::test::run(
-        "model runtime overrides are optional",
-        test_model_runtime_overrides_are_optional);
+    failures += frontier::test::run("model registry and attention binding",
+                                    test_model_registry_and_attention_binding);
+    failures += frontier::test::run("model runtime overrides are optional",
+                                    test_model_runtime_overrides_are_optional);
     failures += frontier::test::run(
         "cluster parallelism above NVL72 parses",
         test_cluster_parallelism_is_not_limited_to_one_nvl72_domain);

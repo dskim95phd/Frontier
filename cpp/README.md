@@ -216,11 +216,25 @@ An analytical cluster replaces its fixed execution model with:
   "type": "analytical",
   "device": "rubin",
   "precision": "fp16",
+  "operator_precisions": {
+    "attention": "fp8",
+    "dense": "fp8",
+    "moe_expert": "fp4",
+    "moe_router": "fp8",
+    "kv_cache": "fp8",
+    "communication": "fp8"
+  },
   "network_bandwidth_gbps": 400.0,
   "network_latency_us": 1.0,
   "intra_node_bandwidth_gbps": 14400.0
 }
 ```
+
+`operator_precisions` is optional. Any omitted field inherits `precision`, so
+existing single-precision configs retain their behavior. Supported values are
+`fp32`, `fp16`, `bf16`, `fp8`, `int8`, `fp4`, and `int4`. The KV-cache value
+controls cached-KV reads and writes; in PDD it must also match
+`kv_cache_transfer.kv_cache_dtype_size_bytes` in both clusters.
 
 The analytical predictor derives the model and layer count from the cluster's
 `model_name`; they are not repeated in `execution_model`. TP comes from the

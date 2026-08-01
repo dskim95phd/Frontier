@@ -273,8 +273,8 @@ MoeRoutingDistribution parse_moe_routing_distribution(std::string_view value) {
 }
 
 ModelConfig parse_model(const Json &cluster, std::string_view context) {
-    ModelConfig parsed = load_model_config(
-        require_string(cluster, "model_name", context));
+    ModelConfig parsed =
+        load_model_config(require_string(cluster, "model_name", context));
     if (cluster.contains("total_expert_num")) {
         parsed.total_expert_num =
             require_uint64(cluster, "total_expert_num", context);
@@ -462,8 +462,7 @@ ParallelismConfig parse_parallelism(const Json &root,
                 "tensor_parallel_size*data_parallel_size == "
                 "moe_tensor_parallel_size*moe_expert_parallel_size");
         }
-        if (model.total_expert_num % parsed.moe_expert_parallel_size !=
-            0) {
+        if (model.total_expert_num % parsed.moe_expert_parallel_size != 0) {
             throw ConfigError("total_expert_num must be divisible by "
                               "moe_expert_parallel_size");
         }
@@ -540,6 +539,62 @@ std::vector<double> require_finite_number_array(const Json &object,
     return result;
 }
 
+bool is_supported_analytical_precision(std::string_view precision) noexcept {
+    return precision == "fp32" || precision == "fp16" || precision == "bf16" ||
+           precision == "fp8" || precision == "int8" || precision == "fp4" ||
+           precision == "int4";
+}
+
+double analytical_precision_size_bytes(std::string_view precision) {
+    if (precision == "fp32") {
+        return 4.0;
+    }
+    if (precision == "fp16" || precision == "bf16") {
+        return 2.0;
+    }
+    if (precision == "fp8" || precision == "int8") {
+        return 1.0;
+    }
+    if (precision == "fp4" || precision == "int4") {
+        return 0.5;
+    }
+    throw ConfigError("unsupported analytical precision: " +
+                      std::string{precision});
+}
+
+OperatorPrecisionConfig parse_operator_precisions(const Json &execution) {
+    OperatorPrecisionConfig result{};
+    if (!execution.contains("operator_precisions")) {
+        return result;
+    }
+    const Json &operators = execution.at("operator_precisions");
+    constexpr std::string_view context =
+        "config.execution_model.operator_precisions";
+    require_keys(operators, {},
+                 {"attention", "dense", "moe_expert", "moe_router", "kv_cache",
+                  "communication"},
+                 context);
+    const auto parse_optional = [&](std::string_view field,
+                                    std::string &destination) {
+        if (!operators.contains(field)) {
+            return;
+        }
+        destination = require_string(operators, field, context);
+        if (!is_supported_analytical_precision(destination)) {
+            throw ConfigError(std::string{context} + "." + std::string{field} +
+                              " must be one of fp32, fp16, bf16, fp8, int8, "
+                              "fp4, or int4");
+        }
+    };
+    parse_optional("attention", result.attention);
+    parse_optional("dense", result.dense);
+    parse_optional("moe_expert", result.moe_expert);
+    parse_optional("moe_router", result.moe_router);
+    parse_optional("kv_cache", result.kv_cache);
+    parse_optional("communication", result.communication);
+    return result;
+}
+
 ExecutionModelConfig parse_execution_model(const Json &root,
                                            const ParallelismConfig &parallelism,
                                            const ModelConfig &model) {
@@ -577,22 +632,23 @@ ExecutionModelConfig parse_execution_model(const Json &root,
     }
 
     if (type == "analytical") {
-        require_exact_keys(execution,
-                           {
-                               "type",
-                               "device",
-                               "precision",
-                               "network_bandwidth_gbps",
-                               "network_latency_us",
-                               "intra_node_bandwidth_gbps",
-                           },
-                           "config.execution_model");
+        require_keys(execution,
+                     {
+                         "type",
+                         "device",
+                         "precision",
+                         "network_bandwidth_gbps",
+                         "network_latency_us",
+                         "intra_node_bandwidth_gbps",
+                     },
+                     {"operator_precisions"}, "config.execution_model");
         AnalyticalExecutionModelConfig analytical = [&]() {
             AnalyticalExecutionModelConfig value{};
             value.device =
                 require_string(execution, "device", "config.execution_model");
             value.precision = require_string(execution, "precision",
                                              "config.execution_model");
+            value.operator_precisions = parse_operator_precisions(execution);
             value.tensor_parallel_size = parallelism.tensor_parallel_size;
             value.network_bandwidth_gbps = require_finite_number(
                 execution, "network_bandwidth_gbps", "config.execution_model");
@@ -604,11 +660,10 @@ ExecutionModelConfig parse_execution_model(const Json &root,
             return value;
         }();
         if (analytical.device != "rubin" ||
-            (analytical.precision != "fp16" &&
-             analytical.precision != "bf16")) {
+            !is_supported_analytical_precision(analytical.precision)) {
             throw ConfigError(
-                "analytical execution requires Rubin with fp16 or bf16 "
-                "precision");
+                "analytical execution requires Rubin with fp32, fp16, bf16, "
+                "fp8, int8, fp4, or int4 precision");
         }
         if (!model.attention.execution_enabled ||
             model.attention.memory_layout ==
@@ -797,6 +852,30 @@ SimulationConfig make_pdd_config(const Json &root, CommonConfigFields common) {
         throw ConfigError("PDD config requires prefix_cache.enabled=false; "
                           "session prefix caching begins in Step 4");
     }
+    PddRuntimeConfig runtime{};
+    runtime.clusters = parse_pdd_clusters(root);
+    runtime.kv_cache_transfer = parse_kv_cache_transfer(root);
+    const auto &prefill_execution = runtime.clusters.prefill.execution_model;
+    const auto &decode_execution = runtime.clusters.decode.execution_model;
+    if (prefill_execution.type == ExecutionModelType::kAnalytical &&
+        decode_execution.type == ExecutionModelType::kAnalytical) {
+        const std::string &prefill_kv =
+            prefill_execution.analytical.kv_cache_precision();
+        const std::string &decode_kv =
+            decode_execution.analytical.kv_cache_precision();
+        if (prefill_kv != decode_kv) {
+            throw ConfigError(
+                "PDD PREFILL and DECODE must use the same KV-cache precision");
+        }
+        const double expected_bytes =
+            analytical_precision_size_bytes(prefill_kv);
+        if (runtime.kv_cache_transfer.kv_cache_dtype_size_bytes !=
+            expected_bytes) {
+            throw ConfigError(
+                "config.kv_cache_transfer.kv_cache_dtype_size_bytes must "
+                "match the analytical KV-cache precision");
+        }
+    }
     return [&]() {
         SimulationConfig value{};
         value.schema_version = common.schema_version;
@@ -806,12 +885,7 @@ SimulationConfig make_pdd_config(const Json &root, CommonConfigFields common) {
         value.enable_parallel_clusters = common.enable_parallel_clusters;
         value.prefix_cache = common.prefix_cache;
         value.cluster_scheduler = parse_cluster_scheduler(root);
-        value.runtime = [&]() {
-            PddRuntimeConfig value{};
-            value.clusters = parse_pdd_clusters(root);
-            value.kv_cache_transfer = parse_kv_cache_transfer(root);
-            return value;
-        }();
+        value.runtime = std::move(runtime);
         return value;
     }();
 }

@@ -112,29 +112,25 @@ struct ModelConfig {
 
     friend bool operator==(const ModelConfig &lhs, const ModelConfig &rhs) {
         return std::tie(lhs.name, lhs.model_type, lhs.kind, lhs.num_layers,
-                        lhs.hidden_size,
-                        lhs.intermediate_size, lhs.num_query_heads,
-                        lhs.num_kv_heads, lhs.head_dim, lhs.gated_mlp,
-                        lhs.fused_add_norm, lhs.num_experts,
+                        lhs.hidden_size, lhs.intermediate_size,
+                        lhs.num_query_heads, lhs.num_kv_heads, lhs.head_dim,
+                        lhs.gated_mlp, lhs.fused_add_norm, lhs.num_experts,
                         lhs.num_experts_per_token, lhs.total_expert_num,
                         lhs.router_topk, lhs.use_mla, lhs.use_mfa,
-                        lhs.q_lora_rank, lhs.kv_lora_rank,
-                        lhs.qk_nope_head_dim, lhs.qk_rope_head_dim,
-                        lhs.qk_head_dim, lhs.v_head_dim, lhs.share_q_dim,
-                        lhs.has_dsa_marker, lhs.exotic_attention_fields,
-                        lhs.attention) ==
+                        lhs.q_lora_rank, lhs.kv_lora_rank, lhs.qk_nope_head_dim,
+                        lhs.qk_rope_head_dim, lhs.qk_head_dim, lhs.v_head_dim,
+                        lhs.share_q_dim, lhs.has_dsa_marker,
+                        lhs.exotic_attention_fields, lhs.attention) ==
                std::tie(rhs.name, rhs.model_type, rhs.kind, rhs.num_layers,
-                        rhs.hidden_size,
-                        rhs.intermediate_size, rhs.num_query_heads,
-                        rhs.num_kv_heads, rhs.head_dim, rhs.gated_mlp,
-                        rhs.fused_add_norm, rhs.num_experts,
+                        rhs.hidden_size, rhs.intermediate_size,
+                        rhs.num_query_heads, rhs.num_kv_heads, rhs.head_dim,
+                        rhs.gated_mlp, rhs.fused_add_norm, rhs.num_experts,
                         rhs.num_experts_per_token, rhs.total_expert_num,
                         rhs.router_topk, rhs.use_mla, rhs.use_mfa,
-                        rhs.q_lora_rank, rhs.kv_lora_rank,
-                        rhs.qk_nope_head_dim, rhs.qk_rope_head_dim,
-                        rhs.qk_head_dim, rhs.v_head_dim, rhs.share_q_dim,
-                        rhs.has_dsa_marker, rhs.exotic_attention_fields,
-                        rhs.attention);
+                        rhs.q_lora_rank, rhs.kv_lora_rank, rhs.qk_nope_head_dim,
+                        rhs.qk_rope_head_dim, rhs.qk_head_dim, rhs.v_head_dim,
+                        rhs.share_q_dim, rhs.has_dsa_marker,
+                        rhs.exotic_attention_fields, rhs.attention);
     }
     friend bool operator!=(const ModelConfig &lhs, const ModelConfig &rhs) {
         return !(lhs == rhs);
@@ -249,9 +245,33 @@ struct FixedExecutionModelConfig {
     }
 };
 
+struct OperatorPrecisionConfig {
+    // Empty fields inherit AnalyticalExecutionModelConfig::precision.
+    std::string attention;
+    std::string dense;
+    std::string moe_expert;
+    std::string moe_router;
+    std::string kv_cache;
+    std::string communication;
+
+    [[nodiscard]] bool empty() const noexcept {
+        return attention.empty() && dense.empty() && moe_expert.empty() &&
+               moe_router.empty() && kv_cache.empty() && communication.empty();
+    }
+
+    friend bool operator==(const OperatorPrecisionConfig &lhs,
+                           const OperatorPrecisionConfig &rhs) {
+        return std::tie(lhs.attention, lhs.dense, lhs.moe_expert,
+                        lhs.moe_router, lhs.kv_cache, lhs.communication) ==
+               std::tie(rhs.attention, rhs.dense, rhs.moe_expert,
+                        rhs.moe_router, rhs.kv_cache, rhs.communication);
+    }
+};
+
 struct AnalyticalExecutionModelConfig {
     std::string device = "rubin";
     std::string precision = "fp16";
+    OperatorPrecisionConfig operator_precisions;
     std::uint64_t tensor_parallel_size = 8;
     double network_bandwidth_gbps = 400.0;
     double network_latency_us = 1.0;
@@ -259,12 +279,43 @@ struct AnalyticalExecutionModelConfig {
 
     friend bool operator==(const AnalyticalExecutionModelConfig &lhs,
                            const AnalyticalExecutionModelConfig &rhs) {
-        return std::tie(lhs.device, lhs.precision, lhs.tensor_parallel_size,
-                        lhs.network_bandwidth_gbps, lhs.network_latency_us,
+        return std::tie(lhs.device, lhs.precision, lhs.operator_precisions,
+                        lhs.tensor_parallel_size, lhs.network_bandwidth_gbps,
+                        lhs.network_latency_us,
                         lhs.intra_node_bandwidth_gbps) ==
-               std::tie(rhs.device, rhs.precision, rhs.tensor_parallel_size,
-                        rhs.network_bandwidth_gbps, rhs.network_latency_us,
-                        rhs.intra_node_bandwidth_gbps);
+               std::tie(rhs.device, rhs.precision, rhs.operator_precisions,
+                        rhs.tensor_parallel_size, rhs.network_bandwidth_gbps,
+                        rhs.network_latency_us, rhs.intra_node_bandwidth_gbps);
+    }
+
+    [[nodiscard]] const std::string &attention_precision() const noexcept {
+        return operator_precisions.attention.empty()
+                   ? precision
+                   : operator_precisions.attention;
+    }
+    [[nodiscard]] const std::string &dense_precision() const noexcept {
+        return operator_precisions.dense.empty() ? precision
+                                                 : operator_precisions.dense;
+    }
+    [[nodiscard]] const std::string &moe_expert_precision() const noexcept {
+        return operator_precisions.moe_expert.empty()
+                   ? precision
+                   : operator_precisions.moe_expert;
+    }
+    [[nodiscard]] const std::string &moe_router_precision() const noexcept {
+        return operator_precisions.moe_router.empty()
+                   ? precision
+                   : operator_precisions.moe_router;
+    }
+    [[nodiscard]] const std::string &kv_cache_precision() const noexcept {
+        return operator_precisions.kv_cache.empty()
+                   ? precision
+                   : operator_precisions.kv_cache;
+    }
+    [[nodiscard]] const std::string &communication_precision() const noexcept {
+        return operator_precisions.communication.empty()
+                   ? precision
+                   : operator_precisions.communication;
     }
 };
 

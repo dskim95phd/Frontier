@@ -110,6 +110,24 @@ OrderedJson serialize_execution_model(const ExecutionModelConfig &execution) {
             execution.analytical.intra_node_bandwidth_gbps,
         },
     });
+    const OperatorPrecisionConfig &operators =
+        execution.analytical.operator_precisions;
+    if (!operators.empty()) {
+        OrderedJson values = OrderedJson::object();
+        const auto add = [&values](std::string_view name,
+                                   const std::string &precision) {
+            if (!precision.empty()) {
+                values[std::string{name}] = precision;
+            }
+        };
+        add("attention", operators.attention);
+        add("dense", operators.dense);
+        add("moe_expert", operators.moe_expert);
+        add("moe_router", operators.moe_router);
+        add("kv_cache", operators.kv_cache);
+        add("communication", operators.communication);
+        result["operator_precisions"] = std::move(values);
+    }
     return result;
 }
 

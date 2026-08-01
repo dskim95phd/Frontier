@@ -235,6 +235,86 @@ void test_long_context_decode_cost_increases() {
            "long-context decode attention must cost more");
 }
 
+void test_operator_precisions_split_dense_and_kv_costs() {
+    expect(
+        analytical::precision_from_string("fp8") ==
+                analytical::Precision::kFp8 &&
+            analytical::precision_from_string("fp4") ==
+                analytical::Precision::kFp4 &&
+            analytical::bytes_per_element(analytical::Precision::kFp8) == 1.0 &&
+            analytical::bytes_per_element(analytical::Precision::kFp4) == 0.5,
+        "FP8 and FP4 precision names must map to packed byte sizes");
+
+    analytical::DenseBatch batch{};
+    batch.total_tokens = 1;
+    batch.decode_requests = {{1, 8'192}};
+    const auto predict = [&](analytical::DenseOperatorPrecisions precisions) {
+        return analytical::predict_dense_layer(
+            analytical::DeviceCeilings::rubin(), analytical::AnalyticalConfig{},
+            analytical::DenseModel::llama2_7b_tp8(), batch, precisions);
+    };
+    const auto fp16 =
+        predict({analytical::Precision::kFp16, analytical::Precision::kFp16,
+                 analytical::Precision::kFp16});
+    const auto fp8_kv =
+        predict({analytical::Precision::kFp8, analytical::Precision::kFp16,
+                 analytical::Precision::kFp8});
+    expect(fp8_kv.decode_attention_ms < fp16.decode_attention_ms &&
+               fp8_kv.kv_cache_save_ms < fp16.kv_cache_save_ms,
+           "FP8 attention/KV must reduce long-context reads and KV writes");
+    expect_approximately_equal(fp8_kv.mlp_up_projection_ms,
+                               fp16.mlp_up_projection_ms,
+                               "dense precision independence");
+
+    const auto fp4_dense =
+        predict({analytical::Precision::kFp16, analytical::Precision::kFp4,
+                 analytical::Precision::kFp16});
+    expect(fp4_dense.mlp_up_projection_ms < fp16.mlp_up_projection_ms,
+           "FP4 dense override must reduce MLP projection time");
+    expect_approximately_equal(fp4_dense.attention_pre_projection_ms,
+                               fp16.attention_pre_projection_ms,
+                               "attention precision independence");
+}
+
+void test_operator_precisions_split_moe_expert_and_router_costs() {
+    analytical::MoEModel model{};
+    model.hidden_size = 4'096;
+    model.intermediate_size = 14'336;
+    model.model_num_experts = 8;
+    model.moe_tensor_parallel_size = 1;
+    const std::vector<std::uint64_t> expert_tokens = {128, 128, 128, 128,
+                                                      128, 128, 128, 128};
+    const auto predict = [&](analytical::MoEOperatorPrecisions precisions) {
+        return analytical::predict_moe_layer(
+            analytical::DeviceCeilings::rubin(), analytical::AnalyticalConfig{},
+            model, 512, 2, expert_tokens, precisions);
+    };
+    const auto fp16 =
+        predict({analytical::Precision::kFp16, analytical::Precision::kFp16,
+                 analytical::Precision::kFp16});
+    const auto fp4_expert =
+        predict({analytical::Precision::kFp4, analytical::Precision::kFp16,
+                 analytical::Precision::kFp16});
+    expect(fp4_expert.grouped_up_projection_ms <
+                   fp16.grouped_up_projection_ms &&
+               fp4_expert.grouped_down_projection_ms <
+                   fp16.grouped_down_projection_ms,
+           "FP4 expert override must reduce grouped expert GEMM time");
+    expect_approximately_equal(fp4_expert.gating_linear_ms,
+                               fp16.gating_linear_ms,
+                               "router precision independence");
+
+    const auto fp8_router =
+        predict({analytical::Precision::kFp16, analytical::Precision::kFp8,
+                 analytical::Precision::kFp16});
+    expect(fp8_router.gating_linear_ms < fp16.gating_linear_ms &&
+               fp8_router.gating_routing_topk_ms < fp16.gating_routing_topk_ms,
+           "FP8 router override must reduce router operator time");
+    expect_approximately_equal(fp8_router.grouped_up_projection_ms,
+                               fp16.grouped_up_projection_ms,
+                               "expert precision independence");
+}
+
 void test_mla_uses_latent_cache_context_costs() {
     const Json golden = load_attention_family_golden();
     analytical::DenseModel model{};
@@ -259,15 +339,13 @@ void test_mla_uses_latent_cache_context_costs() {
         batch.total_tokens = 1;
         batch.decode_requests = {{1, past_context}};
         return analytical::predict_dense_layer(
-            analytical::DeviceCeilings::rubin(),
-            analytical::AnalyticalConfig{}, model, batch,
-            analytical::Precision::kFp16);
+            analytical::DeviceCeilings::rubin(), analytical::AnalyticalConfig{},
+            model, batch, analytical::Precision::kFp16);
     };
 
     const auto short_context = predict(128);
     const auto long_context = predict(8'192);
-    expect(long_context.decode_attention_ms >
-               short_context.decode_attention_ms,
+    expect(long_context.decode_attention_ms > short_context.decode_attention_ms,
            "MLA decode must scale with latent-cache context length");
     expect(short_context.attention_pre_projection_ms > 0.0 &&
                short_context.attention_post_projection_ms > 0.0,
@@ -275,8 +353,7 @@ void test_mla_uses_latent_cache_context_costs() {
     expect(short_context.attention_inter_norm_ms == 0.0 &&
                short_context.attention_wq_projection_ms == 0.0,
            "MLA must not use MFA shared-Q operators");
-    check_attention_fields(
-        long_context, golden.at("mla_decode_1_past_8192"));
+    check_attention_fields(long_context, golden.at("mla_decode_1_past_8192"));
 }
 
 void test_mfa_models_shared_q_projection_path() {
@@ -297,9 +374,8 @@ void test_mfa_models_shared_q_projection_path() {
     batch.total_tokens = 32;
     batch.prefill_requests = {{32, 256}};
     const auto result = analytical::predict_dense_layer(
-        analytical::DeviceCeilings::rubin(),
-        analytical::AnalyticalConfig{}, model, batch,
-        analytical::Precision::kFp16);
+        analytical::DeviceCeilings::rubin(), analytical::AnalyticalConfig{},
+        model, batch, analytical::Precision::kFp16);
 
     const auto expected_inter_norm = analytical::predict_roofline(
         analytical::DeviceCeilings::rubin(), analytical::Precision::kFp16,
@@ -550,6 +626,12 @@ int main() {
                                     test_dense_layer_matches_python_golden);
     failures += frontier::test::run("long-context decode cost increases",
                                     test_long_context_decode_cost_increases);
+    failures +=
+        frontier::test::run("operator precisions split dense and KV costs",
+                            test_operator_precisions_split_dense_and_kv_costs);
+    failures += frontier::test::run(
+        "operator precisions split MoE expert and router costs",
+        test_operator_precisions_split_moe_expert_and_router_costs);
     failures += frontier::test::run("MLA uses latent-cache context costs",
                                     test_mla_uses_latent_cache_context_costs);
     failures += frontier::test::run("MFA models shared-Q projection path",

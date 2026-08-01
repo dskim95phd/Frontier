@@ -80,8 +80,22 @@ AnalyticalRooflineExecutionTimePredictor::
     if (parallelism_.tensor_parallel_size == 0) {
         parallelism_.tensor_parallel_size = config_.tensor_parallel_size;
     }
+    const auto supported_precision = [](std::string_view value) {
+        try {
+            static_cast<void>(detail::precision_from_string(value));
+            return true;
+        } catch (const detail::AnalyticalModelError &) {
+            return false;
+        }
+    };
     if (communication_backend_ == nullptr || config_.device != "rubin" ||
-        (config_.precision != "fp16" && config_.precision != "bf16") ||
+        !supported_precision(config_.precision) ||
+        !supported_precision(config_.attention_precision()) ||
+        !supported_precision(config_.dense_precision()) ||
+        !supported_precision(config_.moe_expert_precision()) ||
+        !supported_precision(config_.moe_router_precision()) ||
+        !supported_precision(config_.kv_cache_precision()) ||
+        !supported_precision(config_.communication_precision()) ||
         model_.attention.memory_layout ==
             attention::AttentionMemoryLayout::kFrozenDsa ||
         parallelism_.tensor_parallel_size == 0 ||
@@ -129,6 +143,13 @@ AnalyticalRooflineExecutionTimePredictor::predict_stage_execution_time(
         }
     }
 
+    const detail::DenseOperatorPrecisions dense_precisions{
+        detail::precision_from_string(config_.attention_precision()),
+        detail::precision_from_string(config_.dense_precision()),
+        detail::precision_from_string(config_.kv_cache_precision()),
+    };
+    const detail::Precision communication_precision =
+        detail::precision_from_string(config_.communication_precision());
     const detail::DenseLayerTimes layer = detail::predict_dense_layer(
         detail::DeviceCeilings::rubin(), detail::AnalyticalConfig{},
         [&]() {
@@ -152,17 +173,21 @@ AnalyticalRooflineExecutionTimePredictor::predict_stage_execution_time(
             value.share_q_dim = model_.share_q_dim;
             return value;
         }(),
-        dense_batch,
-        config_.precision == "bf16" ? detail::Precision::kBf16
-                                    : detail::Precision::kFp16);
+        dense_batch, dense_precisions);
 
-    if (dense_batch.total_tokens > std::numeric_limits<std::uint64_t>::max() /
-                                       (model_.hidden_size * 2ULL)) {
+    const double communication_element_bytes =
+        detail::bytes_per_element(communication_precision);
+    const long double activation_bytes_exact =
+        static_cast<long double>(dense_batch.total_tokens) *
+        static_cast<long double>(model_.hidden_size) *
+        communication_element_bytes;
+    if (activation_bytes_exact >
+        static_cast<long double>(std::numeric_limits<std::uint64_t>::max())) {
         throw ExecutionTimePredictorError(
             "analytical communication byte count overflows uint64");
     }
     const std::uint64_t activation_bytes =
-        dense_batch.total_tokens * model_.hidden_size * 2ULL;
+        static_cast<std::uint64_t>(std::ceil(activation_bytes_exact));
     const double allreduce_ms =
         parallelism_.tensor_parallel_size > 1
             ? communication_backend_->allreduce_ms(
@@ -216,19 +241,21 @@ AnalyticalRooflineExecutionTimePredictor::predict_stage_execution_time(
             value.fused_add_norm = model_.fused_add_norm;
             return value;
         }();
-        const detail::Precision precision = config_.precision == "bf16"
-                                                ? detail::Precision::kBf16
-                                                : detail::Precision::kFp16;
+        const detail::MoEOperatorPrecisions moe_precisions{
+            detail::precision_from_string(config_.moe_expert_precision()),
+            detail::precision_from_string(config_.moe_router_precision()),
+            detail::precision_from_string(config_.dense_precision()),
+        };
         for (std::uint64_t local_layer = 0; local_layer < layers_per_stage;
              ++local_layer) {
             const detail::RoutingAllocation allocation = detail::route_tokens(
                 dense_batch.total_tokens, model_.router_topk,
-                model_.total_expert_num,
-                parallelism_.moe_expert_parallel_size, routing_, local_layer);
+                model_.total_expert_num, parallelism_.moe_expert_parallel_size,
+                routing_, local_layer);
             const detail::MoELanePrediction lane_prediction =
                 detail::predict_moe_lanes(
                     detail::DeviceCeilings::rubin(), detail::AnalyticalConfig{},
-                    moe_model, allocation, model_.router_topk, precision);
+                    moe_model, allocation, model_.router_topk, moe_precisions);
             std::vector<double> lane_times_ms;
             lane_times_ms.reserve(lane_prediction.lane_times.size());
             for (const detail::MoELayerTime &lane :
@@ -275,7 +302,8 @@ AnalyticalRooflineExecutionTimePredictor::predict_stage_execution_time(
                 parallelism_.tensor_parallel_size,
                 parallelism_.moe_tensor_parallel_size,
                 parallelism_.moe_expert_parallel_size,
-                parallelism_.data_parallel_size, false, 2.0);
+                parallelism_.data_parallel_size, false,
+                communication_element_bytes);
         execution_time.moe_tp_communication_ms =
             static_cast<double>(layers_per_stage) *
             communication_time.moe_tp_ms;
@@ -313,6 +341,13 @@ AnalyticalRooflineExecutionTimePredictor::predict_stage_execution_time(
                 static_cast<double>(dense_batch.decode_requests.size()),
             },
             {"dense_layer_compute_ms", dense_layer_compute_ms},
+            {"attention_element_bytes",
+             detail::bytes_per_element(dense_precisions.attention)},
+            {"dense_element_bytes",
+             detail::bytes_per_element(dense_precisions.dense)},
+            {"kv_cache_element_bytes",
+             detail::bytes_per_element(dense_precisions.kv_cache)},
+            {"communication_element_bytes", communication_element_bytes},
             {"tp_allreduce_ms", allreduce_ms},
             {
                 "dense_layer_total_ms",
@@ -392,6 +427,32 @@ double DenseLayerTimes::total_ms() const noexcept {
            prefill_attention_ms + decode_attention_ms + mlp_up_projection_ms +
            mlp_activation_ms + mlp_down_projection_ms + mlp_norm_ms +
            2.0 * residual_add_ms;
+}
+
+Precision precision_from_string(std::string_view precision) {
+    if (precision == "fp32") {
+        return Precision::kFp32;
+    }
+    if (precision == "fp16") {
+        return Precision::kFp16;
+    }
+    if (precision == "bf16") {
+        return Precision::kBf16;
+    }
+    if (precision == "fp8") {
+        return Precision::kFp8;
+    }
+    if (precision == "int8") {
+        return Precision::kInt8;
+    }
+    if (precision == "fp4") {
+        return Precision::kFp4;
+    }
+    if (precision == "int4") {
+        return Precision::kInt4;
+    }
+    throw AnalyticalModelError("unsupported analytical precision: " +
+                               std::string{precision});
 }
 
 double bytes_per_element(Precision precision) noexcept {
@@ -547,17 +608,22 @@ KernelWork
 attention_context_work(const std::vector<AttentionRequestSlice> &requests,
                        std::uint64_t local_query_heads,
                        std::uint64_t local_kv_heads, std::uint64_t head_dim,
-                       double element_bytes) {
+                       double activation_element_bytes,
+                       double kv_cache_element_bytes) {
     if (local_query_heads == 0 || local_kv_heads == 0 || head_dim == 0) {
         throw AnalyticalModelError("attention dimensions must be positive");
     }
-    require_finite_nonnegative(element_bytes, "element bytes");
-    if (element_bytes == 0.0) {
-        throw AnalyticalModelError("element bytes must be positive");
+    require_finite_nonnegative(activation_element_bytes,
+                               "activation element bytes");
+    require_finite_nonnegative(kv_cache_element_bytes,
+                               "KV cache element bytes");
+    if (activation_element_bytes == 0.0 || kv_cache_element_bytes == 0.0) {
+        throw AnalyticalModelError("attention element bytes must be positive");
     }
 
     double total_flops = 0.0;
-    double total_elements = 0.0;
+    double activation_elements = 0.0;
+    double kv_cache_elements = 0.0;
     for (const AttentionRequestSlice &request : requests) {
         const double query_tokens = static_cast<double>(request.query_tokens);
         const double past_context = static_cast<double>(request.past_context);
@@ -575,32 +641,47 @@ attention_context_work(const std::vector<AttentionRequestSlice> &requests,
         const double cached_kv_reads = 2.0 * past_context *
                                        static_cast<double>(local_kv_heads) *
                                        static_cast<double>(head_dim);
-        total_elements += q_and_output + new_kv_input + cached_kv_reads;
+        activation_elements += q_and_output + new_kv_input;
+        kv_cache_elements += cached_kv_reads;
     }
     return [&]() {
         KernelWork value{};
         value.flops = total_flops;
-        value.hbm_bytes = total_elements * element_bytes;
+        value.hbm_bytes = activation_elements * activation_element_bytes +
+                          kv_cache_elements * kv_cache_element_bytes;
         return value;
     }();
+}
+
+KernelWork
+attention_context_work(const std::vector<AttentionRequestSlice> &requests,
+                       std::uint64_t local_query_heads,
+                       std::uint64_t local_kv_heads, std::uint64_t head_dim,
+                       double element_bytes) {
+    return attention_context_work(requests, local_query_heads, local_kv_heads,
+                                  head_dim, element_bytes, element_bytes);
 }
 
 KernelWork mla_attention_context_work(
     const std::vector<AttentionRequestSlice> &requests,
     std::uint64_t local_query_heads, std::uint64_t qk_head_dim,
     std::uint64_t v_head_dim, std::uint64_t latent_dim,
-    double element_bytes) {
+    double activation_element_bytes, double kv_cache_element_bytes) {
     if (local_query_heads == 0 || qk_head_dim == 0 || v_head_dim == 0 ||
         latent_dim == 0) {
         throw AnalyticalModelError("MLA attention dimensions must be positive");
     }
-    require_finite_nonnegative(element_bytes, "element bytes");
-    if (element_bytes == 0.0) {
-        throw AnalyticalModelError("element bytes must be positive");
+    require_finite_nonnegative(activation_element_bytes,
+                               "activation element bytes");
+    require_finite_nonnegative(kv_cache_element_bytes,
+                               "KV cache element bytes");
+    if (activation_element_bytes == 0.0 || kv_cache_element_bytes == 0.0) {
+        throw AnalyticalModelError("attention element bytes must be positive");
     }
 
     double total_flops = 0.0;
-    double total_elements = 0.0;
+    double activation_elements = 0.0;
+    double kv_cache_elements = 0.0;
     for (const AttentionRequestSlice &request : requests) {
         const double query_tokens = static_cast<double>(request.query_tokens);
         const double past_context = static_cast<double>(request.past_context);
@@ -609,22 +690,33 @@ KernelWork mla_attention_context_work(
         const double query_and_value_dim =
             static_cast<double>(qk_head_dim + v_head_dim);
         total_flops += 2.0 * static_cast<double>(local_query_heads) *
-                       query_tokens * average_visible_kv *
-                       query_and_value_dim;
-        total_elements +=
-            query_tokens * static_cast<double>(local_query_heads) *
-                query_and_value_dim +
-            query_tokens * static_cast<double>(latent_dim) +
-            past_context * static_cast<double>(latent_dim);
+                       query_tokens * average_visible_kv * query_and_value_dim;
+        activation_elements += query_tokens *
+                                   static_cast<double>(local_query_heads) *
+                                   query_and_value_dim +
+                               query_tokens * static_cast<double>(latent_dim);
+        kv_cache_elements += past_context * static_cast<double>(latent_dim);
     }
-    return KernelWork{total_flops, total_elements * element_bytes};
+    return KernelWork{total_flops,
+                      activation_elements * activation_element_bytes +
+                          kv_cache_elements * kv_cache_element_bytes};
+}
+
+KernelWork
+mla_attention_context_work(const std::vector<AttentionRequestSlice> &requests,
+                           std::uint64_t local_query_heads,
+                           std::uint64_t qk_head_dim, std::uint64_t v_head_dim,
+                           std::uint64_t latent_dim, double element_bytes) {
+    return mla_attention_context_work(requests, local_query_heads, qk_head_dim,
+                                      v_head_dim, latent_dim, element_bytes,
+                                      element_bytes);
 }
 
 DenseLayerTimes predict_dense_layer(const DeviceCeilings &device,
                                     const AnalyticalConfig &config,
                                     const DenseModel &model,
                                     const DenseBatch &batch,
-                                    Precision precision) {
+                                    const DenseOperatorPrecisions &precisions) {
     if (model.hidden_size == 0 || model.intermediate_size == 0 ||
         model.num_query_heads == 0 || model.num_kv_heads == 0 ||
         model.head_dim == 0 || model.tensor_parallel_size == 0) {
@@ -650,7 +742,11 @@ DenseLayerTimes predict_dense_layer(const DeviceCeilings &device,
             "dense batch total_tokens does not match request slices");
     }
 
-    const double element_bytes = bytes_per_element(precision);
+    const double attention_element_bytes =
+        bytes_per_element(precisions.attention);
+    const double dense_element_bytes = bytes_per_element(precisions.dense);
+    const double kv_cache_element_bytes =
+        bytes_per_element(precisions.kv_cache);
     const std::uint64_t local_query_heads =
         dense_ceil_div(model.num_query_heads, model.tensor_parallel_size);
     const std::uint64_t local_kv_heads =
@@ -663,9 +759,16 @@ DenseLayerTimes predict_dense_layer(const DeviceCeilings &device,
             ? config.small_gemm
             : config.large_gemm;
 
-    const auto kernel_ms = [&](const KernelWork &work,
-                               const Efficiency &efficiency) {
-        return predict_dense_kernel_ms(device, precision, work, efficiency,
+    const auto attention_kernel_ms = [&](const KernelWork &work,
+                                         const Efficiency &efficiency) {
+        return predict_dense_kernel_ms(device, precisions.attention, work,
+                                       efficiency,
+                                       config.kernel_launch_latency_us);
+    };
+    const auto dense_kernel_ms = [&](const KernelWork &work,
+                                     const Efficiency &efficiency) {
+        return predict_dense_kernel_ms(device, precisions.dense, work,
+                                       efficiency,
                                        config.kernel_launch_latency_us);
     };
 
@@ -688,8 +791,7 @@ DenseLayerTimes predict_dense_layer(const DeviceCeilings &device,
         throw AnalyticalModelError(
             "MLA requires consistent latent attention dimensions");
     }
-    if (model.use_mfa &&
-        (model.share_q_dim == 0 || model.num_kv_heads != 1)) {
+    if (model.use_mfa && (model.share_q_dim == 0 || model.num_kv_heads != 1)) {
         throw AnalyticalModelError(
             "MFA requires share_q_dim and exactly one KV head");
     }
@@ -709,87 +811,89 @@ DenseLayerTimes predict_dense_layer(const DeviceCeilings &device,
         const std::uint64_t latent_dim =
             model.kv_lora_rank + model.qk_rope_head_dim;
         attention_pre_projection_ms =
-            kernel_ms(gemm_work(batch.total_tokens, model.hidden_size,
-                                q_lora_rank, element_bytes),
-                      gemm_efficiency) +
-            kernel_ms(gemm_work(batch.total_tokens, q_lora_rank,
-                                local_query_heads * model.qk_head_dim,
-                                element_bytes),
-                      gemm_efficiency) +
-            kernel_ms(gemm_work(batch.total_tokens, model.hidden_size,
-                                latent_dim, element_bytes),
-                      gemm_efficiency) +
-            kernel_ms(gemm_work(
-                          batch.total_tokens, model.kv_lora_rank,
+            attention_kernel_ms(gemm_work(batch.total_tokens, model.hidden_size,
+                                          q_lora_rank, attention_element_bytes),
+                                gemm_efficiency) +
+            attention_kernel_ms(gemm_work(batch.total_tokens, q_lora_rank,
+                                          local_query_heads * model.qk_head_dim,
+                                          attention_element_bytes),
+                                gemm_efficiency) +
+            attention_kernel_ms(gemm_work(batch.total_tokens, model.hidden_size,
+                                          latent_dim, attention_element_bytes),
+                                gemm_efficiency) +
+            attention_kernel_ms(
+                gemm_work(batch.total_tokens, model.kv_lora_rank,
                           local_query_heads *
                               (model.qk_nope_head_dim + model.v_head_dim),
-                          element_bytes),
-                      gemm_efficiency);
-        attention_post_projection_ms = kernel_ms(
-            gemm_work(batch.total_tokens,
-                      local_query_heads * model.v_head_dim, model.hidden_size,
-                      element_bytes),
+                          attention_element_bytes),
+                gemm_efficiency);
+        attention_post_projection_ms = attention_kernel_ms(
+            gemm_work(batch.total_tokens, local_query_heads * model.v_head_dim,
+                      model.hidden_size, attention_element_bytes),
             gemm_efficiency);
         rope_elements = tokens * (query_heads + 1.0) *
                         static_cast<double>(model.qk_rope_head_dim);
         kv_elements = tokens * static_cast<double>(latent_dim);
         prefill_attention = mla_attention_context_work(
             batch.prefill_requests, local_query_heads, model.qk_head_dim,
-            model.v_head_dim, latent_dim, element_bytes);
+            model.v_head_dim, latent_dim, attention_element_bytes,
+            kv_cache_element_bytes);
         decode_attention = mla_attention_context_work(
             batch.decode_requests, local_query_heads, model.qk_head_dim,
-            model.v_head_dim, latent_dim, element_bytes);
+            model.v_head_dim, latent_dim, attention_element_bytes,
+            kv_cache_element_bytes);
     } else if (model.use_mfa) {
         const std::uint64_t replicated_qkv_dim =
             model.share_q_dim + 2 * local_kv_heads * model.head_dim;
-        attention_pre_projection_ms = kernel_ms(
-            gemm_work(batch.total_tokens, model.hidden_size,
-                      replicated_qkv_dim, element_bytes),
+        attention_pre_projection_ms = attention_kernel_ms(
+            gemm_work(batch.total_tokens, model.hidden_size, replicated_qkv_dim,
+                      attention_element_bytes),
             gemm_efficiency);
-        attention_inter_norm_ms = kernel_ms(
+        attention_inter_norm_ms = attention_kernel_ms(
             streaming_work(tokens * static_cast<double>(model.share_q_dim),
                            tokens * static_cast<double>(model.share_q_dim),
                            5.0 * tokens *
                                static_cast<double>(model.share_q_dim),
-                           element_bytes),
+                           attention_element_bytes),
             config.streaming);
-        attention_wq_projection_ms = kernel_ms(
-            gemm_work(batch.total_tokens, model.share_q_dim,
-                      local_query_heads * model.head_dim, element_bytes),
-            gemm_efficiency);
-        attention_post_projection_ms = kernel_ms(
+        attention_wq_projection_ms =
+            attention_kernel_ms(gemm_work(batch.total_tokens, model.share_q_dim,
+                                          local_query_heads * model.head_dim,
+                                          attention_element_bytes),
+                                gemm_efficiency);
+        attention_post_projection_ms = attention_kernel_ms(
             gemm_work(batch.total_tokens, local_query_heads * model.head_dim,
-                      model.hidden_size, element_bytes),
+                      model.hidden_size, attention_element_bytes),
             gemm_efficiency);
         rope_elements = tokens * (query_heads + kv_heads) * head_dim;
         kv_elements = tokens * 2.0 * kv_heads * head_dim;
         prefill_attention = attention_context_work(
             batch.prefill_requests, local_query_heads, local_kv_heads,
-            model.head_dim, element_bytes);
+            model.head_dim, attention_element_bytes, kv_cache_element_bytes);
         decode_attention = attention_context_work(
             batch.decode_requests, local_query_heads, local_kv_heads,
-            model.head_dim, element_bytes);
+            model.head_dim, attention_element_bytes, kv_cache_element_bytes);
     } else {
         const std::uint64_t local_qkv_dim =
             (local_query_heads + 2 * local_kv_heads) * model.head_dim;
-        attention_pre_projection_ms = kernel_ms(
+        attention_pre_projection_ms = attention_kernel_ms(
             gemm_work(batch.total_tokens, model.hidden_size, local_qkv_dim,
-                      element_bytes),
+                      attention_element_bytes),
             gemm_efficiency);
-        attention_post_projection_ms = kernel_ms(
+        attention_post_projection_ms = attention_kernel_ms(
             gemm_work(batch.total_tokens,
                       std::max<std::uint64_t>(
                           1, model.hidden_size / model.tensor_parallel_size),
-                      model.hidden_size, element_bytes),
+                      model.hidden_size, attention_element_bytes),
             gemm_efficiency);
         rope_elements = tokens * (query_heads + kv_heads) * head_dim;
         kv_elements = tokens * 2.0 * kv_heads * head_dim;
         prefill_attention = attention_context_work(
             batch.prefill_requests, local_query_heads, local_kv_heads,
-            model.head_dim, element_bytes);
+            model.head_dim, attention_element_bytes, kv_cache_element_bytes);
         decode_attention = attention_context_work(
             batch.decode_requests, local_query_heads, local_kv_heads,
-            model.head_dim, element_bytes);
+            model.head_dim, attention_element_bytes, kv_cache_element_bytes);
     }
 
     const double attention_norm_factor = model.fused_add_norm ? 3.0 : 2.0;
@@ -799,55 +903,67 @@ DenseLayerTimes predict_dense_layer(const DeviceCeilings &device,
     double residual_add_ms = 0.0;
     if (!model.fused_add_norm) {
         const double residual_elements = tokens * hidden;
-        residual_add_ms =
-            kernel_ms(streaming_work(2.0 * residual_elements, residual_elements,
-                                     residual_elements, element_bytes),
-                      config.streaming);
+        residual_add_ms = dense_kernel_ms(
+            streaming_work(2.0 * residual_elements, residual_elements,
+                           residual_elements, dense_element_bytes),
+            config.streaming);
     }
 
     return [&]() {
         DenseLayerTimes value{};
         value.attention_pre_projection_ms = attention_pre_projection_ms;
         value.attention_post_projection_ms = attention_post_projection_ms;
-        value.rope_ms =
-            kernel_ms(streaming_work(rope_elements, rope_elements,
-                                     6.0 * rope_elements, element_bytes),
-                      config.streaming);
-        value.kv_cache_save_ms = kernel_ms(
-            streaming_work(kv_elements, kv_elements, 0.0, element_bytes),
+        value.rope_ms = attention_kernel_ms(
+            streaming_work(rope_elements, rope_elements, 6.0 * rope_elements,
+                           attention_element_bytes),
             config.streaming);
-        value.attention_norm_ms = kernel_ms(
+        value.kv_cache_save_ms = attention_kernel_ms(
+            KernelWork{0.0, kv_elements * (attention_element_bytes +
+                                           kv_cache_element_bytes)},
+            config.streaming);
+        value.attention_norm_ms = attention_kernel_ms(
             streaming_work(tokens * hidden * (attention_norm_factor - 1.0),
                            tokens * hidden, 5.0 * tokens * hidden,
-                           element_bytes),
+                           attention_element_bytes),
             config.streaming);
         value.attention_inter_norm_ms = attention_inter_norm_ms;
         value.attention_wq_projection_ms = attention_wq_projection_ms;
         value.prefill_attention_ms =
-            kernel_ms(prefill_attention, config.prefill_attention);
+            attention_kernel_ms(prefill_attention, config.prefill_attention);
         value.decode_attention_ms =
-            kernel_ms(decode_attention, config.decode_attention);
-        value.mlp_up_projection_ms = kernel_ms(
+            attention_kernel_ms(decode_attention, config.decode_attention);
+        value.mlp_up_projection_ms = dense_kernel_ms(
             gemm_work(batch.total_tokens, model.hidden_size, local_intermediate,
-                      element_bytes, gated_multiplier),
+                      dense_element_bytes, gated_multiplier),
             gemm_efficiency);
-        value.mlp_activation_ms = kernel_ms(
-            streaming_work(
-                activation_elements * static_cast<double>(gated_multiplier),
-                activation_elements, 8.0 * activation_elements, element_bytes),
+        value.mlp_activation_ms = dense_kernel_ms(
+            streaming_work(activation_elements *
+                               static_cast<double>(gated_multiplier),
+                           activation_elements, 8.0 * activation_elements,
+                           dense_element_bytes),
             config.streaming);
         value.mlp_down_projection_ms =
-            kernel_ms(gemm_work(batch.total_tokens, local_intermediate,
-                                model.hidden_size, element_bytes),
-                      gemm_efficiency);
-        value.mlp_norm_ms =
-            kernel_ms(streaming_work(tokens * hidden * (mlp_norm_factor - 1.0),
-                                     tokens * hidden, 5.0 * tokens * hidden,
-                                     element_bytes),
-                      config.streaming);
+            dense_kernel_ms(gemm_work(batch.total_tokens, local_intermediate,
+                                      model.hidden_size, dense_element_bytes),
+                            gemm_efficiency);
+        value.mlp_norm_ms = dense_kernel_ms(
+            streaming_work(tokens * hidden * (mlp_norm_factor - 1.0),
+                           tokens * hidden, 5.0 * tokens * hidden,
+                           dense_element_bytes),
+            config.streaming);
         value.residual_add_ms = residual_add_ms;
         return value;
     }();
+}
+
+DenseLayerTimes predict_dense_layer(const DeviceCeilings &device,
+                                    const AnalyticalConfig &config,
+                                    const DenseModel &model,
+                                    const DenseBatch &batch,
+                                    Precision precision) {
+    return predict_dense_layer(
+        device, config, model, batch,
+        DenseOperatorPrecisions{precision, precision, precision});
 }
 
 } // namespace frontier::execution_time_predictor::detail
@@ -951,20 +1067,32 @@ predict_moe_layer(const DeviceCeilings &device, const AnalyticalConfig &config,
                   const MoEModel &model, std::uint64_t input_tokens,
                   std::uint64_t router_topk,
                   const std::vector<std::uint64_t> &local_expert_tokens,
-                  Precision precision) {
+                  const MoEOperatorPrecisions &precisions) {
     if (model.hidden_size == 0 || model.intermediate_size == 0 ||
         model.model_num_experts == 0 || model.moe_tensor_parallel_size == 0 ||
         router_topk == 0) {
         throw AnalyticalModelError("MoE model dimensions must be positive");
     }
 
-    const double element_bytes = bytes_per_element(precision);
+    const double expert_element_bytes = bytes_per_element(precisions.expert);
+    const double router_element_bytes = bytes_per_element(precisions.router);
+    const double dense_element_bytes = bytes_per_element(precisions.dense);
     const std::uint64_t local_intermediate =
         ceil_div(model.intermediate_size, model.moe_tensor_parallel_size);
     const std::uint64_t gated_multiplier = model.gated_mlp ? 2 : 1;
-    const auto roofline = [&](const KernelWork &work,
-                              const Efficiency &efficiency) {
-        return predict_ms(device, precision, work, efficiency,
+    const auto expert_roofline = [&](const KernelWork &work,
+                                     const Efficiency &efficiency) {
+        return predict_ms(device, precisions.expert, work, efficiency,
+                          config.kernel_launch_latency_us);
+    };
+    const auto router_roofline = [&](const KernelWork &work,
+                                     const Efficiency &efficiency) {
+        return predict_ms(device, precisions.router, work, efficiency,
+                          config.kernel_launch_latency_us);
+    };
+    const auto dense_roofline = [&](const KernelWork &work,
+                                    const Efficiency &efficiency) {
+        return predict_ms(device, precisions.dense, work, efficiency,
                           config.kernel_launch_latency_us);
     };
 
@@ -978,11 +1106,12 @@ predict_moe_layer(const DeviceCeilings &device, const AnalyticalConfig &config,
         local_routed_tokens += tokens;
         const KernelWork up =
             gemm_work(tokens, model.hidden_size, local_intermediate,
-                      element_bytes, gated_multiplier);
+                      expert_element_bytes, gated_multiplier);
         grouped_up.flops += up.flops;
         grouped_up.hbm_bytes += up.hbm_bytes;
-        const KernelWork down = gemm_work(tokens, local_intermediate,
-                                          model.hidden_size, element_bytes);
+        const KernelWork down =
+            gemm_work(tokens, local_intermediate, model.hidden_size,
+                      expert_element_bytes);
         grouped_down.flops += down.flops;
         grouped_down.hbm_bytes += down.hbm_bytes;
     }
@@ -995,36 +1124,51 @@ predict_moe_layer(const DeviceCeilings &device, const AnalyticalConfig &config,
 
     return [&]() {
         MoELayerTime value{};
-        value.gating_linear_ms =
-            roofline(gemm_work(input_tokens, model.hidden_size,
-                               model.model_num_experts, element_bytes),
-                     input_tokens < config.small_gemm_token_threshold
-                         ? config.small_gemm
-                         : config.large_gemm);
-        value.gating_routing_topk_ms =
-            roofline(streaming_work(tokens * experts,
-                                    tokens * static_cast<double>(router_topk),
-                                    4.0 * tokens * experts, element_bytes),
-                     config.routing);
-        value.grouped_up_projection_ms = roofline(grouped_up, config.moe);
-        value.grouped_down_projection_ms = roofline(grouped_down, config.moe);
+        value.gating_linear_ms = router_roofline(
+            gemm_work(input_tokens, model.hidden_size, model.model_num_experts,
+                      router_element_bytes),
+            input_tokens < config.small_gemm_token_threshold
+                ? config.small_gemm
+                : config.large_gemm);
+        value.gating_routing_topk_ms = router_roofline(
+            streaming_work(tokens * experts,
+                           tokens * static_cast<double>(router_topk),
+                           4.0 * tokens * experts, router_element_bytes),
+            config.routing);
+        value.grouped_up_projection_ms =
+            expert_roofline(grouped_up, config.moe);
+        value.grouped_down_projection_ms =
+            expert_roofline(grouped_down, config.moe);
         value.shuffling_ms =
-            roofline(streaming_work(routed * hidden, routed * hidden, 0.0,
-                                    element_bytes),
-                     config.streaming);
-        value.post_attention_norm_ms =
-            roofline(streaming_work(tokens * hidden * (norm_factor - 1.0),
-                                    tokens * hidden, 5.0 * tokens * hidden,
-                                    element_bytes),
-                     config.streaming);
+            expert_roofline(streaming_work(routed * hidden, routed * hidden,
+                                           0.0, expert_element_bytes),
+                            config.streaming);
+        value.post_attention_norm_ms = dense_roofline(
+            streaming_work(tokens * hidden * (norm_factor - 1.0),
+                           tokens * hidden, 5.0 * tokens * hidden,
+                           dense_element_bytes),
+            config.streaming);
         return value;
     }();
 }
 
-MoELanePrediction
-predict_moe_lanes(const DeviceCeilings &device, const AnalyticalConfig &config,
-                  const MoEModel &model, const RoutingAllocation &routing,
-                  std::uint64_t router_topk, Precision precision) {
+MoELayerTime
+predict_moe_layer(const DeviceCeilings &device, const AnalyticalConfig &config,
+                  const MoEModel &model, std::uint64_t input_tokens,
+                  std::uint64_t router_topk,
+                  const std::vector<std::uint64_t> &local_expert_tokens,
+                  Precision precision) {
+    return predict_moe_layer(
+        device, config, model, input_tokens, router_topk, local_expert_tokens,
+        MoEOperatorPrecisions{precision, precision, precision});
+}
+
+MoELanePrediction predict_moe_lanes(const DeviceCeilings &device,
+                                    const AnalyticalConfig &config,
+                                    const MoEModel &model,
+                                    const RoutingAllocation &routing,
+                                    std::uint64_t router_topk,
+                                    const MoEOperatorPrecisions &precisions) {
     if (routing.lane_expert_tokens.empty()) {
         throw AnalyticalModelError(
             "MoE routing must contain at least one lane");
@@ -1034,7 +1178,7 @@ predict_moe_lanes(const DeviceCeilings &device, const AnalyticalConfig &config,
     for (const auto &lane : routing.lane_expert_tokens) {
         prediction.lane_times.push_back(
             predict_moe_layer(device, config, model, routing.input_tokens,
-                              router_topk, lane, precision));
+                              router_topk, lane, precisions));
     }
     for (std::size_t lane = 0; lane < prediction.lane_times.size(); ++lane) {
         const double time = prediction.lane_times[lane].total_ms();
@@ -1044,6 +1188,15 @@ predict_moe_lanes(const DeviceCeilings &device, const AnalyticalConfig &config,
         }
     }
     return prediction;
+}
+
+MoELanePrediction
+predict_moe_lanes(const DeviceCeilings &device, const AnalyticalConfig &config,
+                  const MoEModel &model, const RoutingAllocation &routing,
+                  std::uint64_t router_topk, Precision precision) {
+    return predict_moe_lanes(
+        device, config, model, routing, router_topk,
+        MoEOperatorPrecisions{precision, precision, precision});
 }
 
 MoECommunicationTime predict_moe_communication(

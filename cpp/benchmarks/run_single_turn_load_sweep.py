@@ -46,6 +46,33 @@ BASE_CONFIG = (
 DEFAULT_OUTPUT = REPO_ROOT / "outputs" / "cpp_single_turn_load_sweep"
 BLOCK_SIZE = 16
 GIB = 1024**3
+PRECISION_BYTES = {
+    "fp32": 4.0,
+    "fp16": 2.0,
+    "bf16": 2.0,
+    "fp8": 1.0,
+    "int8": 1.0,
+    "fp4": 0.5,
+    "int4": 0.5,
+}
+PRECISION_PROFILES = {
+    "fp16": {
+        "attention": "fp16",
+        "dense": "fp16",
+        "moe_expert": "fp16",
+        "moe_router": "fp16",
+        "kv_cache": "fp16",
+        "communication": "fp16",
+    },
+    "fp8-fp4-mixed": {
+        "attention": "fp8",
+        "dense": "fp8",
+        "moe_expert": "fp4",
+        "moe_router": "fp8",
+        "kv_cache": "fp8",
+        "communication": "fp8",
+    },
+}
 
 
 @dataclass(frozen=True)
@@ -96,16 +123,18 @@ class TopologyConfig:
             return self.decode_gpu_count
         return self.prefill_gpu_count + self.decode_gpu_count
 
-    @property
-    def kv_bytes_per_token_per_gpu(self) -> int:
-        # Llama-2-7B: 32 layers, 32 KV heads, head_dim 128, K+V, FP16.
-        return (
+    def kv_bytes_per_token_per_gpu(self, dtype_size_bytes: float) -> int:
+        # Llama-2-7B: 32 layers, 32 KV heads, head_dim 128, K+V.
+        byte_count = (
             (32 // self.pipeline_parallel_size)
             * (32 // self.tensor_parallel_size)
             * 128
             * 2
-            * 2
+            * dtype_size_bytes
         )
+        if not float(byte_count).is_integer():
+            raise ValueError("KV bytes per token must be integral")
+        return int(byte_count)
 
 
 TOPOLOGIES = {
@@ -281,6 +310,7 @@ def write_config(
     prefill_chunk_tokens: int,
     num_blocks: int,
     topology: TopologyConfig,
+    operator_precisions: dict[str, str],
 ) -> None:
     config = json.loads(BASE_CONFIG.read_text(encoding="utf-8"))
     config["run_id"] = run_id
@@ -321,6 +351,9 @@ def write_config(
                 "num_preallocate_tokens": 0,
             }
         )
+        cluster["execution_model"]["operator_precisions"] = dict(
+            operator_precisions
+        )
         return cluster
 
     config["system_architecture"] = topology.system_architecture
@@ -338,7 +371,9 @@ def write_config(
             "type": "analytical",
             "network_bandwidth_gbps": 38_400.0,
             "network_latency_ms": 0.02,
-            "kv_cache_dtype_size_bytes": 2,
+            "kv_cache_dtype_size_bytes": PRECISION_BYTES[
+                operator_precisions["kv_cache"]
+            ],
             "enable_compression": False,
         }
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -403,6 +438,7 @@ def summarize_case(
     measurement_trim_fraction: float,
     num_blocks: int,
     topology: TopologyConfig,
+    kv_bytes_per_token_per_gpu: int,
     process_seconds: float,
 ) -> dict[str, float | int | str]:
     requests = output["requests"]
@@ -511,7 +547,7 @@ def summarize_case(
     kv_token_capacity_per_target = num_blocks * BLOCK_SIZE
     kv_gib_per_gpu = (
         kv_token_capacity_per_target
-        * topology.kv_bytes_per_token_per_gpu
+        * kv_bytes_per_token_per_gpu
         / GIB
     )
 
@@ -738,6 +774,16 @@ def build_parser() -> argparse.ArgumentParser:
         choices=tuple(WORKLOAD_PROFILES),
         default="balanced-8k-1k",
     )
+    parser.add_argument(
+        "--precision-profile",
+        choices=tuple(PRECISION_PROFILES),
+        default="fp16",
+        help=(
+            "Operator precision mapping. fp8-fp4-mixed uses FP8 for "
+            "attention, dense, router, KV cache, and communication, with "
+            "FP4 MoE experts."
+        ),
+    )
     parser.add_argument("--requests", type=int, default=64)
     parser.add_argument("--seed", type=int, default=20260728)
     parser.add_argument(
@@ -814,6 +860,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     topology = TOPOLOGIES[args.topology]
     workload_profile = WORKLOAD_PROFILES[args.workload_profile]
+    operator_precisions = PRECISION_PROFILES[args.precision_profile]
+    kv_dtype_size_bytes = PRECISION_BYTES[operator_precisions["kv_cache"]]
+    kv_bytes_per_token_per_gpu = topology.kv_bytes_per_token_per_gpu(
+        kv_dtype_size_bytes
+    )
     binary = args.binary.resolve()
     if not binary.is_file():
         raise SystemExit(f"binary not found: {binary}")
@@ -869,7 +920,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         num_blocks_values = []
         for capacity_gib in kv_capacities_gib:
             blocks = capacity_gib * GIB / (
-                BLOCK_SIZE * topology.kv_bytes_per_token_per_gpu
+                BLOCK_SIZE * kv_bytes_per_token_per_gpu
             )
             rounded_blocks = round(blocks)
             if not math.isclose(blocks, rounded_blocks):
@@ -902,6 +953,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         prefill_chunk_tokens=args.prefill_chunk_tokens,
         num_blocks=max(num_blocks_values),
         topology=topology,
+        operator_precisions=operator_precisions,
     )
     print("calibration start", flush=True)
     calibration, calibration_process_seconds = run_simulator(
@@ -1006,6 +1058,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     prefill_chunk_tokens=args.prefill_chunk_tokens,
                     num_blocks=num_blocks,
                     topology=topology,
+                    operator_precisions=operator_precisions,
                 )
                 print(
                     f"[{case_index}/{total_cases}] {run_id}",
@@ -1033,6 +1086,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                         ),
                         num_blocks=num_blocks,
                         topology=topology,
+                        kv_bytes_per_token_per_gpu=(
+                            kv_bytes_per_token_per_gpu
+                        ),
                         process_seconds=process_seconds,
                     )
                     print(
@@ -1064,7 +1120,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "kv_capacity_gib_per_gpu": (
                             num_blocks
                             * BLOCK_SIZE
-                            * topology.kv_bytes_per_token_per_gpu
+                            * kv_bytes_per_token_per_gpu
                             / GIB
                         ),
                     }
@@ -1085,6 +1141,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             workload_config
         ),
         "workload_profile": workload_profile.name,
+        "precision_profile": args.precision_profile,
+        "operator_precisions": operator_precisions,
         "realized_workload": {
             "prompt_tokens": distribution(
                 shape.prompt_tokens for shape in shapes
@@ -1116,6 +1174,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "model": "meta-llama/Llama-2-7b-hf",
             "device": "rubin",
             "precision": "fp16",
+            "operator_precisions": operator_precisions,
             "cluster_count": topology.cluster_count,
             "num_replicas_per_cluster": topology.num_replicas,
             "tensor_parallel_size": topology.tensor_parallel_size,
@@ -1128,7 +1187,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "decode_gpu_count": topology.decode_gpu_count,
             "physical_gpu_count": topology.physical_gpu_count,
             "kv_bytes_per_token_per_gpu": (
-                topology.kv_bytes_per_token_per_gpu
+                kv_bytes_per_token_per_gpu
             ),
             "max_tokens_in_batch": args.max_tokens_in_batch,
             "prefill_chunk_tokens": args.prefill_chunk_tokens,

@@ -69,6 +69,16 @@ python cpp/benchmarks/run_single_turn_load_sweep.py `
   --binary .build-step35-release/frontier_load_benchmark_summary.exe
 ```
 
+The default remains the historical all-FP16 baseline. To run FP8 attention,
+dense, router, KV cache, and communication with FP4 MoE experts, add:
+
+```powershell
+  --precision-profile fp8-fp4-mixed
+```
+
+The mixed profile also changes PDD KV-transfer bytes and logical KV-capacity
+conversion to the FP8 byte width.
+
 The default grid contains 64 requests per case, offered concurrency
 `1,2,4,8,16,32`, batch caps `1,4,8,16,32`, and 4/16 GiB of logical KV
 capacity per GPU. Results and generated inputs are written under

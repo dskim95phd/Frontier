@@ -3,6 +3,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -30,6 +31,8 @@ enum class Precision {
     kFp4,
     kInt4,
 };
+
+[[nodiscard]] Precision precision_from_string(std::string_view precision);
 
 enum class Bottleneck {
     kNone,
@@ -144,6 +147,12 @@ struct DenseLayerTimes {
     [[nodiscard]] double total_ms() const noexcept;
 };
 
+struct DenseOperatorPrecisions {
+    Precision attention = Precision::kFp16;
+    Precision dense = Precision::kFp16;
+    Precision kv_cache = Precision::kFp16;
+};
+
 class AnalyticalModelError : public std::runtime_error {
   public:
     using std::runtime_error::runtime_error;
@@ -167,13 +176,28 @@ class AnalyticalModelError : public std::runtime_error {
 attention_context_work(const std::vector<AttentionRequestSlice> &requests,
                        std::uint64_t local_query_heads,
                        std::uint64_t local_kv_heads, std::uint64_t head_dim,
-                       double element_bytes);
+                       double activation_element_bytes,
+                       double kv_cache_element_bytes);
 [[nodiscard]] KernelWork
-mla_attention_context_work(
+attention_context_work(const std::vector<AttentionRequestSlice> &requests,
+                       std::uint64_t local_query_heads,
+                       std::uint64_t local_kv_heads, std::uint64_t head_dim,
+                       double element_bytes);
+[[nodiscard]] KernelWork mla_attention_context_work(
     const std::vector<AttentionRequestSlice> &requests,
     std::uint64_t local_query_heads, std::uint64_t qk_head_dim,
     std::uint64_t v_head_dim, std::uint64_t latent_dim,
-    double element_bytes);
+    double activation_element_bytes, double kv_cache_element_bytes);
+[[nodiscard]] KernelWork
+mla_attention_context_work(const std::vector<AttentionRequestSlice> &requests,
+                           std::uint64_t local_query_heads,
+                           std::uint64_t qk_head_dim, std::uint64_t v_head_dim,
+                           std::uint64_t latent_dim, double element_bytes);
+[[nodiscard]] DenseLayerTimes
+predict_dense_layer(const DeviceCeilings &device,
+                    const AnalyticalConfig &config, const DenseModel &model,
+                    const DenseBatch &batch,
+                    const DenseOperatorPrecisions &precisions);
 [[nodiscard]] DenseLayerTimes
 predict_dense_layer(const DeviceCeilings &device,
                     const AnalyticalConfig &config, const DenseModel &model,
@@ -285,12 +309,29 @@ struct MoELanePrediction {
     double critical_lane_time_ms = 0.0;
 };
 
+struct MoEOperatorPrecisions {
+    Precision expert = Precision::kFp16;
+    Precision router = Precision::kFp16;
+    Precision dense = Precision::kFp16;
+};
+
+[[nodiscard]] MoELayerTime
+predict_moe_layer(const DeviceCeilings &device, const AnalyticalConfig &config,
+                  const MoEModel &model, std::uint64_t input_tokens,
+                  std::uint64_t router_topk,
+                  const std::vector<std::uint64_t> &local_expert_tokens,
+                  const MoEOperatorPrecisions &precisions);
 [[nodiscard]] MoELayerTime
 predict_moe_layer(const DeviceCeilings &device, const AnalyticalConfig &config,
                   const MoEModel &model, std::uint64_t input_tokens,
                   std::uint64_t router_topk,
                   const std::vector<std::uint64_t> &local_expert_tokens,
                   Precision precision);
+[[nodiscard]] MoELanePrediction
+predict_moe_lanes(const DeviceCeilings &device, const AnalyticalConfig &config,
+                  const MoEModel &model, const RoutingAllocation &routing,
+                  std::uint64_t router_topk,
+                  const MoEOperatorPrecisions &precisions);
 [[nodiscard]] MoELanePrediction
 predict_moe_lanes(const DeviceCeilings &device, const AnalyticalConfig &config,
                   const MoEModel &model, const RoutingAllocation &routing,
