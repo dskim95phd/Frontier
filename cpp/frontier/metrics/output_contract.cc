@@ -300,6 +300,7 @@ OrderedJson serialize_batch_stage(const BatchStageMetricsRecord &stage) {
     }
     const entities::ExecutionTime &execution = stage.execution_time;
     if (!std::isfinite(execution.dense_compute_ms) ||
+        !std::isfinite(execution.lm_head_ms) ||
         !std::isfinite(execution.tp_communication_ms) ||
         !std::isfinite(execution.pp_communication_ms) ||
         !std::isfinite(execution.moe_gating_linear_ms) ||
@@ -313,7 +314,7 @@ OrderedJson serialize_batch_stage(const BatchStageMetricsRecord &stage) {
         !std::isfinite(execution.dp_input_communication_ms) ||
         !std::isfinite(execution.dp_output_communication_ms) ||
         !std::isfinite(execution.synchronization_wait_ms) ||
-        execution.dense_compute_ms < 0.0 ||
+        execution.dense_compute_ms < 0.0 || execution.lm_head_ms < 0.0 ||
         execution.tp_communication_ms < 0.0 ||
         execution.pp_communication_ms < 0.0 ||
         execution.moe_gating_linear_ms < 0.0 ||
@@ -337,6 +338,7 @@ OrderedJson serialize_batch_stage(const BatchStageMetricsRecord &stage) {
         {"started_at_s", stage.started_at.seconds()},
         {"completed_at_s", stage.completed_at.seconds()},
         {"dense_compute_ms", execution.dense_compute_ms},
+        {"lm_head_ms", execution.lm_head_ms},
         {"tp_communication_ms", execution.tp_communication_ms},
         {"pp_communication_ms", execution.pp_communication_ms},
         {"moe_gating_linear_ms", execution.moe_gating_linear_ms},

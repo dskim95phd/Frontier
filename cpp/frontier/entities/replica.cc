@@ -15,7 +15,7 @@ Replica::Replica(ReplicaId replica_id, config::ParallelismConfig parallelism,
         parallelism_.moe_expert_parallel_size == 0 || model_.num_layers == 0) {
         throw ReplicaError("replica topology dimensions must be positive");
     }
-    if (model_.num_layers % parallelism_.pipeline_parallel_size != 0 ||
+    if (parallelism_.pipeline_parallel_size > model_.num_layers ||
         model_.hidden_size % parallelism_.tensor_parallel_size != 0 ||
         model_.num_query_heads % parallelism_.tensor_parallel_size != 0 ||
         model_.num_kv_heads % parallelism_.tensor_parallel_size != 0) {

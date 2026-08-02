@@ -423,13 +423,14 @@ void BaseClusterScheduler::begin_moe_stage(
     const std::uint64_t expected =
         monolithic_decode ? runtime.parallelism.moe_expert_parallel_size
                           : runtime.parallelism.data_parallel_size;
-    const std::uint64_t layers_per_stage =
-        runtime.model.num_layers / runtime.parallelism.pipeline_parallel_size;
+    const std::uint64_t layers_per_stage = prediction.moe_routing.size();
+    if (layers_per_stage == 0) {
+        throw std::logic_error("MoE synchronization stage has no MoE layers");
+    }
     const entities::ExecutionTime &execution = prediction.execution_time;
-    const double attention_ms = execution.dense_compute_ms;
     const SimTime initial_pre_arrival = SimTime::from_seconds(
         started_at.seconds() +
-        attention_ms / static_cast<double>(layers_per_stage) * 1e-3);
+        prediction.moe_routing.front().pre_moe_compute_ms * 1e-3);
     const MoECounterKey counter_key = [&]() {
         MoECounterKey value{};
         value.replica_id = batch.replica_id();
@@ -564,8 +565,12 @@ void BaseClusterScheduler::begin_moe_stage(
         value.participants = participants;
         value.layers_per_stage = layers_per_stage;
         value.current_layer = 0;
-        value.attention_ms_per_layer =
-            attention_ms / static_cast<double>(layers_per_stage);
+        value.pre_moe_compute_ms_by_layer.reserve(
+            prediction.moe_routing.size());
+        for (const auto &diagnostic : prediction.moe_routing) {
+            value.pre_moe_compute_ms_by_layer.push_back(
+                diagnostic.pre_moe_compute_ms);
+        }
         value.prefill_post_attention_ms_by_layer =
             std::move(prefill_post_attention_ms_by_layer);
         value.decode_ep_communication_ms_per_layer =
@@ -576,6 +581,8 @@ void BaseClusterScheduler::begin_moe_stage(
              execution.dp_output_communication_ms) /
             static_cast<double>(layers_per_stage);
         value.decode_lane_times_ms = std::move(decode_lane_times_ms);
+        value.suffix_compute_ms = prediction.moe_suffix_compute_ms;
+        value.lm_head_ms = execution.lm_head_ms;
         value.pp_ms = execution.pp_communication_ms;
         return value;
     }();
@@ -603,8 +610,9 @@ void BaseClusterScheduler::begin_moe_stage(
         enqueue_moe_arrival(
             stored, participant, LayerId{0}, MoESyncPhase::kPreMoe,
             SimTime::from_seconds(started_at.seconds() +
-                                  stored.attention_ms_per_layer * 1e-3),
-            stored.attention_ms_per_layer, simulator);
+                                  stored.pre_moe_compute_ms_by_layer.front() *
+                                      1e-3),
+            stored.pre_moe_compute_ms_by_layer.front(), simulator);
     }
 }
 
@@ -811,11 +819,17 @@ void BaseClusterScheduler::continue_moe_stage(
                 get_replica_scheduler(state.replica_id, state.dp_id)
                     .get_replica_stage_scheduler(state.stage_id)
                     .predict(simulator.batch(batch_id), simulator.requests());
-            const double refreshed_attention_ms_per_layer =
-                refreshed_prediction.execution_time.dense_compute_ms /
-                static_cast<double>(state.layers_per_stage);
+            if (refreshed_prediction.moe_routing.size() !=
+                state.layers_per_stage) {
+                throw std::logic_error(
+                    "refreshed MoE prediction changed stage layer count");
+            }
+            const double refreshed_pre_moe_ms =
+                refreshed_prediction.moe_routing
+                    .at(static_cast<std::size_t>(state.current_layer))
+                    .pre_moe_compute_ms;
             const double transition_ms =
-                refreshed_attention_ms_per_layer +
+                refreshed_pre_moe_ms +
                 (path == MoESyncPath::kDecode
                      ? state.decode_ep_communication_ms_per_layer
                      : 0.0);
@@ -830,9 +844,10 @@ void BaseClusterScheduler::continue_moe_stage(
     for (const MoEStageKey &stage_key : real_states) {
         const MoEStageState &state = moe_stage_states_.at(stage_key);
         const double final_transition_ms =
-            state.pp_ms + (path == MoESyncPath::kDecode
-                               ? state.decode_ep_communication_ms_per_layer
-                               : 0.0);
+            state.suffix_compute_ms + state.lm_head_ms + state.pp_ms +
+            (path == MoESyncPath::kDecode
+                 ? state.decode_ep_communication_ms_per_layer
+                 : 0.0);
         simulator.event_queue().push(
             SimTime::from_seconds(time.seconds() + final_transition_ms * 1e-3),
             [&]() {

@@ -70,7 +70,7 @@ python cpp/benchmarks/run_single_turn_load_sweep.py `
 ```
 
 The default remains the historical all-FP16 baseline. To run FP8 attention,
-dense, router, KV cache, and communication with FP4 MoE experts, add:
+dense, router, KV cache, and communication with W4A8 MoE experts, add:
 
 ```powershell
   --precision-profile fp8-fp4-mixed

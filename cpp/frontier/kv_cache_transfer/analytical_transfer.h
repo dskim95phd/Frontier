@@ -32,6 +32,10 @@ class TransferModelError : public std::runtime_error {
 [[nodiscard]] std::uint64_t
 dense_kv_cache_size_bytes(std::uint64_t num_tokens,
                           const DenseKvLayout &layout);
+[[nodiscard]] std::uint64_t
+model_kv_cache_size_bytes(std::uint64_t num_tokens,
+                          const config::ModelConfig &model,
+                          double kv_cache_dtype_size_bytes);
 [[nodiscard]] TransferPrediction predict_transfer(std::uint64_t size_bytes,
                                                   const TransferConfig &config);
 

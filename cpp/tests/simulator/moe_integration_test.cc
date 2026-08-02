@@ -143,6 +143,38 @@ void test_pdd_moe_preserves_phi_kv_contract() {
     }
 }
 
+void test_kimi_k2_dense_prefix_runs_with_uneven_pp() {
+    auto config = load_config("analytical_moe_ep4_colocation.json");
+    auto &runtime = config.cluster();
+    runtime.model =
+        frontier::config::load_model_config("moonshotai/Kimi-K2-Instruct");
+    runtime.parallelism.tensor_parallel_size = 4;
+    runtime.parallelism.pipeline_parallel_size = 4;
+    runtime.parallelism.data_parallel_size = 2;
+    runtime.parallelism.moe_tensor_parallel_size = 1;
+    runtime.parallelism.moe_expert_parallel_size = 8;
+    runtime.execution_model.analytical.tensor_parallel_size = 4;
+    runtime.execution_model.analytical.precision = "fp8";
+    runtime.execution_model.analytical.operator_precisions.moe_expert_weight =
+        "fp4";
+    runtime.execution_model.analytical.operator_precisions
+        .moe_expert_activation = "fp8";
+
+    const auto output = run_simulation(
+        config,
+        parse_workload_csv("arrived_at,num_prefill_tokens,num_decode_tokens\n"
+                           "0,1,1\n"));
+    expect(output.requests.size() == 1 && output.batch_stages.size() >= 4 &&
+               output.batch_stages.size() % 4 == 0,
+           "Kimi K2 PP4 must complete every four-stage pipeline pass");
+    expect(std::any_of(output.batch_stages.begin(), output.batch_stages.end(),
+                       [](const auto &stage) {
+                           return stage.stage_id.value() == 3 &&
+                                  stage.execution_time.lm_head_ms > 0.0;
+                       }),
+           "Kimi K2 final stage must report LM-head projection time");
+}
+
 } // namespace
 
 int main() {
@@ -154,5 +186,8 @@ int main() {
                             test_colocation_runs_all_sync_event_families);
     failures += frontier::test::run("PDD MoE Phi KV contract",
                                     test_pdd_moe_preserves_phi_kv_contract);
+    failures +=
+        frontier::test::run("Kimi K2 dense prefix and uneven PP",
+                            test_kimi_k2_dense_prefix_runs_with_uneven_pp);
     return failures == 0 ? 0 : 1;
 }

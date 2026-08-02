@@ -90,6 +90,12 @@ void test_operator_precision_contract_round_trip() {
     analytical.operator_precisions.moe_router = "fp8";
     analytical.operator_precisions.kv_cache = "fp8";
     analytical.operator_precisions.communication = "fp8";
+    analytical.operator_precisions.attention_weight = "fp8";
+    analytical.operator_precisions.attention_activation = "bf16";
+    analytical.operator_precisions.moe_expert_weight = "fp4";
+    analytical.operator_precisions.moe_expert_activation = "fp8";
+    analytical.operator_precisions.lm_head_weight = "fp8";
+    analytical.operator_precisions.lm_head_activation = "bf16";
 
     const std::string serialized = serialize_simulation_config_json(config);
     const auto parsed = parse_simulation_config_json(serialized);
@@ -99,7 +105,12 @@ void test_operator_precision_contract_round_trip() {
                resolved.moe_expert_precision() == "fp4" &&
                resolved.moe_router_precision() == "fp8" &&
                resolved.kv_cache_precision() == "fp8" &&
-               resolved.communication_precision() == "fp8",
+               resolved.communication_precision() == "fp8" &&
+               resolved.attention_activation_precision() == "bf16" &&
+               resolved.moe_expert_weight_precision() == "fp4" &&
+               resolved.moe_expert_activation_precision() == "fp8" &&
+               resolved.lm_head_weight_precision() == "fp8" &&
+               resolved.lm_head_activation_precision() == "bf16",
            "operator precision overrides must round-trip and resolve");
 
     std::string invalid = serialized;
@@ -354,8 +365,23 @@ void test_model_registry_and_attention_binding() {
     expect(kimi.is_moe() && kimi.num_experts == 384 &&
                kimi.num_experts_per_token == 8 && kimi.use_mla &&
                kimi.runtime_num_kv_heads() == 1 &&
-               kimi.runtime_head_size() == 576,
-           "Kimi K2 asset must expose Python-equivalent MoE and MLA fields");
+               kimi.runtime_head_size() == 576 && kimi.num_layers == 61 &&
+               kimi.first_k_dense_replace == 1 && !kimi.is_moe_layer(0) &&
+               kimi.is_moe_layer(1) && kimi.dense_intermediate_size == 18'432 &&
+               kimi.moe_intermediate_size == 2'048 &&
+               kimi.num_shared_experts == 1 && kimi.vocab_size == 163'840,
+           "Kimi K2 asset must expose dense-prefix, shared-expert, LM-head, "
+           "and MLA fields");
+
+    const auto stage0 =
+        frontier::config::pipeline_stage_layer_range(kimi.num_layers, 4, 0);
+    const auto stage1 =
+        frontier::config::pipeline_stage_layer_range(kimi.num_layers, 4, 1);
+    const auto stage3 =
+        frontier::config::pipeline_stage_layer_range(kimi.num_layers, 4, 3);
+    expect(stage0.begin == 0 && stage0.end == 16 && stage1.begin == 16 &&
+               stage1.end == 31 && stage3.begin == 46 && stage3.end == 61,
+           "61 Kimi K2 layers must partition over PP4 as 16/15/15/15");
 
     const auto step = frontier::config::load_model_config("step-moe");
     expect(step.is_moe() && step.use_mfa && step.share_q_dim == 2'048 &&

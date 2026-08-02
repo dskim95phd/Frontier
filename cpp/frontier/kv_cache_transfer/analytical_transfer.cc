@@ -4,6 +4,8 @@
 #include <limits>
 #include <utility>
 
+#include "frontier/attention/mla.h"
+
 namespace frontier::kv_cache_transfer {
 
 std::uint64_t dense_kv_cache_size_bytes(std::uint64_t num_tokens,
@@ -30,6 +32,38 @@ std::uint64_t dense_kv_cache_size_bytes(std::uint64_t num_tokens,
         throw TransferModelError("dense KV cache size overflows uint64");
     }
     return static_cast<std::uint64_t>(size);
+}
+
+std::uint64_t model_kv_cache_size_bytes(std::uint64_t num_tokens,
+                                        const config::ModelConfig &model,
+                                        double kv_cache_dtype_size_bytes) {
+    if (!std::isfinite(kv_cache_dtype_size_bytes) ||
+        kv_cache_dtype_size_bytes <= 0.0) {
+        throw TransferModelError("KV dtype size must be finite and positive");
+    }
+    if (model.use_mla) {
+        try {
+            return attention::mla_kv_cache_size_bytes(
+                num_tokens, model.num_layers,
+                attention::MlaKvCacheLayout{
+                    model.kv_lora_rank,
+                    model.qk_rope_head_dim,
+                    kv_cache_dtype_size_bytes,
+                    2.0,
+                });
+        } catch (const attention::MlaLayoutError &error) {
+            throw TransferModelError(error.what());
+        }
+    }
+    return dense_kv_cache_size_bytes(num_tokens, [&]() {
+        DenseKvLayout value{};
+        value.num_layers = model.num_layers;
+        value.num_kv_heads_per_worker = model.runtime_num_kv_heads();
+        value.head_dim = model.runtime_head_size();
+        value.kv_factor = model.kv_factor();
+        value.dtype_size_bytes = kv_cache_dtype_size_bytes;
+        return value;
+    }());
 }
 
 TransferPrediction predict_transfer(std::uint64_t size_bytes,
@@ -72,16 +106,8 @@ AnalyticalKVCacheTransferPredictor::AnalyticalKVCacheTransferPredictor(
 
 TransferPrediction AnalyticalKVCacheTransferPredictor::predict(
     std::uint64_t num_tokens, const config::ModelConfig &model) const {
-    const std::uint64_t size_bytes =
-        dense_kv_cache_size_bytes(num_tokens, [&]() {
-            DenseKvLayout value{};
-            value.num_layers = model.num_layers;
-            value.num_kv_heads_per_worker = model.runtime_num_kv_heads();
-            value.head_dim = model.runtime_head_size();
-            value.kv_factor = model.kv_factor();
-            value.dtype_size_bytes = config_.kv_cache_dtype_size_bytes;
-            return value;
-        }());
+    const std::uint64_t size_bytes = model_kv_cache_size_bytes(
+        num_tokens, model, config_.kv_cache_dtype_size_bytes);
     return predict_transfer(size_bytes, [&]() {
         TransferConfig value{};
         value.network_bandwidth_gbps = config_.network_bandwidth_gbps;

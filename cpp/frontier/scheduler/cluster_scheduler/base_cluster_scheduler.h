@@ -290,11 +290,13 @@ class BaseClusterScheduler {
         std::vector<MoEParticipantId> participants;
         std::uint64_t layers_per_stage = 0;
         std::uint64_t current_layer = 0;
-        double attention_ms_per_layer = 0.0;
+        std::vector<double> pre_moe_compute_ms_by_layer;
         std::vector<double> prefill_post_attention_ms_by_layer;
         double decode_ep_communication_ms_per_layer = 0.0;
         double decode_dp_communication_ms_per_layer = 0.0;
         std::vector<std::vector<double>> decode_lane_times_ms;
+        double suffix_compute_ms = 0.0;
+        double lm_head_ms = 0.0;
         double pp_ms = 0.0;
     };
 

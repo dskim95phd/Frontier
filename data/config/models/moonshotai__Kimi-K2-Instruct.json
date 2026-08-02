@@ -1,5 +1,5 @@
 {
-  "_comment": "Frontier adaptation of MoonshotAI Kimi K2 Instruct. The single shared expert is intentionally excluded for the NVL12 CPU-DRAM study.",
+  "_comment": "Frontier adaptation of MoonshotAI Kimi K2 Instruct, including its replicated shared expert.",
   "_source": "https://huggingface.co/moonshotai/Kimi-K2-Instruct/blob/49e03b011e494f0127d804ffe1f544e6da95ff1c/config.json",
   "architectures": [
     "DeepseekV3ForCausalLM"

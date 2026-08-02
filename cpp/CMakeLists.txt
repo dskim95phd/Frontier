@@ -69,6 +69,7 @@ endfunction()
 add_library(
   frontier_core
   STATIC
+  frontier/attention/mla.cc
   frontier/attention/model_binding.cc
   frontier/config/config.cc
   frontier/config/model_config.cc

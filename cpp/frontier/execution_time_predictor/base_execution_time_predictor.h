@@ -15,6 +15,8 @@ namespace frontier::execution_time_predictor {
 
 struct MoERoutingDiagnostic {
     LayerId layer_id;
+    std::uint64_t model_layer_id = 0;
+    double pre_moe_compute_ms = 0.0;
     std::uint64_t input_tokens = 0;
     std::uint64_t routed_tokens = 0;
     std::vector<std::uint64_t> global_expert_tokens;
@@ -29,6 +31,7 @@ struct ExecutionTimePrediction {
     entities::ExecutionTime execution_time;
     std::vector<std::pair<std::string, double>> diagnostics;
     std::vector<MoERoutingDiagnostic> moe_routing;
+    double moe_suffix_compute_ms = 0.0;
 };
 
 class ExecutionTimePredictorError : public std::runtime_error {

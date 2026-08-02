@@ -213,6 +213,53 @@ void test_moe_lane_analytical_model() {
             "distributed MoE must retain distinct communication terms");
 }
 
+void test_shared_expert_is_replicated_across_ep_and_sharded_by_tp() {
+    using frontier::execution_time_predictor::detail::AnalyticalConfig;
+    using frontier::execution_time_predictor::detail::DeviceCeilings;
+    using frontier::execution_time_predictor::detail::MoEModel;
+    using frontier::execution_time_predictor::detail::Precision;
+
+    const std::vector<std::uint64_t> cold_lane = {0, 0};
+    MoEModel without_shared{};
+    without_shared.hidden_size = 4'096;
+    without_shared.intermediate_size = 2'048;
+    without_shared.model_num_experts = 4;
+    without_shared.moe_tensor_parallel_size = 1;
+    without_shared.gated_mlp = true;
+
+    MoEModel tp1 = without_shared;
+    tp1.num_shared_experts = 1;
+    const auto no_shared =
+        frontier::execution_time_predictor::detail::predict_moe_layer(
+            DeviceCeilings::rubin(), AnalyticalConfig{}, without_shared, 128, 1,
+            cold_lane, Precision::kFp8);
+    const auto replicated_tp1 =
+        frontier::execution_time_predictor::detail::predict_moe_layer(
+            DeviceCeilings::rubin(), AnalyticalConfig{}, tp1, 128, 1, cold_lane,
+            Precision::kFp8);
+    require(replicated_tp1.grouped_up_projection_ms >
+                    no_shared.grouped_up_projection_ms &&
+                replicated_tp1.grouped_down_projection_ms >
+                    no_shared.grouped_down_projection_ms,
+            "a shared expert must execute even on an EP lane with no routed "
+            "tokens");
+    require(replicated_tp1.shuffling_ms == no_shared.shuffling_ms,
+            "a replicated shared expert must not add routed-token shuffle "
+            "work");
+
+    MoEModel tp2 = tp1;
+    tp2.moe_tensor_parallel_size = 2;
+    const auto replicated_tp2 =
+        frontier::execution_time_predictor::detail::predict_moe_layer(
+            DeviceCeilings::rubin(), AnalyticalConfig{}, tp2, 128, 1, cold_lane,
+            Precision::kFp8);
+    require(replicated_tp2.grouped_up_projection_ms <
+                    replicated_tp1.grouped_up_projection_ms &&
+                replicated_tp2.grouped_down_projection_ms <
+                    replicated_tp1.grouped_down_projection_ms,
+            "MoE TP must shard the replicated shared expert");
+}
+
 void test_moe_overflow_and_nonfinite_inputs_fail_fast() {
     using frontier::config::MoeRoutingConfig;
     bool routing_overflow_rejected = false;
@@ -273,6 +320,7 @@ int main() {
         test_deterministic_distributions();
         test_numpy_random_golden_vectors();
         test_moe_lane_analytical_model();
+        test_shared_expert_is_replicated_across_ep_and_sharded_by_tp();
         test_moe_overflow_and_nonfinite_inputs_fail_fast();
     } catch (const std::exception &error) {
         std::cerr << error.what() << '\n';

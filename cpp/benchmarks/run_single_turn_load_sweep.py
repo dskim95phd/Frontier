@@ -67,8 +67,11 @@ PRECISION_PROFILES = {
     "fp8-fp4-mixed": {
         "attention": "fp8",
         "dense": "fp8",
-        "moe_expert": "fp4",
+        "moe_expert": "fp8",
+        "moe_expert_weight": "fp4",
+        "moe_expert_activation": "fp8",
         "moe_router": "fp8",
+        "lm_head": "fp8",
         "kv_cache": "fp8",
         "communication": "fp8",
     },
@@ -781,7 +784,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Operator precision mapping. fp8-fp4-mixed uses FP8 for "
             "attention, dense, router, KV cache, and communication, with "
-            "FP4 MoE experts."
+            "W4A8 MoE experts."
         ),
     )
     parser.add_argument("--requests", type=int, default=64)

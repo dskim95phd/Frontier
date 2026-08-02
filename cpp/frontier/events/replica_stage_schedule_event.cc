@@ -39,7 +39,8 @@ void handle_event(const ReplicaStageSchedulePayload &payload, SimTime time,
     scheduler::BaseClusterScheduler &cluster_scheduler =
         simulator.cluster(payload.cluster_type);
     const bool requires_sync =
-        cluster_scheduler.requires_moe_synchronization(batch, simulator);
+        cluster_scheduler.requires_moe_synchronization(batch, simulator) &&
+        !prediction.moe_routing.empty();
     if (requires_sync) {
         cluster_scheduler.begin_moe_stage(batch, payload.stage_id, time,
                                           prediction, simulator);

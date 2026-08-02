@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -151,6 +152,10 @@ struct DenseOperatorPrecisions {
     Precision attention = Precision::kFp16;
     Precision dense = Precision::kFp16;
     Precision kv_cache = Precision::kFp16;
+    std::optional<Precision> attention_weight;
+    std::optional<Precision> attention_activation;
+    std::optional<Precision> dense_weight;
+    std::optional<Precision> dense_activation;
 };
 
 class AnalyticalModelError : public std::runtime_error {
@@ -169,6 +174,10 @@ class AnalyticalModelError : public std::runtime_error {
 [[nodiscard]] KernelWork gemm_work(std::uint64_t m, std::uint64_t k,
                                    std::uint64_t n, double element_bytes,
                                    std::uint64_t weight_multiplier = 1);
+[[nodiscard]] KernelWork gemm_work(std::uint64_t m, std::uint64_t k,
+                                   std::uint64_t n, double weight_element_bytes,
+                                   double activation_element_bytes,
+                                   std::uint64_t weight_multiplier);
 [[nodiscard]] KernelWork streaming_work(double elements_read,
                                         double elements_written, double flops,
                                         double element_bytes);
@@ -183,16 +192,16 @@ attention_context_work(const std::vector<AttentionRequestSlice> &requests,
                        std::uint64_t local_query_heads,
                        std::uint64_t local_kv_heads, std::uint64_t head_dim,
                        double element_bytes);
-[[nodiscard]] KernelWork mla_attention_context_work(
+[[nodiscard]] KernelWork mla_unabsorbed_attention_work(
     const std::vector<AttentionRequestSlice> &requests,
-    std::uint64_t local_query_heads, std::uint64_t qk_head_dim,
-    std::uint64_t v_head_dim, std::uint64_t latent_dim,
-    double activation_element_bytes, double kv_cache_element_bytes);
-[[nodiscard]] KernelWork
-mla_attention_context_work(const std::vector<AttentionRequestSlice> &requests,
-                           std::uint64_t local_query_heads,
-                           std::uint64_t qk_head_dim, std::uint64_t v_head_dim,
-                           std::uint64_t latent_dim, double element_bytes);
+    std::uint64_t local_query_heads, std::uint64_t qk_nope_head_dim,
+    std::uint64_t qk_rope_head_dim, std::uint64_t v_head_dim,
+    double activation_element_bytes, double rope_cache_element_bytes);
+[[nodiscard]] KernelWork mla_absorbed_attention_work(
+    const std::vector<AttentionRequestSlice> &requests,
+    std::uint64_t local_query_heads, std::uint64_t kv_lora_rank,
+    std::uint64_t qk_rope_head_dim, double activation_element_bytes,
+    double latent_cache_element_bytes, double rope_cache_element_bytes);
 [[nodiscard]] DenseLayerTimes
 predict_dense_layer(const DeviceCeilings &device,
                     const AnalyticalConfig &config, const DenseModel &model,
@@ -275,6 +284,7 @@ struct MoEModel {
     std::uint64_t hidden_size = 0;
     std::uint64_t intermediate_size = 0;
     std::uint64_t model_num_experts = 0;
+    std::uint64_t num_shared_experts = 0;
     std::uint64_t moe_tensor_parallel_size = 1;
     bool gated_mlp = true;
     bool fused_add_norm = false;
@@ -313,7 +323,19 @@ struct MoEOperatorPrecisions {
     Precision expert = Precision::kFp16;
     Precision router = Precision::kFp16;
     Precision dense = Precision::kFp16;
+    std::optional<Precision> expert_weight;
+    std::optional<Precision> expert_activation;
+    std::optional<Precision> router_weight;
+    std::optional<Precision> router_activation;
+    std::optional<Precision> dense_weight;
+    std::optional<Precision> dense_activation;
 };
+
+[[nodiscard]] double predict_output_projection_ms(
+    const DeviceCeilings &device, const AnalyticalConfig &config,
+    std::uint64_t tokens, std::uint64_t hidden_size, std::uint64_t vocab_size,
+    std::uint64_t tensor_parallel_size, Precision weight_precision,
+    Precision activation_precision);
 
 [[nodiscard]] MoELayerTime
 predict_moe_layer(const DeviceCeilings &device, const AnalyticalConfig &config,

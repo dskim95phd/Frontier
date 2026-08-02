@@ -219,8 +219,11 @@ An analytical cluster replaces its fixed execution model with:
   "operator_precisions": {
     "attention": "fp8",
     "dense": "fp8",
-    "moe_expert": "fp4",
+    "moe_expert": "fp8",
+    "moe_expert_weight": "fp4",
+    "moe_expert_activation": "fp8",
     "moe_router": "fp8",
+    "lm_head": "fp8",
     "kv_cache": "fp8",
     "communication": "fp8"
   },
@@ -235,15 +238,38 @@ existing single-precision configs retain their behavior. Supported values are
 `fp32`, `fp16`, `bf16`, `fp8`, `int8`, `fp4`, and `int4`. The KV-cache value
 controls cached-KV reads and writes; in PDD it must also match
 `kv_cache_transfer.kv_cache_dtype_size_bytes` in both clusters.
+Each compute family (`attention`, `dense`, `moe_expert`, `moe_router`, and
+`lm_head`) can be split further with `_weight` and `_activation` suffixes.
+The unsuffixed value remains the fallback for both, so the example above
+models W4A8 experts while retaining the compact syntax elsewhere.
+
+For MLA models, the analytical path uses distinct phase-specific execution
+modes. Prefill uses compute-friendly unabsorbed MHA: cached latent KV is
+expanded through the KV up-projection, the head-specific NoPE K/V result is
+materialized in a temporary HBM workspace, and attention uses the model's
+ordinary QK/V head dimensions. Decode uses data-movement-friendly absorbed
+MQA: the query is transformed into latent space, attention reads the latent
+cache directly, and the latent result is expanded on the output side. The
+temporary prefill workspace contributes projection FLOPs and HBM write/read
+time but does not consume scheduler KV-block capacity.
+
+Persistent MLA cache layout is component-wise rather than a uniform tensor:
+the latent component uses `operator_precisions.kv_cache`, while the decoupled
+RoPE component remains BF16. Scale metadata and quantization time are omitted.
+For Kimi K2 with FP8 KV this is `512 * 1 + 64 * 2 = 640` bytes per token per
+layer. The same layout is used for cache writes, decode reads, and PDD transfer;
+for MLA, `kv_cache_transfer.kv_cache_dtype_size_bytes` therefore specifies the
+latent component size and the BF16 RoPE bytes are added automatically.
 
 The analytical predictor derives the model and layer count from the cluster's
 `model_name`; they are not repeated in `execution_model`. TP comes from the
-cluster's `parallelism` object. The current model validates TP 1/2/4/8,
-requires model layers to divide evenly across PP stages, and supports the
-dense-KV attention family (MHA/GQA/MQA), Step3Text MFA's shared-Q projection
-path, and latent-cache MLA. MLA uses the latent KV-cache width for context IO;
-MFA accounts separately for its replicated QKV projection, shared-Q norm, and
-WQ projection. Frozen DSA remains unsupported.
+cluster's `parallelism` object. The current model validates TP 1/2/4/8 and
+allows uneven contiguous PP partitions (for example, 61 layers over PP4 become
+16/15/15/15). MoE assets may configure a dense prefix and shared experts;
+shared experts are replicated across EP lanes and sharded only by MoE TP. The
+last PP stage also models the vocabulary-parallel LM-head projection. Supported
+attention families include dense-KV MHA/GQA/MQA, Step3Text MFA's shared-Q path,
+and latent-cache MLA. Frozen DSA remains unsupported.
 
 ## Workload contract
 

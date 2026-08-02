@@ -20,6 +20,7 @@ void require_time_at_or_after(SimTime time, SimTime lower_bound,
 bool valid_execution_time(const ExecutionTime &execution_time) {
     const std::array values{
         execution_time.dense_compute_ms,
+        execution_time.lm_head_ms,
         execution_time.tp_communication_ms,
         execution_time.pp_communication_ms,
         execution_time.moe_gating_linear_ms,

@@ -126,6 +126,17 @@ OrderedJson serialize_execution_model(const ExecutionModelConfig &execution) {
         add("moe_router", operators.moe_router);
         add("kv_cache", operators.kv_cache);
         add("communication", operators.communication);
+        add("attention_weight", operators.attention_weight);
+        add("attention_activation", operators.attention_activation);
+        add("dense_weight", operators.dense_weight);
+        add("dense_activation", operators.dense_activation);
+        add("moe_expert_weight", operators.moe_expert_weight);
+        add("moe_expert_activation", operators.moe_expert_activation);
+        add("moe_router_weight", operators.moe_router_weight);
+        add("moe_router_activation", operators.moe_router_activation);
+        add("lm_head", operators.lm_head);
+        add("lm_head_weight", operators.lm_head_weight);
+        add("lm_head_activation", operators.lm_head_activation);
         result["operator_precisions"] = std::move(values);
     }
     return result;
@@ -142,6 +153,8 @@ OrderedJson serialize_cluster_runtime(const ClusterRuntimeConfig &cluster) {
         {"model_name", cluster.model.name},
         {"total_expert_num", cluster.model.total_expert_num},
         {"router_topk", cluster.model.router_topk},
+        {"first_k_dense_replace", cluster.model.first_k_dense_replace},
+        {"num_shared_experts", cluster.model.num_shared_experts},
         {"moe_routing", serialize_moe_routing(cluster.moe_routing)},
     });
 }

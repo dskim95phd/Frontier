@@ -63,6 +63,8 @@ struct ModelConfig {
     std::uint64_t num_layers = 32;
     std::uint64_t hidden_size = 4'096;
     std::uint64_t intermediate_size = 11'008;
+    std::uint64_t dense_intermediate_size = 11'008;
+    std::uint64_t moe_intermediate_size = 11'008;
     std::uint64_t num_query_heads = 32;
     std::uint64_t num_kv_heads = 32;
     std::uint64_t head_dim = 128;
@@ -72,6 +74,10 @@ struct ModelConfig {
     std::uint64_t num_experts_per_token = 1;
     std::uint64_t total_expert_num = 1;
     std::uint64_t router_topk = 1;
+    std::uint64_t num_shared_experts = 0;
+    std::uint64_t first_k_dense_replace = 0;
+    std::uint64_t moe_layer_freq = 1;
+    std::uint64_t vocab_size = 32'000;
     bool use_mla = false;
     bool use_mfa = false;
     std::uint64_t q_lora_rank = 0;
@@ -87,6 +93,12 @@ struct ModelConfig {
 
     [[nodiscard]] bool is_moe() const noexcept {
         return kind == ModelKind::kMoe;
+    }
+
+    [[nodiscard]] bool is_moe_layer(std::uint64_t layer) const noexcept {
+        return is_moe() && moe_layer_freq > 0 &&
+               layer >= first_k_dense_replace &&
+               (layer - first_k_dense_replace) % moe_layer_freq == 0;
     }
 
     [[nodiscard]] std::uint64_t runtime_num_kv_heads() const noexcept {
@@ -113,20 +125,26 @@ struct ModelConfig {
     friend bool operator==(const ModelConfig &lhs, const ModelConfig &rhs) {
         return std::tie(lhs.name, lhs.model_type, lhs.kind, lhs.num_layers,
                         lhs.hidden_size, lhs.intermediate_size,
+                        lhs.dense_intermediate_size, lhs.moe_intermediate_size,
                         lhs.num_query_heads, lhs.num_kv_heads, lhs.head_dim,
                         lhs.gated_mlp, lhs.fused_add_norm, lhs.num_experts,
                         lhs.num_experts_per_token, lhs.total_expert_num,
-                        lhs.router_topk, lhs.use_mla, lhs.use_mfa,
+                        lhs.router_topk, lhs.num_shared_experts,
+                        lhs.first_k_dense_replace, lhs.moe_layer_freq,
+                        lhs.vocab_size, lhs.use_mla, lhs.use_mfa,
                         lhs.q_lora_rank, lhs.kv_lora_rank, lhs.qk_nope_head_dim,
                         lhs.qk_rope_head_dim, lhs.qk_head_dim, lhs.v_head_dim,
                         lhs.share_q_dim, lhs.has_dsa_marker,
                         lhs.exotic_attention_fields, lhs.attention) ==
                std::tie(rhs.name, rhs.model_type, rhs.kind, rhs.num_layers,
                         rhs.hidden_size, rhs.intermediate_size,
+                        rhs.dense_intermediate_size, rhs.moe_intermediate_size,
                         rhs.num_query_heads, rhs.num_kv_heads, rhs.head_dim,
                         rhs.gated_mlp, rhs.fused_add_norm, rhs.num_experts,
                         rhs.num_experts_per_token, rhs.total_expert_num,
-                        rhs.router_topk, rhs.use_mla, rhs.use_mfa,
+                        rhs.router_topk, rhs.num_shared_experts,
+                        rhs.first_k_dense_replace, rhs.moe_layer_freq,
+                        rhs.vocab_size, rhs.use_mla, rhs.use_mfa,
                         rhs.q_lora_rank, rhs.kv_lora_rank, rhs.qk_nope_head_dim,
                         rhs.qk_rope_head_dim, rhs.qk_head_dim, rhs.v_head_dim,
                         rhs.share_q_dim, rhs.has_dsa_marker,
@@ -136,6 +154,29 @@ struct ModelConfig {
         return !(lhs == rhs);
     }
 };
+
+struct PipelineStageLayerRange {
+    std::uint64_t begin = 0;
+    std::uint64_t end = 0;
+
+    [[nodiscard]] std::uint64_t size() const noexcept { return end - begin; }
+};
+
+[[nodiscard]] inline PipelineStageLayerRange
+pipeline_stage_layer_range(std::uint64_t num_layers,
+                           std::uint64_t pipeline_parallel_size,
+                           std::uint64_t stage) {
+    if (pipeline_parallel_size == 0 || pipeline_parallel_size > num_layers ||
+        stage >= pipeline_parallel_size) {
+        throw std::invalid_argument("invalid pipeline layer partition");
+    }
+    const std::uint64_t base = num_layers / pipeline_parallel_size;
+    const std::uint64_t remainder = num_layers % pipeline_parallel_size;
+    const std::uint64_t begin =
+        stage * base + (stage < remainder ? stage : remainder);
+    const std::uint64_t size = base + (stage < remainder ? 1 : 0);
+    return PipelineStageLayerRange{begin, begin + size};
+}
 
 enum class MoeRoutingMode {
     kSimulation,
@@ -253,18 +294,47 @@ struct OperatorPrecisionConfig {
     std::string moe_router;
     std::string kv_cache;
     std::string communication;
+    std::string attention_weight;
+    std::string attention_activation;
+    std::string dense_weight;
+    std::string dense_activation;
+    std::string moe_expert_weight;
+    std::string moe_expert_activation;
+    std::string moe_router_weight;
+    std::string moe_router_activation;
+    std::string lm_head;
+    std::string lm_head_weight;
+    std::string lm_head_activation;
 
     [[nodiscard]] bool empty() const noexcept {
         return attention.empty() && dense.empty() && moe_expert.empty() &&
-               moe_router.empty() && kv_cache.empty() && communication.empty();
+               moe_router.empty() && kv_cache.empty() &&
+               communication.empty() && attention_weight.empty() &&
+               attention_activation.empty() && dense_weight.empty() &&
+               dense_activation.empty() && moe_expert_weight.empty() &&
+               moe_expert_activation.empty() && moe_router_weight.empty() &&
+               moe_router_activation.empty() && lm_head.empty() &&
+               lm_head_weight.empty() && lm_head_activation.empty();
     }
 
     friend bool operator==(const OperatorPrecisionConfig &lhs,
                            const OperatorPrecisionConfig &rhs) {
         return std::tie(lhs.attention, lhs.dense, lhs.moe_expert,
-                        lhs.moe_router, lhs.kv_cache, lhs.communication) ==
+                        lhs.moe_router, lhs.kv_cache, lhs.communication,
+                        lhs.attention_weight, lhs.attention_activation,
+                        lhs.dense_weight, lhs.dense_activation,
+                        lhs.moe_expert_weight, lhs.moe_expert_activation,
+                        lhs.moe_router_weight, lhs.moe_router_activation,
+                        lhs.lm_head, lhs.lm_head_weight,
+                        lhs.lm_head_activation) ==
                std::tie(rhs.attention, rhs.dense, rhs.moe_expert,
-                        rhs.moe_router, rhs.kv_cache, rhs.communication);
+                        rhs.moe_router, rhs.kv_cache, rhs.communication,
+                        rhs.attention_weight, rhs.attention_activation,
+                        rhs.dense_weight, rhs.dense_activation,
+                        rhs.moe_expert_weight, rhs.moe_expert_activation,
+                        rhs.moe_router_weight, rhs.moe_router_activation,
+                        rhs.lm_head, rhs.lm_head_weight,
+                        rhs.lm_head_activation);
     }
 };
 
@@ -316,6 +386,69 @@ struct AnalyticalExecutionModelConfig {
         return operator_precisions.communication.empty()
                    ? precision
                    : operator_precisions.communication;
+    }
+    [[nodiscard]] const std::string &
+    attention_weight_precision() const noexcept {
+        return operator_precisions.attention_weight.empty()
+                   ? attention_precision()
+                   : operator_precisions.attention_weight;
+    }
+    [[nodiscard]] const std::string &
+    attention_activation_precision() const noexcept {
+        return operator_precisions.attention_activation.empty()
+                   ? attention_precision()
+                   : operator_precisions.attention_activation;
+    }
+    [[nodiscard]] const std::string &dense_weight_precision() const noexcept {
+        return operator_precisions.dense_weight.empty()
+                   ? dense_precision()
+                   : operator_precisions.dense_weight;
+    }
+    [[nodiscard]] const std::string &
+    dense_activation_precision() const noexcept {
+        return operator_precisions.dense_activation.empty()
+                   ? dense_precision()
+                   : operator_precisions.dense_activation;
+    }
+    [[nodiscard]] const std::string &
+    moe_expert_weight_precision() const noexcept {
+        return operator_precisions.moe_expert_weight.empty()
+                   ? moe_expert_precision()
+                   : operator_precisions.moe_expert_weight;
+    }
+    [[nodiscard]] const std::string &
+    moe_expert_activation_precision() const noexcept {
+        return operator_precisions.moe_expert_activation.empty()
+                   ? moe_expert_precision()
+                   : operator_precisions.moe_expert_activation;
+    }
+    [[nodiscard]] const std::string &
+    moe_router_weight_precision() const noexcept {
+        return operator_precisions.moe_router_weight.empty()
+                   ? moe_router_precision()
+                   : operator_precisions.moe_router_weight;
+    }
+    [[nodiscard]] const std::string &
+    moe_router_activation_precision() const noexcept {
+        return operator_precisions.moe_router_activation.empty()
+                   ? moe_router_precision()
+                   : operator_precisions.moe_router_activation;
+    }
+    [[nodiscard]] const std::string &lm_head_precision() const noexcept {
+        return operator_precisions.lm_head.empty()
+                   ? dense_precision()
+                   : operator_precisions.lm_head;
+    }
+    [[nodiscard]] const std::string &lm_head_weight_precision() const noexcept {
+        return operator_precisions.lm_head_weight.empty()
+                   ? lm_head_precision()
+                   : operator_precisions.lm_head_weight;
+    }
+    [[nodiscard]] const std::string &
+    lm_head_activation_precision() const noexcept {
+        return operator_precisions.lm_head_activation.empty()
+                   ? lm_head_precision()
+                   : operator_precisions.lm_head_activation;
     }
 };
 

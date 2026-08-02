@@ -54,8 +54,11 @@ FixedExecutionTimePredictor::predict_stage_execution_time(
     }();
     if (model_.is_moe()) {
         const std::uint64_t layers_per_stage =
-            model_.num_layers /
-            std::max<std::uint64_t>(1, parallelism_.pipeline_parallel_size);
+            config::pipeline_stage_layer_range(
+                model_.num_layers,
+                std::max<std::uint64_t>(1, parallelism_.pipeline_parallel_size),
+                stage_id.index())
+                .size();
         const double component =
             latency * static_cast<double>(layers_per_stage);
         execution_time = [&]() {
@@ -88,18 +91,32 @@ FixedExecutionTimePredictor::predict_stage_execution_time(
 
     std::vector<MoERoutingDiagnostic> routing_diagnostics;
     if (model_.is_moe()) {
-        const std::uint64_t layers_per_stage =
-            model_.num_layers / parallelism_.pipeline_parallel_size;
-        routing_diagnostics.reserve(static_cast<std::size_t>(layers_per_stage));
-        for (std::uint64_t local_layer = 0; local_layer < layers_per_stage;
-             ++local_layer) {
+        const config::PipelineStageLayerRange stage_layers =
+            config::pipeline_stage_layer_range(
+                model_.num_layers, parallelism_.pipeline_parallel_size,
+                stage_id.index());
+        std::uint64_t moe_layer_count = 0;
+        for (std::uint64_t layer = stage_layers.begin; layer < stage_layers.end;
+             ++layer) {
+            moe_layer_count += model_.is_moe_layer(layer) ? 1 : 0;
+        }
+        routing_diagnostics.reserve(static_cast<std::size_t>(moe_layer_count));
+        std::uint64_t local_moe_layer = 0;
+        for (std::uint64_t model_layer = stage_layers.begin;
+             model_layer < stage_layers.end; ++model_layer) {
+            if (!model_.is_moe_layer(model_layer)) {
+                continue;
+            }
             const detail::RoutingAllocation allocation = detail::route_tokens(
                 batch.total_scheduled_tokens(), model_.router_topk,
-                model_.total_expert_num,
-                parallelism_.moe_expert_parallel_size, routing_, local_layer);
+                model_.total_expert_num, parallelism_.moe_expert_parallel_size,
+                routing_, model_layer);
             routing_diagnostics.push_back([&]() {
                 MoERoutingDiagnostic value{};
-                value.layer_id = LayerId{local_layer};
+                value.layer_id = LayerId{local_moe_layer};
+                value.model_layer_id = model_layer;
+                value.pre_moe_compute_ms = execution_time.dense_compute_ms /
+                                           static_cast<double>(moe_layer_count);
                 value.input_tokens = allocation.input_tokens;
                 value.routed_tokens = allocation.routed_tokens;
                 value.global_expert_tokens = allocation.global_expert_tokens;
@@ -112,6 +129,7 @@ FixedExecutionTimePredictor::predict_stage_execution_time(
                 value.critical_lane_time_ms = latency;
                 return value;
             }());
+            ++local_moe_layer;
         }
     }
     return [&]() {

@@ -25,8 +25,7 @@ using Json = nlohmann::json;
 
 std::string lowercase(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(), [](char ch) {
-        return static_cast<char>(
-            std::tolower(static_cast<unsigned char>(ch)));
+        return static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
     });
     return value;
 }
@@ -42,8 +41,8 @@ std::uint64_t require_positive_u64(const Json &root, std::string_view key,
         if (root.at(key).is_number_unsigned()) {
             const std::uint64_t value = root.at(key).get<std::uint64_t>();
             if (value == 0) {
-                throw ConfigError(std::string{source} + "." +
-                                  std::string{key} + " must be positive");
+                throw ConfigError(std::string{source} + "." + std::string{key} +
+                                  " must be positive");
             }
             return value;
         }
@@ -67,6 +66,34 @@ std::uint64_t optional_positive_u64(const Json &root, std::string_view key,
     return root.contains(key) && !root.at(key).is_null()
                ? require_positive_u64(root, key, source)
                : fallback;
+}
+
+std::uint64_t optional_nonnegative_u64(const Json &root, std::string_view key,
+                                       std::uint64_t fallback,
+                                       std::string_view source) {
+    if (!root.contains(key) || root.at(key).is_null()) {
+        return fallback;
+    }
+    if (!root.at(key).is_number_integer() || root.at(key).is_number_float()) {
+        throw ConfigError(std::string{source} + "." + std::string{key} +
+                          " must be a nonnegative integer");
+    }
+    try {
+        if (root.at(key).is_number_unsigned()) {
+            return root.at(key).get<std::uint64_t>();
+        }
+        const std::int64_t value = root.at(key).get<std::int64_t>();
+        if (value < 0) {
+            throw ConfigError(std::string{source} + "." + std::string{key} +
+                              " must be nonnegative");
+        }
+        return static_cast<std::uint64_t>(value);
+    } catch (const ConfigError &) {
+        throw;
+    } catch (const Json::exception &) {
+        throw ConfigError(std::string{source} + "." + std::string{key} +
+                          " is outside the supported integer range");
+    }
 }
 
 bool optional_bool(const Json &root, std::string_view key, bool fallback,
@@ -93,14 +120,12 @@ std::uint64_t first_positive_u64(const Json &root,
     return fallback;
 }
 
-ModelConfig registered_dense_model(std::string name, std::string model_type,
-                                   std::uint64_t num_layers,
-                                   std::uint64_t num_query_heads,
-                                   std::uint64_t num_kv_heads,
-                                   std::uint64_t hidden_size,
-                                   std::uint64_t intermediate_size,
-                                   bool gated_mlp = true,
-                                   bool fused_add_norm = true) {
+ModelConfig
+registered_dense_model(std::string name, std::string model_type,
+                       std::uint64_t num_layers, std::uint64_t num_query_heads,
+                       std::uint64_t num_kv_heads, std::uint64_t hidden_size,
+                       std::uint64_t intermediate_size, bool gated_mlp = true,
+                       bool fused_add_norm = true) {
     ModelConfig model{};
     model.name = std::move(name);
     model.model_type = std::move(model_type);
@@ -108,6 +133,8 @@ ModelConfig registered_dense_model(std::string name, std::string model_type,
     model.num_layers = num_layers;
     model.hidden_size = hidden_size;
     model.intermediate_size = intermediate_size;
+    model.dense_intermediate_size = intermediate_size;
+    model.moe_intermediate_size = intermediate_size;
     model.num_query_heads = num_query_heads;
     model.num_kv_heads = num_kv_heads;
     if (hidden_size % num_query_heads != 0) {
@@ -151,12 +178,12 @@ std::optional<ModelConfig> registered_model(std::string_view name) {
                                       8'192, 28'672);
     }
     if (name == "internlm/internlm-20b") {
-        return registered_dense_model(std::string{name}, "internlm", 60, 40,
-                                      40, 5'120, 13'824);
+        return registered_dense_model(std::string{name}, "internlm", 60, 40, 40,
+                                      5'120, 13'824);
     }
     if (name == "internlm/internlm2-20b") {
-        return registered_dense_model(std::string{name}, "internlm2", 48, 48,
-                                      8, 6'144, 16'384);
+        return registered_dense_model(std::string{name}, "internlm2", 48, 48, 8,
+                                      6'144, 16'384);
     }
     if (name == "microsoft/phi-2") {
         return registered_dense_model(std::string{name}, "phi", 32, 32, 32,
@@ -211,8 +238,8 @@ std::vector<std::filesystem::path> model_directories() {
 #ifdef _WIN32
     char *configured = nullptr;
     std::size_t configured_size = 0;
-    if (_dupenv_s(&configured, &configured_size,
-                  "FRONTIER_MODEL_CONFIG_DIR") == 0 &&
+    if (_dupenv_s(&configured, &configured_size, "FRONTIER_MODEL_CONFIG_DIR") ==
+            0 &&
         configured != nullptr && *configured != '\0') {
         directories.emplace_back(configured);
     }
@@ -290,12 +317,11 @@ ModelConfig parse_model_asset(std::string_view model_name, const Json &root,
     const std::string source = "model config " + path.string();
     ModelConfig model{};
     model.name = std::string{model_name};
-    model.model_type = lowercase(
-        root.contains("model_type") && root.at("model_type").is_string()
-            ? root.at("model_type").get<std::string>()
-            : std::string{});
-    model.num_layers =
-        require_positive_u64(root, "num_hidden_layers", source);
+    model.model_type = lowercase(root.contains("model_type") &&
+                                         root.at("model_type").is_string()
+                                     ? root.at("model_type").get<std::string>()
+                                     : std::string{});
+    model.num_layers = require_positive_u64(root, "num_hidden_layers", source);
     model.hidden_size = require_positive_u64(root, "hidden_size", source);
     model.num_query_heads =
         require_positive_u64(root, "num_attention_heads", source);
@@ -305,18 +331,21 @@ ModelConfig parse_model_asset(std::string_view model_name, const Json &root,
         root, {"num_experts", "num_local_experts", "n_routed_experts"}, 1,
         source);
     model.kind = model.num_experts > 1 ? ModelKind::kMoe : ModelKind::kDense;
-    model.intermediate_size = model.is_moe()
-                                  ? first_positive_u64(
-                                        root,
-                                        {"moe_intermediate_size",
-                                         "intermediate_size"},
-                                        0, source)
-                                  : require_positive_u64(
-                                        root, "intermediate_size", source);
+    model.intermediate_size =
+        model.is_moe()
+            ? first_positive_u64(root,
+                                 {"moe_intermediate_size", "intermediate_size"},
+                                 0, source)
+            : require_positive_u64(root, "intermediate_size", source);
     if (model.intermediate_size == 0) {
         throw ConfigError(source +
                           " requires moe_intermediate_size for an MoE model");
     }
+    model.dense_intermediate_size = first_positive_u64(
+        root, {"intermediate_size"}, model.intermediate_size, source);
+    model.moe_intermediate_size = model.is_moe()
+                                      ? model.intermediate_size
+                                      : model.dense_intermediate_size;
     if (root.contains("head_dim")) {
         model.head_dim = require_positive_u64(root, "head_dim", source);
     } else {
@@ -333,12 +362,30 @@ ModelConfig parse_model_asset(std::string_view model_name, const Json &root,
             : std::string{});
     model.gated_mlp = hidden_act == "silu" || hidden_act == "swish";
     model.fused_add_norm = inferred_fused_add_norm(root, model.model_type);
-    model.num_experts_per_token = model.is_moe()
-                                      ? require_positive_u64(
-                                            root, "num_experts_per_tok", source)
-                                      : 1;
+    model.num_experts_per_token =
+        model.is_moe()
+            ? require_positive_u64(root, "num_experts_per_tok", source)
+            : 1;
     model.total_expert_num = model.num_experts;
     model.router_topk = model.num_experts_per_token;
+    model.num_shared_experts =
+        model.is_moe()
+            ? optional_nonnegative_u64(root, "n_shared_experts", 0, source)
+            : 0;
+    model.first_k_dense_replace =
+        model.is_moe()
+            ? optional_nonnegative_u64(root, "first_k_dense_replace", 0, source)
+            : model.num_layers;
+    model.moe_layer_freq =
+        model.is_moe()
+            ? optional_positive_u64(root, "moe_layer_freq", 1, source)
+            : 1;
+    model.vocab_size =
+        optional_positive_u64(root, "vocab_size", model.vocab_size, source);
+    if (model.first_k_dense_replace > model.num_layers) {
+        throw ConfigError(source +
+                          ".first_k_dense_replace must not exceed num_layers");
+    }
     model.use_mla = optional_bool(root, "use_mla", false, source) ||
                     ((model.model_type == "deepseek_v2" ||
                       model.model_type == "deepseek_v3" ||
@@ -347,38 +394,32 @@ ModelConfig parse_model_asset(std::string_view model_name, const Json &root,
                      root.contains("kv_lora_rank"));
     model.use_mfa = optional_bool(root, "use_mfa", false, source);
     model.q_lora_rank = optional_positive_u64(root, "q_lora_rank", 0, source);
-    model.kv_lora_rank =
-        optional_positive_u64(root, "kv_lora_rank", 0, source);
+    model.kv_lora_rank = optional_positive_u64(root, "kv_lora_rank", 0, source);
     model.qk_nope_head_dim =
         optional_positive_u64(root, "qk_nope_head_dim", 0, source);
     model.qk_rope_head_dim =
         optional_positive_u64(root, "qk_rope_head_dim", 0, source);
-    model.qk_head_dim =
-        optional_positive_u64(root, "qk_head_dim", 0, source);
+    model.qk_head_dim = optional_positive_u64(root, "qk_head_dim", 0, source);
     if (model.qk_head_dim == 0 && model.qk_nope_head_dim > 0 &&
         model.qk_rope_head_dim > 0) {
         model.qk_head_dim = model.qk_nope_head_dim + model.qk_rope_head_dim;
     }
     if (model.use_mla &&
-        model.qk_head_dim !=
-            model.qk_nope_head_dim + model.qk_rope_head_dim) {
-        throw ConfigError(source +
-                          " qk_head_dim must equal qk_nope_head_dim + "
-                          "qk_rope_head_dim for MLA");
+        model.qk_head_dim != model.qk_nope_head_dim + model.qk_rope_head_dim) {
+        throw ConfigError(source + " qk_head_dim must equal qk_nope_head_dim + "
+                                   "qk_rope_head_dim for MLA");
     }
-    model.v_head_dim =
-        optional_positive_u64(root, "v_head_dim", 0, source);
-    model.share_q_dim =
-        optional_positive_u64(root, "share_q_dim", 0, source);
-    for (const std::string_view marker : {"dsa_topk", "dsa_top_k",
-                                          "dsa_index_topk", "dsa_indexer"}) {
+    model.v_head_dim = optional_positive_u64(root, "v_head_dim", 0, source);
+    model.share_q_dim = optional_positive_u64(root, "share_q_dim", 0, source);
+    for (const std::string_view marker :
+         {"dsa_topk", "dsa_top_k", "dsa_index_topk", "dsa_indexer"}) {
         if (root.contains(marker) && json_truthy(root.at(marker))) {
             model.has_dsa_marker = true;
         }
     }
-    for (const std::string_view marker : {"sliding_window_pattern",
-                                          "dual_chunk_attention",
-                                          "attention_chunk_size"}) {
+    for (const std::string_view marker :
+         {"sliding_window_pattern", "dual_chunk_attention",
+          "attention_chunk_size"}) {
         if (root.contains(marker) && json_truthy(root.at(marker))) {
             model.exotic_attention_fields.emplace_back(marker);
         }

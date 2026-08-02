@@ -1,3 +1,4 @@
+#include "frontier/attention/mla.h"
 #include "frontier/cc_backend/analytical_model.h"
 #include "frontier/entities/batch.h"
 #include "frontier/entities/request.h"
@@ -24,6 +25,7 @@
 namespace {
 
 namespace analytical = frontier::execution_time_predictor::detail;
+namespace attention = frontier::attention;
 namespace predictor = frontier::execution_time_predictor;
 namespace communication = frontier::cc_backend;
 namespace kv_transfer = frontier::kv_cache_transfer;
@@ -274,6 +276,18 @@ void test_operator_precisions_split_dense_and_kv_costs() {
     expect_approximately_equal(fp4_dense.attention_pre_projection_ms,
                                fp16.attention_pre_projection_ms,
                                "attention precision independence");
+
+    const auto fp4_weight_fp16_activation =
+        predict({analytical::Precision::kFp16, analytical::Precision::kFp16,
+                 analytical::Precision::kFp16, analytical::Precision::kFp4,
+                 analytical::Precision::kFp16, analytical::Precision::kFp4,
+                 analytical::Precision::kFp16});
+    expect(fp4_weight_fp16_activation.attention_pre_projection_ms <
+                   fp16.attention_pre_projection_ms &&
+               fp4_weight_fp16_activation.mlp_up_projection_ms <
+                   fp16.mlp_up_projection_ms,
+           "W4A16 must reduce weight traffic and use the weight compute "
+           "ceiling without changing activation bytes");
 }
 
 void test_operator_precisions_split_moe_expert_and_router_costs() {
@@ -313,10 +327,20 @@ void test_operator_precisions_split_moe_expert_and_router_costs() {
     expect_approximately_equal(fp8_router.grouped_up_projection_ms,
                                fp16.grouped_up_projection_ms,
                                "expert precision independence");
+
+    const auto fp4_weight_fp8_activation =
+        predict({analytical::Precision::kFp16, analytical::Precision::kFp16,
+                 analytical::Precision::kFp16, analytical::Precision::kFp4,
+                 analytical::Precision::kFp8, analytical::Precision::kFp16,
+                 analytical::Precision::kFp16, analytical::Precision::kFp16,
+                 analytical::Precision::kFp16});
+    expect(fp4_weight_fp8_activation.grouped_up_projection_ms <
+               fp16.grouped_up_projection_ms,
+           "MoE W4A8 must model expert weight and activation dtypes "
+           "independently");
 }
 
 void test_mla_uses_latent_cache_context_costs() {
-    const Json golden = load_attention_family_golden();
     analytical::DenseModel model{};
     model.hidden_size = 7'168;
     model.intermediate_size = 18'432;
@@ -350,10 +374,62 @@ void test_mla_uses_latent_cache_context_costs() {
     expect(short_context.attention_pre_projection_ms > 0.0 &&
                short_context.attention_post_projection_ms > 0.0,
            "MLA projections must be included in analytical timing");
-    expect(short_context.attention_inter_norm_ms == 0.0 &&
+    expect(short_context.attention_inter_norm_ms > 0.0 &&
                short_context.attention_wq_projection_ms == 0.0,
-           "MLA must not use MFA shared-Q operators");
-    check_attention_fields(long_context, golden.at("mla_decode_1_past_8192"));
+           "MLA must include Q/KV LoRA norms without using MFA shared-Q "
+           "operators");
+
+    const analytical::KernelWork unabsorbed =
+        analytical::mla_unabsorbed_attention_work({{1, 8'192}}, 16, 128, 64,
+                                                  128, 2.0, 2.0);
+    const analytical::KernelWork absorbed =
+        analytical::mla_absorbed_attention_work({{1, 8'192}}, 16, 512, 64, 2.0,
+                                                1.0, 2.0);
+    expect(absorbed.flops > unabsorbed.flops &&
+               absorbed.hbm_bytes < unabsorbed.hbm_bytes,
+           "absorbed MLA decode must trade more attention FLOPs for less HBM "
+           "traffic");
+
+    const auto predict_prefill = [&](std::uint64_t past_context) {
+        analytical::DenseBatch batch{};
+        batch.total_tokens = 1;
+        batch.prefill_requests = {{1, past_context}};
+        return analytical::predict_dense_layer(
+            analytical::DeviceCeilings::rubin(), analytical::AnalyticalConfig{},
+            model, batch,
+            analytical::DenseOperatorPrecisions{
+                analytical::Precision::kFp8,
+                analytical::Precision::kBf16,
+                analytical::Precision::kFp8,
+                analytical::Precision::kFp8,
+                analytical::Precision::kBf16,
+                analytical::Precision::kFp8,
+                analytical::Precision::kBf16,
+            });
+    };
+    const auto short_prefill = predict_prefill(0);
+    const auto long_prefill = predict_prefill(8'192);
+    expect(long_prefill.attention_pre_projection_ms >
+               short_prefill.attention_pre_projection_ms,
+           "unabsorbed MLA prefill must expand cached latent KV");
+}
+
+void test_mla_kv_layout_splits_latent_and_rope() {
+    const attention::MlaKvCacheLayout layout{
+        512,
+        64,
+        1.0,
+        2.0,
+    };
+    expect_approximately_equal(attention::mla_kv_cache_bytes_per_token(layout),
+                               640.0, "MLA KV bytes per token");
+    expect(attention::mla_kv_cache_size_bytes(10, 61, layout) == 390'400,
+           "MLA KV size must use FP8 latent and BF16 RoPE components");
+
+    const auto kimi =
+        frontier::config::load_model_config("moonshotai/Kimi-K2-Instruct");
+    expect(kv_transfer::model_kv_cache_size_bytes(10, kimi, 1.0) == 390'400,
+           "Kimi PDD transfer must use the shared MLA KV layout");
 }
 
 void test_mfa_models_shared_q_projection_path() {
@@ -469,9 +545,13 @@ void test_batch_model_matches_python_golden() {
                                                frontier::StageId{0});
         const Json &expected = test_case.at("expected");
         expect_approximately_equal(
-            prediction.duration_ms,
+            prediction.duration_ms - prediction.execution_time.lm_head_ms,
             expected.at("batch_duration_ms").get<double>(),
-            "batch_duration_ms");
+            "batch_duration_ms_without_lm_head");
+        if (diagnostic_value(prediction, "lm_head_tokens") > 0.0) {
+            expect(prediction.execution_time.lm_head_ms > 0.0,
+                   "final pipeline stage must model the LM head");
+        }
         for (const std::string_view field : {
                  "total_tokens",
                  "prefill_request_count",
@@ -480,11 +560,15 @@ void test_batch_model_matches_python_golden() {
                  "tp_allreduce_ms",
                  "dense_layer_total_ms",
                  "num_layers",
-                 "batch_duration_ms",
              }) {
             expect_approximately_equal(diagnostic_value(prediction, field),
                                        expected.at(field).get<double>(), field);
         }
+        expect_approximately_equal(
+            diagnostic_value(prediction, "batch_duration_ms") -
+                prediction.execution_time.lm_head_ms,
+            expected.at("batch_duration_ms").get<double>(),
+            "diagnostic_batch_duration_ms_without_lm_head");
     }
 }
 
@@ -577,6 +661,68 @@ void test_kv_transfer_matches_python_golden() {
                                "zero-byte KV transfer latency");
 }
 
+void test_kimi_k2_uneven_pipeline_and_lm_head() {
+    frontier::config::ParallelismConfig parallelism{};
+    parallelism.tensor_parallel_size = 4;
+    parallelism.pipeline_parallel_size = 4;
+    parallelism.data_parallel_size = 2;
+    parallelism.moe_tensor_parallel_size = 1;
+    parallelism.moe_expert_parallel_size = 8;
+
+    frontier::config::AnalyticalExecutionModelConfig execution{};
+    execution.precision = "fp8";
+    execution.operator_precisions.moe_expert_weight = "fp4";
+    execution.operator_precisions.moe_expert_activation = "fp8";
+    const frontier::config::ModelConfig model_config =
+        frontier::config::load_model_config("moonshotai/Kimi-K2-Instruct");
+    const predictor::AnalyticalRooflineExecutionTimePredictor model{
+        execution, parallelism, model_config,
+        frontier::config::MoeRoutingConfig{}};
+
+    std::vector<Request> requests;
+    requests.emplace_back([&]() {
+        WorkloadRequest value{};
+        value.request_id = RequestId{0};
+        value.arrived_at = SimTime::from_seconds(0.0);
+        value.num_prefill_tokens = 1;
+        value.num_decode_tokens = 1;
+        return value;
+    }());
+    requests.front().on_arrival(SimTime::from_seconds(0.0));
+    requests.front().on_admitted(SimTime::from_seconds(0.0));
+    requests.front().advance_scheduler_frontier(1);
+    RequestBatchSnapshot snapshot{};
+    snapshot.request_id = RequestId{0};
+    snapshot.scheduled_tokens = 1;
+    snapshot.processed_tokens = 0;
+    snapshot.scheduler_frontier = 1;
+    const Batch batch{BatchId{0},
+                      IterationId{0},
+                      {snapshot},
+                      SimTime::from_seconds(0.0),
+                      Generation{0}};
+
+    const auto stage0 = model.predict_stage_execution_time(
+        batch, requests, frontier::StageId{0});
+    const auto stage1 = model.predict_stage_execution_time(
+        batch, requests, frontier::StageId{1});
+    const auto stage3 = model.predict_stage_execution_time(
+        batch, requests, frontier::StageId{3});
+    expect(stage0.moe_routing.size() == 15 &&
+               stage0.moe_routing.front().model_layer_id == 1 &&
+               stage0.moe_routing.back().model_layer_id == 15,
+           "Kimi stage 0 must contain dense layer 0 followed by MoE layers "
+           "1..15");
+    expect(stage1.moe_routing.size() == 15 &&
+               stage1.moe_routing.front().model_layer_id == 16 &&
+               stage1.moe_routing.back().model_layer_id == 30,
+           "Kimi stage 1 must continue at global layer 16");
+    expect(stage0.execution_time.lm_head_ms == 0.0 &&
+               stage1.execution_time.lm_head_ms == 0.0 &&
+               stage3.execution_time.lm_head_ms > 0.0,
+           "only the final PP stage must execute the LM-head projection");
+}
+
 void test_invalid_analytical_inputs_are_rejected() {
     expect_throws<analytical::AnalyticalModelError>(
         [] {
@@ -634,6 +780,8 @@ int main() {
         test_operator_precisions_split_moe_expert_and_router_costs);
     failures += frontier::test::run("MLA uses latent-cache context costs",
                                     test_mla_uses_latent_cache_context_costs);
+    failures += frontier::test::run("MLA KV layout splits latent and RoPE",
+                                    test_mla_kv_layout_splits_latent_and_rope);
     failures += frontier::test::run("MFA models shared-Q projection path",
                                     test_mfa_models_shared_q_projection_path);
     failures += frontier::test::run("batch model matches Python golden",
@@ -642,6 +790,8 @@ int main() {
                                     test_communication_matches_python_golden);
     failures += frontier::test::run("KV transfer matches Python golden",
                                     test_kv_transfer_matches_python_golden);
+    failures += frontier::test::run("Kimi K2 uneven pipeline and LM head",
+                                    test_kimi_k2_uneven_pipeline_and_lm_head);
     failures +=
         frontier::test::run("invalid analytical inputs are rejected",
                             test_invalid_analytical_inputs_are_rejected);

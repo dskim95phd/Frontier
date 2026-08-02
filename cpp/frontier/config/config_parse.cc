@@ -282,6 +282,14 @@ ModelConfig parse_model(const Json &cluster, std::string_view context) {
     if (cluster.contains("router_topk")) {
         parsed.router_topk = require_uint64(cluster, "router_topk", context);
     }
+    if (cluster.contains("first_k_dense_replace")) {
+        parsed.first_k_dense_replace =
+            require_uint64(cluster, "first_k_dense_replace", context);
+    }
+    if (cluster.contains("num_shared_experts")) {
+        parsed.num_shared_experts =
+            require_uint64(cluster, "num_shared_experts", context);
+    }
     if (!parsed.is_moe()) {
         if (parsed.total_expert_num != 1 || parsed.router_topk != 1) {
             throw ConfigError(std::string{context} +
@@ -300,6 +308,11 @@ ModelConfig parse_model(const Json &cluster, std::string_view context) {
         parsed.router_topk > parsed.total_expert_num) {
         throw ConfigError(std::string{context} +
                           ".router_topk must be in [1, total_expert_num]");
+    }
+    if (parsed.first_k_dense_replace > parsed.num_layers) {
+        throw ConfigError(std::string{context} +
+                          ".first_k_dense_replace must not exceed model "
+                          "num_layers");
     }
     return parsed;
 }
@@ -445,9 +458,9 @@ ParallelismConfig parse_parallelism(const Json &root,
         throw ConfigError("config.parallelism.tensor_parallel_size must be one "
                           "of 1, 2, 4, 8");
     }
-    if (model.num_layers % parsed.pipeline_parallel_size != 0) {
-        throw ConfigError("model num_layers must be divisible by "
-                          "config.parallelism.pipeline_parallel_size");
+    if (parsed.pipeline_parallel_size > model.num_layers) {
+        throw ConfigError("config.parallelism.pipeline_parallel_size must not "
+                          "exceed model num_layers");
     }
     if (model.hidden_size % parsed.tensor_parallel_size != 0 ||
         model.num_query_heads % parsed.tensor_parallel_size != 0) {
@@ -466,7 +479,8 @@ ParallelismConfig parse_parallelism(const Json &root,
             throw ConfigError("total_expert_num must be divisible by "
                               "moe_expert_parallel_size");
         }
-        if (model.intermediate_size % parsed.moe_tensor_parallel_size != 0) {
+        if (model.moe_intermediate_size % parsed.moe_tensor_parallel_size !=
+            0) {
             throw ConfigError("MoE intermediate size must be divisible by "
                               "moe_tensor_parallel_size");
         }
@@ -572,7 +586,11 @@ OperatorPrecisionConfig parse_operator_precisions(const Json &execution) {
         "config.execution_model.operator_precisions";
     require_keys(operators, {},
                  {"attention", "dense", "moe_expert", "moe_router", "kv_cache",
-                  "communication"},
+                  "communication", "attention_weight", "attention_activation",
+                  "dense_weight", "dense_activation", "moe_expert_weight",
+                  "moe_expert_activation", "moe_router_weight",
+                  "moe_router_activation", "lm_head", "lm_head_weight",
+                  "lm_head_activation"},
                  context);
     const auto parse_optional = [&](std::string_view field,
                                     std::string &destination) {
@@ -592,6 +610,17 @@ OperatorPrecisionConfig parse_operator_precisions(const Json &execution) {
     parse_optional("moe_router", result.moe_router);
     parse_optional("kv_cache", result.kv_cache);
     parse_optional("communication", result.communication);
+    parse_optional("attention_weight", result.attention_weight);
+    parse_optional("attention_activation", result.attention_activation);
+    parse_optional("dense_weight", result.dense_weight);
+    parse_optional("dense_activation", result.dense_activation);
+    parse_optional("moe_expert_weight", result.moe_expert_weight);
+    parse_optional("moe_expert_activation", result.moe_expert_activation);
+    parse_optional("moe_router_weight", result.moe_router_weight);
+    parse_optional("moe_router_activation", result.moe_router_activation);
+    parse_optional("lm_head", result.lm_head);
+    parse_optional("lm_head_weight", result.lm_head_weight);
+    parse_optional("lm_head_activation", result.lm_head_activation);
     return result;
 }
 
@@ -708,7 +737,9 @@ ClusterRuntimeConfig parse_cluster_runtime(const Json &clusters,
                      "model_name",
                      "moe_routing",
                  },
-                 {"total_expert_num", "router_topk"}, context);
+                 {"total_expert_num", "router_topk", "first_k_dense_replace",
+                  "num_shared_experts"},
+                 context);
     const ModelConfig model = parse_model(cluster, context);
     const ParallelismConfig parallelism = parse_parallelism(cluster, model);
     return [&]() {
