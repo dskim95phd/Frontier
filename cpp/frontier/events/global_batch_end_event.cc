@@ -23,7 +23,7 @@ void handle_event(const GlobalBatchEndPayload &payload, SimTime time,
         simulator.runtime_config(payload.cluster_type));
     for (const entities::RequestBatchSnapshot &snapshot : batch.requests()) {
         if (simulator.request(snapshot.request_id).completed()) {
-            simulator.record_request_completion(snapshot.request_id);
+            simulator.record_request_completion(snapshot.request_id, time);
         }
     }
     simulator.event_queue().push(time, [&]() {

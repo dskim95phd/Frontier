@@ -87,4 +87,37 @@ void BatchStage::reconcile_synchronization_wait(SimTime completed_at) {
         std::max(0.0, wall_ms - modeled_without_wait);
 }
 
+void BatchStage::accumulate_execution_time(
+    const ExecutionTime &execution_time) {
+    if (completed_at_.valid() || !valid_execution_time(execution_time)) {
+        throw BatchStageError(
+            "cannot accumulate invalid timing into a completed stage");
+    }
+    execution_time_.dense_compute_ms += execution_time.dense_compute_ms;
+    execution_time_.lm_head_ms += execution_time.lm_head_ms;
+    execution_time_.tp_communication_ms +=
+        execution_time.tp_communication_ms;
+    execution_time_.pp_communication_ms +=
+        execution_time.pp_communication_ms;
+    execution_time_.moe_gating_linear_ms +=
+        execution_time.moe_gating_linear_ms;
+    execution_time_.moe_gating_routing_topk_ms +=
+        execution_time.moe_gating_routing_topk_ms;
+    execution_time_.moe_grouped_gemm_ms +=
+        execution_time.moe_grouped_gemm_ms;
+    execution_time_.moe_shuffling_ms += execution_time.moe_shuffling_ms;
+    execution_time_.moe_post_attention_norm_ms +=
+        execution_time.moe_post_attention_norm_ms;
+    execution_time_.moe_tp_communication_ms +=
+        execution_time.moe_tp_communication_ms;
+    execution_time_.ep_dispatch_ms += execution_time.ep_dispatch_ms;
+    execution_time_.ep_combine_ms += execution_time.ep_combine_ms;
+    execution_time_.dp_input_communication_ms +=
+        execution_time.dp_input_communication_ms;
+    execution_time_.dp_output_communication_ms +=
+        execution_time.dp_output_communication_ms;
+    execution_time_.synchronization_wait_ms +=
+        execution_time.synchronization_wait_ms;
+}
+
 } // namespace frontier::entities

@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <string>
@@ -175,6 +176,122 @@ void test_kimi_k2_dense_prefix_runs_with_uneven_pp() {
            "Kimi K2 final stage must report LM-head projection time");
 }
 
+void test_kimi_k2_first_layer_scaled_preserves_completion_time() {
+    auto detailed_config = load_config("analytical_moe_ep4_colocation.json");
+    auto &runtime = detailed_config.cluster();
+    runtime.model =
+        frontier::config::load_model_config("moonshotai/Kimi-K2-Instruct");
+    runtime.parallelism.tensor_parallel_size = 4;
+    runtime.parallelism.pipeline_parallel_size = 4;
+    runtime.parallelism.data_parallel_size = 2;
+    runtime.parallelism.moe_tensor_parallel_size = 1;
+    runtime.parallelism.moe_expert_parallel_size = 8;
+    runtime.execution_model.analytical.tensor_parallel_size = 4;
+    runtime.execution_model.analytical.precision = "fp8";
+    runtime.execution_model.analytical.operator_precisions.moe_expert_weight =
+        "fp4";
+    runtime.execution_model.analytical.operator_precisions
+        .moe_expert_activation = "fp8";
+    auto scaled_config = detailed_config;
+    scaled_config.cluster()
+        .execution_model.analytical.moe_layer_event_mode =
+        "first_layer_scaled";
+    const auto workload = parse_workload_csv(
+        "arrived_at,num_prefill_tokens,num_decode_tokens\n0,8,2\n");
+
+    const auto detailed = run_simulation(detailed_config, workload);
+    const auto scaled = run_simulation(scaled_config, workload);
+    expect(detailed.requests.size() == 1 && scaled.requests.size() == 1 &&
+               std::abs(detailed.requests.front().completed_at.seconds() -
+                        scaled.requests.front().completed_at.seconds()) <
+                   1e-12,
+           "scaled MoE layers must preserve request completion time: " +
+               std::to_string(detailed.requests.front().completed_at.seconds()) +
+               " vs " +
+               std::to_string(scaled.requests.front().completed_at.seconds()));
+    expect(scaled.aggregate.event_count < detailed.aggregate.event_count &&
+               scaled.aggregate.moe_routing_count * 10 <
+                   detailed.aggregate.moe_routing_count,
+           "scaled MoE layers must materially reduce events and routing "
+           "records");
+}
+
+void test_kimi_k2_first_layer_scaled_preserves_pdd_completion_time() {
+    auto detailed_config = load_config("fixed_moe_sequential_pdd.json");
+    const auto model =
+        frontier::config::load_model_config("moonshotai/Kimi-K2-Instruct");
+    const auto configure_cluster = [&model](
+                                       frontier::config::ClusterRuntimeConfig
+                                           &cluster,
+                                       std::uint64_t data_parallel,
+                                       std::uint64_t expert_parallel) {
+        cluster.model = model;
+        cluster.parallelism.tensor_parallel_size = 4;
+        cluster.parallelism.pipeline_parallel_size = 4;
+        cluster.parallelism.data_parallel_size = data_parallel;
+        cluster.parallelism.moe_tensor_parallel_size = 1;
+        cluster.parallelism.moe_expert_parallel_size = expert_parallel;
+        cluster.execution_model.type =
+            frontier::config::ExecutionModelType::kAnalytical;
+        cluster.execution_model.analytical.tensor_parallel_size = 4;
+        cluster.execution_model.analytical.precision = "fp8";
+        cluster.execution_model.analytical.operator_precisions
+            .moe_expert_weight = "fp4";
+        cluster.execution_model.analytical.operator_precisions
+            .moe_expert_activation = "fp8";
+    };
+    configure_cluster(detailed_config.pdd().clusters.prefill, 1, 4);
+    configure_cluster(detailed_config.pdd().clusters.decode, 2, 8);
+    detailed_config.pdd().clusters.prefill.moe_routing.distribution =
+        frontier::config::MoeRoutingDistribution::kBalanced;
+    detailed_config.pdd().clusters.decode.moe_routing.distribution =
+        frontier::config::MoeRoutingDistribution::kBalanced;
+    detailed_config.pdd().clusters.prefill.moe_routing.mode =
+        frontier::config::MoeRoutingMode::kUniformLegacy;
+    detailed_config.pdd().clusters.decode.moe_routing.mode =
+        frontier::config::MoeRoutingMode::kUniformLegacy;
+    detailed_config.pdd().kv_cache_transfer.kv_cache_dtype_size_bytes = 1.0;
+    auto scaled_config = detailed_config;
+    scaled_config.pdd()
+        .clusters.prefill.execution_model.analytical.moe_layer_event_mode =
+        "first_layer_scaled";
+    scaled_config.pdd()
+        .clusters.decode.execution_model.analytical.moe_layer_event_mode =
+        "first_layer_scaled";
+    const auto workload = parse_workload_csv(
+        "arrived_at,num_prefill_tokens,num_decode_tokens\n0,8,2\n");
+
+    const auto detailed = run_simulation(detailed_config, workload);
+    const auto scaled = run_simulation(scaled_config, workload);
+    expect(detailed.batch_stages.size() == scaled.batch_stages.size(),
+           "scaled PDD run must preserve the batch-stage count");
+    for (std::size_t index = 0; index < detailed.batch_stages.size(); ++index) {
+        const double detailed_ms =
+            (detailed.batch_stages.at(index).completed_at.seconds() -
+             detailed.batch_stages.at(index).started_at.seconds()) *
+            1e3;
+        const double scaled_ms =
+            (scaled.batch_stages.at(index).completed_at.seconds() -
+             scaled.batch_stages.at(index).started_at.seconds()) *
+            1e3;
+        expect(std::abs(detailed_ms - scaled_ms) < 1e-9,
+               "scaled PDD stage duration mismatch at index " +
+                   std::to_string(index) + ": " +
+                   std::to_string(detailed_ms) + " vs " +
+                   std::to_string(scaled_ms));
+    }
+    expect(std::abs(detailed.requests.front().completed_at.seconds() -
+                    scaled.requests.front().completed_at.seconds()) < 1e-12,
+           "scaled PDD MoE layers must preserve request completion time: " +
+               std::to_string(detailed.requests.front().completed_at.seconds()) +
+               " vs " +
+               std::to_string(scaled.requests.front().completed_at.seconds()));
+    expect(scaled.aggregate.event_count < detailed.aggregate.event_count &&
+               scaled.aggregate.moe_routing_count * 10 <
+                   detailed.aggregate.moe_routing_count,
+           "scaled PDD MoE layers must materially reduce detailed records");
+}
+
 } // namespace
 
 int main() {
@@ -189,5 +306,11 @@ int main() {
     failures +=
         frontier::test::run("Kimi K2 dense prefix and uneven PP",
                             test_kimi_k2_dense_prefix_runs_with_uneven_pp);
+    failures += frontier::test::run(
+        "Kimi K2 first-layer-scaled completion",
+        test_kimi_k2_first_layer_scaled_preserves_completion_time);
+    failures += frontier::test::run(
+        "Kimi K2 first-layer-scaled PDD completion",
+        test_kimi_k2_first_layer_scaled_preserves_pdd_completion_time);
     return failures == 0 ? 0 : 1;
 }

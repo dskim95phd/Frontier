@@ -50,6 +50,16 @@ class ReplicaStageScheduler {
     execution_time_predictor::ExecutionTimePrediction
     predict(const entities::Batch &batch,
             const std::vector<entities::Request> &requests) const;
+    [[nodiscard]] bool supports_lazy_moe_prediction() const noexcept;
+    [[nodiscard]] execution_time_predictor::ExecutionTimePrediction
+    prepare_moe_stage(
+        const entities::Batch &batch,
+        const std::vector<entities::Request> &requests) const;
+    [[nodiscard]] execution_time_predictor::ExecutionTimePrediction
+    predict_moe_layer(
+        const entities::Batch &batch,
+        const std::vector<entities::Request> &requests,
+        std::uint64_t local_moe_layer) const;
     void on_stage_end(BatchId batch_id);
 
     [[nodiscard]] ReplicaId replica_id() const noexcept { return replica_id_; }

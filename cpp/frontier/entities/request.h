@@ -33,6 +33,7 @@ class Request {
 
     [[nodiscard]] RequestId id() const noexcept { return request_id_; }
     [[nodiscard]] SimTime arrived_at() const noexcept { return arrived_at_; }
+    void reschedule_pending_arrival(SimTime time);
     [[nodiscard]] std::uint64_t num_prefill_tokens() const noexcept {
         return num_prefill_tokens_;
     }

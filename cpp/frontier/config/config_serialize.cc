@@ -100,6 +100,8 @@ OrderedJson serialize_execution_model(const ExecutionModelConfig &execution) {
         {"type", to_string(execution.type)},
         {"device", execution.analytical.device},
         {"precision", execution.analytical.precision},
+        {"moe_layer_event_mode",
+         execution.analytical.moe_layer_event_mode},
         {
             "network_bandwidth_gbps",
             execution.analytical.network_bandwidth_gbps,
@@ -110,6 +112,23 @@ OrderedJson serialize_execution_model(const ExecutionModelConfig &execution) {
             execution.analytical.intra_node_bandwidth_gbps,
         },
     });
+    const AnalyticalDeviceOverrides &device_overrides =
+        execution.analytical.device_overrides;
+    if (!device_overrides.empty()) {
+        OrderedJson values = OrderedJson::object();
+        const auto add = [&values](std::string_view name,
+                                   const std::optional<double> &value) {
+            if (value.has_value()) {
+                values[std::string{name}] = value.value();
+            }
+        };
+        add("hbm_bandwidth_tbps", device_overrides.hbm_bandwidth_tbps);
+        add("fp32_tflops", device_overrides.fp32_tflops);
+        add("fp16_tflops", device_overrides.fp16_tflops);
+        add("fp8_tflops", device_overrides.fp8_tflops);
+        add("fp4_tflops", device_overrides.fp4_tflops);
+        result["device_overrides"] = std::move(values);
+    }
     const OperatorPrecisionConfig &operators =
         execution.analytical.operator_precisions;
     if (!operators.empty()) {
@@ -196,6 +215,10 @@ std::string serialize_simulation_config_json(const SimulationConfig &config) {
     root["simulation_mode"] = to_string(config.simulation_mode);
     root["system_architecture"] = to_string(config.system_architecture);
     root["enable_parallel_clusters"] = config.enable_parallel_clusters;
+    if (config.closed_loop_max_concurrency > 0) {
+        root["closed_loop_max_concurrency"] =
+            config.closed_loop_max_concurrency;
+    }
     root["prefix_cache"] = serialize_prefix_cache(config.prefix_cache);
     root["cluster_scheduler"] =
         serialize_cluster_scheduler(config.cluster_scheduler);

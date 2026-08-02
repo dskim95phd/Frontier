@@ -27,11 +27,15 @@ struct MoERoutingDiagnostic {
 };
 
 struct ExecutionTimePrediction {
-    double duration_ms;
+    double duration_ms = 0.0;
     entities::ExecutionTime execution_time;
     std::vector<std::pair<std::string, double>> diagnostics;
     std::vector<MoERoutingDiagnostic> moe_routing;
+    std::uint64_t logical_moe_layer_count = 0;
+    double repeated_moe_layer_pre_compute_ms = 0.0;
     double moe_suffix_compute_ms = 0.0;
+    bool lazy_moe_layer_prediction = false;
+    bool scaled_moe_layer_prediction = false;
 };
 
 class ExecutionTimePredictorError : public std::runtime_error {
@@ -49,6 +53,24 @@ class BaseExecutionTimePredictor {
     predict_stage_execution_time(const entities::Batch &batch,
                                  const std::vector<entities::Request> &requests,
                                  StageId stage_id) const = 0;
+
+    [[nodiscard]] virtual bool supports_lazy_moe_prediction() const noexcept {
+        return false;
+    }
+
+    [[nodiscard]] virtual ExecutionTimePrediction prepare_moe_stage_execution(
+        const entities::Batch &batch,
+        const std::vector<entities::Request> &requests,
+        StageId stage_id) const {
+        return predict_stage_execution_time(batch, requests, stage_id);
+    }
+
+    [[nodiscard]] virtual ExecutionTimePrediction predict_moe_layer_execution(
+        const entities::Batch &, const std::vector<entities::Request> &,
+        StageId, std::uint64_t) const {
+        throw ExecutionTimePredictorError(
+            "execution predictor does not support lazy MoE layers");
+    }
 };
 
 using ExecutionTimePredictorPtr =

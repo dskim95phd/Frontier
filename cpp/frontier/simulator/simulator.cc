@@ -111,6 +111,23 @@ Simulator::Simulator(
                 is_pdd ? ClusterType::kPrefill : ClusterType::kMonolithic;
             return value;
         }());
+    } else if (config_.closed_loop_max_concurrency > 0) {
+        const SimTime start = SimTime::from_seconds(0.0);
+        const std::size_t initial = std::min<std::size_t>(
+            entities_.requests().size(),
+            static_cast<std::size_t>(config_.closed_loop_max_concurrency));
+        for (std::size_t index = 0; index < initial; ++index) {
+            entities::Request &request = entities_.requests().at(index);
+            request.reschedule_pending_arrival(start);
+            event_queue_.push(start, [&]() {
+                RequestArrivalPayload value{};
+                value.request_id = request.id();
+                value.cluster_type =
+                    is_pdd ? ClusterType::kPrefill : ClusterType::kMonolithic;
+                return value;
+            }());
+        }
+        next_closed_loop_request_ = initial;
     } else {
         for (const auto &request : workload) {
             event_queue_.push(request.arrived_at, [&]() {
@@ -296,8 +313,24 @@ bool Simulator::on_decode_kv_arrival() {
            decode_arrivals_ == expected_decode_arrivals_;
 }
 
-void Simulator::record_request_completion(RequestId request_id) {
+void Simulator::record_request_completion(RequestId request_id, SimTime time) {
     entities_.record_request_completion(request_id);
+    if (config_.closed_loop_max_concurrency == 0 ||
+        next_closed_loop_request_ >= entities_.requests().size()) {
+        return;
+    }
+    entities::Request &next =
+        entities_.requests().at(next_closed_loop_request_++);
+    next.reschedule_pending_arrival(time);
+    const bool is_pdd = config_.system_architecture ==
+                        config::SystemArchitecture::kPdDisaggregation;
+    event_queue_.push(time, [&]() {
+        RequestArrivalPayload value{};
+        value.request_id = next.id();
+        value.cluster_type =
+            is_pdd ? ClusterType::kPrefill : ClusterType::kMonolithic;
+        return value;
+    }());
 }
 
 bool Simulator::request_completion_recorded(RequestId request_id) const {
@@ -351,6 +384,10 @@ void Simulator::finalize() {
             throw std::runtime_error(
                 "simulation quiesced with incomplete PDD transfer state");
         }
+    }
+    if (entities_.live_batch_count() != 0) {
+        throw std::runtime_error(
+            "simulation quiesced with unreleased batch entities");
     }
     metrics_.collect_completed_requests(config_, entities_);
 }

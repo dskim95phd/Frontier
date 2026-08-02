@@ -65,6 +65,34 @@ ReplicaStageScheduler::predict(
     return predictor_->predict_stage_execution_time(batch, requests, stage_id_);
 }
 
+bool ReplicaStageScheduler::supports_lazy_moe_prediction() const noexcept {
+    return predictor_->supports_lazy_moe_prediction();
+}
+
+execution_time_predictor::ExecutionTimePrediction
+ReplicaStageScheduler::prepare_moe_stage(
+    const entities::Batch &batch,
+    const std::vector<entities::Request> &requests) const {
+    if (!active_batch_id_.valid() || active_batch_id_ != batch.id()) {
+        throw ReplicaStageSchedulerError(
+            "only the active stage batch can prepare MoE execution");
+    }
+    return predictor_->prepare_moe_stage_execution(batch, requests, stage_id_);
+}
+
+execution_time_predictor::ExecutionTimePrediction
+ReplicaStageScheduler::predict_moe_layer(
+    const entities::Batch &batch,
+    const std::vector<entities::Request> &requests,
+    std::uint64_t local_moe_layer) const {
+    if (!active_batch_id_.valid() || active_batch_id_ != batch.id()) {
+        throw ReplicaStageSchedulerError(
+            "only the active stage batch can predict a MoE layer");
+    }
+    return predictor_->predict_moe_layer_execution(
+        batch, requests, stage_id_, local_moe_layer);
+}
+
 void ReplicaStageScheduler::on_stage_end(BatchId batch_id) {
     if (!active_batch_id_.valid() || active_batch_id_ != batch_id) {
         throw ReplicaStageSchedulerError(

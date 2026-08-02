@@ -48,6 +48,13 @@ Prefill:Decode split:
 Both clusters contain a full model copy. PDD KV transfer uses the Kimi K2 NVL12
 sweep assumption of 38,400 Gbit/s aggregate bandwidth and 0.02 ms latency.
 
+The `kimi-k2-gb300-pdd-64` topology models one 64-GPU Prefill rack and one
+64-GPU Decode rack. Decode uses TP4/PP4/DP4/EP16; Prefill uses four TP4/PP4
+replicas with EP4. It enables analytical `first_layer_scaled` MoE events, so
+each 15-MoE-layer PP stage executes one detailed layer and accumulates the
+other 14 layer times without emitting their intermediate barriers. The preset
+uses balanced expert routing so the representative layer is repeatable.
+
 `offered_concurrency` is converted to an arrival rate using
 `arrival_rate = offered_concurrency / isolated_mean_service_time`. Under
 saturation, queued requests cause the measured time-averaged concurrency to be

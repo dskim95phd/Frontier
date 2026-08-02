@@ -423,10 +423,33 @@ void BaseClusterScheduler::begin_moe_stage(
     const std::uint64_t expected =
         monolithic_decode ? runtime.parallelism.moe_expert_parallel_size
                           : runtime.parallelism.data_parallel_size;
-    const std::uint64_t layers_per_stage = prediction.moe_routing.size();
-    if (layers_per_stage == 0) {
+    const std::uint64_t predicted_layers = prediction.moe_routing.size();
+    if (predicted_layers == 0) {
         throw std::logic_error("MoE synchronization stage has no MoE layers");
     }
+    const std::uint64_t logical_moe_layers =
+        prediction.logical_moe_layer_count == 0
+            ? predicted_layers
+            : prediction.logical_moe_layer_count;
+    const bool lazy_layer_prediction =
+        prediction.lazy_moe_layer_prediction;
+    const bool scaled_layer_prediction =
+        prediction.scaled_moe_layer_prediction;
+    if (lazy_layer_prediction && scaled_layer_prediction) {
+        throw std::logic_error(
+            "MoE prediction cannot be lazy and scaled simultaneously");
+    }
+    if (logical_moe_layers < predicted_layers ||
+        ((lazy_layer_prediction || scaled_layer_prediction) &&
+         predicted_layers != 1) ||
+        (!lazy_layer_prediction && !scaled_layer_prediction &&
+         logical_moe_layers != predicted_layers)) {
+        throw std::logic_error("invalid compressed MoE layer prediction");
+    }
+    const std::uint64_t layers_per_stage =
+        lazy_layer_prediction ? logical_moe_layers : predicted_layers;
+    const std::uint64_t component_layer_count =
+        scaled_layer_prediction ? logical_moe_layers : predicted_layers;
     const entities::ExecutionTime &execution = prediction.execution_time;
     const SimTime initial_pre_arrival = SimTime::from_seconds(
         started_at.seconds() +
@@ -524,7 +547,7 @@ void BaseClusterScheduler::begin_moe_stage(
         }
         decode_lane_times_ms.push_back(diagnostic.lane_times_ms);
     }
-    if (decode_lane_times_ms.size() != layers_per_stage) {
+    if (decode_lane_times_ms.size() != predicted_layers) {
         throw std::logic_error(
             "MoE prediction layer count does not match pipeline stage");
     }
@@ -532,6 +555,9 @@ void BaseClusterScheduler::begin_moe_stage(
     for (const auto &lane_times : decode_lane_times_ms) {
         critical_lane_sum_ms +=
             *std::max_element(lane_times.begin(), lane_times.end());
+    }
+    if (scaled_layer_prediction) {
+        critical_lane_sum_ms *= static_cast<double>(logical_moe_layers);
     }
     const double shared_post_attention_ms =
         post_attention_ms - critical_lane_sum_ms;
@@ -541,7 +567,7 @@ void BaseClusterScheduler::begin_moe_stage(
     }
     const double shared_post_attention_ms_per_layer =
         std::max(0.0, shared_post_attention_ms) /
-        static_cast<double>(layers_per_stage);
+        static_cast<double>(component_layer_count);
     std::vector<double> prefill_post_attention_ms_by_layer;
     prefill_post_attention_ms_by_layer.reserve(
         static_cast<std::size_t>(layers_per_stage));
@@ -575,15 +601,38 @@ void BaseClusterScheduler::begin_moe_stage(
             std::move(prefill_post_attention_ms_by_layer);
         value.decode_ep_communication_ms_per_layer =
             (execution.ep_dispatch_ms + execution.ep_combine_ms) /
-            static_cast<double>(layers_per_stage);
+            static_cast<double>(component_layer_count);
         value.decode_dp_communication_ms_per_layer =
             (execution.dp_input_communication_ms +
              execution.dp_output_communication_ms) /
-            static_cast<double>(layers_per_stage);
+            static_cast<double>(component_layer_count);
         value.decode_lane_times_ms = std::move(decode_lane_times_ms);
         value.suffix_compute_ms = prediction.moe_suffix_compute_ms;
         value.lm_head_ms = execution.lm_head_ms;
         value.pp_ms = execution.pp_communication_ms;
+        value.lazy_layer_prediction = lazy_layer_prediction;
+        if (scaled_layer_prediction) {
+            const double critical_lane_ms = *std::max_element(
+                value.decode_lane_times_ms.front().begin(),
+                value.decode_lane_times_ms.front().end());
+            const double repeated_post_ms =
+                path == MoESyncPath::kPrefill
+                    ? value.prefill_post_attention_ms_by_layer.front()
+                    : critical_lane_ms +
+                          (monolithic_decode
+                               ? 0.0
+                               : value.decode_dp_communication_ms_per_layer);
+            const double repeated_transition_ms =
+                path == MoESyncPath::kDecode
+                    ? value.decode_ep_communication_ms_per_layer
+                    : 0.0;
+            const double repeated_layer_ms =
+                prediction.repeated_moe_layer_pre_compute_ms +
+                repeated_post_ms + repeated_transition_ms;
+            value.remaining_moe_layer_wait_ms =
+                static_cast<double>(logical_moe_layers - predicted_layers) *
+                repeated_layer_ms;
+        }
         return value;
     }();
     const MoEStageKey stage_key = [&]() {
@@ -806,6 +855,7 @@ void BaseClusterScheduler::continue_moe_stage(
         for (auto position = group.participants.begin();
              position != group.participants.end();) {
             if (simulator.batch(position->second).is_idle()) {
+                simulator.release_batch(position->second);
                 position = group.participants.erase(position);
             } else {
                 ++position;
@@ -813,21 +863,77 @@ void BaseClusterScheduler::continue_moe_stage(
         }
         group.participants_initialized = false;
         for (const auto &[participant, batch_id] : group.participants) {
-            const MoEStageState &state =
+            MoEStageState &state =
                 moe_stage_state(batch_id, key.stage_id);
-            const auto refreshed_prediction =
-                get_replica_scheduler(state.replica_id, state.dp_id)
-                    .get_replica_stage_scheduler(state.stage_id)
-                    .predict(simulator.batch(batch_id), simulator.requests());
-            if (refreshed_prediction.moe_routing.size() !=
-                state.layers_per_stage) {
-                throw std::logic_error(
-                    "refreshed MoE prediction changed stage layer count");
+            double refreshed_pre_moe_ms = 0.0;
+            if (state.lazy_layer_prediction) {
+                const auto next_prediction =
+                    get_replica_scheduler(state.replica_id, state.dp_id)
+                        .get_replica_stage_scheduler(state.stage_id)
+                        .predict_moe_layer(
+                            simulator.batch(batch_id), simulator.requests(),
+                            state.current_layer);
+                if (!next_prediction.lazy_moe_layer_prediction ||
+                    next_prediction.moe_routing.size() != 1 ||
+                    next_prediction.logical_moe_layer_count !=
+                        state.layers_per_stage ||
+                    next_prediction.moe_routing.front().layer_id.index() !=
+                        state.current_layer) {
+                    throw std::logic_error(
+                        "lazy MoE prediction changed the stage contract");
+                }
+                const auto &diagnostic =
+                    next_prediction.moe_routing.front();
+                if (diagnostic.lane_times_ms.size() !=
+                    simulator.runtime_config(cluster_type())
+                        .parallelism.moe_expert_parallel_size) {
+                    throw std::logic_error(
+                        "lazy MoE prediction changed the EP lane count");
+                }
+                refreshed_pre_moe_ms = diagnostic.pre_moe_compute_ms;
+                state.pre_moe_compute_ms_by_layer.push_back(
+                    refreshed_pre_moe_ms);
+                state.decode_lane_times_ms.push_back(
+                    diagnostic.lane_times_ms);
+                const entities::ExecutionTime &layer_execution =
+                    next_prediction.execution_time;
+                const double critical_lane_ms = *std::max_element(
+                    diagnostic.lane_times_ms.begin(),
+                    diagnostic.lane_times_ms.end());
+                const double post_attention_ms =
+                    layer_execution.tp_communication_ms +
+                    layer_execution.moe_gating_linear_ms +
+                    layer_execution.moe_gating_routing_topk_ms +
+                    layer_execution.moe_grouped_gemm_ms +
+                    layer_execution.moe_shuffling_ms +
+                    layer_execution.moe_post_attention_norm_ms +
+                    layer_execution.moe_tp_communication_ms +
+                    layer_execution.ep_dispatch_ms +
+                    layer_execution.ep_combine_ms +
+                    layer_execution.dp_input_communication_ms +
+                    layer_execution.dp_output_communication_ms;
+                const double shared_post_attention_ms =
+                    post_attention_ms - critical_lane_ms;
+                if (shared_post_attention_ms < -1e-12) {
+                    throw std::logic_error(
+                        "lazy MoE post-attention work is smaller than lane "
+                        "work");
+                }
+                state.prefill_post_attention_ms_by_layer.push_back(
+                    std::max(0.0, shared_post_attention_ms) +
+                    critical_lane_ms);
+                simulator.batch_stage(batch_id, state.stage_id)
+                    .accumulate_execution_time(layer_execution);
+                const config::ClusterRuntimeConfig &runtime =
+                    simulator.runtime_config(cluster_type());
+                simulator.metrics().record_moe_routing(
+                    simulator.batch(batch_id), state.stage_id, diagnostic,
+                    runtime);
+            } else {
+                refreshed_pre_moe_ms =
+                    state.pre_moe_compute_ms_by_layer.at(
+                        static_cast<std::size_t>(state.current_layer));
             }
-            const double refreshed_pre_moe_ms =
-                refreshed_prediction.moe_routing
-                    .at(static_cast<std::size_t>(state.current_layer))
-                    .pre_moe_compute_ms;
             const double transition_ms =
                 refreshed_pre_moe_ms +
                 (path == MoESyncPath::kDecode
@@ -844,7 +950,8 @@ void BaseClusterScheduler::continue_moe_stage(
     for (const MoEStageKey &stage_key : real_states) {
         const MoEStageState &state = moe_stage_states_.at(stage_key);
         const double final_transition_ms =
-            state.suffix_compute_ms + state.lm_head_ms + state.pp_ms +
+            state.remaining_moe_layer_wait_ms + state.suffix_compute_ms +
+            state.lm_head_ms + state.pp_ms +
             (path == MoESyncPath::kDecode
                  ? state.decode_ep_communication_ms_per_layer
                  : 0.0);
@@ -863,6 +970,12 @@ void BaseClusterScheduler::continue_moe_stage(
     }
     for (const MoEStageKey &stage_key : real_states) {
         moe_stage_states_.erase(stage_key);
+    }
+    for (const auto &[unused, batch_id] : group.participants) {
+        static_cast<void>(unused);
+        if (simulator.batch(batch_id).is_idle()) {
+            simulator.release_batch(batch_id);
+        }
     }
     moe_group_states_.erase(group_position);
 }

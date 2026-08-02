@@ -26,7 +26,31 @@ void handle_event(const ReplicaStageSchedulePayload &payload, SimTime time,
         }
         return;
     }
-    const auto prediction = stage.predict(batch, simulator.requests());
+    const config::ClusterRuntimeConfig &runtime =
+        simulator.runtime_config(payload.cluster_type);
+    const config::PipelineStageLayerRange stage_layers =
+        config::pipeline_stage_layer_range(
+            runtime.model.num_layers,
+            runtime.parallelism.pipeline_parallel_size,
+            payload.stage_id.index());
+    bool stage_has_moe = false;
+    if (runtime.model.is_moe()) {
+        for (std::uint64_t model_layer = stage_layers.begin;
+             model_layer < stage_layers.end; ++model_layer) {
+            stage_has_moe = stage_has_moe ||
+                            runtime.model.is_moe_layer(model_layer);
+        }
+    }
+    scheduler::BaseClusterScheduler &cluster_scheduler =
+        simulator.cluster(payload.cluster_type);
+    const bool requires_sync =
+        stage_has_moe &&
+        cluster_scheduler.requires_moe_synchronization(batch, simulator);
+    const bool lazy_moe =
+        requires_sync && stage.supports_lazy_moe_prediction();
+    const auto prediction =
+        lazy_moe ? stage.prepare_moe_stage(batch, simulator.requests())
+                 : stage.predict(batch, simulator.requests());
     entities::BatchStage &batch_stage = simulator.create_batch_stage(
         batch.id(), payload.stage_id, time, prediction);
     if (simulator.execution_model(payload.cluster_type).type ==
@@ -36,17 +60,14 @@ void handle_event(const ReplicaStageSchedulePayload &payload, SimTime time,
                 std::to_string(payload.stage_id.value()),
             prediction.diagnostics);
     }
-    scheduler::BaseClusterScheduler &cluster_scheduler =
-        simulator.cluster(payload.cluster_type);
-    const bool requires_sync =
-        cluster_scheduler.requires_moe_synchronization(batch, simulator) &&
-        !prediction.moe_routing.empty();
+    if (requires_sync && prediction.moe_routing.empty()) {
+        throw std::logic_error(
+            "synchronized MoE stage preparation returned no layer");
+    }
     if (requires_sync) {
         cluster_scheduler.begin_moe_stage(batch, payload.stage_id, time,
                                           prediction, simulator);
     }
-    const config::ClusterRuntimeConfig &runtime =
-        simulator.runtime_config(payload.cluster_type);
     for (const auto &diagnostic : prediction.moe_routing) {
         simulator.metrics().record_moe_routing(batch, payload.stage_id,
                                                diagnostic, runtime);

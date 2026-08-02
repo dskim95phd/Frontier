@@ -97,7 +97,7 @@ class Simulator {
     kv_cache_transfer(TransferId transfer_id) const;
     [[nodiscard]] TransferId request_transfer_id(RequestId request_id) const;
     [[nodiscard]] bool on_decode_kv_arrival();
-    void record_request_completion(RequestId request_id);
+    void record_request_completion(RequestId request_id, SimTime time);
     [[nodiscard]] bool request_completion_recorded(RequestId request_id) const;
     [[nodiscard]] const std::vector<RequestId> &
     completion_order() const noexcept {
@@ -114,6 +114,7 @@ class Simulator {
     scheduler::GlobalScheduler::PredictorMap predictors_;
     std::size_t expected_decode_arrivals_ = 0;
     std::size_t decode_arrivals_ = 0;
+    std::size_t next_closed_loop_request_ = 0;
     std::shared_ptr<const kv_cache_transfer::BaseKVCacheTransferPredictor>
         kv_cache_transfer_predictor_;
     EventQueue event_queue_;

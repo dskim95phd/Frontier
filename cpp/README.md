@@ -11,7 +11,7 @@ Implemented behavior includes:
 - FCFS vLLM V1-style continuous batching, chunked prefill, KV-block
   accounting, and recompute preemption;
 - multiple replicas plus TP, PP, and DP;
-- fixed per-stage and Rubin/Llama-2-7B analytical execution models;
+- fixed per-stage and configurable Rubin/GB300 analytical execution models;
 - sequential prefill/decode clusters with analytical KV-cache transfer;
 - strict JSON configuration and CSV workload contracts; and
 - CTest plus production-Python differential tests.
@@ -216,6 +216,7 @@ An analytical cluster replaces its fixed execution model with:
   "type": "analytical",
   "device": "rubin",
   "precision": "fp16",
+  "moe_layer_event_mode": "detailed",
   "operator_precisions": {
     "attention": "fp8",
     "dense": "fp8",
@@ -232,6 +233,30 @@ An analytical cluster replaces its fixed execution model with:
   "intra_node_bandwidth_gbps": 14400.0
 }
 ```
+
+`device` selects a built-in hardware ceiling preset. The available presets are
+`rubin` and `gb300`. `gb300` uses dense, non-sparse per-GPU ceilings derived
+from the public GB300 NVL72 rack totals: 8 TB/s HBM, 83.333 TFLOPS FP32,
+2,500 TFLOPS FP16/BF16, 5,000 TFLOPS FP8/INT8, and 15,000 TFLOPS FP4/INT4.
+
+Any preset ceiling can be overridden independently without copying the other
+values:
+
+```json
+{
+  "device": "gb300",
+  "device_overrides": {
+    "hbm_bandwidth_tbps": 7.5,
+    "fp8_tflops": 4750.0
+  }
+}
+```
+
+The configurable ceiling fields are `hbm_bandwidth_tbps`, `fp32_tflops`,
+`fp16_tflops`, `fp8_tflops`, and `fp4_tflops`. Use `device: "custom"` to
+define hardware without a preset; custom devices must provide all five fields.
+BF16 uses the FP16 ceiling, INT8 uses the FP8 ceiling, and INT4 uses the FP4
+ceiling.
 
 `operator_precisions` is optional. Any omitted field inherits `precision`, so
 existing single-precision configs retain their behavior. Supported values are
@@ -270,6 +295,20 @@ shared experts are replicated across EP lanes and sharded only by MoE TP. The
 last PP stage also models the vocabulary-parallel LM-head projection. Supported
 attention families include dense-KV MHA/GQA/MQA, Step3Text MFA's shared-Q path,
 and latent-cache MLA. Frozen DSA remains unsupported.
+
+`moe_layer_event_mode` is optional and defaults to `detailed`. In this mode the
+analytical predictor evaluates one MoE layer only when that layer is about to
+run; the scheduler then records its routing, executes its synchronization/event
+sequence, and accumulates its execution-time components into the batch stage.
+It does not predict and retain the whole PP stage again at every layer.
+`first_layer_scaled` runs the first MoE layer through the same routing,
+expert-lane, barrier, and communication events, then waits for the first-layer
+time multiplied by the remaining contiguous MoE-layer count. Execution-time
+component totals remain unchanged. This mode is intended for repeated balanced
+analytical layers; it deliberately omits inter-layer synchronization and
+congestion changes after the representative first layer. A dense prefix is
+supported, but a dense layer after the first MoE layer in the same PP stage is
+rejected.
 
 ## Workload contract
 

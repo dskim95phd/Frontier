@@ -46,6 +46,11 @@ void handle_event(const ClusterBatchEndPayload &payload, SimTime time,
                 return value;
             }());
         }
+        // KV transfer records and queued events own all source metadata needed
+        // after this point. The scheduler retains the source KV allocation
+        // independently until complete_kv_transfer(), so the completed batch
+        // entity can be released immediately.
+        simulator.release_batch(payload.batch_id);
         simulator.event_queue().push(time, [&]() {
             ReplicaSchedulePayload value{};
             value.replica_id = target.replica_id;

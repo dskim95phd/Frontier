@@ -576,6 +576,39 @@ double analytical_precision_size_bytes(std::string_view precision) {
                       std::string{precision});
 }
 
+AnalyticalDeviceOverrides
+parse_analytical_device_overrides(const Json &execution) {
+    AnalyticalDeviceOverrides result{};
+    if (!execution.contains("device_overrides")) {
+        return result;
+    }
+    const Json &overrides = execution.at("device_overrides");
+    constexpr std::string_view context =
+        "config.execution_model.device_overrides";
+    require_keys(overrides, {},
+                 {"hbm_bandwidth_tbps", "fp32_tflops", "fp16_tflops",
+                  "fp8_tflops", "fp4_tflops"},
+                 context);
+    const auto parse_optional = [&](std::string_view field,
+                                    std::optional<double> &destination) {
+        if (!overrides.contains(field)) {
+            return;
+        }
+        const double value = require_finite_number(overrides, field, context);
+        if (value <= 0.0) {
+            throw ConfigError(std::string{context} + "." + std::string{field} +
+                              " must be positive");
+        }
+        destination = value;
+    };
+    parse_optional("hbm_bandwidth_tbps", result.hbm_bandwidth_tbps);
+    parse_optional("fp32_tflops", result.fp32_tflops);
+    parse_optional("fp16_tflops", result.fp16_tflops);
+    parse_optional("fp8_tflops", result.fp8_tflops);
+    parse_optional("fp4_tflops", result.fp4_tflops);
+    return result;
+}
+
 OperatorPrecisionConfig parse_operator_precisions(const Json &execution) {
     OperatorPrecisionConfig result{};
     if (!execution.contains("operator_precisions")) {
@@ -670,14 +703,23 @@ ExecutionModelConfig parse_execution_model(const Json &root,
                          "network_latency_us",
                          "intra_node_bandwidth_gbps",
                      },
-                     {"operator_precisions"}, "config.execution_model");
+                     {"operator_precisions", "device_overrides",
+                      "moe_layer_event_mode"},
+                     "config.execution_model");
         AnalyticalExecutionModelConfig analytical = [&]() {
             AnalyticalExecutionModelConfig value{};
             value.device =
                 require_string(execution, "device", "config.execution_model");
+            value.device_overrides =
+                parse_analytical_device_overrides(execution);
             value.precision = require_string(execution, "precision",
                                              "config.execution_model");
             value.operator_precisions = parse_operator_precisions(execution);
+            if (execution.contains("moe_layer_event_mode")) {
+                value.moe_layer_event_mode = require_string(
+                    execution, "moe_layer_event_mode",
+                    "config.execution_model");
+            }
             value.tensor_parallel_size = parallelism.tensor_parallel_size;
             value.network_bandwidth_gbps = require_finite_number(
                 execution, "network_bandwidth_gbps", "config.execution_model");
@@ -688,11 +730,28 @@ ExecutionModelConfig parse_execution_model(const Json &root,
                                       "config.execution_model");
             return value;
         }();
-        if (analytical.device != "rubin" ||
-            !is_supported_analytical_precision(analytical.precision)) {
+        if (analytical.device != "rubin" && analytical.device != "gb300" &&
+            analytical.device != "custom") {
             throw ConfigError(
-                "analytical execution requires Rubin with fp32, fp16, bf16, "
-                "fp8, int8, fp4, or int4 precision");
+                "config.execution_model.device must be 'rubin', 'gb300', or "
+                "'custom'");
+        }
+        if (analytical.device == "custom" &&
+            !analytical.device_overrides.complete()) {
+            throw ConfigError(
+                "custom analytical device requires all device_overrides "
+                "fields");
+        }
+        if (!is_supported_analytical_precision(analytical.precision)) {
+            throw ConfigError(
+                "analytical execution precision must be fp32, fp16, bf16, "
+                "fp8, int8, fp4, or int4");
+        }
+        if (analytical.moe_layer_event_mode != "detailed" &&
+            analytical.moe_layer_event_mode != "first_layer_scaled") {
+            throw ConfigError(
+                "config.execution_model.moe_layer_event_mode must be "
+                "'detailed' or 'first_layer_scaled'");
         }
         if (!model.attention.execution_enabled ||
             model.attention.memory_layout ==
@@ -819,6 +878,7 @@ struct CommonConfigFields {
     SimulationMode simulation_mode;
     SystemArchitecture system_architecture;
     bool enable_parallel_clusters;
+    std::uint64_t closed_loop_max_concurrency;
     PrefixCacheConfig prefix_cache;
 };
 
@@ -847,23 +907,34 @@ CommonConfigFields parse_common_fields(const Json &root) {
         throw ConfigError(
             "config.enable_parallel_clusters=true is outside the C++ port");
     }
+    const SimulationMode simulation_mode = parse_simulation_mode(
+        require_string(root, "simulation_mode", "config"));
+    const std::uint64_t closed_loop_max_concurrency =
+        root.contains("closed_loop_max_concurrency")
+            ? require_uint64(root, "closed_loop_max_concurrency", "config")
+            : 0;
+    if (closed_loop_max_concurrency > 0 &&
+        simulation_mode != SimulationMode::kOnline) {
+        throw ConfigError(
+            "config.closed_loop_max_concurrency requires online mode");
+    }
     return [&]() {
         CommonConfigFields value{};
         value.schema_version = schema_version;
         value.run_id = std::move(run_id);
-        value.simulation_mode = parse_simulation_mode(
-            require_string(root, "simulation_mode", "config"));
+        value.simulation_mode = simulation_mode;
         value.system_architecture = parse_system_architecture(
             require_string(root, "system_architecture", "config"));
         value.enable_parallel_clusters = enable_parallel_clusters;
+        value.closed_loop_max_concurrency = closed_loop_max_concurrency;
         value.prefix_cache = parse_prefix_cache(root);
         return value;
     }();
 }
 
 SimulationConfig make_pdd_config(const Json &root, CommonConfigFields common) {
-    require_exact_keys(root,
-                       {
+    require_keys(root,
+                 {
                            "schema_version",
                            "run_id",
                            "simulation_mode",
@@ -873,8 +944,8 @@ SimulationConfig make_pdd_config(const Json &root, CommonConfigFields common) {
                            "cluster_scheduler",
                            "clusters",
                            "kv_cache_transfer",
-                       },
-                       "config");
+                 },
+                 {"closed_loop_max_concurrency"}, "config");
     if (common.system_architecture != SystemArchitecture::kPdDisaggregation) {
         throw ConfigError(
             "PDD config requires system_architecture='pd-disaggregation'");
@@ -914,6 +985,8 @@ SimulationConfig make_pdd_config(const Json &root, CommonConfigFields common) {
         value.simulation_mode = common.simulation_mode;
         value.system_architecture = common.system_architecture;
         value.enable_parallel_clusters = common.enable_parallel_clusters;
+        value.closed_loop_max_concurrency =
+            common.closed_loop_max_concurrency;
         value.prefix_cache = common.prefix_cache;
         value.cluster_scheduler = parse_cluster_scheduler(root);
         value.runtime = std::move(runtime);
@@ -923,8 +996,8 @@ SimulationConfig make_pdd_config(const Json &root, CommonConfigFields common) {
 
 SimulationConfig make_single_cluster_config(const Json &root,
                                             CommonConfigFields common) {
-    require_exact_keys(root,
-                       {
+    require_keys(root,
+                 {
                            "schema_version",
                            "run_id",
                            "simulation_mode",
@@ -933,8 +1006,8 @@ SimulationConfig make_single_cluster_config(const Json &root,
                            "prefix_cache",
                            "cluster_scheduler",
                            "clusters",
-                       },
-                       "config");
+                 },
+                 {"closed_loop_max_concurrency"}, "config");
     if (common.system_architecture != SystemArchitecture::kCoLocation) {
         throw ConfigError("single-cluster config requires "
                           "system_architecture='co-location'");
@@ -955,6 +1028,8 @@ SimulationConfig make_single_cluster_config(const Json &root,
         value.simulation_mode = common.simulation_mode;
         value.system_architecture = common.system_architecture;
         value.enable_parallel_clusters = common.enable_parallel_clusters;
+        value.closed_loop_max_concurrency =
+            common.closed_loop_max_concurrency;
         value.prefix_cache = common.prefix_cache;
         value.cluster_scheduler = parse_cluster_scheduler(root);
         value.runtime = parse_cluster_runtime(clusters, "monolithic");

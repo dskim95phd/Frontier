@@ -2,8 +2,8 @@
 """Run a single-turn load, batch-size, and KV-capacity sweep.
 
 Request sizes follow the first-turn distribution from main's
-generate_kimi_k2_probabilistic_workload.py. The model remains the C++ port's
-validated Llama-2-7B Rubin analytical model; this is not a Kimi K2 model study.
+generate_kimi_k2_probabilistic_workload.py. Both the historical Llama-2-7B
+baseline and a Kimi K2 / GB300 PDD rack profile are available.
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ from __future__ import annotations
 import argparse
 import copy
 import csv
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import json
 import math
 from pathlib import Path
@@ -75,6 +75,17 @@ PRECISION_PROFILES = {
         "kv_cache": "fp8",
         "communication": "fp8",
     },
+    "fp8": {
+        "attention": "fp8",
+        "dense": "fp8",
+        "moe_expert": "fp8",
+        "moe_expert_weight": "fp8",
+        "moe_expert_activation": "fp8",
+        "moe_router": "fp8",
+        "lm_head": "fp8",
+        "kv_cache": "fp8",
+        "communication": "fp8",
+    },
 }
 
 
@@ -90,6 +101,15 @@ class TopologyConfig:
     prefill_tensor_parallel_size: int | None = None
     prefill_pipeline_parallel_size: int | None = None
     prefill_data_parallel_size: int | None = None
+    prefill_num_replicas: int | None = None
+    moe_tensor_parallel_size: int = 1
+    moe_expert_parallel_size: int = 1
+    prefill_moe_tensor_parallel_size: int | None = None
+    prefill_moe_expert_parallel_size: int | None = None
+    model_name: str = "meta-llama/Llama-2-7b-hf"
+    device: str = "rubin"
+    moe_layer_event_mode: str = "detailed"
+    moe_routing_distribution: str | None = None
 
     def parallelism(self, *, decode: bool) -> tuple[int, int, int, int]:
         if decode or self.system_architecture == "co-location":
@@ -100,10 +120,23 @@ class TopologyConfig:
                 self.data_parallel_size,
             )
         return (
-            self.num_replicas,
+            self.prefill_num_replicas or self.num_replicas,
             self.prefill_tensor_parallel_size or self.tensor_parallel_size,
             self.prefill_pipeline_parallel_size or self.pipeline_parallel_size,
             self.prefill_data_parallel_size or self.data_parallel_size,
+        )
+
+    def moe_parallelism(self, *, decode: bool) -> tuple[int, int]:
+        if decode or self.system_architecture == "co-location":
+            return (
+                self.moe_tensor_parallel_size,
+                self.moe_expert_parallel_size,
+            )
+        return (
+            self.prefill_moe_tensor_parallel_size
+            or self.moe_tensor_parallel_size,
+            self.prefill_moe_expert_parallel_size
+            or self.moe_expert_parallel_size,
         )
 
     @property
@@ -127,6 +160,14 @@ class TopologyConfig:
         return self.prefill_gpu_count + self.decode_gpu_count
 
     def kv_bytes_per_token_per_gpu(self, dtype_size_bytes: float) -> int:
+        if self.model_name == "moonshotai/Kimi-K2-Instruct":
+            # Latent MLA cache: 512 FP8 latent elements plus 64 FP16 RoPE
+            # elements per token and layer. Account for the largest PP stage.
+            _, _, pipeline_parallel, _ = self.parallelism(decode=True)
+            layers_per_stage = math.ceil(61 / pipeline_parallel)
+            return round(
+                layers_per_stage * (512 * dtype_size_bytes + 64 * 2.0)
+            )
         # Llama-2-7B: 32 layers, 32 KV heads, head_dim 128, K+V.
         byte_count = (
             (32 // self.pipeline_parallel_size)
@@ -172,6 +213,27 @@ TOPOLOGIES = {
         prefill_pipeline_parallel_size=4,
         prefill_data_parallel_size=8,
     ),
+    "kimi-k2-gb300-pdd-64": TopologyConfig(
+        name="kimi-k2-gb300-pdd-64",
+        system_architecture="pd-disaggregation",
+        tensor_parallel_size=4,
+        pipeline_parallel_size=4,
+        data_parallel_size=4,
+        moe_tensor_parallel_size=1,
+        moe_expert_parallel_size=16,
+        num_replicas=1,
+        cluster_count=2,
+        prefill_tensor_parallel_size=4,
+        prefill_pipeline_parallel_size=4,
+        prefill_data_parallel_size=1,
+        prefill_num_replicas=4,
+        prefill_moe_tensor_parallel_size=1,
+        prefill_moe_expert_parallel_size=4,
+        model_name="moonshotai/Kimi-K2-Instruct",
+        device="gb300",
+        moe_layer_event_mode="first_layer_scaled",
+        moe_routing_distribution="balanced",
+    ),
 }
 
 
@@ -192,6 +254,10 @@ class WorkloadConfig:
 @dataclass(frozen=True)
 class WorkloadProfile:
     name: str
+    prompt_median: int
+    prompt_sigma: float
+    prompt_min: int
+    prompt_max: int
     output_median: int
     output_sigma: float
     output_min: int
@@ -201,6 +267,10 @@ class WorkloadProfile:
 WORKLOAD_PROFILES = {
     "kimi-short": WorkloadProfile(
         name="kimi-short",
+        prompt_median=8_192,
+        prompt_sigma=0.8,
+        prompt_min=2_048,
+        prompt_max=32_768,
         output_median=8,
         output_sigma=0.7,
         output_min=4,
@@ -208,6 +278,10 @@ WORKLOAD_PROFILES = {
     ),
     "prefill-heavy": WorkloadProfile(
         name="prefill-heavy",
+        prompt_median=8_192,
+        prompt_sigma=0.8,
+        prompt_min=2_048,
+        prompt_max=32_768,
         output_median=256,
         output_sigma=0.7,
         output_min=64,
@@ -215,10 +289,27 @@ WORKLOAD_PROFILES = {
     ),
     "balanced-8k-1k": WorkloadProfile(
         name="balanced-8k-1k",
+        prompt_median=8_192,
+        prompt_sigma=0.8,
+        prompt_min=2_048,
+        prompt_max=32_768,
         output_median=1_024,
         output_sigma=0.7,
         output_min=256,
         output_max=4_096,
+    ),
+    "balanced-4k-4k": WorkloadProfile(
+        name="balanced-4k-4k",
+        # These medians produce 4,096.117 ISL and 4,096.000 OSL means for
+        # the canonical 1,000-request seed while retaining stochastic lengths.
+        prompt_median=3_414,
+        prompt_sigma=0.55,
+        prompt_min=1_024,
+        prompt_max=16_384,
+        output_median=3_512,
+        output_sigma=0.55,
+        output_min=1_024,
+        output_max=16_384,
     ),
 }
 
@@ -314,10 +405,13 @@ def write_config(
     num_blocks: int,
     topology: TopologyConfig,
     operator_precisions: dict[str, str],
+    closed_loop_max_concurrency: int = 0,
 ) -> None:
     config = json.loads(BASE_CONFIG.read_text(encoding="utf-8"))
     config["run_id"] = run_id
     config["simulation_mode"] = "online"
+    if closed_loop_max_concurrency > 0:
+        config["closed_loop_max_concurrency"] = closed_loop_max_concurrency
     base_cluster = config["clusters"]["monolithic"]
 
     def make_cluster(*, decode: bool) -> dict:
@@ -325,14 +419,17 @@ def write_config(
         replicas, tensor_parallel, pipeline_parallel, data_parallel = (
             topology.parallelism(decode=decode)
         )
+        moe_tensor_parallel, moe_expert_parallel = topology.moe_parallelism(
+            decode=decode
+        )
         cluster["parallelism"].update(
             {
                 "num_replicas": replicas,
                 "tensor_parallel_size": tensor_parallel,
                 "pipeline_parallel_size": pipeline_parallel,
                 "data_parallel_size": data_parallel,
-                "moe_tensor_parallel_size": 1,
-                "moe_expert_parallel_size": 1,
+                "moe_tensor_parallel_size": moe_tensor_parallel,
+                "moe_expert_parallel_size": moe_expert_parallel,
             }
         )
         cluster["scheduler"].update(
@@ -357,6 +454,20 @@ def write_config(
         cluster["execution_model"]["operator_precisions"] = dict(
             operator_precisions
         )
+        cluster["execution_model"]["precision"] = operator_precisions[
+            "attention"
+        ]
+        cluster["execution_model"]["device"] = topology.device
+        cluster["execution_model"]["moe_layer_event_mode"] = (
+            topology.moe_layer_event_mode
+        )
+        if topology.moe_routing_distribution is not None:
+            cluster["moe_routing"]["distribution"] = (
+                topology.moe_routing_distribution
+            )
+        cluster["model_name"] = topology.model_name
+        cluster.pop("total_expert_num", None)
+        cluster.pop("router_topk", None)
         return cluster
 
     config["system_architecture"] = topology.system_architecture
@@ -788,11 +899,28 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--requests", type=int, default=64)
+    parser.add_argument(
+        "--calibration-requests",
+        type=int,
+        help=(
+            "Use this many representative request shapes for isolated-service "
+            "calibration. Defaults to all requests."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=20260728)
     parser.add_argument(
         "--offered-concurrency",
         type=parse_float_list,
         default=parse_float_list("1,2,4,8,16,32"),
+    )
+    parser.add_argument(
+        "--closed-loop-concurrency",
+        action="store_true",
+        help=(
+            "Interpret --offered-concurrency values as exact total in-flight "
+            "request targets. Release one replacement whenever a request "
+            "completes instead of generating Poisson arrivals."
+        ),
     )
     parser.add_argument(
         "--batch-sizes",
@@ -855,6 +983,14 @@ def build_parser() -> argparse.ArgumentParser:
             "paired load comparison."
         ),
     )
+    parser.add_argument(
+        "--moe-layer-event-mode",
+        choices=("detailed", "first_layer_scaled"),
+        help=(
+            "Override the topology's analytical MoE event mode; useful for "
+            "paired detailed-versus-scaled validation."
+        ),
+    )
     parser.add_argument("--resume", action="store_true")
     return parser
 
@@ -862,6 +998,10 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     topology = TOPOLOGIES[args.topology]
+    if args.moe_layer_event_mode is not None:
+        topology = replace(
+            topology, moe_layer_event_mode=args.moe_layer_event_mode
+        )
     workload_profile = WORKLOAD_PROFILES[args.workload_profile]
     operator_precisions = PRECISION_PROFILES[args.precision_profile]
     kv_dtype_size_bytes = PRECISION_BYTES[operator_precisions["kv_cache"]]
@@ -873,6 +1013,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise SystemExit(f"binary not found: {binary}")
     if args.requests <= 0:
         raise SystemExit("--requests must be positive")
+    if args.calibration_requests is not None and (
+        args.calibration_requests <= 0
+        or args.calibration_requests > args.requests
+    ):
+        raise SystemExit(
+            "--calibration-requests must be in [1, --requests]"
+        )
     if args.timeout_seconds <= 0:
         raise SystemExit("--timeout-seconds must be positive")
     if args.prefill_chunk_tokens <= 0:
@@ -937,6 +1084,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     workload_config = WorkloadConfig(
         requests=args.requests,
         seed=args.seed,
+        prompt_median=workload_profile.prompt_median,
+        prompt_sigma=workload_profile.prompt_sigma,
+        prompt_min=workload_profile.prompt_min,
+        prompt_max=workload_profile.prompt_max,
         output_median=workload_profile.output_median,
         output_sigma=workload_profile.output_sigma,
         output_min=workload_profile.output_min,
@@ -944,54 +1095,84 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     shapes = generate_shapes(workload_config)
 
-    calibration_workload = inputs_dir / "calibration.csv"
-    calibration_config = inputs_dir / "calibration.json"
-    write_workload(calibration_workload, shapes, arrival_rate=None)
-    write_config(
-        calibration_config,
-        run_id="single-turn-load-calibration",
-        prefill_batch_size_cap=1,
-        decode_batch_size_cap=1,
-        max_tokens_in_batch=args.max_tokens_in_batch,
-        prefill_chunk_tokens=args.prefill_chunk_tokens,
-        num_blocks=max(num_blocks_values),
-        topology=topology,
-        operator_precisions=operator_precisions,
+    if args.closed_loop_concurrency and any(
+        not float(value).is_integer() for value in args.offered_concurrency
+    ):
+        raise SystemExit(
+            "closed-loop concurrency values must be positive integers"
+        )
+    calibration_request_count = (
+        0
+        if args.closed_loop_concurrency
+        else (args.calibration_requests or len(shapes))
     )
-    print("calibration start", flush=True)
-    calibration, calibration_process_seconds = run_simulator(
-        binary,
-        calibration_config,
-        calibration_workload,
-        timeout_seconds=args.timeout_seconds,
-    )
-    isolated_service_seconds = statistics.fmean(
-        float(row["e2e_ms"]) / 1_000.0
-        for row in calibration["requests"]
-    )
-    if isolated_service_seconds <= 0.0:
-        raise RuntimeError("isolated mean service time must be positive")
-    print(
-        f"calibration mean_service_s={isolated_service_seconds:.9f} "
-        f"process_s={calibration_process_seconds:.3f}",
-        flush=True,
-    )
-    arrival_reference_service_seconds = (
-        args.arrival_reference_service_seconds
-        if args.arrival_reference_service_seconds is not None
-        else isolated_service_seconds
-    )
-    print(
-        "arrival reference_service_s="
-        f"{arrival_reference_service_seconds:.9f}",
-        flush=True,
-    )
+    prompt_mean = statistics.fmean(shape.prompt_tokens for shape in shapes)
+    output_mean = statistics.fmean(shape.output_tokens for shape in shapes)
+    calibration_shapes = sorted(
+        shapes,
+        key=lambda shape: (
+            abs(shape.prompt_tokens - prompt_mean)
+            + abs(shape.output_tokens - output_mean)
+        ),
+    )[:calibration_request_count]
+
+    if args.closed_loop_concurrency:
+        isolated_service_seconds = 0.0
+        arrival_reference_service_seconds = 0.0
+        print("closed-loop concurrency mode; calibration skipped", flush=True)
+    else:
+        calibration_workload = inputs_dir / "calibration.csv"
+        calibration_config = inputs_dir / "calibration.json"
+        write_workload(
+            calibration_workload, calibration_shapes, arrival_rate=None
+        )
+        write_config(
+            calibration_config,
+            run_id="single-turn-load-calibration",
+            prefill_batch_size_cap=1,
+            decode_batch_size_cap=1,
+            max_tokens_in_batch=args.max_tokens_in_batch,
+            prefill_chunk_tokens=args.prefill_chunk_tokens,
+            num_blocks=max(num_blocks_values),
+            topology=topology,
+            operator_precisions=operator_precisions,
+        )
+        print("calibration start", flush=True)
+        calibration, calibration_process_seconds = run_simulator(
+            binary,
+            calibration_config,
+            calibration_workload,
+            timeout_seconds=args.timeout_seconds,
+        )
+        isolated_service_seconds = statistics.fmean(
+            float(row["e2e_ms"]) / 1_000.0
+            for row in calibration["requests"]
+        )
+        if isolated_service_seconds <= 0.0:
+            raise RuntimeError("isolated mean service time must be positive")
+        print(
+            f"calibration mean_service_s={isolated_service_seconds:.9f} "
+            f"process_s={calibration_process_seconds:.3f}",
+            flush=True,
+        )
+        arrival_reference_service_seconds = (
+            args.arrival_reference_service_seconds
+            if args.arrival_reference_service_seconds is not None
+            else isolated_service_seconds
+        )
+        print(
+            "arrival reference_service_s="
+            f"{arrival_reference_service_seconds:.9f}",
+            flush=True,
+        )
 
     workloads: dict[float, Path] = {}
     arrival_rates: dict[float, float] = {}
     for offered_concurrency in args.offered_concurrency:
         arrival_rate = (
-            offered_concurrency / arrival_reference_service_seconds
+            0.0
+            if args.closed_loop_concurrency
+            else offered_concurrency / arrival_reference_service_seconds
         )
         workload_path = (
             inputs_dir / f"load_c{offered_concurrency:g}.csv"
@@ -999,7 +1180,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         write_workload(
             workload_path,
             shapes,
-            arrival_rate=arrival_rate,
+            arrival_rate=1.0 if args.closed_loop_concurrency else arrival_rate,
         )
         workloads[offered_concurrency] = workload_path
         arrival_rates[offered_concurrency] = arrival_rate
@@ -1062,6 +1243,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                     num_blocks=num_blocks,
                     topology=topology,
                     operator_precisions=operator_precisions,
+                    closed_loop_max_concurrency=(
+                        int(offered_concurrency)
+                        if args.closed_loop_concurrency
+                        else 0
+                    ),
                 )
                 print(
                     f"[{case_index}/{total_cases}] {run_id}",
@@ -1137,8 +1323,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     manifest = {
         "description": (
-            "Single-turn Poisson load sweep using the first-turn Kimi K2 "
-            "workload distribution with the Llama-2-7B Rubin analytical model."
+            "Single-turn load sweep using probabilistic request lengths and "
+            "a configurable analytical model topology."
         ),
         "workload": asdict(
             workload_config
@@ -1155,11 +1341,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             ),
         },
         "isolated_mean_service_seconds": isolated_service_seconds,
+        "calibration_requests": calibration_request_count,
         "arrival_reference_service_seconds": (
             arrival_reference_service_seconds
         ),
         "offered_concurrency": args.offered_concurrency,
         "arrival_rates_rps": arrival_rates,
+        "concurrency_mode": (
+            "closed_loop" if args.closed_loop_concurrency else "poisson"
+        ),
         "batch_sizes": (
             [] if args.unbounded_decode_batch else args.batch_sizes
         ),
@@ -1174,18 +1364,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         "topology": {
             "name": topology.name,
             "system_architecture": topology.system_architecture,
-            "model": "meta-llama/Llama-2-7b-hf",
-            "device": "rubin",
-            "precision": "fp16",
+            "model": topology.model_name,
+            "device": topology.device,
+            "precision": operator_precisions["attention"],
             "operator_precisions": operator_precisions,
             "cluster_count": topology.cluster_count,
             "num_replicas_per_cluster": topology.num_replicas,
+            "prefill_num_replicas": topology.parallelism(decode=False)[0],
+            "decode_num_replicas": topology.parallelism(decode=True)[0],
             "tensor_parallel_size": topology.tensor_parallel_size,
             "pipeline_parallel_size": topology.pipeline_parallel_size,
             "data_parallel_size": topology.data_parallel_size,
             "gpu_count_per_cluster": topology.gpu_count_per_cluster,
             "prefill_parallelism": topology.parallelism(decode=False),
             "decode_parallelism": topology.parallelism(decode=True),
+            "prefill_moe_parallelism": topology.moe_parallelism(
+                decode=False
+            ),
+            "decode_moe_parallelism": topology.moe_parallelism(decode=True),
             "prefill_gpu_count": topology.prefill_gpu_count,
             "decode_gpu_count": topology.decode_gpu_count,
             "physical_gpu_count": topology.physical_gpu_count,

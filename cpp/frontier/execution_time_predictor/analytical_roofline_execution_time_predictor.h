@@ -54,6 +54,18 @@ struct DeviceCeilings {
             22.0, 400.0, 4'000.0, 17'500.0, 35'000.0,
         };
     }
+
+    // Dense, non-sparse per-GPU ceilings derived from the public GB300 NVL72
+    // rack totals. Overrides in AnalyticalExecutionModelConfig are applied
+    // after selecting this preset.
+    [[nodiscard]] static constexpr DeviceCeilings gb300() noexcept {
+        return DeviceCeilings{
+            8.0, 83.33333333333333, 2'500.0, 5'000.0, 15'000.0,
+        };
+    }
+
+    [[nodiscard]] static DeviceCeilings
+    from_config(const config::AnalyticalExecutionModelConfig &config);
 };
 
 struct KernelWork {
@@ -389,9 +401,26 @@ class AnalyticalRooflineExecutionTimePredictor final
     predict_stage_execution_time(const entities::Batch &batch,
                                  const std::vector<entities::Request> &requests,
                                  StageId stage_id) const override;
+    [[nodiscard]] bool supports_lazy_moe_prediction() const noexcept override {
+        return true;
+    }
+    [[nodiscard]] ExecutionTimePrediction prepare_moe_stage_execution(
+        const entities::Batch &batch,
+        const std::vector<entities::Request> &requests,
+        StageId stage_id) const override;
+    [[nodiscard]] ExecutionTimePrediction predict_moe_layer_execution(
+        const entities::Batch &batch,
+        const std::vector<entities::Request> &requests, StageId stage_id,
+        std::uint64_t local_moe_layer) const override;
 
   private:
+    [[nodiscard]] ExecutionTimePrediction predict_execution(
+        const entities::Batch &batch,
+        const std::vector<entities::Request> &requests, StageId stage_id,
+        std::optional<std::uint64_t> selected_moe_layer) const;
+
     config::AnalyticalExecutionModelConfig config_;
+    detail::DeviceCeilings device_;
     config::ParallelismConfig parallelism_;
     config::ModelConfig model_;
     config::MoeRoutingConfig routing_;

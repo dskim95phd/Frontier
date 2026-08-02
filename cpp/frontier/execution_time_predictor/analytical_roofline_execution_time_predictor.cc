@@ -205,6 +205,8 @@ struct MoEStagePrediction {
     entities::ExecutionTime execution_time;
     std::vector<std::pair<std::string, double>> diagnostics;
     std::vector<MoERoutingDiagnostic> routing_diagnostics;
+    std::uint64_t logical_moe_layer_count = 0;
+    double repeated_moe_layer_pre_compute_ms = 0.0;
     double suffix_compute_ms = 0.0;
 };
 
@@ -212,6 +214,7 @@ struct MoEStageContext {
     ClusterType cluster_type;
     const StageBatchInfo &batch_info;
     const config::AnalyticalExecutionModelConfig &config;
+    const detail::DeviceCeilings &device;
     const config::ParallelismConfig &parallelism;
     const config::ModelConfig &model;
     const config::MoeRoutingConfig &routing;
@@ -234,6 +237,111 @@ struct MoEStageContext {
         return 2.0 * allreduce_ms;
     }
 };
+
+MoEStagePrediction predict_selected_moe_layer_execution(
+    const MoEStageContext &context, std::uint64_t selected_moe_layer) {
+    const StageBatchInfo &batch_info = context.batch_info;
+    const config::ParallelismConfig &parallelism = context.parallelism;
+    const config::ModelConfig &model = context.model;
+    const detail::DenseLayerTimes &dense_layer = context.dense_layer;
+    MoEStagePrediction result{};
+    result.execution_time = context.base_execution_time;
+    result.execution_time.dense_compute_ms = 0.0;
+    result.execution_time.tp_communication_ms = 0.0;
+    result.execution_time.moe_gating_linear_ms = 0.0;
+    result.execution_time.moe_gating_routing_topk_ms = 0.0;
+    result.execution_time.moe_grouped_gemm_ms = 0.0;
+    result.execution_time.moe_shuffling_ms = 0.0;
+    result.execution_time.moe_post_attention_norm_ms = 0.0;
+    result.execution_time.moe_tp_communication_ms = 0.0;
+    result.execution_time.ep_dispatch_ms = 0.0;
+    result.execution_time.ep_combine_ms = 0.0;
+    result.execution_time.dp_input_communication_ms = 0.0;
+    result.execution_time.dp_output_communication_ms = 0.0;
+
+    const detail::MoEModel moe_model = make_moe_model(model, parallelism);
+    const detail::MoEOperatorPrecisions moe_precisions =
+        make_moe_operator_precisions(context.config);
+    double pending_dense_compute_ms = 0.0;
+    double pending_tp_communication_ms = 0.0;
+    std::uint64_t local_moe_layer = 0;
+    for (std::uint64_t model_layer = context.stage_layers.begin;
+         model_layer < context.stage_layers.end; ++model_layer) {
+        if (!model.is_moe_layer(model_layer)) {
+            pending_dense_compute_ms += context.dense_layer_compute_ms();
+            pending_tp_communication_ms += context.tp_layer_ms();
+            continue;
+        }
+        ++result.logical_moe_layer_count;
+        if (local_moe_layer == selected_moe_layer) {
+            const double pre_moe_compute_ms =
+                pending_dense_compute_ms + context.attention_compute_ms();
+            result.execution_time.dense_compute_ms += pre_moe_compute_ms;
+            result.execution_time.tp_communication_ms +=
+                pending_tp_communication_ms + context.allreduce_ms;
+            const detail::RoutingAllocation allocation = detail::route_tokens(
+                batch_info.dense_batch.total_tokens, model.router_topk,
+                model.total_expert_num,
+                parallelism.moe_expert_parallel_size, context.routing,
+                model_layer);
+            const detail::MoELanePrediction lane_prediction =
+                detail::predict_moe_lanes(
+                    context.device, detail::AnalyticalConfig{}, moe_model,
+                    allocation, model.router_topk, moe_precisions);
+            result.routing_diagnostics.push_back(make_moe_routing_diagnostic(
+                local_moe_layer, model_layer, pre_moe_compute_ms, allocation,
+                lane_prediction));
+            const detail::MoELayerTime &critical =
+                lane_prediction.lane_times.at(static_cast<std::size_t>(
+                    lane_prediction.critical_lane));
+            add_critical_moe_layer_time(result.execution_time, critical,
+                                        dense_layer.residual_add_ms);
+            result.diagnostics.emplace_back(
+                "layer_" + std::to_string(model_layer) + "_critical_lane",
+                static_cast<double>(lane_prediction.critical_lane));
+            result.diagnostics.emplace_back(
+                "layer_" + std::to_string(model_layer) +
+                    "_critical_lane_ms",
+                lane_prediction.critical_lane_time_ms);
+        }
+        pending_dense_compute_ms = 0.0;
+        pending_tp_communication_ms = 0.0;
+        ++local_moe_layer;
+    }
+    if (selected_moe_layer >= result.logical_moe_layer_count ||
+        result.routing_diagnostics.size() != 1) {
+        throw ExecutionTimePredictorError(
+            "lazy MoE layer index is outside the pipeline stage");
+    }
+    if (selected_moe_layer == 0) {
+        result.suffix_compute_ms = pending_dense_compute_ms;
+        result.execution_time.dense_compute_ms += pending_dense_compute_ms;
+        result.execution_time.tp_communication_ms +=
+            pending_tp_communication_ms;
+    }
+
+    const detail::MoECommunicationTime communication_time =
+        detail::predict_moe_communication(
+            context.communication_backend, batch_info.dense_batch.total_tokens,
+            model.hidden_size,
+            batch_info.dense_batch.total_tokens * model.router_topk,
+            parallelism.tensor_parallel_size,
+            parallelism.moe_tensor_parallel_size,
+            parallelism.moe_expert_parallel_size,
+            parallelism.data_parallel_size, false,
+            context.communication_element_bytes);
+    result.execution_time.moe_tp_communication_ms =
+        communication_time.moe_tp_ms;
+    result.execution_time.ep_dispatch_ms = communication_time.ep_dispatch_ms;
+    result.execution_time.ep_combine_ms = communication_time.ep_combine_ms;
+    if (context.cluster_type == ClusterType::kDecode) {
+        result.execution_time.dp_input_communication_ms =
+            communication_time.dp_input_ms;
+        result.execution_time.dp_output_communication_ms =
+            communication_time.dp_output_ms;
+    }
+    return result;
+}
 
 MoEStagePrediction predict_moe_stage_execution(const MoEStageContext &context) {
     const StageBatchInfo &batch_info = context.batch_info;
@@ -259,9 +367,17 @@ MoEStagePrediction predict_moe_stage_execution(const MoEStageContext &context) {
         make_moe_operator_precisions(config);
     double pending_pre_moe_compute_ms = 0.0;
     std::uint64_t moe_layer_index = 0;
+    std::optional<detail::MoELanePrediction> repeated_lane_prediction;
+    const bool first_layer_scaled =
+        config.moe_layer_event_mode == "first_layer_scaled";
     for (std::uint64_t model_layer = stage_layers.begin;
          model_layer < stage_layers.end; ++model_layer) {
         if (!model.is_moe_layer(model_layer)) {
+            if (first_layer_scaled && repeated_lane_prediction.has_value()) {
+                throw ExecutionTimePredictorError(
+                    "first_layer_scaled requires a contiguous MoE suffix "
+                    "within each pipeline stage");
+            }
             result.execution_time.dense_compute_ms += dense_layer_compute_ms;
             result.execution_time.tp_communication_ms += context.tp_layer_ms();
             pending_pre_moe_compute_ms += dense_layer_compute_ms;
@@ -269,6 +385,16 @@ MoEStagePrediction predict_moe_stage_execution(const MoEStageContext &context) {
         }
         result.execution_time.dense_compute_ms += attention_compute_ms;
         result.execution_time.tp_communication_ms += context.allreduce_ms;
+        ++result.logical_moe_layer_count;
+        if (first_layer_scaled && repeated_lane_prediction.has_value()) {
+            const detail::MoELayerTime &critical =
+                repeated_lane_prediction->lane_times.at(
+                    static_cast<std::size_t>(
+                        repeated_lane_prediction->critical_lane));
+            add_critical_moe_layer_time(result.execution_time, critical,
+                                        dense_layer.residual_add_ms);
+            continue;
+        }
         pending_pre_moe_compute_ms += attention_compute_ms;
         const detail::RoutingAllocation allocation = detail::route_tokens(
             batch_info.dense_batch.total_tokens, model.router_topk,
@@ -276,8 +402,8 @@ MoEStagePrediction predict_moe_stage_execution(const MoEStageContext &context) {
             routing, model_layer);
         const detail::MoELanePrediction lane_prediction =
             detail::predict_moe_lanes(
-                detail::DeviceCeilings::rubin(), detail::AnalyticalConfig{},
-                moe_model, allocation, model.router_topk, moe_precisions);
+                context.device, detail::AnalyticalConfig{}, moe_model,
+                allocation, model.router_topk, moe_precisions);
         result.routing_diagnostics.push_back(make_moe_routing_diagnostic(
             moe_layer_index, model_layer, pending_pre_moe_compute_ms,
             allocation, lane_prediction));
@@ -293,6 +419,10 @@ MoEStagePrediction predict_moe_stage_execution(const MoEStageContext &context) {
                                         lane_prediction.critical_lane_time_ms);
         pending_pre_moe_compute_ms = 0.0;
         ++moe_layer_index;
+        if (first_layer_scaled) {
+            repeated_lane_prediction = lane_prediction;
+            result.repeated_moe_layer_pre_compute_ms = attention_compute_ms;
+        }
     }
     result.suffix_compute_ms = pending_pre_moe_compute_ms;
     const detail::MoECommunicationTime communication_time =
@@ -306,7 +436,7 @@ MoEStagePrediction predict_moe_stage_execution(const MoEStageContext &context) {
             parallelism.data_parallel_size, false,
             context.communication_element_bytes);
     const double moe_layers =
-        static_cast<double>(result.routing_diagnostics.size());
+        static_cast<double>(result.logical_moe_layer_count);
     result.execution_time.moe_tp_communication_ms =
         moe_layers * communication_time.moe_tp_ms;
     result.execution_time.ep_dispatch_ms =
@@ -384,8 +514,9 @@ AnalyticalRooflineExecutionTimePredictor::
         config::ParallelismConfig parallelism, config::ModelConfig model,
         config::MoeRoutingConfig routing,
         std::shared_ptr<const cc_backend::BaseCCBackend> communication_backend)
-    : config_(std::move(config)), parallelism_(parallelism),
-      model_(std::move(model)), routing_(routing),
+    : config_(std::move(config)),
+      device_(detail::DeviceCeilings::from_config(config_)),
+      parallelism_(parallelism), model_(std::move(model)), routing_(routing),
       communication_backend_(std::move(communication_backend)) {
     if (parallelism_.tensor_parallel_size == 0) {
         parallelism_.tensor_parallel_size = config_.tensor_parallel_size;
@@ -398,7 +529,7 @@ AnalyticalRooflineExecutionTimePredictor::
             return false;
         }
     };
-    if (communication_backend_ == nullptr || config_.device != "rubin" ||
+    if (communication_backend_ == nullptr ||
         !supported_precision(config_.precision) ||
         !supported_precision(config_.attention_precision()) ||
         !supported_precision(config_.dense_precision()) ||
@@ -416,6 +547,8 @@ AnalyticalRooflineExecutionTimePredictor::
         !supported_precision(config_.moe_router_activation_precision()) ||
         !supported_precision(config_.lm_head_weight_precision()) ||
         !supported_precision(config_.lm_head_activation_precision()) ||
+        (config_.moe_layer_event_mode != "detailed" &&
+         config_.moe_layer_event_mode != "first_layer_scaled") ||
         model_.attention.memory_layout ==
             attention::AttentionMemoryLayout::kFrozenDsa ||
         parallelism_.tensor_parallel_size == 0 ||
@@ -430,6 +563,41 @@ ExecutionTimePrediction
 AnalyticalRooflineExecutionTimePredictor::predict_stage_execution_time(
     const entities::Batch &batch,
     const std::vector<entities::Request> &requests, StageId stage_id) const {
+    return predict_execution(batch, requests, stage_id, std::nullopt);
+}
+
+ExecutionTimePrediction
+AnalyticalRooflineExecutionTimePredictor::prepare_moe_stage_execution(
+    const entities::Batch &batch,
+    const std::vector<entities::Request> &requests, StageId stage_id) const {
+    if (!model_.is_moe()) {
+        throw ExecutionTimePredictorError(
+            "dense model cannot prepare lazy MoE execution");
+    }
+    if (config_.moe_layer_event_mode == "first_layer_scaled") {
+        return predict_execution(batch, requests, stage_id, std::nullopt);
+    }
+    return predict_execution(batch, requests, stage_id, std::uint64_t{0});
+}
+
+ExecutionTimePrediction
+AnalyticalRooflineExecutionTimePredictor::predict_moe_layer_execution(
+    const entities::Batch &batch,
+    const std::vector<entities::Request> &requests, StageId stage_id,
+    std::uint64_t local_moe_layer) const {
+    if (!model_.is_moe() ||
+        config_.moe_layer_event_mode == "first_layer_scaled") {
+        throw ExecutionTimePredictorError(
+            "lazy MoE layer prediction requires detailed analytical mode");
+    }
+    return predict_execution(batch, requests, stage_id, local_moe_layer);
+}
+
+ExecutionTimePrediction
+AnalyticalRooflineExecutionTimePredictor::predict_execution(
+    const entities::Batch &batch,
+    const std::vector<entities::Request> &requests, StageId stage_id,
+    std::optional<std::uint64_t> selected_moe_layer) const {
     if (!stage_id.valid() ||
         stage_id.index() >= parallelism_.pipeline_parallel_size) {
         throw ExecutionTimePredictorError(
@@ -444,7 +612,7 @@ AnalyticalRooflineExecutionTimePredictor::predict_stage_execution_time(
     const detail::Precision communication_precision =
         detail::precision_from_string(config_.communication_precision());
     const detail::DenseLayerTimes layer = detail::predict_dense_layer(
-        detail::DeviceCeilings::rubin(), detail::AnalyticalConfig{},
+        device_, detail::AnalyticalConfig{},
         make_dense_model(model_, parallelism_), dense_batch, dense_precisions);
 
     const double communication_element_bytes =
@@ -478,21 +646,28 @@ AnalyticalRooflineExecutionTimePredictor::predict_stage_execution_time(
     execution_time.pp_communication_ms = pp_communication_ms;
     if (stage_id.index() + 1 == parallelism_.pipeline_parallel_size) {
         execution_time.lm_head_ms = detail::predict_output_projection_ms(
-            detail::DeviceCeilings::rubin(), detail::AnalyticalConfig{},
-            batch_info.lm_head_tokens, model_.hidden_size, model_.vocab_size,
+            device_, detail::AnalyticalConfig{}, batch_info.lm_head_tokens,
+            model_.hidden_size, model_.vocab_size,
             parallelism_.tensor_parallel_size,
             detail::precision_from_string(config_.lm_head_weight_precision()),
             detail::precision_from_string(
                 config_.lm_head_activation_precision()));
     }
+    if (selected_moe_layer.has_value() && selected_moe_layer.value() > 0) {
+        execution_time.lm_head_ms = 0.0;
+        execution_time.pp_communication_ms = 0.0;
+    }
     std::vector<std::pair<std::string, double>> moe_diagnostics;
     std::vector<MoERoutingDiagnostic> routing_diagnostics;
+    std::uint64_t logical_moe_layer_count = 0;
+    double repeated_moe_layer_pre_compute_ms = 0.0;
     double moe_suffix_compute_ms = 0.0;
     if (model_.is_moe()) {
         const MoEStageContext moe_context{
             batch.cluster_type(),
             batch_info,
             config_,
+            device_,
             parallelism_,
             model_,
             routing_,
@@ -504,10 +679,16 @@ AnalyticalRooflineExecutionTimePredictor::predict_stage_execution_time(
             execution_time,
         };
         const MoEStagePrediction moe_prediction =
-            predict_moe_stage_execution(moe_context);
+            selected_moe_layer.has_value()
+                ? predict_selected_moe_layer_execution(
+                      moe_context, selected_moe_layer.value())
+                : predict_moe_stage_execution(moe_context);
         execution_time = moe_prediction.execution_time;
         moe_diagnostics = moe_prediction.diagnostics;
         routing_diagnostics = moe_prediction.routing_diagnostics;
+        logical_moe_layer_count = moe_prediction.logical_moe_layer_count;
+        repeated_moe_layer_pre_compute_ms =
+            moe_prediction.repeated_moe_layer_pre_compute_ms;
         moe_suffix_compute_ms = moe_prediction.suffix_compute_ms;
     }
     dense_compute_ms = execution_time.dense_compute_ms;
@@ -564,7 +745,14 @@ AnalyticalRooflineExecutionTimePredictor::predict_stage_execution_time(
         {"batch_duration_ms", duration_ms},
     };
     result.moe_routing = std::move(routing_diagnostics);
+    result.logical_moe_layer_count = logical_moe_layer_count;
+    result.repeated_moe_layer_pre_compute_ms =
+        repeated_moe_layer_pre_compute_ms;
     result.moe_suffix_compute_ms = moe_suffix_compute_ms;
+    result.lazy_moe_layer_prediction = selected_moe_layer.has_value();
+    result.scaled_moe_layer_prediction =
+        !selected_moe_layer.has_value() &&
+        config_.moe_layer_event_mode == "first_layer_scaled";
     result.diagnostics.insert(result.diagnostics.end(), moe_diagnostics.begin(),
                               moe_diagnostics.end());
     return result;
@@ -573,6 +761,48 @@ AnalyticalRooflineExecutionTimePredictor::predict_stage_execution_time(
 } // namespace frontier::execution_time_predictor
 
 namespace frontier::execution_time_predictor::detail {
+
+DeviceCeilings DeviceCeilings::from_config(
+    const config::AnalyticalExecutionModelConfig &config) {
+    DeviceCeilings result{};
+    if (config.device == "rubin") {
+        result = rubin();
+    } else if (config.device == "gb300") {
+        result = gb300();
+    } else if (config.device != "custom") {
+        throw AnalyticalModelError("unknown analytical device preset: " +
+                                   config.device);
+    }
+
+    const config::AnalyticalDeviceOverrides &overrides =
+        config.device_overrides;
+    const auto apply = [](const std::optional<double> &override_value,
+                          double &destination) {
+        if (override_value.has_value()) {
+            destination = override_value.value();
+        }
+    };
+    apply(overrides.hbm_bandwidth_tbps, result.hbm_bandwidth_tbps);
+    apply(overrides.fp32_tflops, result.fp32_tflops);
+    apply(overrides.fp16_tflops, result.fp16_tflops);
+    apply(overrides.fp8_tflops, result.fp8_tflops);
+    apply(overrides.fp4_tflops, result.fp4_tflops);
+
+    for (const auto &[value, name] : {
+             std::pair{result.hbm_bandwidth_tbps, "HBM bandwidth"},
+             std::pair{result.fp32_tflops, "FP32 ceiling"},
+             std::pair{result.fp16_tflops, "FP16 ceiling"},
+             std::pair{result.fp8_tflops, "FP8 ceiling"},
+             std::pair{result.fp4_tflops, "FP4 ceiling"},
+         }) {
+        if (!std::isfinite(value) || value <= 0.0) {
+            throw AnalyticalModelError(std::string{name} +
+                                       " must be finite and positive");
+        }
+    }
+    return result;
+}
+
 namespace {
 
 void require_finite_nonnegative(double value, const char *field) {

@@ -63,7 +63,7 @@ void test_pdd_contract_round_trip() {
 }
 
 void test_analytical_contract_round_trip() {
-    const auto config = load("analytical_parallel_colocation.json");
+    auto config = load("analytical_parallel_colocation.json");
     expect(config.cluster().execution_model.type ==
                ExecutionModelType::kAnalytical,
            "analytical execution model must parse");
@@ -79,6 +79,51 @@ void test_analytical_contract_round_trip() {
             static_cast<void>(parse_simulation_config_json(unsupported));
         },
         "unsupported analytical hardware must fail fast");
+
+    auto &analytical = config.cluster().execution_model.analytical;
+    analytical.device = "gb300";
+    analytical.moe_layer_event_mode = "first_layer_scaled";
+    analytical.device_overrides.hbm_bandwidth_tbps = 7.5;
+    analytical.device_overrides.fp8_tflops = 4'750.0;
+    const auto gb300 =
+        parse_simulation_config_json(serialize_simulation_config_json(config));
+    expect(
+        gb300 == config &&
+            gb300.cluster()
+                    .execution_model.analytical.device_overrides
+                    .hbm_bandwidth_tbps == 7.5 &&
+            gb300.cluster()
+                    .execution_model.analytical.device_overrides.fp8_tflops ==
+                4'750.0,
+        "GB300 preset and partial device overrides must round-trip");
+
+    std::string invalid_event_mode =
+        serialize_simulation_config_json(config);
+    const std::string valid_event_mode = "\"first_layer_scaled\"";
+    invalid_event_mode.replace(invalid_event_mode.find(valid_event_mode),
+                               valid_event_mode.size(), "\"invalid\"");
+    expect_throws<ConfigError>(
+        [&invalid_event_mode] {
+            static_cast<void>(
+                parse_simulation_config_json(invalid_event_mode));
+        },
+        "unsupported MoE layer event modes must fail fast");
+
+    analytical.device = "custom";
+    const std::string incomplete_custom =
+        serialize_simulation_config_json(config);
+    expect_throws<ConfigError>(
+        [&incomplete_custom] {
+            static_cast<void>(parse_simulation_config_json(incomplete_custom));
+        },
+        "custom devices must provide every hardware ceiling");
+
+    analytical.device_overrides.fp32_tflops = 80.0;
+    analytical.device_overrides.fp16_tflops = 2'000.0;
+    analytical.device_overrides.fp4_tflops = 12'000.0;
+    expect(parse_simulation_config_json(
+               serialize_simulation_config_json(config)) == config,
+           "complete custom analytical devices must round-trip");
 }
 
 void test_operator_precision_contract_round_trip() {

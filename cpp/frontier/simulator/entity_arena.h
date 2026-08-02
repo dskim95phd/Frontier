@@ -61,6 +61,9 @@ class EntityArena {
                                                     StageId stage_id);
     [[nodiscard]] double predicted_batch_ms(BatchId batch_id) const;
     void release_batch(BatchId batch_id);
+    [[nodiscard]] std::size_t live_batch_count() const noexcept {
+        return batches_.size();
+    }
 
     void add_target_domain(ClusterType cluster_type);
     void assign_request_target(RequestId request_id,

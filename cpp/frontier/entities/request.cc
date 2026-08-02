@@ -33,6 +33,14 @@ std::uint64_t Request::num_processed_prefill_tokens() const noexcept {
     return std::min(num_processed_tokens_, num_prefill_tokens_);
 }
 
+void Request::reschedule_pending_arrival(SimTime time) {
+    validate_time(time, "rescheduled arrival");
+    if (state_ != RequestState::kPending) {
+        throw RequestError("only a pending request arrival can be rescheduled");
+    }
+    arrived_at_ = time;
+}
+
 std::uint64_t Request::num_processed_decode_tokens() const noexcept {
     return num_processed_tokens_ > num_prefill_tokens_
                ? num_processed_tokens_ - num_prefill_tokens_

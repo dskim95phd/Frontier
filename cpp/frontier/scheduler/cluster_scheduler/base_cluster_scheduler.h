@@ -298,6 +298,8 @@ class BaseClusterScheduler {
         double suffix_compute_ms = 0.0;
         double lm_head_ms = 0.0;
         double pp_ms = 0.0;
+        double remaining_moe_layer_wait_ms = 0.0;
+        bool lazy_layer_prediction = false;
     };
 
     struct MoEGroupState {

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -338,10 +339,44 @@ struct OperatorPrecisionConfig {
     }
 };
 
+struct AnalyticalDeviceOverrides {
+    std::optional<double> hbm_bandwidth_tbps;
+    std::optional<double> fp32_tflops;
+    std::optional<double> fp16_tflops;
+    std::optional<double> fp8_tflops;
+    std::optional<double> fp4_tflops;
+
+    [[nodiscard]] bool empty() const noexcept {
+        return !hbm_bandwidth_tbps.has_value() && !fp32_tflops.has_value() &&
+               !fp16_tflops.has_value() && !fp8_tflops.has_value() &&
+               !fp4_tflops.has_value();
+    }
+
+    [[nodiscard]] bool complete() const noexcept {
+        return hbm_bandwidth_tbps.has_value() && fp32_tflops.has_value() &&
+               fp16_tflops.has_value() && fp8_tflops.has_value() &&
+               fp4_tflops.has_value();
+    }
+
+    friend bool operator==(const AnalyticalDeviceOverrides &lhs,
+                           const AnalyticalDeviceOverrides &rhs) {
+        return std::tie(lhs.hbm_bandwidth_tbps, lhs.fp32_tflops,
+                        lhs.fp16_tflops, lhs.fp8_tflops, lhs.fp4_tflops) ==
+               std::tie(rhs.hbm_bandwidth_tbps, rhs.fp32_tflops,
+                        rhs.fp16_tflops, rhs.fp8_tflops, rhs.fp4_tflops);
+    }
+};
+
 struct AnalyticalExecutionModelConfig {
     std::string device = "rubin";
+    AnalyticalDeviceOverrides device_overrides;
     std::string precision = "fp16";
     OperatorPrecisionConfig operator_precisions;
+    // "detailed" predicts and emits synchronization events one MoE layer at a
+    // time.
+    // "first_layer_scaled" emits the first layer normally and models the
+    // remaining identical layers as one accumulated delay.
+    std::string moe_layer_event_mode = "detailed";
     std::uint64_t tensor_parallel_size = 8;
     double network_bandwidth_gbps = 400.0;
     double network_latency_us = 1.0;
@@ -349,13 +384,16 @@ struct AnalyticalExecutionModelConfig {
 
     friend bool operator==(const AnalyticalExecutionModelConfig &lhs,
                            const AnalyticalExecutionModelConfig &rhs) {
-        return std::tie(lhs.device, lhs.precision, lhs.operator_precisions,
-                        lhs.tensor_parallel_size, lhs.network_bandwidth_gbps,
-                        lhs.network_latency_us,
+        return std::tie(lhs.device, lhs.device_overrides, lhs.precision,
+                        lhs.operator_precisions, lhs.moe_layer_event_mode,
+                        lhs.tensor_parallel_size,
+                        lhs.network_bandwidth_gbps, lhs.network_latency_us,
                         lhs.intra_node_bandwidth_gbps) ==
-               std::tie(rhs.device, rhs.precision, rhs.operator_precisions,
-                        rhs.tensor_parallel_size, rhs.network_bandwidth_gbps,
-                        rhs.network_latency_us, rhs.intra_node_bandwidth_gbps);
+               std::tie(rhs.device, rhs.device_overrides, rhs.precision,
+                        rhs.operator_precisions, rhs.moe_layer_event_mode,
+                        rhs.tensor_parallel_size,
+                        rhs.network_bandwidth_gbps, rhs.network_latency_us,
+                        rhs.intra_node_bandwidth_gbps);
     }
 
     [[nodiscard]] const std::string &attention_precision() const noexcept {
@@ -531,6 +569,10 @@ struct SimulationConfig {
     SimulationMode simulation_mode;
     SystemArchitecture system_architecture;
     bool enable_parallel_clusters;
+    // Online closed-loop mode releases this many requests initially and
+    // releases one replacement whenever a request completes. Zero preserves
+    // trace-driven arrivals.
+    std::uint64_t closed_loop_max_concurrency = 0;
     PrefixCacheConfig prefix_cache;
     ClusterSchedulerConfig cluster_scheduler;
     RuntimeConfig runtime;
@@ -544,10 +586,12 @@ struct SimulationConfig {
                            const SimulationConfig &rhs) {
         return std::tie(lhs.schema_version, lhs.run_id, lhs.simulation_mode,
                         lhs.system_architecture, lhs.enable_parallel_clusters,
-                        lhs.prefix_cache, lhs.cluster_scheduler, lhs.runtime) ==
+                        lhs.closed_loop_max_concurrency, lhs.prefix_cache,
+                        lhs.cluster_scheduler, lhs.runtime) ==
                std::tie(rhs.schema_version, rhs.run_id, rhs.simulation_mode,
                         rhs.system_architecture, rhs.enable_parallel_clusters,
-                        rhs.prefix_cache, rhs.cluster_scheduler, rhs.runtime);
+                        rhs.closed_loop_max_concurrency, rhs.prefix_cache,
+                        rhs.cluster_scheduler, rhs.runtime);
     }
 };
 

@@ -123,6 +123,49 @@ void test_roofline_matches_python_golden() {
            "roofline bottleneck must match Python");
 }
 
+void test_device_presets_and_overrides() {
+    frontier::config::AnalyticalExecutionModelConfig config{};
+    config.device = "gb300";
+    const analytical::DeviceCeilings gb300 =
+        analytical::DeviceCeilings::from_config(config);
+    expect_approximately_equal(gb300.hbm_bandwidth_tbps, 8.0,
+                               "GB300 HBM bandwidth");
+    expect_approximately_equal(gb300.fp32_tflops, 83.33333333333333,
+                               "GB300 FP32 ceiling");
+    expect_approximately_equal(gb300.fp16_tflops, 2'500.0,
+                               "GB300 FP16 ceiling");
+    expect_approximately_equal(gb300.fp8_tflops, 5'000.0, "GB300 FP8 ceiling");
+    expect_approximately_equal(gb300.fp4_tflops, 15'000.0, "GB300 FP4 ceiling");
+
+    config.device_overrides.hbm_bandwidth_tbps = 7.25;
+    config.device_overrides.fp8_tflops = 4'500.0;
+    const analytical::DeviceCeilings overridden =
+        analytical::DeviceCeilings::from_config(config);
+    expect_approximately_equal(overridden.hbm_bandwidth_tbps, 7.25,
+                               "overridden HBM bandwidth");
+    expect_approximately_equal(overridden.fp8_tflops, 4'500.0,
+                               "overridden FP8 ceiling");
+    expect_approximately_equal(overridden.fp16_tflops, gb300.fp16_tflops,
+                               "non-overridden GB300 ceiling");
+
+    config.device = "custom";
+    expect_throws<analytical::AnalyticalModelError>(
+        [&config] {
+            static_cast<void>(analytical::DeviceCeilings::from_config(config));
+        },
+        "incomplete custom device ceilings must fail fast");
+
+    config.device_overrides.fp32_tflops = 75.0;
+    config.device_overrides.fp16_tflops = 2'100.0;
+    config.device_overrides.fp4_tflops = 11'000.0;
+    const analytical::DeviceCeilings custom =
+        analytical::DeviceCeilings::from_config(config);
+    expect_approximately_equal(custom.hbm_bandwidth_tbps, 7.25,
+                               "custom HBM bandwidth");
+    expect_approximately_equal(custom.fp4_tflops, 11'000.0,
+                               "custom FP4 ceiling");
+}
+
 void check_dense_fields(const analytical::DenseLayerTimes &actual,
                         const Json &expected) {
     for (const auto &[name, value] : {
@@ -487,6 +530,11 @@ void test_batch_model_matches_python_golden() {
     const frontier::execution_time_predictor::
         AnalyticalRooflineExecutionTimePredictor model{
             frontier::config::AnalyticalExecutionModelConfig{}};
+    frontier::config::AnalyticalExecutionModelConfig gb300_config{};
+    gb300_config.device = "gb300";
+    const frontier::execution_time_predictor::
+        AnalyticalRooflineExecutionTimePredictor gb300_model{gb300_config};
+    bool observed_device_effect = false;
 
     for (const Json &test_case : golden.at("cases")) {
         std::vector<Request> requests;
@@ -543,6 +591,12 @@ void test_batch_model_matches_python_golden() {
         const predictor::ExecutionTimePrediction prediction =
             model.predict_stage_execution_time(batch, requests,
                                                frontier::StageId{0});
+        const predictor::ExecutionTimePrediction gb300_prediction =
+            gb300_model.predict_stage_execution_time(batch, requests,
+                                                     frontier::StageId{0});
+        observed_device_effect =
+            observed_device_effect ||
+            gb300_prediction.duration_ms > prediction.duration_ms;
         const Json &expected = test_case.at("expected");
         expect_approximately_equal(
             prediction.duration_ms - prediction.execution_time.lm_head_ms,
@@ -570,6 +624,8 @@ void test_batch_model_matches_python_golden() {
             expected.at("batch_duration_ms").get<double>(),
             "diagnostic_batch_duration_ms_without_lm_head");
     }
+    expect(observed_device_effect,
+           "selected device preset must affect predictor stage duration");
 }
 
 void test_communication_matches_python_golden() {
@@ -723,6 +779,94 @@ void test_kimi_k2_uneven_pipeline_and_lm_head() {
            "only the final PP stage must execute the LM-head projection");
 }
 
+void test_kimi_k2_first_layer_scaled_prediction() {
+    frontier::config::ParallelismConfig parallelism{};
+    parallelism.tensor_parallel_size = 4;
+    parallelism.pipeline_parallel_size = 4;
+    parallelism.data_parallel_size = 4;
+    parallelism.moe_tensor_parallel_size = 1;
+    parallelism.moe_expert_parallel_size = 16;
+
+    frontier::config::AnalyticalExecutionModelConfig detailed_config{};
+    detailed_config.precision = "fp8";
+    detailed_config.operator_precisions.moe_expert_weight = "fp4";
+    detailed_config.operator_precisions.moe_expert_activation = "fp8";
+    auto scaled_config = detailed_config;
+    scaled_config.moe_layer_event_mode = "first_layer_scaled";
+    const auto model_config =
+        frontier::config::load_model_config("moonshotai/Kimi-K2-Instruct");
+    const predictor::AnalyticalRooflineExecutionTimePredictor detailed{
+        detailed_config, parallelism, model_config,
+        frontier::config::MoeRoutingConfig{}};
+    const predictor::AnalyticalRooflineExecutionTimePredictor scaled{
+        scaled_config, parallelism, model_config,
+        frontier::config::MoeRoutingConfig{}};
+
+    std::vector<Request> requests;
+    requests.emplace_back([&]() {
+        WorkloadRequest value{};
+        value.request_id = RequestId{0};
+        value.arrived_at = SimTime::from_seconds(0.0);
+        value.num_prefill_tokens = 4'096;
+        value.num_decode_tokens = 1;
+        return value;
+    }());
+    requests.front().on_arrival(SimTime::from_seconds(0.0));
+    requests.front().on_admitted(SimTime::from_seconds(0.0));
+    requests.front().advance_scheduler_frontier(4'096);
+    RequestBatchSnapshot snapshot{};
+    snapshot.request_id = RequestId{0};
+    snapshot.scheduled_tokens = 4'096;
+    snapshot.processed_tokens = 0;
+    snapshot.scheduler_frontier = 4'096;
+    const Batch batch{BatchId{0}, IterationId{0}, {snapshot},
+                      SimTime::from_seconds(0.0), Generation{0}};
+
+    const auto detailed_stage = detailed.predict_stage_execution_time(
+        batch, requests, frontier::StageId{0});
+    const auto scaled_stage = scaled.predict_stage_execution_time(
+        batch, requests, frontier::StageId{0});
+    const auto first_lazy_layer = detailed.prepare_moe_stage_execution(
+        batch, requests, frontier::StageId{0});
+    expect(detailed_stage.moe_routing.size() == 15 &&
+               scaled_stage.moe_routing.size() == 1 &&
+               scaled_stage.logical_moe_layer_count == 15 &&
+               scaled_stage.repeated_moe_layer_pre_compute_ms > 0.0,
+           "scaled Kimi stage must retain one detailed layer for 15 logical "
+           "MoE layers");
+    expect(detailed_stage.execution_time == scaled_stage.execution_time,
+           "scaled prediction must preserve every execution-time component");
+    expect(detailed_stage.moe_routing.front().model_layer_id ==
+                   scaled_stage.moe_routing.front().model_layer_id &&
+               detailed_stage.moe_routing.front().lane_times_ms ==
+                   scaled_stage.moe_routing.front().lane_times_ms &&
+               detailed_stage.moe_routing.front().pre_moe_compute_ms ==
+                   scaled_stage.moe_routing.front().pre_moe_compute_ms,
+            "scaled prediction must preserve the first detailed MoE layer");
+
+    expect(first_lazy_layer.lazy_moe_layer_prediction &&
+               first_lazy_layer.moe_routing.size() == 1 &&
+               first_lazy_layer.logical_moe_layer_count == 15 &&
+               first_lazy_layer.moe_routing.front().layer_id.index() == 0 &&
+               first_lazy_layer.moe_routing.front().model_layer_id == 1,
+           "detailed Kimi execution must prepare only its first MoE layer");
+    double lazy_total_ms = first_lazy_layer.execution_time.total_ms();
+    for (std::uint64_t layer = 1; layer < 15; ++layer) {
+        const auto lazy_layer = detailed.predict_moe_layer_execution(
+            batch, requests, frontier::StageId{0}, layer);
+        expect(lazy_layer.lazy_moe_layer_prediction &&
+                   lazy_layer.moe_routing.size() == 1 &&
+                   lazy_layer.logical_moe_layer_count == 15 &&
+                   lazy_layer.moe_routing.front().layer_id.index() == layer &&
+                   lazy_layer.moe_routing.front().model_layer_id == layer + 1,
+               "lazy Kimi prediction must retain the requested layer identity");
+        lazy_total_ms += lazy_layer.execution_time.total_ms();
+    }
+    expect_approximately_equal(lazy_total_ms,
+                               detailed_stage.execution_time.total_ms(),
+                               "sum of lazy Kimi layer predictions");
+}
+
 void test_invalid_analytical_inputs_are_rejected() {
     expect_throws<analytical::AnalyticalModelError>(
         [] {
@@ -768,6 +912,8 @@ int main() {
     int failures = 0;
     failures += frontier::test::run("roofline matches Python golden",
                                     test_roofline_matches_python_golden);
+    failures += frontier::test::run("device presets and overrides",
+                                    test_device_presets_and_overrides);
     failures += frontier::test::run("dense layer matches Python golden",
                                     test_dense_layer_matches_python_golden);
     failures += frontier::test::run("long-context decode cost increases",
@@ -792,6 +938,9 @@ int main() {
                                     test_kv_transfer_matches_python_golden);
     failures += frontier::test::run("Kimi K2 uneven pipeline and LM head",
                                     test_kimi_k2_uneven_pipeline_and_lm_head);
+    failures += frontier::test::run(
+        "Kimi K2 first-layer-scaled prediction",
+        test_kimi_k2_first_layer_scaled_prediction);
     failures +=
         frontier::test::run("invalid analytical inputs are rejected",
                             test_invalid_analytical_inputs_are_rejected);
