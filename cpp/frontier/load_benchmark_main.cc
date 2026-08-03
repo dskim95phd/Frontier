@@ -65,8 +65,7 @@ std::optional<InputPaths> parse_input_paths(int argc, char *argv[]) {
         return std::nullopt;
     }
     return InputPaths{std::move(config_path.value()),
-                      std::move(workload_path.value()),
-                      std::move(output_path)};
+                      std::move(workload_path.value()), std::move(output_path)};
 }
 
 double milliseconds_between(frontier::SimTime end, frontier::SimTime start) {
@@ -83,8 +82,7 @@ OrderedJson summarize(const frontier::metrics::SimulationOutput &output,
         {"requests", output.requests.size()},
         {"batches", output.aggregate.batch_count},
         {"batch_stages", output.aggregate.batch_stage_count},
-        {"scheduler_iterations",
-         output.aggregate.scheduler_iteration_count},
+        {"scheduler_iterations", output.aggregate.scheduler_iteration_count},
         {"events", output.aggregate.event_count},
         {"analytical_diagnostics",
          output.aggregate.analytical_diagnostic_count},
@@ -99,15 +97,17 @@ OrderedJson summarize(const frontier::metrics::SimulationOutput &output,
             {"request_id", request.request_id.value()},
             {"arrived_at_s", request.arrived_at.seconds()},
             {"first_scheduled_at_s", request.first_scheduled_at.seconds()},
-            {"prefill_completed_at_s",
-             request.prefill_completed_at.seconds()},
+            {"prefill_completed_at_s", request.prefill_completed_at.seconds()},
             {"first_token_completed_at_s",
              request.first_token_completed_at.seconds()},
             {"completed_at_s", request.completed_at.seconds()},
             {"scheduling_delay_ms",
              milliseconds_between(request.first_scheduled_at,
                                   request.arrived_at)},
-            {"ttft_ms", milliseconds_between(request.prefill_completed_at,
+            {"prefill_latency_ms",
+             milliseconds_between(request.prefill_completed_at,
+                                  request.arrived_at)},
+            {"ttft_ms", milliseconds_between(request.first_token_completed_at,
                                              request.arrived_at)},
             {"e2e_ms",
              milliseconds_between(request.completed_at, request.arrived_at)},
@@ -122,8 +122,7 @@ OrderedJson summarize(const frontier::metrics::SimulationOutput &output,
     for (const auto &[cluster_type, aggregate] :
          output.aggregate.batches_by_cluster) {
         static_cast<void>(cluster_type);
-        for (const auto &[batch_size, count] :
-             aggregate.batch_size_histogram) {
+        for (const auto &[batch_size, count] : aggregate.batch_size_histogram) {
             batch_size_histogram[batch_size] += count;
         }
     }
@@ -135,11 +134,9 @@ OrderedJson summarize(const frontier::metrics::SimulationOutput &output,
     root["batch_summary_by_cluster"] = OrderedJson::object();
     for (const auto &[cluster_type_value, aggregate] :
          output.aggregate.batches_by_cluster) {
-        const std::string cluster_type{
-            frontier::to_string(cluster_type_value)};
+        const std::string cluster_type{frontier::to_string(cluster_type_value)};
         OrderedJson cluster_histogram = OrderedJson::object();
-        for (const auto &[batch_size, count] :
-             aggregate.batch_size_histogram) {
+        for (const auto &[batch_size, count] : aggregate.batch_size_histogram) {
             cluster_histogram[std::to_string(batch_size)] = count;
         }
         root["batch_size_histogram_by_cluster"][cluster_type] =
@@ -176,9 +173,8 @@ OrderedJson summarize(const frontier::metrics::SimulationOutput &output,
 }
 
 void print_usage() {
-    std::cerr
-        << "Usage: frontier_load_benchmark --config <config.json> "
-           "--workload <workload.csv> [--output <summary.json>]\n";
+    std::cerr << "Usage: frontier_load_benchmark --config <config.json> "
+                 "--workload <workload.csv> [--output <summary.json>]\n";
 }
 
 } // namespace
@@ -228,8 +224,7 @@ int main(int argc, char *argv[]) {
         }
         return 0;
     } catch (const std::exception &error) {
-        std::cerr << "frontier_load_benchmark: error: " << error.what()
-                  << '\n';
+        std::cerr << "frontier_load_benchmark: error: " << error.what() << '\n';
         return 1;
     }
 }

@@ -1,0 +1,9 @@
+session_start_at,think_time,num_prefill_tokens,num_decode_tokens,session_id,session_turn_index
+0,0,32,8,,
+0.002,0,64,16,,
+0.003,0,48,12,,
+0.006,0,96,8,,
+0.008,0,40,20,,
+0.011,0,80,12,,
+0.014,0,24,8,,
+0.018,0,128,16,,

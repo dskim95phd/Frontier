@@ -222,6 +222,9 @@ struct SimulationOutput {
 [[nodiscard]] std::string
 serialize_simulation_output_json(const SimulationOutput &output);
 [[nodiscard]] std::string
+serialize_simulation_summary_json(const SimulationOutput &output,
+                                  double wall_clock_seconds);
+[[nodiscard]] std::string
 serialize_request_metrics_csv(const std::vector<RequestMetricsRecord> &requests,
                               config::SystemArchitecture architecture =
                                   config::SystemArchitecture::kCoLocation);

@@ -543,22 +543,25 @@ Note: Metrics plotting imports `plotly` unconditionally, so `plotly` must be ins
 
 ### Canonical TTFT Contract for Frontier vs vLLM V1 Online Alignment
 
-For the online alignment suite under `tests/comparison/chunked_prefill_online/`, the canonical `TTFT` definition is frozen to:
+The canonical `TTFT` definition is:
 
-- `queue-visible request arrival -> request prefill completion`
+- `queue-visible request arrival -> first generated token completion`
 
-This is intentionally narrower than the official streaming/client-side "first token visible" meaning. The reason is pragmatic: it avoids mixing currently unresolved request-visible tails and other output-side overhead into the primary TTFT error budget.
+Arrival-to-Prefill completion remains available as the separate
+`prefill_latency` metric. In PDD, TTFT therefore includes KV-cache transfer and
+the first Decode execution.
 
 When reading artifacts, keep the following distinction:
 
 - Canonical comparison TTFT:
   - Frontier: `request_metrics.csv` column `ttft`
-  - vLLM: `comparison/vllm_request_metrics.csv` column `ttft_ms`, reconstructed from batch-log prefill completion
-- Legacy/raw TTFT references:
-  - `vllm_clean/vllm_request_metrics.csv` client-visible `ttft_ms`
+  - vLLM: client-visible first-token latency
+- Prefill-only comparison reference:
+  - Frontier: `request_metrics.csv` column `prefill_latency`
   - `vllm_server_request_metrics.jsonl` field `ttft`
 
-Those raw vLLM TTFT values are still useful for debugging and historical context, but they are not the canonical Frontier-vs-vLLM comparison target anymore.
+Historical comparison artifacts that reconstructed TTFT from Prefill completion
+must be treated as `prefill_latency` baselines rather than canonical TTFT.
 
 ## Training (Execution-Time & Network Models)
 

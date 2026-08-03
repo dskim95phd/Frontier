@@ -16,9 +16,9 @@ Implemented behavior includes:
 - strict JSON configuration and CSV workload contracts; and
 - CTest plus production-Python differential tests.
 
-Session prefix caching, block-hash prefix caching, MoE/expert parallelism,
-parallel PDD clusters, and topology-aware communication backends remain
-outside the current C++ surface.
+Session prefix caching and MoE/expert parallelism are implemented. Block-hash
+prefix caching, parallel PDD clusters, and topology-aware communication
+backends remain outside the current C++ surface.
 
 ## Build in WSL
 
@@ -69,6 +69,44 @@ Sequential PDD:
   --workload cpp/tests/fixtures/workloads/step3_pdd_small.csv
 ```
 
+For user-facing recipes, start with `cpp/examples` instead of the test
+fixtures:
+
+```powershell
+python cpp/examples/run_example.py hello `
+  --binary .build-step4/frontier_sim.exe
+
+python cpp/examples/run_example.py pdd `
+  --binary .build-step4/frontier_sim.exe
+```
+
+The example runner writes normalized inputs and analysis-ready artifacts under
+`outputs/cpp_examples/`. See `cpp/examples/README.md` for dense analytical,
+KV-pressure, MoE, PDD, and session-prefix-cache recipes.
+
+### Analysis-ready output
+
+Pass an output directory to avoid emitting the entire detailed trace to
+stdout:
+
+```powershell
+.build-step4/frontier_sim.exe `
+  --config cpp/examples/configs/03_sequential_pdd.json `
+  --workload cpp/examples/workloads/00_tiny.csv `
+  --output-dir outputs/my-pdd-run `
+  --output-mode requests
+```
+
+Every output-directory run writes `config.normalized.json`,
+`workload.normalized.csv`, and `summary.json`. Mode `requests` also writes
+`requests.csv`; mode `full` additionally retains detailed runtime records and
+writes `trace.json`. Summary and requests modes disable detailed event,
+scheduler, batch, and analytical traces during the run.
+
+`summary.json` reports request/token throughput, latency mean/p50/p90/p99,
+preemptions, cluster batch distributions, KV-transfer latency, and prefix-cache
+hit rate.
+
 Read-only normalization:
 
 ```bash
@@ -107,8 +145,9 @@ Common top-level fields are:
 ```
 
 All fields are required. Unknown fields and unsupported values are rejected.
-`enable_parallel_clusters` and `prefix_cache.enabled` must currently be
-`false`.
+`enable_parallel_clusters` must currently be `false`. Session prefix caching
+is supported with `prefix_cache.enabled=true`, `key_mode="session"`, and a
+sticky cluster scheduler when more than one replica/DP target is available.
 
 ### Co-location clusters
 
@@ -359,7 +398,9 @@ records additionally identify prefill/decode owners, cluster types, and
 KV-cache transfers.
 
 Timestamps use seconds with `_s` suffixes. Latencies use milliseconds with
-`_ms` suffixes. TTFT is measured from request arrival to prefill completion.
+`_ms` suffixes. TTFT is measured from request arrival to completion of the
+first generated token. Arrival-to-Prefill completion is reported separately as
+`prefill_latency_ms`.
 IDs, token counts, arrays, and event order are exact; floating-point parity
 comparisons use `1e-12` absolute and relative tolerance.
 

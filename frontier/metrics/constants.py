@@ -158,13 +158,14 @@ class RequestMetricsTimeDistributions(enum.Enum):
 
     # =========================================================================
     # TTFT (TIME TO FIRST TOKEN) METRICS
-    # These metrics now use the queue-arrival -> prefill-complete contract
+    # TTFT uses the user-visible queue-arrival -> first-token-complete contract.
     # =========================================================================
-    TTFT = "ttft"  # Total time from arrival to prefill completion
+    TTFT = "ttft"  # Total time from arrival to first token completion
+    PREFILL_LATENCY = "prefill_latency"  # Arrival to Prefill completion
     TTFT_PREFILL_ONLY = "ttft_prefill_only"  # Prefill execution time component
     TTFT_KV_TRANSFER = "ttft_kv_transfer"  # KV cache transfer time component (PD/PD+AF modes)
     TTFT_DECODE_FIRST_TOKEN = (
-        "ttft_decode_first_token"  # Legacy TTFT residual kept for backward reference only
+        "ttft_decode_first_token"  # First-token tail after Prefill and KV transfer
     )
 
     # =========================================================================

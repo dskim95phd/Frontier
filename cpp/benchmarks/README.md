@@ -1,5 +1,10 @@
 # Single-turn load sweep
 
+> Historical results in this document were collected before TTFT was corrected
+> to end at first generated-token completion. Columns labeled TTFT in the
+> archived tables should be interpreted as Prefill latency. Current runs emit
+> first-token TTFT and a separate `prefill_latency_ms` field.
+
 This benchmark studies how offered load, request batch-size limits, KV-cache
 capacity, and co-location versus PDD topology affect the C++ simulator.
 
@@ -256,8 +261,10 @@ low TPOT.
 PDD saturates at batch cap 8 in this workload. Prefill and Decode have
 independent scheduler caps, and the short outputs leave the dedicated Decode
 cluster lightly loaded. The mean KV transfer time is 1.197 ms per request.
-Frontier's canonical TTFT ends at prefill completion, before PDD KV transfer;
-the `first_token_latency_*` columns include transfer and the first Decode step.
+In these archived results, the column labeled TTFT ended at Prefill completion;
+the `first_token_latency_*` columns included transfer and the first Decode step.
+Current Frontier reports the latter as TTFT and preserves the former as Prefill
+latency.
 
 The 4, 16, and 64 GiB PDD grids are identical and have no preemptions. A
 separate 2 GiB diagnostic remains feasible; TP-half at batch cap 8 experiences
@@ -316,6 +323,6 @@ cap 32:
 | PDD PP-half | 4 GiB | 1.133 | 29.6 | 206.8 | 2.208 | 7 |
 | PDD TP-half | 4 GiB | 0.766 | 31.6 | 766.8 | 14.925 | 10 |
 
-Canonical PDD TTFT still ends before transfer and Decode admission, so it
-remains low even when the Decode side is memory-starved. First-token latency,
-TPOT, E2E, and throughput reveal the actual degradation.
+The archived TTFT column ends before transfer and Decode admission, so it
+remains low even when the Decode side is memory-starved. In current output this
+column is named Prefill latency; TTFT includes the first-token path.

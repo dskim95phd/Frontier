@@ -2835,6 +2835,8 @@ class MetricsStore:
                 * 1000.0,
                 "ttft_s": float(request.ttft),
                 "ttft_ms": float(request.ttft) * 1000.0,
+                "prefill_latency_s": float(request.prefill_latency),
+                "prefill_latency_ms": float(request.prefill_latency) * 1000.0,
                 "tpot_s": float(request.tpot),
                 "tpot_ms": float(request.tpot) * 1000.0,
             }
@@ -3196,11 +3198,14 @@ class MetricsStore:
                         cluster_stats["tokens_at_preemption"].extend(tokens_list)
 
         # TTFT (Time To First Token) metrics
-        if request.is_prefill_complete:
+        if request.first_decode_token_completed_at > 0:
             ttft_value = self._get_ttft_export_value(request)
             self._request_metrics_time_distributions[
                 RequestMetricsTimeDistributions.TTFT
             ].put(request.id, ttft_value)
+            self._request_metrics_time_distributions[
+                RequestMetricsTimeDistributions.PREFILL_LATENCY
+            ].put(request.id, request.prefill_latency)
 
             # TTFT breakdown components
             if request.is_prefill_complete:
@@ -3215,12 +3220,11 @@ class MetricsStore:
                     RequestMetricsTimeDistributions.TTFT_KV_TRANSFER
                 ].put(request.id, request.kv_cache_transfer_time)
 
-                # Legacy TTFT residual kept for backward-compatible reporting.
-                # This is no longer the canonical first pure decode latency.
-                # Use decode_first_token_latency for the actual first pure decode
-                # token duration after TTFT re-anchoring.
+                # First-token tail after queue-visible Prefill and KV transfer.
                 ttft_decode_first = (
-                    ttft_value - prefill_exec_time - request.kv_cache_transfer_time
+                    ttft_value
+                    - request.prefill_latency
+                    - request.kv_cache_transfer_time
                 )
                 self._request_metrics_time_distributions[
                     RequestMetricsTimeDistributions.TTFT_DECODE_FIRST_TOKEN

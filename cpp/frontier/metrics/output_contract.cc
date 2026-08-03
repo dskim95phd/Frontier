@@ -137,9 +137,12 @@ OrderedJson serialize_request(const RequestMetricsRecord &request,
     json["completed_at_s"] = request.completed_at.seconds();
     json["scheduling_delay_ms"] = milliseconds_between(
         request.first_scheduled_at, request.arrived_at, "first_scheduled_at");
-    json["ttft_ms"] =
+    json["prefill_latency_ms"] =
         milliseconds_between(request.prefill_completed_at, request.arrived_at,
                              "prefill_completed_at");
+    json["ttft_ms"] =
+        milliseconds_between(request.first_token_completed_at,
+                             request.arrived_at, "first_token_completed_at");
     json["e2e_ms"] = milliseconds_between(request.completed_at,
                                           request.arrived_at, "completed_at");
     json["num_processed_tokens"] = request.num_processed_tokens;
@@ -698,6 +701,175 @@ std::string serialize_simulation_output_json(const SimulationOutput &output) {
     return root.dump(2) + '\n';
 }
 
+std::string serialize_simulation_summary_json(const SimulationOutput &output,
+                                              double wall_clock_seconds) {
+    if (!std::isfinite(wall_clock_seconds) || wall_clock_seconds < 0.0) {
+        throw std::invalid_argument(
+            "summary wall_clock_seconds must be finite and nonnegative");
+    }
+    validate_request_metrics(output.requests, output.run.system_architecture);
+
+    const auto summarize_values = [](std::vector<double> values) {
+        OrderedJson summary = OrderedJson::object();
+        summary["count"] = values.size();
+        if (values.empty()) {
+            summary["mean"] = 0.0;
+            summary["p50"] = 0.0;
+            summary["p90"] = 0.0;
+            summary["p99"] = 0.0;
+            return summary;
+        }
+        std::sort(values.begin(), values.end());
+        const double total = std::accumulate(values.begin(), values.end(), 0.0);
+        const auto percentile = [&values](double quantile) {
+            const double position =
+                quantile * static_cast<double>(values.size() - 1);
+            const std::size_t lower = static_cast<std::size_t>(position);
+            const std::size_t upper = std::min(lower + 1, values.size() - 1);
+            const double fraction = position - static_cast<double>(lower);
+            return values[lower] + (values[upper] - values[lower]) * fraction;
+        };
+        summary["mean"] = total / static_cast<double>(values.size());
+        summary["p50"] = percentile(0.50);
+        summary["p90"] = percentile(0.90);
+        summary["p99"] = percentile(0.99);
+        return summary;
+    };
+
+    std::vector<double> scheduling_delay_ms;
+    std::vector<double> prefill_latency_ms;
+    std::vector<double> ttft_ms;
+    std::vector<double> tpot_ms;
+    std::vector<double> e2e_ms;
+    scheduling_delay_ms.reserve(output.requests.size());
+    prefill_latency_ms.reserve(output.requests.size());
+    ttft_ms.reserve(output.requests.size());
+    tpot_ms.reserve(output.requests.size());
+    e2e_ms.reserve(output.requests.size());
+
+    double first_arrival_s = std::numeric_limits<double>::infinity();
+    double last_completion_s = 0.0;
+    std::uint64_t total_prefill_tokens = 0;
+    std::uint64_t total_decode_tokens = 0;
+    std::uint64_t total_preemptions = 0;
+    for (const RequestMetricsRecord &request : output.requests) {
+        first_arrival_s =
+            std::min(first_arrival_s, request.arrived_at.seconds());
+        last_completion_s =
+            std::max(last_completion_s, request.completed_at.seconds());
+        total_prefill_tokens += request.num_prefill_tokens;
+        total_decode_tokens += request.num_decode_tokens;
+        total_preemptions += request.preemption_count;
+        scheduling_delay_ms.push_back(
+            milliseconds_between(request.first_scheduled_at, request.arrived_at,
+                                 "first_scheduled_at"));
+        prefill_latency_ms.push_back(
+            milliseconds_between(request.prefill_completed_at,
+                                 request.arrived_at, "prefill_completed_at"));
+        ttft_ms.push_back(milliseconds_between(request.first_token_completed_at,
+                                               request.arrived_at,
+                                               "first_token_completed_at"));
+        e2e_ms.push_back(milliseconds_between(
+            request.completed_at, request.arrived_at, "completed_at"));
+        if (request.num_decode_tokens > 1) {
+            tpot_ms.push_back(
+                milliseconds_between(request.completed_at,
+                                     request.first_token_completed_at,
+                                     "completed_at") /
+                static_cast<double>(request.num_decode_tokens - 1));
+        }
+    }
+
+    const double simulation_window_s =
+        output.requests.empty() ? 0.0 : last_completion_s - first_arrival_s;
+    const auto rate = [simulation_window_s](std::uint64_t count) {
+        return simulation_window_s > 0.0
+                   ? static_cast<double>(count) / simulation_window_s
+                   : 0.0;
+    };
+
+    OrderedJson root = OrderedJson::object();
+    root["schema_version"] = 1;
+    root["run"] = OrderedJson::object({
+        {"run_id", output.run.run_id},
+        {"simulation_mode",
+         std::string{config::to_string(output.run.simulation_mode)}},
+        {"system_architecture",
+         std::string{config::to_string(output.run.system_architecture)}},
+    });
+    root["wall_clock_seconds"] = wall_clock_seconds;
+    root["simulation_window_seconds"] = simulation_window_s;
+    root["counts"] = OrderedJson::object({
+        {"requests", output.requests.size()},
+        {"batches", output.aggregate.batch_count},
+        {"batch_stages", output.aggregate.batch_stage_count},
+        {"scheduler_iterations", output.aggregate.scheduler_iteration_count},
+        {"events", output.aggregate.event_count},
+        {"kv_cache_transfers", output.aggregate.kv_cache_transfer_count},
+        {"preemptions", total_preemptions},
+    });
+    root["throughput"] = OrderedJson::object({
+        {"requests_per_second", rate(output.requests.size())},
+        {"prompt_tokens_per_second", rate(total_prefill_tokens)},
+        {"decode_tokens_per_second", rate(total_decode_tokens)},
+        {"total_tokens_per_second",
+         rate(total_prefill_tokens + total_decode_tokens)},
+    });
+    root["latency_ms"] = OrderedJson::object({
+        {"scheduling_delay", summarize_values(std::move(scheduling_delay_ms))},
+        {"prefill", summarize_values(std::move(prefill_latency_ms))},
+        {"ttft", summarize_values(std::move(ttft_ms))},
+        {"tpot", summarize_values(std::move(tpot_ms))},
+        {"e2e", summarize_values(std::move(e2e_ms))},
+    });
+
+    root["batch_summary_by_cluster"] = OrderedJson::object();
+    for (const auto &[cluster_type, aggregate] :
+         output.aggregate.batches_by_cluster) {
+        OrderedJson histogram = OrderedJson::object();
+        for (const auto &[batch_size, count] : aggregate.batch_size_histogram) {
+            histogram[std::to_string(batch_size)] = count;
+        }
+        root["batch_summary_by_cluster"][std::string{to_string(cluster_type)}] =
+            OrderedJson::object({
+                {"batch_count", aggregate.batch_count},
+                {"mean_batch_size",
+                 aggregate.batch_count == 0
+                     ? 0.0
+                     : static_cast<double>(aggregate.request_slots) /
+                           static_cast<double>(aggregate.batch_count)},
+                {"predicted_execution_ms", aggregate.predicted_execution_ms},
+                {"batch_size_histogram", std::move(histogram)},
+            });
+    }
+
+    std::vector<double> transfer_latency_ms;
+    std::uint64_t transfer_bytes = 0;
+    transfer_latency_ms.reserve(output.kv_cache_transfers.size());
+    for (const KVCacheTransferMetricsRecord &transfer :
+         output.kv_cache_transfers) {
+        transfer_latency_ms.push_back(transfer.predicted_time_ms);
+        transfer_bytes += transfer.size_bytes;
+    }
+    root["kv_cache_transfer"] = OrderedJson::object({
+        {"total_bytes", transfer_bytes},
+        {"latency_ms", summarize_values(std::move(transfer_latency_ms))},
+    });
+
+    const PrefixCacheMetricsAggregate &cache = output.aggregate.prefix_cache;
+    root["prefix_cache"] = OrderedJson::object({
+        {"query_blocks", cache.query_blocks},
+        {"hit_blocks", cache.hit_blocks},
+        {"hit_rate", cache.query_blocks == 0
+                         ? 0.0
+                         : static_cast<double>(cache.hit_blocks) /
+                               static_cast<double>(cache.query_blocks)},
+        {"evicted_blocks", cache.evicted_blocks},
+        {"evicted_sessions", cache.evicted_sessions},
+    });
+    return root.dump(2) + '\n';
+}
+
 std::string
 serialize_request_metrics_csv(const std::vector<RequestMetricsRecord> &requests,
                               config::SystemArchitecture architecture) {
@@ -712,7 +884,8 @@ serialize_request_metrics_csv(const std::vector<RequestMetricsRecord> &requests,
                   "prefix_cache_hit_blocks,prefix_cache_key_mode,arrived_at_s,"
                   "first_scheduled_at_s,"
                   "prefill_completed_at_s,first_token_completed_at_s,"
-                  "completed_at_s,scheduling_delay_ms,ttft_ms,e2e_ms,"
+                  "completed_at_s,scheduling_delay_ms,prefill_latency_ms,"
+                  "ttft_ms,e2e_ms,"
                   "num_processed_tokens,preemption_count,replica_id,dp_id\n";
     } else {
         output << "request_id,session_id,num_prefill_tokens,num_decode_tokens,"
@@ -720,7 +893,8 @@ serialize_request_metrics_csv(const std::vector<RequestMetricsRecord> &requests,
                   "prefix_cache_hit_blocks,prefix_cache_key_mode,arrived_at_s,"
                   "first_scheduled_at_s,"
                   "prefill_completed_at_s,first_token_completed_at_s,"
-                  "completed_at_s,scheduling_delay_ms,ttft_ms,e2e_ms,"
+                  "completed_at_s,scheduling_delay_ms,prefill_latency_ms,"
+                  "ttft_ms,e2e_ms,"
                   "num_processed_tokens,preemption_count,"
                   "prefill_replica_id,prefill_dp_id,decode_replica_id,decode_"
                   "dp_id,"
@@ -751,6 +925,10 @@ serialize_request_metrics_csv(const std::vector<RequestMetricsRecord> &requests,
         output << milliseconds_between(request.prefill_completed_at,
                                        request.arrived_at,
                                        "prefill_completed_at")
+               << ',';
+        output << milliseconds_between(request.first_token_completed_at,
+                                       request.arrived_at,
+                                       "first_token_completed_at")
                << ','
                << milliseconds_between(request.completed_at, request.arrived_at,
                                        "completed_at");

@@ -25,6 +25,7 @@ using frontier::metrics::SchedulerDecisionRecord;
 using frontier::metrics::SchedulerTraceRecord;
 using frontier::metrics::serialize_request_metrics_csv;
 using frontier::metrics::serialize_simulation_output_json;
+using frontier::metrics::serialize_simulation_summary_json;
 using frontier::metrics::SimulationOutput;
 using frontier::test::expect;
 using Json = nlohmann::json;
@@ -50,7 +51,7 @@ SimulationOutput make_output() {
                 value.prefill_completed_at = SimTime::from_seconds(0.001);
                 value.completed_at = SimTime::from_seconds(0.002);
                 value.first_scheduled_at = SimTime::from_seconds(0.0);
-                value.first_token_completed_at = SimTime::from_seconds(0.001);
+                value.first_token_completed_at = SimTime::from_seconds(0.0015);
                 value.num_processed_tokens = 6;
                 value.preemption_count = 1;
                 value.tokens_at_preemption = {};
@@ -168,6 +169,10 @@ void test_json_contract() {
            "scheduler decision sequence must serialize");
     expect(json.at("requests").at(0).at("num_prefill_tokens") == 4,
            "prefix-cache request shape must serialize");
+    expect(json.at("requests").at(0).at("prefill_latency_ms") == 1.0 &&
+               json.at("requests").at(0).at("ttft_ms") == 1.5,
+           "TTFT must end at first-token completion while prefill latency is "
+           "reported separately");
     expect(json.contains("prefix_cache"),
            "aggregate prefix-cache metrics must serialize");
     expect(json.at("prefix_cache").at("storage_model") ==
@@ -191,8 +196,20 @@ void test_csv_contract() {
                std::string{"request_id,session_id,num_prefill_tokens,"}.size(),
                "request_id,session_id,num_prefill_tokens,") == 0,
            "CSV must expose canonical scheduling fields");
+    expect(csv.find("prefill_latency_ms,ttft_ms") != std::string::npos,
+           "CSV must distinguish prefill latency from TTFT");
     expect(csv.find(",6,1,0,0\n") != std::string::npos,
            "CSV must include progress, preemption, and target fields");
+}
+
+void test_summary_contract() {
+    const Json json =
+        Json::parse(serialize_simulation_summary_json(make_output(), 0.25));
+    expect(json.at("latency_ms").at("prefill").at("mean") == 1.0 &&
+               json.at("latency_ms").at("ttft").at("mean") == 1.5,
+           "summary must use first-token TTFT semantics");
+    expect(json.at("latency_ms").at("tpot").at("mean") == 0.5,
+           "summary must derive TPOT from the post-first-token decode tail");
 }
 
 } // namespace
@@ -201,5 +218,6 @@ int main() {
     int failures = 0;
     failures += frontier::test::run("JSON contract", test_json_contract);
     failures += frontier::test::run("CSV contract", test_csv_contract);
+    failures += frontier::test::run("summary contract", test_summary_contract);
     return failures == 0 ? 0 : 1;
 }
