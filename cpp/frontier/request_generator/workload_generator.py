@@ -20,7 +20,8 @@ import numpy as np
 
 @dataclass(frozen=True)
 class WorkloadRequest:
-    arrived_at: float
+    session_start_at: float | None
+    think_time: float
     num_prefill_tokens: int
     num_decode_tokens: int
     session_id: int | None = None
@@ -348,7 +349,7 @@ def materialize_requests(
         if fixed_interval_seconds < 0.0:
             raise ValueError("fixed_interval_seconds must be nonnegative")
 
-    arrived_at = 0.0
+    session_start_at = 0.0
     requests: list[WorkloadRequest] = []
     for index, shape in enumerate(shapes):
         interval = (
@@ -357,10 +358,11 @@ def materialize_requests(
             else shape.unit_interval * scale
         )
         if index > 0 or not first_arrival_at_zero:
-            arrived_at += interval
+            session_start_at += interval
         requests.append(
             WorkloadRequest(
-                arrived_at=arrived_at,
+                session_start_at=session_start_at,
+                think_time=0.0,
                 num_prefill_tokens=shape.num_prefill_tokens,
                 num_decode_tokens=shape.num_decode_tokens,
             )
@@ -391,7 +393,7 @@ def write_workload_csv(
     destination: Path | TextIO,
     requests: Sequence[WorkloadRequest],
     *,
-    arrival_decimal_places: int | None = None,
+    time_decimal_places: int | None = None,
 ) -> None:
     should_close = isinstance(destination, Path)
     if should_close:
@@ -404,16 +406,25 @@ def write_workload_csv(
         writer = csv.writer(output, lineterminator="\n")
         writer.writerow(
             (
-                "arrived_at",
+                "session_start_at",
+                "think_time",
                 "num_prefill_tokens",
                 "num_decode_tokens",
                 "session_id",
                 "session_turn_index",
             )
         )
+        seen_sessions: set[int] = set()
         for request in requests:
-            if not math.isfinite(request.arrived_at) or request.arrived_at < 0.0:
-                raise ValueError("request arrived_at must be finite and nonnegative")
+            if request.session_start_at is not None and (
+                not math.isfinite(request.session_start_at)
+                or request.session_start_at < 0.0
+            ):
+                raise ValueError(
+                    "request session_start_at must be finite and nonnegative"
+                )
+            if not math.isfinite(request.think_time) or request.think_time < 0.0:
+                raise ValueError("request think_time must be finite and nonnegative")
             _positive_int(request.num_prefill_tokens, "num_prefill_tokens")
             _positive_int(request.num_decode_tokens, "num_decode_tokens")
             if request.session_turn_index is not None and request.session_id is None:
@@ -424,14 +435,33 @@ def write_workload_csv(
                 _nonnegative_int(
                     request.session_turn_index, "session_turn_index"
                 )
-            arrived_at = (
-                format(request.arrived_at, ".17g")
-                if arrival_decimal_places is None
-                else f"{request.arrived_at:.{arrival_decimal_places}f}"
+            first_turn = (
+                request.session_id is None or request.session_id not in seen_sessions
+            )
+            if request.session_id is not None:
+                seen_sessions.add(request.session_id)
+            if first_turn and request.session_start_at is None:
+                raise ValueError("a first turn requires session_start_at")
+            if first_turn and request.think_time != 0.0:
+                raise ValueError("a first turn must have think_time=0")
+            if not first_turn and request.session_start_at is not None:
+                raise ValueError("a successor turn must omit session_start_at")
+            session_start_at = ""
+            if request.session_start_at is not None:
+                session_start_at = (
+                    format(request.session_start_at, ".17g")
+                    if time_decimal_places is None
+                    else f"{request.session_start_at:.{time_decimal_places}f}"
+                )
+            think_time = (
+                format(request.think_time, ".17g")
+                if time_decimal_places is None
+                else f"{request.think_time:.{time_decimal_places}f}"
             )
             writer.writerow(
                 (
-                    arrived_at,
+                    session_start_at,
+                    think_time,
                     request.num_prefill_tokens,
                     request.num_decode_tokens,
                     "" if request.session_id is None else request.session_id,

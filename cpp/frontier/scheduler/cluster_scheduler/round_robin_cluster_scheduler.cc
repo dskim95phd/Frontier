@@ -9,9 +9,11 @@ RoundRobinClusterScheduler::RoundRobinClusterScheduler(
     const entities::Cluster &cluster, std::vector<entities::Request> &requests,
     execution_time_predictor::ExecutionTimePredictorPtr predictor,
     std::shared_ptr<const kv_cache_transfer::BaseKVCacheTransferPredictor>
-        kv_cache_transfer_predictor)
+        kv_cache_transfer_predictor,
+    config::PrefixCacheConfig prefix_cache_config)
     : BaseClusterScheduler(cluster, requests, std::move(predictor),
-                           std::move(kv_cache_transfer_predictor)) {}
+                           std::move(kv_cache_transfer_predictor),
+                           prefix_cache_config) {}
 
 std::vector<ClusterRequestAssignment> RoundRobinClusterScheduler::schedule() {
     // Python's BaseClusterScheduler sorts the pending queue by the request's

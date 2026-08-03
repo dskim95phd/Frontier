@@ -201,9 +201,9 @@ def _write_workload(
     rows: list[tuple[float, int, int]],
 ) -> Path:
     lines = [
-        "arrived_at,num_prefill_tokens,num_decode_tokens",
+        "session_start_at,think_time,num_prefill_tokens,num_decode_tokens",
         *[
-            f"{arrival:.12f},{prefill},{decode}"
+            f"{arrival:.12f},0,{prefill},{decode}"
             for arrival, prefill, decode in rows
         ],
     ]

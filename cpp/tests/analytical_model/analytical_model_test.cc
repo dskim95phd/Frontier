@@ -552,7 +552,7 @@ void test_batch_model_matches_python_golden() {
             requests.emplace_back([&]() {
                 WorkloadRequest value{};
                 value.request_id = RequestId{request_index};
-                value.arrived_at = SimTime::from_seconds(0.0);
+                value.session_start_at = SimTime::from_seconds(0.0);
                 value.num_prefill_tokens = prefill_tokens;
                 value.num_decode_tokens = 2;
                 value.session_id = frontier::SessionId{};
@@ -739,7 +739,7 @@ void test_kimi_k2_uneven_pipeline_and_lm_head() {
     requests.emplace_back([&]() {
         WorkloadRequest value{};
         value.request_id = RequestId{0};
-        value.arrived_at = SimTime::from_seconds(0.0);
+        value.session_start_at = SimTime::from_seconds(0.0);
         value.num_prefill_tokens = 1;
         value.num_decode_tokens = 1;
         return value;
@@ -806,7 +806,7 @@ void test_kimi_k2_first_layer_scaled_prediction() {
     requests.emplace_back([&]() {
         WorkloadRequest value{};
         value.request_id = RequestId{0};
-        value.arrived_at = SimTime::from_seconds(0.0);
+        value.session_start_at = SimTime::from_seconds(0.0);
         value.num_prefill_tokens = 4'096;
         value.num_decode_tokens = 1;
         return value;
@@ -819,8 +819,11 @@ void test_kimi_k2_first_layer_scaled_prediction() {
     snapshot.scheduled_tokens = 4'096;
     snapshot.processed_tokens = 0;
     snapshot.scheduler_frontier = 4'096;
-    const Batch batch{BatchId{0}, IterationId{0}, {snapshot},
-                      SimTime::from_seconds(0.0), Generation{0}};
+    const Batch batch{BatchId{0},
+                      IterationId{0},
+                      {snapshot},
+                      SimTime::from_seconds(0.0),
+                      Generation{0}};
 
     const auto detailed_stage = detailed.predict_stage_execution_time(
         batch, requests, frontier::StageId{0});
@@ -842,7 +845,7 @@ void test_kimi_k2_first_layer_scaled_prediction() {
                    scaled_stage.moe_routing.front().lane_times_ms &&
                detailed_stage.moe_routing.front().pre_moe_compute_ms ==
                    scaled_stage.moe_routing.front().pre_moe_compute_ms,
-            "scaled prediction must preserve the first detailed MoE layer");
+           "scaled prediction must preserve the first detailed MoE layer");
 
     expect(first_lazy_layer.lazy_moe_layer_prediction &&
                first_lazy_layer.moe_routing.size() == 1 &&
@@ -938,9 +941,8 @@ int main() {
                                     test_kv_transfer_matches_python_golden);
     failures += frontier::test::run("Kimi K2 uneven pipeline and LM head",
                                     test_kimi_k2_uneven_pipeline_and_lm_head);
-    failures += frontier::test::run(
-        "Kimi K2 first-layer-scaled prediction",
-        test_kimi_k2_first_layer_scaled_prediction);
+    failures += frontier::test::run("Kimi K2 first-layer-scaled prediction",
+                                    test_kimi_k2_first_layer_scaled_prediction);
     failures +=
         frontier::test::run("invalid analytical inputs are rejected",
                             test_invalid_analytical_inputs_are_rejected);

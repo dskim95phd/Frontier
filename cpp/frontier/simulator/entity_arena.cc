@@ -31,17 +31,12 @@ make_snapshots(const scheduler::ScheduleResult &schedule,
 } // namespace
 
 EntityArena::EntityArena(
-    const std::vector<request_generator::WorkloadRequest> &workload,
-    config::SimulationMode simulation_mode)
+    const std::vector<request_generator::WorkloadRequest> &workload)
     : request_transfer_ids_(workload.size()),
       completion_recorded_(workload.size(), false) {
     requests_.reserve(workload.size());
     for (const auto &request : workload) {
-        request_generator::WorkloadRequest normalized = request;
-        if (simulation_mode == config::SimulationMode::kOffline) {
-            normalized.arrived_at = SimTime::from_seconds(0.0);
-        }
-        requests_.emplace_back(normalized);
+        requests_.emplace_back(request);
     }
 }
 
@@ -107,8 +102,7 @@ BatchId EntityArena::create_batch(const scheduler::ScheduleResult &schedule,
         model_kind);
     state.stage_arrival_times.resize(
         static_cast<std::size_t>(pipeline_parallel_size));
-    state.batch_stages.resize(
-        static_cast<std::size_t>(pipeline_parallel_size));
+    state.batch_stages.resize(static_cast<std::size_t>(pipeline_parallel_size));
     const auto [position, inserted] =
         batches_.emplace(batch_id.value(), std::move(state));
     static_cast<void>(position);
@@ -141,8 +135,7 @@ BatchId EntityArena::create_moe_idle_batch(MoESyncGroupId sync_group_id,
         participant_id);
     state.stage_arrival_times.resize(
         static_cast<std::size_t>(pipeline_parallel_size));
-    state.batch_stages.resize(
-        static_cast<std::size_t>(pipeline_parallel_size));
+    state.batch_stages.resize(static_cast<std::size_t>(pipeline_parallel_size));
     const auto [position, inserted] =
         batches_.emplace(batch_id.value(), std::move(state));
     static_cast<void>(position);

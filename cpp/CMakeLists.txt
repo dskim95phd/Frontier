@@ -83,6 +83,7 @@ add_library(
   frontier/entities/cluster.cc
   frontier/entities/replica.cc
   frontier/entities/kv_cache_transfer_info.cc
+  frontier/kv_cache/replica_kv_cache_manager.cc
   frontier/events/batch_stage_arrival_event.cc
   frontier/events/batch_stage_end_event.cc
   frontier/events/cluster_batch_end_event.cc
@@ -109,6 +110,7 @@ add_library(
   frontier/request_generator/workload.cc
   frontier/scheduler/cluster_scheduler/base_cluster_scheduler.cc
   frontier/scheduler/cluster_scheduler/round_robin_cluster_scheduler.cc
+  frontier/scheduler/cluster_scheduler/sticky_round_robin_cluster_scheduler.cc
   frontier/scheduler/global_scheduler/global_scheduler.cc
   frontier/scheduler/kv_block_accounting.cc
   frontier/scheduler/replica_scheduler/base_replica_scheduler.cc
@@ -350,6 +352,20 @@ if(BUILD_TESTING)
   )
 
   add_executable(
+    frontier_replica_kv_cache_manager_test
+    tests/kv_cache/replica_kv_cache_manager_test.cc
+  )
+  target_link_libraries(
+    frontier_replica_kv_cache_manager_test
+    PRIVATE frontier_core
+  )
+  frontier_enable_warnings(frontier_replica_kv_cache_manager_test)
+  add_test(
+    NAME frontier_kv_cache.replica_manager
+    COMMAND $<TARGET_FILE:frontier_replica_kv_cache_manager_test>
+  )
+
+  add_executable(
     frontier_vllm_v1_scheduler_test
     tests/scheduler/vllm_v1_scheduler_test.cc
   )
@@ -438,5 +454,69 @@ if(BUILD_TESTING)
   add_test(
     NAME frontier_simulator.moe_integration
     COMMAND $<TARGET_FILE:frontier_moe_integration_test>
+  )
+
+  add_executable(
+    frontier_prefix_cache_integration_test
+    tests/simulator/prefix_cache_integration_test.cc
+  )
+  target_compile_definitions(
+    frontier_prefix_cache_integration_test
+    PRIVATE
+      FRONTIER_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures"
+  )
+  target_link_libraries(
+    frontier_prefix_cache_integration_test
+    PRIVATE frontier_core
+  )
+  frontier_enable_warnings(frontier_prefix_cache_integration_test)
+  add_test(
+    NAME frontier_simulator.prefix_cache
+    COMMAND $<TARGET_FILE:frontier_prefix_cache_integration_test>
+  )
+
+  add_executable(
+    frontier_prefix_cache_topology_matrix_test
+    tests/simulator/prefix_cache_topology_matrix_test.cc
+  )
+  target_compile_definitions(
+    frontier_prefix_cache_topology_matrix_test
+    PRIVATE
+      FRONTIER_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures"
+  )
+  target_link_libraries(
+    frontier_prefix_cache_topology_matrix_test
+    PRIVATE frontier_core
+  )
+  frontier_enable_warnings(frontier_prefix_cache_topology_matrix_test)
+  add_test(
+    NAME frontier_simulator.prefix_cache_topology_matrix
+    COMMAND $<TARGET_FILE:frontier_prefix_cache_topology_matrix_test>
+  )
+
+  add_executable(
+    frontier_prefix_cache_stress_test
+    tests/simulator/prefix_cache_stress_test.cc
+  )
+  target_compile_definitions(
+    frontier_prefix_cache_stress_test
+    PRIVATE
+      FRONTIER_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures"
+  )
+  target_link_libraries(
+    frontier_prefix_cache_stress_test
+    PRIVATE frontier_core
+  )
+  frontier_enable_warnings(frontier_prefix_cache_stress_test)
+  add_test(
+    NAME frontier_simulator.prefix_cache_stress
+    COMMAND $<TARGET_FILE:frontier_prefix_cache_stress_test>
+  )
+  set_tests_properties(
+    frontier_simulator.prefix_cache_stress
+    PROPERTIES
+      LABELS stress
+      RUN_SERIAL TRUE
+      TIMEOUT 180
   )
 endif()

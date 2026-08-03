@@ -28,6 +28,11 @@ struct ReplicaTarget;
 struct ScheduleResult;
 } // namespace frontier::scheduler
 
+namespace frontier::kv_cache {
+struct PrefixCacheStats;
+struct PrefixCacheDiagnostics;
+} // namespace frontier::kv_cache
+
 namespace frontier::metrics {
 
 // Runtime metrics ownership corresponding to Python's MetricsStore.
@@ -64,6 +69,11 @@ class MetricsStore {
 
     void collect_completed_requests(const config::SimulationConfig &config,
                                     const simulator::EntityArena &entities);
+    void record_prefix_cache_target(
+        const kv_cache::PrefixCacheStats &stats,
+        const kv_cache::PrefixCacheDiagnostics &diagnostics,
+        scheduler::ReplicaTarget target, ClusterType cluster_type,
+        std::uint64_t block_size, config::PrefixCachingKeyMode key_mode);
 
     [[nodiscard]] SimulationOutput take_output() noexcept;
 

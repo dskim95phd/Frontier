@@ -24,8 +24,11 @@ BaseReplicaScheduler::BaseReplicaScheduler(
     config::SchedulerConfig config, std::vector<entities::Request> &requests,
     const entities::Replica &replica, DataParallelId dp_id,
     execution_time_predictor::ExecutionTimePredictorPtr predictor,
-    ClusterType cluster_type)
-    : config_(std::move(config)), requests_(&requests), kv_blocks_(config_),
+    ClusterType cluster_type, config::PrefixCacheConfig prefix_cache_config)
+    : config_(std::move(config)), requests_(&requests),
+      kv_blocks_(config_, prefix_cache_config,
+                 cluster_type == ClusterType::kMonolithic ||
+                     cluster_type == ClusterType::kPrefill),
       pipeline_parallel_size_(replica.pipeline_parallel_size()),
       replica_(&replica), dp_id_(dp_id), cluster_type_(cluster_type) {
     const std::uint64_t pipeline_parallel_size =

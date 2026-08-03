@@ -9,13 +9,22 @@ namespace frontier::entities {
 
 Request::Request(const request_generator::WorkloadRequest &workload_request)
     : request_id_(workload_request.request_id),
-      arrived_at_(workload_request.arrived_at),
+      session_start_at_(workload_request.session_start_at),
+      arrived_at_(workload_request.session_start_at),
+      think_time_(workload_request.think_time),
+      initial_num_prefill_tokens_(workload_request.num_prefill_tokens),
+      initial_num_decode_tokens_(workload_request.num_decode_tokens),
       num_prefill_tokens_(workload_request.num_prefill_tokens),
       num_decode_tokens_(workload_request.num_decode_tokens),
       session_id_(workload_request.session_id),
       session_turn_index_(workload_request.session_turn_index) {
-    if (!std::isfinite(arrived_at_.seconds()) || arrived_at_.seconds() < 0.0) {
-        throw RequestError("request arrival must be finite and nonnegative");
+    if (!think_time_.valid()) {
+        throw RequestError("request think time must be finite and nonnegative");
+    }
+    if (!session_start_at_.valid() &&
+        session_start_at_.seconds() != SimTime{}.seconds()) {
+        throw RequestError(
+            "request session start must be finite and nonnegative");
     }
     if (num_prefill_tokens_ == 0 || num_decode_tokens_ == 0) {
         throw RequestError("request token counts must be positive");
@@ -33,8 +42,8 @@ std::uint64_t Request::num_processed_prefill_tokens() const noexcept {
     return std::min(num_processed_tokens_, num_prefill_tokens_);
 }
 
-void Request::reschedule_pending_arrival(SimTime time) {
-    validate_time(time, "rescheduled arrival");
+void Request::set_pending_arrival(SimTime time) {
+    validate_time(time, "pending arrival");
     if (state_ != RequestState::kPending) {
         throw RequestError("only a pending request arrival can be rescheduled");
     }
@@ -59,6 +68,11 @@ void Request::validate_time(SimTime time, const char *context) const {
 }
 
 void Request::validate_progress() const {
+    if (num_prefill_tokens_ < initial_num_prefill_tokens_ ||
+        total_tokens() !=
+            initial_num_prefill_tokens_ + initial_num_decode_tokens_) {
+        throw RequestError("request replay token split is invalid");
+    }
     if (num_processed_tokens_ > total_tokens()) {
         throw RequestError("request-visible progress exceeds total tokens");
     }
@@ -122,6 +136,30 @@ void Request::on_admitted(SimTime time) {
     }
     state_ = RequestState::kRunning;
     preempted_ = false;
+}
+
+void Request::restore_prefix_cache_lookup(
+    std::uint64_t query_blocks, std::uint64_t hit_blocks,
+    std::uint64_t cached_tokens, config::PrefixCachingKeyMode key_mode) {
+    if (state_ != RequestState::kWaiting || is_prefill_complete_ ||
+        num_processed_tokens_ != 0 || scheduler_num_computed_tokens_ != 0) {
+        throw RequestError(
+            "prefix-cache restoration requires a zero-frontier waiting "
+            "prefill request");
+    }
+    if (hit_blocks > query_blocks || cached_tokens >= num_prefill_tokens_) {
+        throw RequestError("prefix-cache restoration exceeds prompt bounds");
+    }
+    num_processed_tokens_ = cached_tokens;
+    scheduler_num_computed_tokens_ = cached_tokens;
+    if (!prefix_cache_lookup_recorded_) {
+        cached_prefill_tokens_ = cached_tokens;
+        prefix_cache_query_blocks_ = query_blocks;
+        prefix_cache_hit_blocks_ = hit_blocks;
+        prefix_cache_key_mode_ = key_mode;
+        prefix_cache_lookup_recorded_ = true;
+    }
+    validate_progress();
 }
 
 void Request::advance_scheduler_frontier(std::uint64_t scheduled_tokens) {
@@ -207,6 +245,16 @@ void Request::on_preempted(SimTime time, ClusterType cluster_type) {
         scheduler_num_computed_tokens_ = 0;
         is_prefill_complete_ = true;
     } else {
+        if (cluster_type == ClusterType::kMonolithic) {
+            const std::uint64_t total = total_tokens();
+            // Only committed tokens are replayable. Keeping the larger of the
+            // current prefill boundary and committed progress preserves a
+            // partial/restarted prefill, while reclassifying generated decode
+            // tokens as parallel replay-prefill context.
+            num_prefill_tokens_ =
+                std::max(num_prefill_tokens_, num_processed_tokens_);
+            num_decode_tokens_ = total - num_prefill_tokens_;
+        }
         num_processed_tokens_ = 0;
         scheduler_num_computed_tokens_ = 0;
         is_prefill_complete_ = false;

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 from contextlib import redirect_stdout
 import io
 import json
@@ -19,6 +20,41 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 logging.disable(logging.CRITICAL)
+
+
+def _make_python_trace(workload_path: Path, output_dir: str) -> Path:
+    """Adapt root-only C++ think-time fixtures to Python's legacy reader."""
+    with workload_path.open(encoding="utf-8", newline="") as source:
+        rows = list(csv.DictReader(source))
+    if any(not row.get("session_start_at", "") for row in rows):
+        raise ValueError(
+            "the production-Python parity adapter only supports root turns; "
+            "completion-relative session arrivals are covered by C++ tests"
+        )
+    destination = Path(output_dir) / "python_trace.csv"
+    with destination.open("w", encoding="utf-8", newline="") as output:
+        writer = csv.DictWriter(
+            output,
+            fieldnames=[
+                "arrived_at",
+                "num_prefill_tokens",
+                "num_decode_tokens",
+                "session_id",
+                "session_turn_index",
+            ],
+        )
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(
+                {
+                    "arrived_at": row["session_start_at"],
+                    "num_prefill_tokens": row["num_prefill_tokens"],
+                    "num_decode_tokens": row["num_decode_tokens"],
+                    "session_id": row.get("session_id", ""),
+                    "session_turn_index": row.get("session_turn_index", ""),
+                }
+            )
+    return destination
 
 from frontier.cc_backend.cc_backend_config import AnalyticalCCBackendConfig
 from frontier.config import (
@@ -794,11 +830,12 @@ def run_oracle(
     with tempfile.TemporaryDirectory(
         prefix="frontier-step3-oracle-"
     ) as output_dir:
+        python_workload_path = _make_python_trace(workload_path, output_dir)
         with redirect_stdout(io.StringIO()):
             simulator = Simulator(
                 _build_python_config(
                     config,
-                    workload_path,
+                    python_workload_path,
                     output_dir,
                 )
             )

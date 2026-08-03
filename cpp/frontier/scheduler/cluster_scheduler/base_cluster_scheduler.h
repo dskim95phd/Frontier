@@ -104,7 +104,8 @@ class BaseClusterScheduler {
         std::vector<entities::Request> &requests,
         execution_time_predictor::ExecutionTimePredictorPtr predictor,
         std::shared_ptr<const kv_cache_transfer::BaseKVCacheTransferPredictor>
-            kv_cache_transfer_predictor);
+            kv_cache_transfer_predictor,
+        config::PrefixCacheConfig prefix_cache_config);
 
     [[nodiscard]] std::uint64_t num_replicas() const noexcept {
         return cluster_->parallelism().num_replicas;
@@ -112,6 +113,7 @@ class BaseClusterScheduler {
     [[nodiscard]] std::uint64_t data_parallel_size() const noexcept {
         return cluster_->parallelism().data_parallel_size;
     }
+    [[nodiscard]] SessionId request_session_id(RequestId request_id) const;
 
     std::vector<QueuedRequest> request_queue_;
 
@@ -344,6 +346,7 @@ class BaseClusterScheduler {
 
     std::vector<std::unique_ptr<BaseReplicaScheduler>> replica_schedulers_;
     const entities::Cluster *cluster_;
+    const std::vector<entities::Request> *requests_;
     std::shared_ptr<const kv_cache_transfer::BaseKVCacheTransferPredictor>
         kv_cache_transfer_predictor_;
     MoEBarrierCoordinator moe_barrier_;

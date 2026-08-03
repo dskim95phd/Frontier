@@ -3,6 +3,7 @@
 #include <utility>
 
 #include "frontier/scheduler/cluster_scheduler/round_robin_cluster_scheduler.h"
+#include "frontier/scheduler/cluster_scheduler/sticky_round_robin_cluster_scheduler.h"
 
 namespace frontier::scheduler {
 
@@ -11,7 +12,8 @@ GlobalScheduler::GlobalScheduler(
     std::vector<entities::Request> &requests, const PredictorMap &predictors,
     std::shared_ptr<const kv_cache_transfer::BaseKVCacheTransferPredictor>
         kv_cache_transfer_predictor,
-    const config::ClusterSchedulerConfig &scheduler_config)
+    const config::ClusterSchedulerConfig &scheduler_config,
+    config::PrefixCacheConfig prefix_cache_config)
     : clusters_(&clusters),
       kv_cache_transfer_predictor_(std::move(kv_cache_transfer_predictor)) {
     if (clusters.empty()) {
@@ -29,7 +31,13 @@ GlobalScheduler::GlobalScheduler(
         case config::ClusterSchedulerType::kRoundRobin:
             cluster_scheduler = std::make_unique<RoundRobinClusterScheduler>(
                 cluster, requests, predictor->second,
-                kv_cache_transfer_predictor_);
+                kv_cache_transfer_predictor_, prefix_cache_config);
+            break;
+        case config::ClusterSchedulerType::kStickyRoundRobin:
+            cluster_scheduler =
+                std::make_unique<StickyRoundRobinClusterScheduler>(
+                    cluster, requests, predictor->second,
+                    kv_cache_transfer_predictor_, prefix_cache_config);
             break;
         }
         if (cluster_scheduler == nullptr ||

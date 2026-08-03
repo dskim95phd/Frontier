@@ -21,6 +21,7 @@ class BaseReplicaScheduler;
     std::vector<entities::Request> &requests,
     execution_time_predictor::ExecutionTimePredictorPtr predictor,
     const entities::Replica &replica, DataParallelId dp_id,
-    ClusterType cluster_type);
+    ClusterType cluster_type,
+    config::PrefixCacheConfig prefix_cache_config = {});
 
 } // namespace frontier::scheduler

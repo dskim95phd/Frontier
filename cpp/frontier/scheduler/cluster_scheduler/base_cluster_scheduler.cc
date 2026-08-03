@@ -146,8 +146,9 @@ BaseClusterScheduler::BaseClusterScheduler(
     const entities::Cluster &cluster, std::vector<entities::Request> &requests,
     execution_time_predictor::ExecutionTimePredictorPtr predictor,
     std::shared_ptr<const kv_cache_transfer::BaseKVCacheTransferPredictor>
-        kv_cache_transfer_predictor)
-    : cluster_(&cluster),
+        kv_cache_transfer_predictor,
+    config::PrefixCacheConfig prefix_cache_config)
+    : cluster_(&cluster), requests_(&requests),
       kv_cache_transfer_predictor_(std::move(kv_cache_transfer_predictor)) {
     const std::uint64_t num_replicas = cluster.parallelism().num_replicas;
     const std::uint64_t data_parallel_size =
@@ -166,10 +167,10 @@ BaseClusterScheduler::BaseClusterScheduler(
     const config::ClusterRuntimeConfig &runtime = cluster.runtime_config();
     for (std::uint64_t replica = 0; replica < num_replicas; ++replica) {
         for (std::uint64_t dp = 0; dp < data_parallel_size; ++dp) {
-            replica_schedulers_.push_back(
-                make_replica_scheduler(runtime.scheduler, requests, predictor,
-                                       cluster.replica(ReplicaId{replica}),
-                                       DataParallelId{dp}, cluster.type()));
+            replica_schedulers_.push_back(make_replica_scheduler(
+                runtime.scheduler, requests, predictor,
+                cluster.replica(ReplicaId{replica}), DataParallelId{dp},
+                cluster.type(), prefix_cache_config));
         }
     }
     for (std::uint64_t replica = 0; replica < num_replicas; ++replica) {
@@ -188,6 +189,14 @@ BaseClusterScheduler::BaseClusterScheduler(
             }
         }
     }
+}
+
+SessionId BaseClusterScheduler::request_session_id(RequestId request_id) const {
+    if (!request_id.valid() || request_id.index() >= requests_->size()) {
+        throw ClusterSchedulerError(
+            "cluster scheduler references an unknown request");
+    }
+    return requests_->at(request_id.index()).session_id();
 }
 
 kv_cache_transfer::TransferPrediction
@@ -431,10 +440,8 @@ void BaseClusterScheduler::begin_moe_stage(
         prediction.logical_moe_layer_count == 0
             ? predicted_layers
             : prediction.logical_moe_layer_count;
-    const bool lazy_layer_prediction =
-        prediction.lazy_moe_layer_prediction;
-    const bool scaled_layer_prediction =
-        prediction.scaled_moe_layer_prediction;
+    const bool lazy_layer_prediction = prediction.lazy_moe_layer_prediction;
+    const bool scaled_layer_prediction = prediction.scaled_moe_layer_prediction;
     if (lazy_layer_prediction && scaled_layer_prediction) {
         throw std::logic_error(
             "MoE prediction cannot be lazy and scaled simultaneously");
@@ -612,9 +619,9 @@ void BaseClusterScheduler::begin_moe_stage(
         value.pp_ms = execution.pp_communication_ms;
         value.lazy_layer_prediction = lazy_layer_prediction;
         if (scaled_layer_prediction) {
-            const double critical_lane_ms = *std::max_element(
-                value.decode_lane_times_ms.front().begin(),
-                value.decode_lane_times_ms.front().end());
+            const double critical_lane_ms =
+                *std::max_element(value.decode_lane_times_ms.front().begin(),
+                                  value.decode_lane_times_ms.front().end());
             const double repeated_post_ms =
                 path == MoESyncPath::kPrefill
                     ? value.prefill_post_attention_ms_by_layer.front()
@@ -685,6 +692,13 @@ void BaseClusterScheduler::ensure_moe_group_participants(
         if (participant == arriving_participant) {
             continue;
         }
+        if (group.participants.find(participant) != group.participants.end()) {
+            // A real batch may already have joined this synchronization group
+            // before the first barrier arrival.  Creating an idle stand-in in
+            // that case leaves an unowned batch entity behind and can also
+            // enqueue a redundant barrier arrival for the same participant.
+            continue;
+        }
         const DataParallelId dp_id{value};
         const BatchId idle_batch_id = simulator.create_moe_idle_batch(
             group_key.sync_group_id, participant,
@@ -696,9 +710,9 @@ void BaseClusterScheduler::ensure_moe_group_participants(
             }(),
             cluster_type(), runtime.parallelism.pipeline_parallel_size, time,
             group_key.sync_generation);
-        const auto owner = group.participants.find(participant);
-        if (owner == group.participants.end()) {
-            group.participants.emplace(participant, idle_batch_id);
+        if (!group.participants.emplace(participant, idle_batch_id).second) {
+            throw std::logic_error(
+                "MoE idle participant was concurrently materialized");
         }
         if (!compact_decode) {
             enqueue_idle_moe_arrival(group_key, idle_batch_id, participant,
@@ -863,16 +877,15 @@ void BaseClusterScheduler::continue_moe_stage(
         }
         group.participants_initialized = false;
         for (const auto &[participant, batch_id] : group.participants) {
-            MoEStageState &state =
-                moe_stage_state(batch_id, key.stage_id);
+            MoEStageState &state = moe_stage_state(batch_id, key.stage_id);
             double refreshed_pre_moe_ms = 0.0;
             if (state.lazy_layer_prediction) {
                 const auto next_prediction =
                     get_replica_scheduler(state.replica_id, state.dp_id)
                         .get_replica_stage_scheduler(state.stage_id)
-                        .predict_moe_layer(
-                            simulator.batch(batch_id), simulator.requests(),
-                            state.current_layer);
+                        .predict_moe_layer(simulator.batch(batch_id),
+                                           simulator.requests(),
+                                           state.current_layer);
                 if (!next_prediction.lazy_moe_layer_prediction ||
                     next_prediction.moe_routing.size() != 1 ||
                     next_prediction.logical_moe_layer_count !=
@@ -882,8 +895,7 @@ void BaseClusterScheduler::continue_moe_stage(
                     throw std::logic_error(
                         "lazy MoE prediction changed the stage contract");
                 }
-                const auto &diagnostic =
-                    next_prediction.moe_routing.front();
+                const auto &diagnostic = next_prediction.moe_routing.front();
                 if (diagnostic.lane_times_ms.size() !=
                     simulator.runtime_config(cluster_type())
                         .parallelism.moe_expert_parallel_size) {
@@ -893,13 +905,12 @@ void BaseClusterScheduler::continue_moe_stage(
                 refreshed_pre_moe_ms = diagnostic.pre_moe_compute_ms;
                 state.pre_moe_compute_ms_by_layer.push_back(
                     refreshed_pre_moe_ms);
-                state.decode_lane_times_ms.push_back(
-                    diagnostic.lane_times_ms);
+                state.decode_lane_times_ms.push_back(diagnostic.lane_times_ms);
                 const entities::ExecutionTime &layer_execution =
                     next_prediction.execution_time;
-                const double critical_lane_ms = *std::max_element(
-                    diagnostic.lane_times_ms.begin(),
-                    diagnostic.lane_times_ms.end());
+                const double critical_lane_ms =
+                    *std::max_element(diagnostic.lane_times_ms.begin(),
+                                      diagnostic.lane_times_ms.end());
                 const double post_attention_ms =
                     layer_execution.tp_communication_ms +
                     layer_execution.moe_gating_linear_ms +
@@ -920,8 +931,7 @@ void BaseClusterScheduler::continue_moe_stage(
                         "work");
                 }
                 state.prefill_post_attention_ms_by_layer.push_back(
-                    std::max(0.0, shared_post_attention_ms) +
-                    critical_lane_ms);
+                    std::max(0.0, shared_post_attention_ms) + critical_lane_ms);
                 simulator.batch_stage(batch_id, state.stage_id)
                     .accumulate_execution_time(layer_execution);
                 const config::ClusterRuntimeConfig &runtime =
@@ -930,9 +940,8 @@ void BaseClusterScheduler::continue_moe_stage(
                     simulator.batch(batch_id), state.stage_id, diagnostic,
                     runtime);
             } else {
-                refreshed_pre_moe_ms =
-                    state.pre_moe_compute_ms_by_layer.at(
-                        static_cast<std::size_t>(state.current_layer));
+                refreshed_pre_moe_ms = state.pre_moe_compute_ms_by_layer.at(
+                    static_cast<std::size_t>(state.current_layer));
             }
             const double transition_ms =
                 refreshed_pre_moe_ms +

@@ -33,12 +33,22 @@ class Request {
 
     [[nodiscard]] RequestId id() const noexcept { return request_id_; }
     [[nodiscard]] SimTime arrived_at() const noexcept { return arrived_at_; }
-    void reschedule_pending_arrival(SimTime time);
+    [[nodiscard]] SimTime session_start_at() const noexcept {
+        return session_start_at_;
+    }
+    [[nodiscard]] SimTime think_time() const noexcept { return think_time_; }
+    void set_pending_arrival(SimTime time);
     [[nodiscard]] std::uint64_t num_prefill_tokens() const noexcept {
         return num_prefill_tokens_;
     }
     [[nodiscard]] std::uint64_t num_decode_tokens() const noexcept {
         return num_decode_tokens_;
+    }
+    [[nodiscard]] std::uint64_t initial_num_prefill_tokens() const noexcept {
+        return initial_num_prefill_tokens_;
+    }
+    [[nodiscard]] std::uint64_t initial_num_decode_tokens() const noexcept {
+        return initial_num_decode_tokens_;
     }
     [[nodiscard]] std::uint64_t total_tokens() const noexcept {
         return num_prefill_tokens_ + num_decode_tokens_;
@@ -110,10 +120,32 @@ class Request {
     [[nodiscard]] double cumulative_waiting_time_s() const noexcept {
         return cumulative_waiting_time_s_;
     }
+    [[nodiscard]] std::uint64_t cached_prefill_tokens() const noexcept {
+        return cached_prefill_tokens_;
+    }
+    [[nodiscard]] std::uint64_t prefix_cache_query_blocks() const noexcept {
+        return prefix_cache_query_blocks_;
+    }
+    [[nodiscard]] std::uint64_t prefix_cache_hit_blocks() const noexcept {
+        return prefix_cache_hit_blocks_;
+    }
+    [[nodiscard]] config::PrefixCachingKeyMode
+    prefix_cache_key_mode() const noexcept {
+        return prefix_cache_key_mode_;
+    }
+    [[nodiscard]] bool prefix_cache_lookup_recorded() const noexcept {
+        return prefix_cache_lookup_recorded_;
+    }
 
     void on_arrival(SimTime time,
                     ClusterType cluster_type = ClusterType::kMonolithic);
     void on_admitted(SimTime time);
+    void
+    restore_prefix_cache_lookup(std::uint64_t query_blocks,
+                                std::uint64_t hit_blocks,
+                                std::uint64_t cached_tokens,
+                                config::PrefixCachingKeyMode key_mode =
+                                    config::PrefixCachingKeyMode::kSession);
     void advance_scheduler_frontier(std::uint64_t scheduled_tokens);
     void
     on_batch_completion(SimTime time, std::uint64_t scheduled_tokens,
@@ -131,7 +163,11 @@ class Request {
     void validate_progress() const;
 
     RequestId request_id_;
+    SimTime session_start_at_;
     SimTime arrived_at_;
+    SimTime think_time_;
+    std::uint64_t initial_num_prefill_tokens_;
+    std::uint64_t initial_num_decode_tokens_;
     std::uint64_t num_prefill_tokens_;
     std::uint64_t num_decode_tokens_;
     SessionId session_id_;
@@ -158,6 +194,12 @@ class Request {
     double kv_cache_transfer_time_s_ = 0.0;
     SimTime waiting_since_;
     double cumulative_waiting_time_s_ = 0.0;
+    std::uint64_t cached_prefill_tokens_ = 0;
+    std::uint64_t prefix_cache_query_blocks_ = 0;
+    std::uint64_t prefix_cache_hit_blocks_ = 0;
+    config::PrefixCachingKeyMode prefix_cache_key_mode_ =
+        config::PrefixCachingKeyMode::kSession;
+    bool prefix_cache_lookup_recorded_ = false;
 };
 
 } // namespace frontier::entities

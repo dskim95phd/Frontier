@@ -17,35 +17,41 @@ void handle_event(const ClusterBatchEndPayload &payload, SimTime time,
         scheduler::BaseReplicaScheduler &replica =
             simulator.cluster(payload.cluster_type)
                 .get_replica_scheduler(target.replica_id, target.dp_id);
-        if (!replica.on_batch_completed(batch, time)) {
-            return;
-        }
-        simulator.metrics().record_batch(
-            batch, simulator.requests(),
-            simulator.predicted_batch_ms(payload.batch_id),
-            simulator.runtime_config(payload.cluster_type));
-        for (const entities::RequestBatchSnapshot &snapshot :
-             batch.requests()) {
-            const entities::Request &request =
-                simulator.request(snapshot.request_id);
-            if (!request.is_prefill_complete() ||
-                request.state() != entities::RequestState::kTransferPending) {
-                continue;
+        const bool has_valid_request = replica.on_batch_completed(batch, time);
+        if (has_valid_request) {
+            simulator.metrics().record_batch(
+                batch, simulator.requests(),
+                simulator.predicted_batch_ms(payload.batch_id),
+                simulator.runtime_config(payload.cluster_type));
+            for (const entities::RequestBatchSnapshot &snapshot :
+                 batch.requests()) {
+                const entities::Request &request =
+                    simulator.request(snapshot.request_id);
+                if (!request.is_prefill_complete() ||
+                    request.state() !=
+                        entities::RequestState::kTransferPending) {
+                    continue;
+                }
+                const TransferId transfer_id =
+                    simulator.create_kv_cache_transfer(
+                        snapshot.request_id, payload.batch_id, target);
+                simulator.event_queue().push(time, [&]() {
+                    KVCacheTransferStartPayload value{};
+                    value.transfer_id = transfer_id;
+                    value.request_id = snapshot.request_id;
+                    value.batch_id = payload.batch_id;
+                    value.replica_id = target.replica_id;
+                    value.dp_id = target.dp_id;
+                    value.generation = batch.schedule_epoch();
+                    value.cluster_type = ClusterType::kDecode;
+                    return value;
+                }());
             }
-            const TransferId transfer_id = simulator.create_kv_cache_transfer(
-                snapshot.request_id, payload.batch_id, target);
-            simulator.event_queue().push(time, [&]() {
-                KVCacheTransferStartPayload value{};
-                value.transfer_id = transfer_id;
-                value.request_id = snapshot.request_id;
-                value.batch_id = payload.batch_id;
-                value.replica_id = target.replica_id;
-                value.dp_id = target.dp_id;
-                value.generation = batch.schedule_epoch();
-                value.cluster_type = ClusterType::kDecode;
-                return value;
-            }());
         }
+        // An all-stale prefill batch still left the replica's in-flight set in
+        // on_batch_completed(). It owns no transfer or metrics record, but its
+        // arena entity must be released and the target must be polled just like
+        // a batch containing valid work.
         // KV transfer records and queued events own all source metadata needed
         // after this point. The scheduler retains the source KV allocation
         // independently until complete_kv_transfer(), so the completed batch

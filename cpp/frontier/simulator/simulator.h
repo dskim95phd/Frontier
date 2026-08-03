@@ -108,13 +108,16 @@ class Simulator {
     [[nodiscard]] metrics::SimulationOutput take_output();
 
   private:
+    void enqueue_request_arrival(RequestId request_id, SimTime ready_at);
+
     config::SimulationConfig config_;
     EntityArena entities_;
     std::map<ClusterType, entities::Cluster> clusters_;
     scheduler::GlobalScheduler::PredictorMap predictors_;
     std::size_t expected_decode_arrivals_ = 0;
     std::size_t decode_arrivals_ = 0;
-    std::size_t next_closed_loop_request_ = 0;
+    std::vector<RequestId> session_successors_;
+    bool has_session_successors_ = false;
     std::shared_ptr<const kv_cache_transfer::BaseKVCacheTransferPredictor>
         kv_cache_transfer_predictor_;
     EventQueue event_queue_;

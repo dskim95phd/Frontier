@@ -12,7 +12,8 @@ class OracleError(ValueError):
 
 
 _REQUIRED_WORKLOAD_COLUMNS = {
-    "arrived_at",
+    "session_start_at",
+    "think_time",
     "num_prefill_tokens",
     "num_decode_tokens",
 }
@@ -64,6 +65,7 @@ def parse_normalized_workload(text: str) -> list[dict[str, Any]]:
     indices = {name: index for index, name in enumerate(header)}
 
     requests: list[dict[str, Any]] = []
+    seen_sessions: set[int] = set()
     for raw_line in lines[1:]:
         if not raw_line.strip(" \t\r"):
             continue
@@ -73,15 +75,23 @@ def parse_normalized_workload(text: str) -> list[dict[str, Any]]:
                 "workload CSV field count does not match header"
             )
 
-        arrived_text = fields[indices["arrived_at"]]
+        start_text = fields[indices["session_start_at"]]
+        session_start_at = None
+        if start_text:
+            try:
+                session_start_at = float(start_text)
+            except ValueError as error:
+                raise OracleError("session_start_at must be numeric") from error
+            if not math.isfinite(session_start_at) or session_start_at < 0.0:
+                raise OracleError(
+                    "session_start_at must be finite and nonnegative"
+                )
         try:
-            arrived_at = float(arrived_text)
+            think_time = float(fields[indices["think_time"]])
         except ValueError as error:
-            raise OracleError("arrived_at must be numeric") from error
-        if not math.isfinite(arrived_at) or arrived_at < 0.0:
-            raise OracleError(
-                "arrived_at must be finite and nonnegative"
-            )
+            raise OracleError("think_time must be numeric") from error
+        if not math.isfinite(think_time) or think_time < 0.0:
+            raise OracleError("think_time must be finite and nonnegative")
 
         def optional_integer(field: str) -> int | None:
             if field not in indices:
@@ -98,10 +108,21 @@ def parse_normalized_workload(text: str) -> list[dict[str, Any]]:
                 "session_turn_index requires session_id"
             )
 
+        first_turn = session_id is None or session_id not in seen_sessions
+        if session_id is not None:
+            seen_sessions.add(session_id)
+        if first_turn and session_start_at is None:
+            raise OracleError("a first turn requires session_start_at")
+        if first_turn and think_time != 0.0:
+            raise OracleError("a first turn must have think_time=0")
+        if not first_turn and session_start_at is not None:
+            raise OracleError("a successor turn must omit session_start_at")
+
         requests.append(
             {
                 "request_id": len(requests),
-                "arrived_at": arrived_at,
+                "session_start_at": session_start_at,
+                "think_time": think_time,
                 "num_prefill_tokens": _parse_nonnegative_integer(
                     fields[indices["num_prefill_tokens"]],
                     "num_prefill_tokens",

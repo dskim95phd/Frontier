@@ -877,18 +877,18 @@ def test_workload_acceptance_and_normalization_match(
     [
         (
             "workload_block_hash",
-            "arrived_at,num_prefill_tokens,num_decode_tokens,"
-            "block_hash_ids\n0,1,1,9\n",
+            "session_start_at,think_time,num_prefill_tokens,"
+            "num_decode_tokens,block_hash_ids\n0,0,1,1,9\n",
         ),
         (
             "workload_nonfinite_arrival",
-            "arrived_at,num_prefill_tokens,num_decode_tokens\n"
-            "nan,1,1\n",
+            "session_start_at,think_time,num_prefill_tokens,num_decode_tokens\n"
+            "nan,0,1,1\n",
         ),
         (
             "workload_noninteger_tokens",
-            "arrived_at,num_prefill_tokens,num_decode_tokens\n"
-            "0,1.5,1\n",
+            "session_start_at,think_time,num_prefill_tokens,num_decode_tokens\n"
+            "0,0,1.5,1\n",
         ),
     ],
 )

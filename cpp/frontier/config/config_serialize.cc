@@ -100,8 +100,7 @@ OrderedJson serialize_execution_model(const ExecutionModelConfig &execution) {
         {"type", to_string(execution.type)},
         {"device", execution.analytical.device},
         {"precision", execution.analytical.precision},
-        {"moe_layer_event_mode",
-         execution.analytical.moe_layer_event_mode},
+        {"moe_layer_event_mode", execution.analytical.moe_layer_event_mode},
         {
             "network_bandwidth_gbps",
             execution.analytical.network_bandwidth_gbps,
@@ -215,10 +214,6 @@ std::string serialize_simulation_config_json(const SimulationConfig &config) {
     root["simulation_mode"] = to_string(config.simulation_mode);
     root["system_architecture"] = to_string(config.system_architecture);
     root["enable_parallel_clusters"] = config.enable_parallel_clusters;
-    if (config.closed_loop_max_concurrency > 0) {
-        root["closed_loop_max_concurrency"] =
-            config.closed_loop_max_concurrency;
-    }
     root["prefix_cache"] = serialize_prefix_cache(config.prefix_cache);
     root["cluster_scheduler"] =
         serialize_cluster_scheduler(config.cluster_scheduler);
@@ -226,7 +221,6 @@ std::string serialize_simulation_config_json(const SimulationConfig &config) {
     if (config.system_architecture == SystemArchitecture::kPdDisaggregation) {
         if (config.system_architecture !=
                 SystemArchitecture::kPdDisaggregation ||
-            config.prefix_cache.enabled ||
             !std::holds_alternative<PddRuntimeConfig>(config.runtime)) {
             throw ConfigError(
                 "PDD config requires sequential cluster and transfer configs");
@@ -240,10 +234,8 @@ std::string serialize_simulation_config_json(const SimulationConfig &config) {
     if (!std::holds_alternative<ClusterRuntimeConfig>(config.runtime)) {
         throw ConfigError("co-location config requires a monolithic cluster");
     }
-    if (config.system_architecture != SystemArchitecture::kCoLocation ||
-        config.prefix_cache.enabled) {
-        throw ConfigError(
-            "co-location config requires prefix caching disabled");
+    if (config.system_architecture != SystemArchitecture::kCoLocation) {
+        throw ConfigError("co-location config requires a monolithic cluster");
     }
     root["clusters"] = serialize_single_cluster(config.cluster());
     return root.dump(2) + '\n';

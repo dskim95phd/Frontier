@@ -23,6 +23,7 @@ from workload_generator import (  # noqa: E402
     PoissonIntervalDistribution,
     StaticIntervalDistribution,
     UniformLengthDistribution,
+    WorkloadRequest,
     ZipfLengthDistribution,
     generate_request_shapes,
     generate_requests,
@@ -96,13 +97,15 @@ def test_fixed_static_workload_uses_canonical_csv_contract() -> None:
         length_distribution=FixedLengthDistribution(32, 8),
         interval_distribution=StaticIntervalDistribution(0.25),
     )
-    assert [request.arrived_at for request in requests] == [0.0, 0.25, 0.5]
+    assert [request.session_start_at for request in requests] == [0.0, 0.25, 0.5]
+    assert [request.think_time for request in requests] == [0.0, 0.0, 0.0]
 
     output = io.StringIO()
     write_workload_csv(output, requests)
     rows = list(csv.DictReader(io.StringIO(output.getvalue())))
     assert tuple(rows[0]) == (
-        "arrived_at",
+        "session_start_at",
+        "think_time",
         "num_prefill_tokens",
         "num_decode_tokens",
         "session_id",
@@ -110,27 +113,46 @@ def test_fixed_static_workload_uses_canonical_csv_contract() -> None:
     )
     assert rows == [
         {
-            "arrived_at": "0",
+            "session_start_at": "0",
+            "think_time": "0",
             "num_prefill_tokens": "32",
             "num_decode_tokens": "8",
             "session_id": "",
             "session_turn_index": "",
         },
         {
-            "arrived_at": "0.25",
+            "session_start_at": "0.25",
+            "think_time": "0",
             "num_prefill_tokens": "32",
             "num_decode_tokens": "8",
             "session_id": "",
             "session_turn_index": "",
         },
         {
-            "arrived_at": "0.5",
+            "session_start_at": "0.5",
+            "think_time": "0",
             "num_prefill_tokens": "32",
             "num_decode_tokens": "8",
             "session_id": "",
             "session_turn_index": "",
         },
     ]
+
+
+def test_multi_turn_workload_records_completion_relative_think_time() -> None:
+    output = io.StringIO()
+    write_workload_csv(
+        output,
+        [
+            WorkloadRequest(0.25, 0.0, 32, 8, 7, 0),
+            WorkloadRequest(None, 1.5, 16, 4, 7, 1),
+        ],
+    )
+    rows = list(csv.DictReader(io.StringIO(output.getvalue())))
+    assert rows[0]["session_start_at"] == "0.25"
+    assert rows[0]["think_time"] == "0"
+    assert rows[1]["session_start_at"] == ""
+    assert rows[1]["think_time"] == "1.5"
 
 
 @pytest.mark.parametrize(
@@ -165,9 +187,10 @@ def test_copied_distributions_produce_valid_requests(
     )
     assert all(request.num_prefill_tokens > 0 for request in requests)
     assert all(request.num_decode_tokens > 0 for request in requests)
-    assert all(request.arrived_at >= 0.0 for request in requests)
+    assert all(request.session_start_at is not None for request in requests)
+    assert all(request.session_start_at >= 0.0 for request in requests)
     assert all(
-        left.arrived_at <= right.arrived_at
+        left.session_start_at <= right.session_start_at
         for left, right in zip(requests, requests[1:])
     )
 
@@ -210,7 +233,8 @@ def test_cli_generates_a_normalized_workload(tmp_path: Path) -> None:
     with output_path.open(encoding="utf-8") as output:
         rows = list(csv.DictReader(output))
     assert len(rows) == 2
-    assert rows[0]["arrived_at"] == "0"
+    assert rows[0]["session_start_at"] == "0"
+    assert rows[0]["think_time"] == "0"
     assert rows[0]["num_prefill_tokens"] == "128"
     assert rows[0]["num_decode_tokens"] == "16"
 

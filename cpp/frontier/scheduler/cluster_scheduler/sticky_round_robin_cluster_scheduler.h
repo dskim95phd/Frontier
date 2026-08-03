@@ -2,15 +2,16 @@
 
 #include <cstdint>
 #include <memory>
+#include <unordered_map>
 #include <vector>
 
 #include "frontier/scheduler/cluster_scheduler/base_cluster_scheduler.h"
 
 namespace frontier::scheduler {
 
-class RoundRobinClusterScheduler final : public BaseClusterScheduler {
+class StickyRoundRobinClusterScheduler final : public BaseClusterScheduler {
   public:
-    RoundRobinClusterScheduler(
+    StickyRoundRobinClusterScheduler(
         const entities::Cluster &cluster,
         std::vector<entities::Request> &requests,
         execution_time_predictor::ExecutionTimePredictorPtr predictor,
@@ -21,7 +22,9 @@ class RoundRobinClusterScheduler final : public BaseClusterScheduler {
     [[nodiscard]] std::vector<ClusterRequestAssignment> schedule() override;
 
   private:
-    std::uint64_t request_counter_ = 0;
+    std::unordered_map<SessionId, ReplicaTarget, StrongIdHash<SessionId>>
+        session_targets_;
+    std::uint64_t next_session_target_ = 0;
 };
 
 } // namespace frontier::scheduler

@@ -50,6 +50,8 @@ std::string_view to_string(ClusterSchedulerType type) noexcept {
     switch (type) {
     case ClusterSchedulerType::kRoundRobin:
         return "round_robin";
+    case ClusterSchedulerType::kStickyRoundRobin:
+        return "sticky_round_robin";
     }
     return "unknown";
 }

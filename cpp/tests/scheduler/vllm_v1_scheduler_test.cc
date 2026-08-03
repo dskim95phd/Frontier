@@ -39,7 +39,7 @@ std::vector<Request> make_requests(
             WorkloadRequest value{};
             value.request_id =
                 RequestId{static_cast<RequestId::ValueType>(index)};
-            value.arrived_at = SimTime::from_seconds(0.0);
+            value.session_start_at = SimTime::from_seconds(0.0);
             value.num_prefill_tokens = tokens[index].first;
             value.num_decode_tokens = tokens[index].second;
             value.session_id = frontier::SessionId{};
@@ -361,6 +361,183 @@ void test_requester_self_preemption_and_disabled_pressure() {
            "disabled pressure must preserve running progress and allocation");
 }
 
+void test_session_prefix_hit_and_all_hit_demotion() {
+    std::vector<Request> requests;
+    for (const auto &[prefill, decode] :
+         std::vector<std::pair<std::uint64_t, std::uint64_t>>{
+             {4, 1}, {4, 1}, {5, 1}}) {
+        const std::size_t index = requests.size();
+        WorkloadRequest value{};
+        value.request_id = RequestId{index};
+        value.session_start_at = SimTime::from_seconds(0.0);
+        value.num_prefill_tokens = prefill;
+        value.num_decode_tokens = decode;
+        value.session_id = frontier::SessionId{7};
+        value.session_turn_index = index;
+        requests.emplace_back(value);
+    }
+    SchedulerConfig config = scheduler_config();
+    config.block_size = 4;
+    config.num_blocks = 8;
+    VllmV1Scheduler scheduler{
+        config, requests,
+        frontier::config::PrefixCacheConfig{
+            true, frontier::config::PrefixCachingKeyMode::kSession}};
+
+    requests[0].on_arrival(requests[0].arrived_at());
+    scheduler.add_request(RequestId{0});
+    const ScheduleResult first = scheduler.schedule(SimTime::from_seconds(0.0));
+    static_cast<void>(complete_schedule(scheduler, requests, first, 0, 0.001));
+    expect(requests[0].completed() && scheduler.idle(),
+           "first cache-producing request must release ownership");
+
+    requests[1].on_arrival(requests[1].arrived_at());
+    scheduler.add_request(RequestId{1});
+    const ScheduleResult all_hit =
+        scheduler.schedule(SimTime::from_seconds(0.001));
+    expect(all_hit.scheduled_requests.size() == 1 &&
+               all_hit.scheduled_requests[0].num_tokens == 4 &&
+               requests[1].cached_prefill_tokens() == 0 &&
+               requests[1].prefix_cache_query_blocks() == 1 &&
+               requests[1].prefix_cache_hit_blocks() == 0,
+           "a fully block-aligned all-hit prompt must recompute its final "
+           "block");
+    static_cast<void>(
+        complete_schedule(scheduler, requests, all_hit, 1, 0.002));
+
+    requests[2].on_arrival(requests[2].arrived_at());
+    scheduler.add_request(RequestId{2});
+    const ScheduleResult partial =
+        scheduler.schedule(SimTime::from_seconds(0.002));
+    expect(partial.scheduled_requests.size() == 1 &&
+               partial.scheduled_requests[0].num_tokens == 1 &&
+               requests[2].num_processed_tokens() == 4 &&
+               requests[2].scheduler_num_computed_tokens() == 5 &&
+               requests[2].cached_prefill_tokens() == 4,
+           "a partial suffix must restore both request frontiers and schedule "
+           "only new work");
+    static_cast<void>(
+        complete_schedule(scheduler, requests, partial, 2, 0.003));
+    expect(scheduler.idle() && scheduler.prefix_cache_stats().hit_blocks == 1,
+           "zero-ref cache contents must not prevent scheduler quiescence");
+}
+
+void test_preemption_reentry_uses_resident_free_cache_once() {
+    std::vector<Request> requests;
+    for (std::uint64_t index = 0; index < 2; ++index) {
+        WorkloadRequest workload{};
+        workload.request_id = RequestId{index};
+        workload.session_start_at = SimTime::from_seconds(0.0);
+        workload.num_prefill_tokens = 5;
+        workload.num_decode_tokens = 5;
+        workload.session_id = frontier::SessionId{11 + index};
+        workload.session_turn_index = 0;
+        requests.emplace_back(workload);
+    }
+
+    SchedulerConfig config = scheduler_config();
+    config.block_size = 4;
+    config.num_blocks = 5;
+    config.enable_preemption = true;
+    VllmV1Scheduler scheduler{
+        config, requests,
+        frontier::config::PrefixCacheConfig{
+            true, frontier::config::PrefixCachingKeyMode::kSession}};
+    arrive_all(scheduler, requests);
+
+    double time = 0.0;
+    for (std::uint64_t batch_id = 0; batch_id < 4; ++batch_id) {
+        const ScheduleResult schedule =
+            scheduler.schedule(SimTime::from_seconds(time));
+        expect(schedule.scheduled_requests.size() == 2,
+               "both requests must progress to nine committed tokens");
+        time += 0.001;
+        static_cast<void>(
+            complete_schedule(scheduler, requests, schedule, batch_id, time));
+    }
+    expect(requests[0].num_processed_tokens() == 9 &&
+               requests[1].num_processed_tokens() == 9,
+           "fixture must commit four decode tokens for both requests");
+    const ScheduleResult pressure =
+        scheduler.schedule(SimTime::from_seconds(time));
+    expect(pressure.preempted_count == 1 &&
+               pressure.scheduled_requests.size() == 1 &&
+               pressure.scheduled_requests[0].request_id == RequestId{1} &&
+               requests[0].preempted(),
+           "the FCFS tail victim must be preempted after reserving its "
+           "uncomputed suffix block");
+    expect(requests[0].num_prefill_tokens() == 9 &&
+               requests[0].num_decode_tokens() == 1 &&
+               scheduler.kv_blocks().available_blocks() == 2 &&
+               scheduler.kv_blocks().gpu_cache_valid_prefix_blocks(
+                   frontier::SessionId{11}) == 2,
+           "preemption must convert committed decode progress to replay "
+           "prefill while retaining both complete GPU blocks");
+    time += 0.001;
+    static_cast<void>(
+        complete_schedule(scheduler, requests, pressure, 4, time));
+
+    const ScheduleResult reentry =
+        scheduler.schedule(SimTime::from_seconds(time + 0.001));
+    expect(reentry.scheduled_requests.size() == 1 &&
+               reentry.scheduled_requests[0].num_tokens == 1 &&
+               requests[0].num_processed_tokens() == 8 &&
+               requests[0].scheduler_num_computed_tokens() == 9 &&
+               requests[0].cached_prefill_tokens() == 0,
+           "reentry must restore both replay-prefill blocks without "
+           "overwriting the request's first-lookup metrics");
+    expect(scheduler.prefix_cache_stats().successful_admissions == 3 &&
+               scheduler.prefix_cache_stats().query_blocks == 4 &&
+               scheduler.prefix_cache_stats().hit_blocks == 2,
+           "system metrics must count the exact cached replay admission");
+    time += 0.002;
+    static_cast<void>(complete_schedule(scheduler, requests, reentry, 5, time));
+    expect(requests[0].completed() && scheduler.idle(),
+           "one replay token and one remaining decode token must complete the "
+           "victim");
+}
+
+void test_cache_disabled_reentry_replays_decode_as_prefill() {
+    auto requests = make_requests({{5, 5}, {5, 5}});
+    SchedulerConfig config = scheduler_config();
+    config.block_size = 4;
+    config.num_blocks = 5;
+    config.enable_preemption = true;
+    VllmV1Scheduler scheduler{config, requests};
+    arrive_all(scheduler, requests);
+
+    double time = 0.0;
+    for (std::uint64_t batch_id = 0; batch_id < 4; ++batch_id) {
+        const ScheduleResult schedule =
+            scheduler.schedule(SimTime::from_seconds(time));
+        time += 0.001;
+        static_cast<void>(
+            complete_schedule(scheduler, requests, schedule, batch_id, time));
+    }
+    const ScheduleResult pressure =
+        scheduler.schedule(SimTime::from_seconds(time));
+    expect(pressure.preempted_count == 1 && requests[0].preempted() &&
+               requests[0].num_prefill_tokens() == 9 &&
+               requests[0].num_decode_tokens() == 1,
+           "cache-disabled victim must still reconstruct the replay split");
+    time += 0.001;
+    static_cast<void>(
+        complete_schedule(scheduler, requests, pressure, 4, time));
+
+    const ScheduleResult replay =
+        scheduler.schedule(SimTime::from_seconds(time + 0.001));
+    expect(replay.scheduled_requests.size() == 1 &&
+               replay.scheduled_requests[0].request_id == RequestId{0} &&
+               replay.scheduled_requests[0].num_tokens == 9,
+           "without resident cache the committed nine-token context must be "
+           "recomputed as one prefill");
+    time += 0.002;
+    static_cast<void>(complete_schedule(scheduler, requests, replay, 5, time));
+    expect(requests[0].completed() && scheduler.idle(),
+           "cache-disabled replay must finish without four extra decode "
+           "iterations");
+}
+
 } // namespace
 
 int main() {
@@ -385,5 +562,14 @@ int main() {
     failures += frontier::test::run(
         "requester self-preemption and disabled pressure",
         test_requester_self_preemption_and_disabled_pressure);
+    failures +=
+        frontier::test::run("session prefix hit and all-hit demotion",
+                            test_session_prefix_hit_and_all_hit_demotion);
+    failures += frontier::test::run(
+        "preemption reentry uses resident free cache once",
+        test_preemption_reentry_uses_resident_free_cache_once);
+    failures += frontier::test::run(
+        "cache-disabled reentry replays decode as prefill",
+        test_cache_disabled_reentry_replays_decode_as_prefill);
     return failures == 0 ? 0 : 1;
 }

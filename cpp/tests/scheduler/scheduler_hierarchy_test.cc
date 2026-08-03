@@ -51,7 +51,7 @@ void test_colocation_scheduler_hierarchy_routes_and_executes() {
     requests.emplace_back([&]() {
         WorkloadRequest value{};
         value.request_id = RequestId{0};
-        value.arrived_at = SimTime::from_seconds(0.0);
+        value.session_start_at = SimTime::from_seconds(0.0);
         value.num_prefill_tokens = 2;
         value.num_decode_tokens = 1;
         value.session_id = frontier::SessionId{};
@@ -184,7 +184,7 @@ void test_colocation_hierarchy_rejects_unknown_targets() {
     requests.emplace_back([&]() {
         WorkloadRequest value{};
         value.request_id = RequestId{0};
-        value.arrived_at = SimTime::from_seconds(0.0);
+        value.session_start_at = SimTime::from_seconds(0.0);
         value.num_prefill_tokens = 2;
         value.num_decode_tokens = 1;
         value.session_id = frontier::SessionId{};

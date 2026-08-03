@@ -50,6 +50,13 @@ void validate_request_metrics(const std::vector<RequestMetricsRecord> &requests,
                 "request metrics contain duplicate request_id=" +
                 std::to_string(request.request_id.value()));
         }
+        if (request.num_prefill_tokens == 0 || request.num_decode_tokens == 0 ||
+            request.prefix_cache_hit_blocks >
+                request.prefix_cache_query_blocks ||
+            request.cached_prefill_tokens > request.num_prefill_tokens) {
+            throw std::invalid_argument(
+                "request prefix-cache metrics are invalid");
+        }
         static_cast<void>(milliseconds_between(request.prefill_completed_at,
                                                request.arrived_at,
                                                "prefill_completed_at"));
@@ -110,6 +117,18 @@ OrderedJson serialize_request(const RequestMetricsRecord &request,
                               config::SystemArchitecture architecture) {
     OrderedJson json = OrderedJson::object();
     json["request_id"] = request.request_id.value();
+    if (request.session_id.valid()) {
+        json["session_id"] = request.session_id.value();
+    } else {
+        json["session_id"] = nullptr;
+    }
+    json["num_prefill_tokens"] = request.num_prefill_tokens;
+    json["num_decode_tokens"] = request.num_decode_tokens;
+    json["cached_prefill_tokens"] = request.cached_prefill_tokens;
+    json["prefix_cache_query_blocks"] = request.prefix_cache_query_blocks;
+    json["prefix_cache_hit_blocks"] = request.prefix_cache_hit_blocks;
+    json["prefix_cache_key_mode"] =
+        config::to_string(request.prefix_cache_key_mode);
     json["arrived_at_s"] = request.arrived_at.seconds();
     json["first_scheduled_at_s"] = request.first_scheduled_at.seconds();
     json["prefill_completed_at_s"] = request.prefill_completed_at.seconds();
@@ -642,6 +661,40 @@ std::string serialize_simulation_output_json(const SimulationOutput &output) {
         root["moe_routing"].push_back(serialize_moe_routing(routing));
     }
 
+    const PrefixCacheMetricsAggregate &cache = output.aggregate.prefix_cache;
+    const double hit_rate = cache.query_blocks == 0
+                                ? 0.0
+                                : static_cast<double>(cache.hit_blocks) /
+                                      static_cast<double>(cache.query_blocks);
+    root["prefix_cache"] = OrderedJson::object({
+        {"storage_model", cache.storage_model},
+        {"key_mode", config::to_string(cache.key_mode)},
+        {"block_size", cache.block_size},
+        {"successful_admissions", cache.successful_admissions},
+        {"query_blocks", cache.query_blocks},
+        {"hit_blocks", cache.hit_blocks},
+        {"hit_rate", hit_rate},
+        {"evicted_blocks", cache.evicted_blocks},
+        {"evicted_sessions", cache.evicted_sessions},
+    });
+    root["prefix_cache_targets"] = OrderedJson::array();
+    for (const PrefixCacheTargetMetricsRecord &target :
+         output.prefix_cache_targets) {
+        root["prefix_cache_targets"].push_back(OrderedJson::object({
+            {"cluster_type", to_string(target.cluster_type)},
+            {"replica_id", target.replica_id.value()},
+            {"dp_id", target.dp_id.value()},
+            {"capacity_blocks", target.capacity_blocks},
+            {"available_blocks", target.available_blocks},
+            {"active_blocks", target.active_blocks},
+            {"resident_blocks", target.resident_blocks},
+            {"evictable_blocks", target.evictable_blocks},
+            {"evictable_sessions", target.evictable_sessions},
+            {"sessions_with_nonzero_frontier",
+             target.sessions_with_nonzero_frontier},
+        }));
+    }
+
     return root.dump(2) + '\n';
 }
 
@@ -654,12 +707,18 @@ serialize_request_metrics_csv(const std::vector<RequestMetricsRecord> &requests,
     output.imbue(std::locale::classic());
     output << std::setprecision(std::numeric_limits<double>::max_digits10);
     if (!is_pdd(architecture)) {
-        output << "request_id,arrived_at_s,first_scheduled_at_s,"
+        output << "request_id,session_id,num_prefill_tokens,num_decode_tokens,"
+                  "cached_prefill_tokens,prefix_cache_query_blocks,"
+                  "prefix_cache_hit_blocks,prefix_cache_key_mode,arrived_at_s,"
+                  "first_scheduled_at_s,"
                   "prefill_completed_at_s,first_token_completed_at_s,"
                   "completed_at_s,scheduling_delay_ms,ttft_ms,e2e_ms,"
                   "num_processed_tokens,preemption_count,replica_id,dp_id\n";
     } else {
-        output << "request_id,arrived_at_s,first_scheduled_at_s,"
+        output << "request_id,session_id,num_prefill_tokens,num_decode_tokens,"
+                  "cached_prefill_tokens,prefix_cache_query_blocks,"
+                  "prefix_cache_hit_blocks,prefix_cache_key_mode,arrived_at_s,"
+                  "first_scheduled_at_s,"
                   "prefill_completed_at_s,first_token_completed_at_s,"
                   "completed_at_s,scheduling_delay_ms,ttft_ms,e2e_ms,"
                   "num_processed_tokens,preemption_count,"
@@ -671,7 +730,16 @@ serialize_request_metrics_csv(const std::vector<RequestMetricsRecord> &requests,
     }
 
     for (const RequestMetricsRecord &request : requests) {
-        output << request.request_id.value() << ','
+        output << request.request_id.value() << ',';
+        if (request.session_id.valid()) {
+            output << request.session_id.value();
+        }
+        output << ',' << request.num_prefill_tokens << ','
+               << request.num_decode_tokens << ','
+               << request.cached_prefill_tokens << ','
+               << request.prefix_cache_query_blocks << ','
+               << request.prefix_cache_hit_blocks << ','
+               << config::to_string(request.prefix_cache_key_mode) << ','
                << request.arrived_at.seconds() << ',';
         output << request.first_scheduled_at.seconds() << ',';
         output << request.prefill_completed_at.seconds() << ',';

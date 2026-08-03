@@ -391,7 +391,7 @@ def write_workload(
             isolated_gap_seconds if arrival_rate is None else None
         ),
     )
-    write_workload_csv(path, requests, arrival_decimal_places=12)
+    write_workload_csv(path, requests, time_decimal_places=12)
 
 
 def write_config(
@@ -405,13 +405,10 @@ def write_config(
     num_blocks: int,
     topology: TopologyConfig,
     operator_precisions: dict[str, str],
-    closed_loop_max_concurrency: int = 0,
 ) -> None:
     config = json.loads(BASE_CONFIG.read_text(encoding="utf-8"))
     config["run_id"] = run_id
     config["simulation_mode"] = "online"
-    if closed_loop_max_concurrency > 0:
-        config["closed_loop_max_concurrency"] = closed_loop_max_concurrency
     base_cluster = config["clusters"]["monolithic"]
 
     def make_cluster(*, decode: bool) -> dict:
@@ -914,15 +911,6 @@ def build_parser() -> argparse.ArgumentParser:
         default=parse_float_list("1,2,4,8,16,32"),
     )
     parser.add_argument(
-        "--closed-loop-concurrency",
-        action="store_true",
-        help=(
-            "Interpret --offered-concurrency values as exact total in-flight "
-            "request targets. Release one replacement whenever a request "
-            "completes instead of generating Poisson arrivals."
-        ),
-    )
-    parser.add_argument(
         "--batch-sizes",
         type=parse_int_list,
         default=parse_int_list("1,4,8,16,32"),
@@ -1095,17 +1083,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     shapes = generate_shapes(workload_config)
 
-    if args.closed_loop_concurrency and any(
-        not float(value).is_integer() for value in args.offered_concurrency
-    ):
-        raise SystemExit(
-            "closed-loop concurrency values must be positive integers"
-        )
-    calibration_request_count = (
-        0
-        if args.closed_loop_concurrency
-        else (args.calibration_requests or len(shapes))
-    )
+    calibration_request_count = args.calibration_requests or len(shapes)
     prompt_mean = statistics.fmean(shape.prompt_tokens for shape in shapes)
     output_mean = statistics.fmean(shape.output_tokens for shape in shapes)
     calibration_shapes = sorted(
@@ -1116,71 +1094,59 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
     )[:calibration_request_count]
 
-    if args.closed_loop_concurrency:
-        isolated_service_seconds = 0.0
-        arrival_reference_service_seconds = 0.0
-        print("closed-loop concurrency mode; calibration skipped", flush=True)
-    else:
-        calibration_workload = inputs_dir / "calibration.csv"
-        calibration_config = inputs_dir / "calibration.json"
-        write_workload(
-            calibration_workload, calibration_shapes, arrival_rate=None
-        )
-        write_config(
-            calibration_config,
-            run_id="single-turn-load-calibration",
-            prefill_batch_size_cap=1,
-            decode_batch_size_cap=1,
-            max_tokens_in_batch=args.max_tokens_in_batch,
-            prefill_chunk_tokens=args.prefill_chunk_tokens,
-            num_blocks=max(num_blocks_values),
-            topology=topology,
-            operator_precisions=operator_precisions,
-        )
-        print("calibration start", flush=True)
-        calibration, calibration_process_seconds = run_simulator(
-            binary,
-            calibration_config,
-            calibration_workload,
-            timeout_seconds=args.timeout_seconds,
-        )
-        isolated_service_seconds = statistics.fmean(
-            float(row["e2e_ms"]) / 1_000.0
-            for row in calibration["requests"]
-        )
-        if isolated_service_seconds <= 0.0:
-            raise RuntimeError("isolated mean service time must be positive")
-        print(
-            f"calibration mean_service_s={isolated_service_seconds:.9f} "
-            f"process_s={calibration_process_seconds:.3f}",
-            flush=True,
-        )
-        arrival_reference_service_seconds = (
-            args.arrival_reference_service_seconds
-            if args.arrival_reference_service_seconds is not None
-            else isolated_service_seconds
-        )
-        print(
-            "arrival reference_service_s="
-            f"{arrival_reference_service_seconds:.9f}",
-            flush=True,
-        )
+    calibration_workload = inputs_dir / "calibration.csv"
+    calibration_config = inputs_dir / "calibration.json"
+    write_workload(calibration_workload, calibration_shapes, arrival_rate=None)
+    write_config(
+        calibration_config,
+        run_id="single-turn-load-calibration",
+        prefill_batch_size_cap=1,
+        decode_batch_size_cap=1,
+        max_tokens_in_batch=args.max_tokens_in_batch,
+        prefill_chunk_tokens=args.prefill_chunk_tokens,
+        num_blocks=max(num_blocks_values),
+        topology=topology,
+        operator_precisions=operator_precisions,
+    )
+    print("calibration start", flush=True)
+    calibration, calibration_process_seconds = run_simulator(
+        binary,
+        calibration_config,
+        calibration_workload,
+        timeout_seconds=args.timeout_seconds,
+    )
+    isolated_service_seconds = statistics.fmean(
+        float(row["e2e_ms"]) / 1_000.0 for row in calibration["requests"]
+    )
+    if isolated_service_seconds <= 0.0:
+        raise RuntimeError("isolated mean service time must be positive")
+    print(
+        f"calibration mean_service_s={isolated_service_seconds:.9f} "
+        f"process_s={calibration_process_seconds:.3f}",
+        flush=True,
+    )
+    arrival_reference_service_seconds = (
+        args.arrival_reference_service_seconds
+        if args.arrival_reference_service_seconds is not None
+        else isolated_service_seconds
+    )
+    print(
+        "arrival reference_service_s="
+        f"{arrival_reference_service_seconds:.9f}",
+        flush=True,
+    )
 
     workloads: dict[float, Path] = {}
     arrival_rates: dict[float, float] = {}
     for offered_concurrency in args.offered_concurrency:
-        arrival_rate = (
-            0.0
-            if args.closed_loop_concurrency
-            else offered_concurrency / arrival_reference_service_seconds
-        )
+        arrival_rate = offered_concurrency / arrival_reference_service_seconds
         workload_path = (
             inputs_dir / f"load_c{offered_concurrency:g}.csv"
         )
         write_workload(
             workload_path,
             shapes,
-            arrival_rate=1.0 if args.closed_loop_concurrency else arrival_rate,
+            arrival_rate=arrival_rate,
         )
         workloads[offered_concurrency] = workload_path
         arrival_rates[offered_concurrency] = arrival_rate
@@ -1243,11 +1209,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                     num_blocks=num_blocks,
                     topology=topology,
                     operator_precisions=operator_precisions,
-                    closed_loop_max_concurrency=(
-                        int(offered_concurrency)
-                        if args.closed_loop_concurrency
-                        else 0
-                    ),
                 )
                 print(
                     f"[{case_index}/{total_cases}] {run_id}",
@@ -1347,9 +1308,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
         "offered_concurrency": args.offered_concurrency,
         "arrival_rates_rps": arrival_rates,
-        "concurrency_mode": (
-            "closed_loop" if args.closed_loop_concurrency else "poisson"
-        ),
+        "concurrency_mode": "poisson",
         "batch_sizes": (
             [] if args.unbounded_decode_batch else args.batch_sizes
         ),

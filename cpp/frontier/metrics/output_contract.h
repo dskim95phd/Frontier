@@ -24,6 +24,14 @@ struct RunMetadata {
 
 struct RequestMetricsRecord {
     RequestId request_id;
+    SessionId session_id;
+    std::uint64_t num_prefill_tokens = 0;
+    std::uint64_t num_decode_tokens = 0;
+    std::uint64_t cached_prefill_tokens = 0;
+    std::uint64_t prefix_cache_query_blocks = 0;
+    std::uint64_t prefix_cache_hit_blocks = 0;
+    config::PrefixCachingKeyMode prefix_cache_key_mode =
+        config::PrefixCachingKeyMode::kSession;
     SimTime arrived_at;
     SimTime prefill_completed_at;
     SimTime completed_at;
@@ -158,6 +166,31 @@ struct BatchMetricsAggregate {
     std::map<std::size_t, std::uint64_t> batch_size_histogram;
 };
 
+struct PrefixCacheTargetMetricsRecord {
+    ClusterType cluster_type = ClusterType::kMonolithic;
+    ReplicaId replica_id{0};
+    DataParallelId dp_id{0};
+    std::uint64_t capacity_blocks = 0;
+    std::uint64_t available_blocks = 0;
+    std::uint64_t active_blocks = 0;
+    std::uint64_t resident_blocks = 0;
+    std::uint64_t evictable_blocks = 0;
+    std::uint64_t evictable_sessions = 0;
+    std::uint64_t sessions_with_nonzero_frontier = 0;
+};
+
+struct PrefixCacheMetricsAggregate {
+    std::string storage_model = "analytical_session";
+    config::PrefixCachingKeyMode key_mode =
+        config::PrefixCachingKeyMode::kSession;
+    std::uint64_t block_size = 0;
+    std::uint64_t successful_admissions = 0;
+    std::uint64_t query_blocks = 0;
+    std::uint64_t hit_blocks = 0;
+    std::uint64_t evicted_blocks = 0;
+    std::uint64_t evicted_sessions = 0;
+};
+
 struct MetricsAggregate {
     std::uint64_t event_count = 0;
     std::uint64_t batch_count = 0;
@@ -166,6 +199,7 @@ struct MetricsAggregate {
     std::uint64_t analytical_diagnostic_count = 0;
     std::uint64_t moe_routing_count = 0;
     std::uint64_t kv_cache_transfer_count = 0;
+    PrefixCacheMetricsAggregate prefix_cache;
     std::map<ClusterType, BatchMetricsAggregate> batches_by_cluster;
 };
 
@@ -180,6 +214,7 @@ struct SimulationOutput {
     std::vector<AnalyticalDiagnostic> analytical_diagnostics;
     std::vector<MoERoutingMetricsRecord> moe_routing;
     std::vector<KVCacheTransferMetricsRecord> kv_cache_transfers;
+    std::vector<PrefixCacheTargetMetricsRecord> prefix_cache_targets;
     MetricsAggregate aggregate;
 };
 

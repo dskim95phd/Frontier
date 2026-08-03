@@ -23,6 +23,9 @@ class VllmV1Scheduler final : public BaseReplicaScheduler {
   public:
     VllmV1Scheduler(config::SchedulerConfig config,
                     std::vector<entities::Request> &requests);
+    VllmV1Scheduler(config::SchedulerConfig config,
+                    std::vector<entities::Request> &requests,
+                    config::PrefixCacheConfig prefix_cache_config);
     VllmV1Scheduler(
         config::SchedulerConfig config,
         std::vector<entities::Request> &requests,
@@ -33,7 +36,8 @@ class VllmV1Scheduler final : public BaseReplicaScheduler {
         std::vector<entities::Request> &requests,
         execution_time_predictor::ExecutionTimePredictorPtr predictor,
         const entities::Replica &replica, DataParallelId dp_id,
-        ClusterType cluster_type);
+        ClusterType cluster_type,
+        config::PrefixCacheConfig prefix_cache_config = {});
 
     [[nodiscard]] bool
     consume_terminal_release_followup_poll() noexcept override;
@@ -69,8 +73,17 @@ class VllmV1Scheduler final : public BaseReplicaScheduler {
     [[nodiscard]] const std::vector<RequestId> &running_order() const noexcept {
         return running_;
     }
-    [[nodiscard]] const KvBlockAccounting &kv_blocks() const noexcept {
+    [[nodiscard]] const kv_cache::ReplicaKVCacheManager &
+    kv_blocks() const noexcept {
         return kv_blocks_;
+    }
+    [[nodiscard]] const kv_cache::PrefixCacheStats &
+    prefix_cache_stats() const noexcept override {
+        return kv_blocks_.stats();
+    }
+    [[nodiscard]] kv_cache::PrefixCacheDiagnostics
+    prefix_cache_diagnostics() const override {
+        return kv_blocks_.diagnostics();
     }
 
   private:

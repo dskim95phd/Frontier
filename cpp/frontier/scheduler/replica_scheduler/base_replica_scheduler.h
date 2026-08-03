@@ -15,7 +15,7 @@
 #include "frontier/entities/replica.h"
 #include "frontier/entities/request.h"
 #include "frontier/execution_time_predictor/base_execution_time_predictor.h"
-#include "frontier/scheduler/kv_block_accounting.h"
+#include "frontier/kv_cache/replica_kv_cache_manager.h"
 #include "frontier/scheduler/replica_stage_scheduler/replica_stage_scheduler.h"
 
 namespace frontier::scheduler {
@@ -71,7 +71,8 @@ class BaseReplicaScheduler {
         std::vector<entities::Request> &requests,
         const entities::Replica &replica, DataParallelId dp_id,
         execution_time_predictor::ExecutionTimePredictorPtr predictor,
-        ClusterType cluster_type = ClusterType::kMonolithic);
+        ClusterType cluster_type = ClusterType::kMonolithic,
+        config::PrefixCacheConfig prefix_cache_config = {});
     virtual ~BaseReplicaScheduler() = default;
 
     BaseReplicaScheduler(const BaseReplicaScheduler &) = delete;
@@ -115,6 +116,10 @@ class BaseReplicaScheduler {
     [[nodiscard]] virtual std::size_t running_count() const noexcept = 0;
     [[nodiscard]] virtual std::uint64_t
     allocated_kv_blocks() const noexcept = 0;
+    [[nodiscard]] virtual const kv_cache::PrefixCacheStats &
+    prefix_cache_stats() const noexcept = 0;
+    [[nodiscard]] virtual kv_cache::PrefixCacheDiagnostics
+    prefix_cache_diagnostics() const = 0;
 
     [[nodiscard]] ReplicaId replica_id() const noexcept {
         return replica_->id();
@@ -147,7 +152,7 @@ class BaseReplicaScheduler {
 
     config::SchedulerConfig config_;
     std::vector<entities::Request> *requests_;
-    KvBlockAccounting kv_blocks_;
+    kv_cache::ReplicaKVCacheManager kv_blocks_;
     std::deque<RequestId> waiting_;
     std::uint64_t pipeline_parallel_size_;
     std::uint64_t in_flight_batch_count_ = 0;

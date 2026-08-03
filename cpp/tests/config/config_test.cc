@@ -97,15 +97,13 @@ void test_analytical_contract_round_trip() {
                 4'750.0,
         "GB300 preset and partial device overrides must round-trip");
 
-    std::string invalid_event_mode =
-        serialize_simulation_config_json(config);
+    std::string invalid_event_mode = serialize_simulation_config_json(config);
     const std::string valid_event_mode = "\"first_layer_scaled\"";
     invalid_event_mode.replace(invalid_event_mode.find(valid_event_mode),
                                valid_event_mode.size(), "\"invalid\"");
     expect_throws<ConfigError>(
         [&invalid_event_mode] {
-            static_cast<void>(
-                parse_simulation_config_json(invalid_event_mode));
+            static_cast<void>(parse_simulation_config_json(invalid_event_mode));
         },
         "unsupported MoE layer event modes must fail fast");
 
@@ -289,11 +287,11 @@ void test_invalid_surfaces_are_rejected() {
 
     auto colocation = load("fixed_parallel_colocation.json");
     colocation.prefix_cache.enabled = true;
-    expect_throws<ConfigError>(
-        [&colocation] {
-            static_cast<void>(serialize_simulation_config_json(colocation));
-        },
-        "prefix caching must remain deferred");
+    colocation.cluster_scheduler.type =
+        frontier::config::ClusterSchedulerType::kStickyRoundRobin;
+    expect(parse_simulation_config_json(
+               serialize_simulation_config_json(colocation)) == colocation,
+           "session prefix caching must round-trip in Step 4");
 
     std::string priority = serialize_simulation_config_json(
         load("fixed_parallel_colocation.json"));

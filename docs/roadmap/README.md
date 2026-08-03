@@ -35,6 +35,10 @@ Detailed implementation plans and records:
     per-request transfer events, independent PREFILL/DECODE topology,
     online/offline decode-admission parity, and a 14-case production-Python
     differential matrix.
+  - [Step 4: session-scoped GPU prefix cache](cpp-porting-step4-session-prefix-cache.md) -
+    implemented target-local analytical session ranges, session-suffix LRU,
+    sticky affinity, vLLM V1 integration, resident-versus-evicted semantics,
+    metrics, and co-location/PDD validation.
 
 - [NVIDIA Vera Rubin NVL72 analytical modeling](vera-rubin-nvl72-analytical-modeling-plan.md) -
   proposed profile-free MVP covering roofline-based operator timing, a logical

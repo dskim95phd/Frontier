@@ -44,6 +44,8 @@ SimulationOutput make_output() {
             [&]() {
                 RequestMetricsRecord value{};
                 value.request_id = RequestId{0};
+                value.num_prefill_tokens = 4;
+                value.num_decode_tokens = 2;
                 value.arrived_at = SimTime::from_seconds(0.0);
                 value.prefill_completed_at = SimTime::from_seconds(0.001);
                 value.completed_at = SimTime::from_seconds(0.002);
@@ -127,6 +129,25 @@ SimulationOutput make_output() {
         };
         value.analytical_diagnostics = {};
         value.kv_cache_transfers = {};
+        value.aggregate.prefix_cache.block_size = 4;
+        value.aggregate.prefix_cache.successful_admissions = 3;
+        value.aggregate.prefix_cache.query_blocks = 5;
+        value.aggregate.prefix_cache.hit_blocks = 3;
+        value.aggregate.prefix_cache.evicted_blocks = 7;
+        value.aggregate.prefix_cache.evicted_sessions = 2;
+        value.prefix_cache_targets = {
+            [&]() {
+                frontier::metrics::PrefixCacheTargetMetricsRecord value{};
+                value.capacity_blocks = 16;
+                value.available_blocks = 12;
+                value.active_blocks = 2;
+                value.resident_blocks = 6;
+                value.evictable_blocks = 4;
+                value.evictable_sessions = 2;
+                value.sessions_with_nonzero_frontier = 3;
+                return value;
+            }(),
+        };
         return value;
     }();
 }
@@ -145,17 +166,31 @@ void test_json_contract() {
                    .at(0)
                    .at("decision_result") == "ADMISSION",
            "scheduler decision sequence must serialize");
+    expect(json.at("requests").at(0).at("num_prefill_tokens") == 4,
+           "prefix-cache request shape must serialize");
+    expect(json.contains("prefix_cache"),
+           "aggregate prefix-cache metrics must serialize");
+    expect(json.at("prefix_cache").at("storage_model") ==
+                   "analytical_session" &&
+               json.at("prefix_cache").at("evicted_blocks") == 7 &&
+               json.at("prefix_cache").at("evicted_sessions") == 2,
+           "analytical cache identity and eviction metrics must serialize");
+    expect(json.at("prefix_cache_targets").at(0).at("resident_blocks") == 6 &&
+               json.at("prefix_cache_targets").at(0).at("evictable_sessions") ==
+                   2,
+           "analytical target counters must serialize");
+    expect(!json.at("prefix_cache").contains("physical_evictions"),
+           "removed physical allocator metrics must not leak into output");
 }
 
 void test_csv_contract() {
     const std::string csv =
         serialize_request_metrics_csv(make_output().requests);
-    expect(
-        csv.compare(
-            0,
-            std::string{"request_id,arrived_at_s,first_scheduled_at_s,"}.size(),
-            "request_id,arrived_at_s,first_scheduled_at_s,") == 0,
-        "CSV must expose canonical scheduling fields");
+    expect(csv.compare(
+               0,
+               std::string{"request_id,session_id,num_prefill_tokens,"}.size(),
+               "request_id,session_id,num_prefill_tokens,") == 0,
+           "CSV must expose canonical scheduling fields");
     expect(csv.find(",6,1,0,0\n") != std::string::npos,
            "CSV must include progress, preemption, and target fields");
 }

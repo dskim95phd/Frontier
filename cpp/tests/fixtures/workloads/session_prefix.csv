@@ -1,4 +1,4 @@
-arrived_at,num_prefill_tokens,num_decode_tokens,session_id,session_turn_index
-0,32,8,7,0
-1,16,4,9,0
-2,8,2,7,1
+session_start_at,think_time,num_prefill_tokens,num_decode_tokens,session_id,session_turn_index
+0,0,32,8,7,0
+1,0,16,4,9,0
+,2,8,2,7,1

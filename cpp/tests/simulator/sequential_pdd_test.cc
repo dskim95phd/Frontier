@@ -104,11 +104,12 @@ void test_offline_barrier_and_deterministic_drain() {
     expect(first_decode_schedule != output.event_trace.end() &&
                first_decode_schedule->time >= final_transfer->completed_at,
            "offline decode scheduling must wait until all transfers drain");
-    expect(std::none_of(output.event_trace.begin(), output.event_trace.end(),
-                        [](const auto &event) {
-                            return event.type() == EventType::kRequestArrival;
-                        }),
-           "offline mode must preload requests instead of replaying arrivals");
+    expect(std::all_of(output.requests.begin(), output.requests.end(),
+                       [](const auto &request) {
+                           return request.arrived_at ==
+                                  frontier::SimTime::from_seconds(0.0);
+                       }),
+           "offline mode must ignore external start and think times");
 
     const std::string first = serialize_simulation_output_json(output);
     const std::string second =
@@ -141,15 +142,10 @@ void test_prefill_and_decode_use_independent_topologies() {
 
     const auto output = run_simulation(
         config,
-        parse_workload_csv("arrived_at,num_prefill_tokens,num_decode_tokens\n"
-                           "0,1,2\n"
-                           "0,2,2\n"
-                           "0,3,2\n"
-                           "0,4,2\n"
-                           "0,1,2\n"
-                           "0,2,2\n"
-                           "0,3,2\n"
-                           "0,4,2\n"));
+        parse_workload_csv(
+            "session_start_at,think_time,num_prefill_tokens,num_decode_tokens\n"
+            "0,0,1,2\n0,0,2,2\n0,0,3,2\n0,0,4,2\n"
+            "0,0,1,2\n0,0,2,2\n0,0,3,2\n0,0,4,2\n"));
 
     std::set<std::uint64_t> prefill_replicas;
     std::set<std::uint64_t> prefill_dps;
@@ -186,11 +182,9 @@ void test_decode_preemption_recovers_to_quiescence() {
     config.pdd().clusters.decode.scheduler.num_blocks = 3;
     const auto output = run_simulation(
         config,
-        parse_workload_csv("arrived_at,num_prefill_tokens,num_decode_tokens\n"
-                           "0,3,3\n"
-                           "0,4,2\n"
-                           "0,3,3\n"
-                           "0,4,2\n"));
+        parse_workload_csv(
+            "session_start_at,think_time,num_prefill_tokens,num_decode_tokens\n"
+            "0,0,3,3\n0,0,4,2\n0,0,3,3\n0,0,4,2\n"));
 
     const std::uint64_t preemptions = std::accumulate(
         output.requests.begin(), output.requests.end(), std::uint64_t{0},
@@ -202,45 +196,32 @@ void test_decode_preemption_recovers_to_quiescence() {
            "decode memory pressure must preempt and still drain every request");
 }
 
-void test_closed_loop_releases_one_replacement_per_completion() {
+void test_session_successors_arrive_after_completion_and_think_time() {
     SimulationConfig config = load_config();
-    config.closed_loop_max_concurrency = 2;
     const auto output = run_simulation(
         config,
-        parse_workload_csv("arrived_at,num_prefill_tokens,num_decode_tokens\n"
-                           "0,3,3\n"
-                           "100,4,2\n"
-                           "200,3,3\n"
-                           "300,4,2\n"));
+        parse_workload_csv(
+            "session_start_at,think_time,num_prefill_tokens,num_decode_tokens,"
+            "session_id,session_turn_index\n"
+            "0,0,3,3,7,0\n1,0,4,2,9,0\n"
+            ",0.75,3,3,7,1\n,0.25,4,2,9,1\n"));
 
     std::vector<const frontier::metrics::RequestMetricsRecord *> requests;
     requests.reserve(output.requests.size());
     for (const auto &request : output.requests) {
         requests.push_back(&request);
     }
-    std::sort(requests.begin(), requests.end(), [](const auto *left,
-                                                   const auto *right) {
-        return left->request_id.value() < right->request_id.value();
-    });
+    std::sort(requests.begin(), requests.end(),
+              [](const auto *left, const auto *right) {
+                  return left->request_id.value() < right->request_id.value();
+              });
     expect(requests.size() == 4 &&
-               requests.at(0)->arrived_at ==
-                   frontier::SimTime::from_seconds(0.0) &&
-               requests.at(1)->arrived_at ==
-                   frontier::SimTime::from_seconds(0.0) &&
-               requests.at(2)->arrived_at <
-                   frontier::SimTime::from_seconds(100.0) &&
-               requests.at(3)->arrived_at <
-                   frontier::SimTime::from_seconds(100.0),
-           "closed loop must ignore later trace times and release replacements");
-    for (const auto *request : requests) {
-        const auto active = std::count_if(
-            requests.begin(), requests.end(), [request](const auto *candidate) {
-                return candidate->arrived_at <= request->arrived_at &&
-                       candidate->completed_at > request->arrived_at;
-            });
-        expect(active == 2,
-               "closed loop must replenish exactly two in-flight requests");
-    }
+               requests.at(2)->arrived_at.seconds() ==
+                   requests.at(0)->completed_at.seconds() + 0.75 &&
+               requests.at(3)->arrived_at.seconds() ==
+                   requests.at(1)->completed_at.seconds() + 0.25,
+           "each successor must arrive after terminal completion plus its "
+           "recorded think time");
 }
 
 } // namespace
@@ -259,7 +240,7 @@ int main() {
         frontier::test::run("decode preemption reaches quiescence",
                             test_decode_preemption_recovers_to_quiescence);
     failures += frontier::test::run(
-        "closed-loop request replenishment",
-        test_closed_loop_releases_one_replacement_per_completion);
+        "session completion plus think-time injection",
+        test_session_successors_arrive_after_completion_and_think_time);
     return failures == 0 ? 0 : 1;
 }

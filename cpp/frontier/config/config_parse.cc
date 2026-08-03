@@ -234,9 +234,12 @@ ClusterSchedulerType parse_cluster_scheduler_type(std::string_view value) {
     if (value == "round_robin") {
         return ClusterSchedulerType::kRoundRobin;
     }
-    throw ConfigError(
-        "config.cluster_scheduler.type must be 'round_robin', got '" +
-        std::string{value} + "'");
+    if (value == "sticky_round_robin") {
+        return ClusterSchedulerType::kStickyRoundRobin;
+    }
+    throw ConfigError("config.cluster_scheduler.type must be 'round_robin' or "
+                      "'sticky_round_robin', got '" +
+                      std::string{value} + "'");
 }
 
 MoeRoutingMode parse_moe_routing_mode(std::string_view value) {
@@ -694,18 +697,18 @@ ExecutionModelConfig parse_execution_model(const Json &root,
     }
 
     if (type == "analytical") {
-        require_keys(execution,
-                     {
-                         "type",
-                         "device",
-                         "precision",
-                         "network_bandwidth_gbps",
-                         "network_latency_us",
-                         "intra_node_bandwidth_gbps",
-                     },
-                     {"operator_precisions", "device_overrides",
-                      "moe_layer_event_mode"},
-                     "config.execution_model");
+        require_keys(
+            execution,
+            {
+                "type",
+                "device",
+                "precision",
+                "network_bandwidth_gbps",
+                "network_latency_us",
+                "intra_node_bandwidth_gbps",
+            },
+            {"operator_precisions", "device_overrides", "moe_layer_event_mode"},
+            "config.execution_model");
         AnalyticalExecutionModelConfig analytical = [&]() {
             AnalyticalExecutionModelConfig value{};
             value.device =
@@ -716,9 +719,9 @@ ExecutionModelConfig parse_execution_model(const Json &root,
                                              "config.execution_model");
             value.operator_precisions = parse_operator_precisions(execution);
             if (execution.contains("moe_layer_event_mode")) {
-                value.moe_layer_event_mode = require_string(
-                    execution, "moe_layer_event_mode",
-                    "config.execution_model");
+                value.moe_layer_event_mode =
+                    require_string(execution, "moe_layer_event_mode",
+                                   "config.execution_model");
             }
             value.tensor_parallel_size = parallelism.tensor_parallel_size;
             value.network_bandwidth_gbps = require_finite_number(
@@ -878,7 +881,6 @@ struct CommonConfigFields {
     SimulationMode simulation_mode;
     SystemArchitecture system_architecture;
     bool enable_parallel_clusters;
-    std::uint64_t closed_loop_max_concurrency;
     PrefixCacheConfig prefix_cache;
 };
 
@@ -909,15 +911,6 @@ CommonConfigFields parse_common_fields(const Json &root) {
     }
     const SimulationMode simulation_mode = parse_simulation_mode(
         require_string(root, "simulation_mode", "config"));
-    const std::uint64_t closed_loop_max_concurrency =
-        root.contains("closed_loop_max_concurrency")
-            ? require_uint64(root, "closed_loop_max_concurrency", "config")
-            : 0;
-    if (closed_loop_max_concurrency > 0 &&
-        simulation_mode != SimulationMode::kOnline) {
-        throw ConfigError(
-            "config.closed_loop_max_concurrency requires online mode");
-    }
     return [&]() {
         CommonConfigFields value{};
         value.schema_version = schema_version;
@@ -926,7 +919,6 @@ CommonConfigFields parse_common_fields(const Json &root) {
         value.system_architecture = parse_system_architecture(
             require_string(root, "system_architecture", "config"));
         value.enable_parallel_clusters = enable_parallel_clusters;
-        value.closed_loop_max_concurrency = closed_loop_max_concurrency;
         value.prefix_cache = parse_prefix_cache(root);
         return value;
     }();
@@ -935,24 +927,20 @@ CommonConfigFields parse_common_fields(const Json &root) {
 SimulationConfig make_pdd_config(const Json &root, CommonConfigFields common) {
     require_keys(root,
                  {
-                           "schema_version",
-                           "run_id",
-                           "simulation_mode",
-                           "system_architecture",
-                           "enable_parallel_clusters",
-                           "prefix_cache",
-                           "cluster_scheduler",
-                           "clusters",
-                           "kv_cache_transfer",
+                     "schema_version",
+                     "run_id",
+                     "simulation_mode",
+                     "system_architecture",
+                     "enable_parallel_clusters",
+                     "prefix_cache",
+                     "cluster_scheduler",
+                     "clusters",
+                     "kv_cache_transfer",
                  },
-                 {"closed_loop_max_concurrency"}, "config");
+                 {}, "config");
     if (common.system_architecture != SystemArchitecture::kPdDisaggregation) {
         throw ConfigError(
             "PDD config requires system_architecture='pd-disaggregation'");
-    }
-    if (common.prefix_cache.enabled) {
-        throw ConfigError("PDD config requires prefix_cache.enabled=false; "
-                          "session prefix caching begins in Step 4");
     }
     PddRuntimeConfig runtime{};
     runtime.clusters = parse_pdd_clusters(root);
@@ -985,8 +973,6 @@ SimulationConfig make_pdd_config(const Json &root, CommonConfigFields common) {
         value.simulation_mode = common.simulation_mode;
         value.system_architecture = common.system_architecture;
         value.enable_parallel_clusters = common.enable_parallel_clusters;
-        value.closed_loop_max_concurrency =
-            common.closed_loop_max_concurrency;
         value.prefix_cache = common.prefix_cache;
         value.cluster_scheduler = parse_cluster_scheduler(root);
         value.runtime = std::move(runtime);
@@ -998,26 +984,20 @@ SimulationConfig make_single_cluster_config(const Json &root,
                                             CommonConfigFields common) {
     require_keys(root,
                  {
-                           "schema_version",
-                           "run_id",
-                           "simulation_mode",
-                           "system_architecture",
-                           "enable_parallel_clusters",
-                           "prefix_cache",
-                           "cluster_scheduler",
-                           "clusters",
+                     "schema_version",
+                     "run_id",
+                     "simulation_mode",
+                     "system_architecture",
+                     "enable_parallel_clusters",
+                     "prefix_cache",
+                     "cluster_scheduler",
+                     "clusters",
                  },
-                 {"closed_loop_max_concurrency"}, "config");
+                 {}, "config");
     if (common.system_architecture != SystemArchitecture::kCoLocation) {
         throw ConfigError("single-cluster config requires "
                           "system_architecture='co-location'");
     }
-    if (common.prefix_cache.enabled) {
-        throw ConfigError(
-            "single-cluster config requires prefix_cache.enabled=false; "
-            "session prefix caching begins in Step 4");
-    }
-
     const Json &clusters = root.at("clusters");
     require_exact_keys(clusters, {"monolithic"}, "config.clusters");
 
@@ -1028,8 +1008,6 @@ SimulationConfig make_single_cluster_config(const Json &root,
         value.simulation_mode = common.simulation_mode;
         value.system_architecture = common.system_architecture;
         value.enable_parallel_clusters = common.enable_parallel_clusters;
-        value.closed_loop_max_concurrency =
-            common.closed_loop_max_concurrency;
         value.prefix_cache = common.prefix_cache;
         value.cluster_scheduler = parse_cluster_scheduler(root);
         value.runtime = parse_cluster_runtime(clusters, "monolithic");

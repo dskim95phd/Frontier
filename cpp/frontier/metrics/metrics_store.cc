@@ -9,6 +9,7 @@
 #include "frontier/entities/kv_cache_transfer_info.h"
 #include "frontier/entities/request.h"
 #include "frontier/execution_time_predictor/base_execution_time_predictor.h"
+#include "frontier/kv_cache/replica_kv_cache_manager.h"
 #include "frontier/scheduler/replica_scheduler/base_replica_scheduler.h"
 #include "frontier/scheduler/scheduler_types.h"
 #include "frontier/simulator/entity_arena.h"
@@ -264,6 +265,14 @@ void MetricsStore::collect_completed_requests(
         RequestMetricsRecord record = [&]() {
             RequestMetricsRecord value{};
             value.request_id = request_id;
+            value.session_id = request.session_id();
+            value.num_prefill_tokens = request.initial_num_prefill_tokens();
+            value.num_decode_tokens = request.initial_num_decode_tokens();
+            value.cached_prefill_tokens = request.cached_prefill_tokens();
+            value.prefix_cache_query_blocks =
+                request.prefix_cache_query_blocks();
+            value.prefix_cache_hit_blocks = request.prefix_cache_hit_blocks();
+            value.prefix_cache_key_mode = request.prefix_cache_key_mode();
             value.arrived_at = request.arrived_at();
             value.prefill_completed_at = request.prefill_completed_at();
             value.completed_at = request.completed_at();
@@ -305,6 +314,30 @@ void MetricsStore::collect_completed_requests(
         }
         record_request(std::move(record));
     }
+}
+
+void MetricsStore::record_prefix_cache_target(
+    const kv_cache::PrefixCacheStats &stats,
+    const kv_cache::PrefixCacheDiagnostics &diagnostics,
+    scheduler::ReplicaTarget target, ClusterType cluster_type,
+    std::uint64_t block_size, config::PrefixCachingKeyMode key_mode) {
+    PrefixCacheMetricsAggregate &aggregate = output_.aggregate.prefix_cache;
+    if (aggregate.block_size != 0 && aggregate.block_size != block_size) {
+        throw std::logic_error("prefix-cache targets disagree on block size");
+    }
+    aggregate.key_mode = key_mode;
+    aggregate.block_size = block_size;
+    aggregate.successful_admissions += stats.successful_admissions;
+    aggregate.query_blocks += stats.query_blocks;
+    aggregate.hit_blocks += stats.hit_blocks;
+    aggregate.evicted_blocks += stats.evicted_blocks;
+    aggregate.evicted_sessions += stats.evicted_sessions;
+    output_.prefix_cache_targets.push_back(PrefixCacheTargetMetricsRecord{
+        cluster_type, target.replica_id, target.dp_id,
+        diagnostics.capacity_blocks, diagnostics.available_blocks,
+        diagnostics.active_blocks, diagnostics.resident_blocks,
+        diagnostics.evictable_blocks, diagnostics.evictable_sessions,
+        diagnostics.sessions_with_nonzero_frontier});
 }
 
 SimulationOutput MetricsStore::take_output() noexcept {

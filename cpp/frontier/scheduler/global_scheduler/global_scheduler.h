@@ -38,7 +38,8 @@ class GlobalScheduler final {
         const PredictorMap &predictors,
         std::shared_ptr<const kv_cache_transfer::BaseKVCacheTransferPredictor>
             kv_cache_transfer_predictor,
-        const config::ClusterSchedulerConfig &scheduler_config);
+        const config::ClusterSchedulerConfig &scheduler_config,
+        config::PrefixCacheConfig prefix_cache_config = {});
 
     void add_request(RequestId request_id, ClusterType cluster_type);
     [[nodiscard]] std::vector<GlobalRequestAssignment> schedule();

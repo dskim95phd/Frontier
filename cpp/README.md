@@ -315,7 +315,7 @@ rejected.
 Required CSV columns:
 
 ```text
-arrived_at,num_prefill_tokens,num_decode_tokens
+session_start_at,think_time,num_prefill_tokens,num_decode_tokens
 ```
 
 Optional columns:
@@ -324,9 +324,18 @@ Optional columns:
 session_id,session_turn_index
 ```
 
-Request IDs follow row order from zero. Arrival times must be finite and
-nonnegative; token counts must be positive integers. Duplicate, missing,
-unknown, quoted, and block-hash columns are rejected.
+Request IDs follow row order from zero. A standalone request or the first turn
+of a session records `session_start_at` and uses `think_time=0`. A later turn
+leaves `session_start_at` empty and records its delay after the previous turn's
+terminal completion in `think_time`:
+
+```text
+actual_arrival = predecessor_completion + think_time
+```
+
+Both time fields must be finite and nonnegative when present; token counts must
+be positive integers. Duplicate, missing, unknown, quoted, legacy `arrived_at`,
+and block-hash columns are rejected.
 
 Generate a workload without importing the Python simulator:
 
@@ -337,7 +346,8 @@ python cpp/frontier/request_generator/generate_workload.py `
 ```
 
 The generator implements fixed, uniform, Zipf, and bounded log-normal request
-lengths plus static, Poisson, and Gamma arrival intervals. Its output uses the
+lengths plus static, Poisson, and Gamma initial-arrival distributions. Its
+single-turn output records `session_start_at` with zero think time and uses the
 same normalized CSV contract parsed by `frontier_sim`.
 
 ## Output contract

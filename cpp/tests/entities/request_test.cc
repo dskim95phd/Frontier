@@ -18,7 +18,7 @@ Request make_request(std::uint64_t prefill = 4, std::uint64_t decode = 3) {
     return Request{[&]() {
         WorkloadRequest value{};
         value.request_id = RequestId{0};
-        value.arrived_at = SimTime::from_seconds(0.0);
+        value.session_start_at = SimTime::from_seconds(0.0);
         value.num_prefill_tokens = prefill;
         value.num_decode_tokens = decode;
         value.session_id = frontier::SessionId{};
@@ -86,6 +86,12 @@ void test_preemption_resets_recompute_progress_and_epochs() {
            "preemption must reset recompute frontiers");
     expect(!request.is_prefill_complete(),
            "preemption must restore prefill work");
+    expect(request.num_prefill_tokens() == 5 &&
+               request.num_decode_tokens() == 1 &&
+               request.initial_num_prefill_tokens() == 4 &&
+               request.initial_num_decode_tokens() == 2,
+           "committed decode progress must become replay-prefill without "
+           "changing the initial token split");
     expect(request.runtime_epoch() == 1 && request.execution_epoch() == 1,
            "preemption must invalidate stale execution snapshots");
     expect(request.preemption_count() == 1 &&
@@ -93,10 +99,49 @@ void test_preemption_resets_recompute_progress_and_epochs() {
            "preemption metrics must retain prior scheduler frontier");
 
     request.on_admitted(SimTime::from_seconds(0.3));
-    request.advance_scheduler_frontier(4);
-    request.on_batch_completion(SimTime::from_seconds(0.4), 4);
+    request.advance_scheduler_frontier(5);
+    request.on_batch_completion(SimTime::from_seconds(0.4), 5);
+    expect(request.completed(),
+           "replay-prefill plus the remaining decode token must complete");
     expect(request.prefill_completed_at() == original_ttft,
            "canonical first prefill timestamp must be write-once");
+}
+
+void test_partial_and_repeated_prefill_replay_boundaries() {
+    Request partial = make_request(10, 3);
+    partial.on_arrival(SimTime::from_seconds(0.0));
+    partial.on_admitted(SimTime::from_seconds(0.0));
+    partial.advance_scheduler_frontier(6);
+    partial.on_batch_completion(SimTime::from_seconds(0.1), 6);
+    partial.on_preempted(SimTime::from_seconds(0.2));
+    expect(partial.num_prefill_tokens() == 10 &&
+               partial.num_decode_tokens() == 3,
+           "partial-prefill preemption must preserve the original boundary");
+
+    Request repeated = make_request(5, 5);
+    repeated.on_arrival(SimTime::from_seconds(0.0));
+    repeated.on_admitted(SimTime::from_seconds(0.0));
+    repeated.advance_scheduler_frontier(5);
+    repeated.on_batch_completion(SimTime::from_seconds(0.1), 5);
+    for (std::uint64_t index = 0; index < 3; ++index) {
+        repeated.advance_scheduler_frontier(1);
+        repeated.on_batch_completion(
+            SimTime::from_seconds(0.2 + static_cast<double>(index) * 0.1), 1);
+    }
+    expect(repeated.num_processed_tokens() == 9,
+           "fixture must commit four decode tokens before preemption");
+    repeated.on_preempted(SimTime::from_seconds(0.5));
+    expect(repeated.num_prefill_tokens() == 9 &&
+               repeated.num_decode_tokens() == 1,
+           "decode progress must extend the replay-prefill boundary");
+
+    repeated.on_admitted(SimTime::from_seconds(0.6));
+    repeated.advance_scheduler_frontier(4);
+    repeated.on_batch_completion(SimTime::from_seconds(0.7), 4);
+    repeated.on_preempted(SimTime::from_seconds(0.8));
+    expect(repeated.num_prefill_tokens() == 9 &&
+               repeated.num_decode_tokens() == 1,
+           "preempting an incomplete replay must not shrink its boundary");
 }
 
 void test_invalid_transitions_are_rejected() {
@@ -122,6 +167,9 @@ int main() {
     failures += frontier::test::run(
         "preemption resets recompute progress and epochs",
         test_preemption_resets_recompute_progress_and_epochs);
+    failures += frontier::test::run(
+        "partial and repeated replay boundaries",
+        test_partial_and_repeated_prefill_replay_boundaries);
     failures += frontier::test::run("invalid request transitions are rejected",
                                     test_invalid_transitions_are_rejected);
     return failures == 0 ? 0 : 1;

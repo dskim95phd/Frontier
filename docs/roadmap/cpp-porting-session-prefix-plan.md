@@ -16,11 +16,11 @@ object model. The implementation should use compact ID-based state and a
 single deterministic event queue.
 
 The port should nevertheless preserve the Python simulator's domain boundaries
-and state-machine semantics where they define observable behavior. In
-particular, the scheduler and KV-cache implementation should have an explicit
-semantic mapping to the corresponding Python queues, block states,
-reservations, leases, and metrics. Python object references become stable C++
-IDs and contiguous storage; the behavior is not independently redesigned.
+and state-machine semantics where they define observable behavior. The GPU
+session cache preserves lookup, replay, capacity, and actual-eviction
+semantics, but uses analytical session ranges instead of reproducing physical
+block identity. Python object references become stable C++ IDs where identity
+is observable; large logical KV ranges remain compact counts.
 
 ## MVP Scope
 
@@ -40,8 +40,9 @@ IDs and contiguous storage; the behavior is not independently redesigned.
   model and the selected analytical communication backend.
 - Basic workloads:
   - synthetic fixed/uniform request lengths and arrivals;
-  - CSV trace replay with `arrived_at`, `num_prefill_tokens`,
-    `num_decode_tokens`, and optional `session_id` / `session_turn_index`.
+  - CSV session replay with `session_start_at`, `think_time`,
+    `num_prefill_tokens`, `num_decode_tokens`, and optional `session_id` /
+    `session_turn_index`.
 - GPU-resident, session-scoped prefix caching:
   - `prefix_caching_key_mode=session`;
   - complete-block lookup/allocation and eviction;
@@ -121,11 +122,8 @@ cpp/
       vllm_v1_scheduler.h
       vllm_v1_scheduler.cc
     kv_cache/
-      kv_cache_block.h
-      block_pool.h
-      block_pool.cc
-      prefix_cache.h
-      prefix_cache.cc
+      replica_kv_cache_manager.h
+      replica_kv_cache_manager.cc
       cpu_cache.h
       cpu_cache.cc
       tiered_prefix_plan.h
@@ -175,10 +173,10 @@ needed by an implemented vertical slice should be created.
 | Event | value type `{time, sequence, type, payload}` in a min-heap | Deterministic DES ordering without event-object allocation. |
 | Batch | ephemeral value containing `std::vector<RequestId>` and scheduled token counts | It has no need to own request lifetime. |
 | Scheduler queues | `std::deque<RequestId>` for waiting, vectors for running work | Matches vLLM-style admission and minimizes allocations. |
-| GPU KV block | contiguous block pool of `{BlockId, ref_count, optional<SessionBlockKey>, prev_free, next_free}` | Preserves Python `KVCacheBlock` semantics with ID-based links. |
-| GPU free blocks | intrusive queue over block IDs | Mirrors `FreeKVCacheBlockQueue` and provides allocation/eviction order parity. |
-| Session cache | `std::unordered_map<SessionBlockKey, std::set<BlockId>>` plus the intrusive free/eviction queue | Preserves the Python ability to associate more than one physical block with a key and deterministically select the lowest block ID. |
-| CPU KV block | `{BlockId, FREE/RESERVED/COMMITTED, session, block_index, pin_count, reservation_id}` | Direct semantic mapping of Python `CPUKVCacheBlock`. |
+| GPU session cache | `SessionId -> {resident_prefix_blocks, active_request, LRU position}` | Makes lookup/admission/release independent of cumulative prefix length. |
+| GPU reclaim queue | LRU of inactive session IDs with suffix-range reclamation | Preserves resident-versus-evicted semantics without physical block ordering. |
+| Active GPU allocation | `RequestId -> {session_id, allocated_blocks, published_blocks}` | Tracks ownership and complete-block publication in O(1) state. |
+| CPU KV block | explicit CPU-tier block/state record | CPU offload fidelity is independent of the analytical GPU cache representation. |
 | CPU session state | session entry plus offload reservations and restore leases referenced by IDs | Preserves committed frontier, capacity reservation, pinning, cancellation, and generation behavior. |
 | Cluster routing | `SessionId -> ReplicaTarget` affinity map | Necessary because prefix cache state is target-local. |
 
@@ -186,11 +184,13 @@ Events should reference IDs and a generation/epoch number rather than owning
 `Request` or `Batch` pointers. A stale event is ignored when its stored epoch
 does not match the request's current epoch.
 
-The initial implementation should port the observable Python state transitions,
-not replace them with a new cache policy:
+The initial implementation ports the observable Python state transitions while
+using the selected analytical GPU cache policy:
 
-- GPU blocks retain Python-compatible reference counting, cache-key assignment,
-  free-list ordering, touch, release, and eviction behavior.
+- GPU release retains complete KV as reclaimable resident state; only later
+  session-suffix reclamation counts as eviction.
+- GPU lookup, admission, publication, and release use scalar range counts, not
+  per-block reference counting or a physical free list.
 - CPU blocks retain `FREE`, `RESERVED`, and `COMMITTED` states.
 - CPU session entries retain committed/reserved frontiers, generation checks,
   active reservation IDs, restore pins, and session-level eviction behavior.
@@ -203,10 +203,12 @@ Freeze a small, versioned C++ input schema before implementing scheduler
 behavior. Do not reproduce the full flattened Python dataclass CLI.
 
 - A normalized JSON configuration contains a required `schema_version`.
-- CSV trace input supports `arrived_at`, `num_prefill_tokens`,
+- CSV input supports `session_start_at`, `think_time`, `num_prefill_tokens`,
   `num_decode_tokens`, and optional `session_id` / `session_turn_index`.
+  Successor turns omit `session_start_at` and arrive after predecessor
+  completion plus `think_time`.
   `block_hash_ids` is intentionally unsupported.
-- Invalid nonfinite/negative arrival times and nonfinite/nonpositive token
+- Invalid nonfinite/negative time values and nonfinite/nonpositive token
   counts are rejected rather than clipped.
 - Output JSON/CSV schemas define timestamp and latency units, float
   serialization precision, optional-field behavior, and the canonical TTFT
@@ -312,11 +314,13 @@ queue both matches the release contract and removes synchronization overhead.
 4. **Session prefix cache**
    - Add session affinity, complete-block GPU cache lookup, allocation,
      eviction, and metrics to the validated co-location and PDD paths.
-   - Port the Python GPU block-pool, reference-counting, free-list, and
-     cache-admission semantics using IDs rather than object references.
+   - Implement an analytical session-range cache with a session-level LRU;
+     preserve replay and actual-eviction semantics without physical block IDs.
    - Validate repeated turns in one session, interleaved sessions, and
      multiple replica/DP targets.
    - Reject `prefix_caching_key_mode=block_hash`.
+   - Follow the detailed
+     [Step 4 session-scoped GPU prefix-cache plan](cpp-porting-step4-session-prefix-cache.md).
 
 5. **CPU KV-cache tiering**
    - Add analytical GPU-to-CPU offload and CPU-to-GPU restore events only after

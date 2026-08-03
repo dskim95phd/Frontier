@@ -38,6 +38,21 @@ VllmV1Scheduler::VllmV1Scheduler(config::SchedulerConfig config,
               return value;
           }())) {}
 
+VllmV1Scheduler::VllmV1Scheduler(config::SchedulerConfig config,
+                                 std::vector<entities::Request> &requests,
+                                 config::PrefixCacheConfig prefix_cache_config)
+    : VllmV1Scheduler(
+          std::move(config), requests,
+          std::make_shared<
+              execution_time_predictor::FixedExecutionTimePredictor>([&]() {
+              config::FixedExecutionModelConfig value{};
+              value.batch_latency_ms = 0.0;
+              value.stage_latencies_ms = {};
+              return value;
+          }()),
+          default_replica(), DataParallelId{0}, ClusterType::kMonolithic,
+          prefix_cache_config) {}
+
 VllmV1Scheduler::VllmV1Scheduler(
     config::SchedulerConfig config, std::vector<entities::Request> &requests,
     std::unique_ptr<execution_time_predictor::BaseExecutionTimePredictor>
@@ -56,9 +71,10 @@ VllmV1Scheduler::VllmV1Scheduler(
     config::SchedulerConfig config, std::vector<entities::Request> &requests,
     execution_time_predictor::ExecutionTimePredictorPtr predictor,
     const entities::Replica &replica, DataParallelId dp_id,
-    ClusterType cluster_type)
+    ClusterType cluster_type, config::PrefixCacheConfig prefix_cache_config)
     : BaseReplicaScheduler(std::move(config), requests, replica, dp_id,
-                           std::move(predictor), cluster_type) {
+                           std::move(predictor), cluster_type,
+                           prefix_cache_config) {
     if (config_.type != config::SchedulerType::kVllmV1 ||
         config_.scheduling_policy != config::SchedulingPolicy::kFcfs) {
         throw SchedulerError(
@@ -446,7 +462,20 @@ ScheduleResult VllmV1Scheduler::schedule_requests(SimTime time) {
             }
             const RequestId request_id = queue.front();
             entities::Request &value = request(request_id);
-            std::uint64_t num_tokens = next_num_tokens(value);
+            kv_cache::PrefixLookupResult prefix_lookup{};
+            if (kv_blocks_.prefix_cache_enabled() &&
+                !value.is_prefill_complete()) {
+                prefix_lookup = kv_blocks_.lookup(value);
+                if (prefix_lookup.cached_tokens == value.num_prefill_tokens() &&
+                    prefix_lookup.hit_blocks > 0) {
+                    --prefix_lookup.hit_blocks;
+                    prefix_lookup.cached_tokens -= kv_blocks_.block_size();
+                }
+            }
+            std::uint64_t num_tokens =
+                value.is_prefill_complete()
+                    ? next_num_tokens(value)
+                    : value.num_prefill_tokens() - prefix_lookup.cached_tokens;
             if (!value.is_prefill_complete() &&
                 config_.long_prefill_token_threshold > 0) {
                 num_tokens =
@@ -465,14 +494,34 @@ ScheduleResult VllmV1Scheduler::schedule_requests(SimTime time) {
                 queue.pop_front();
                 continue;
             }
-            const std::uint64_t accounted = kv_accounted_tokens(value);
-            if (!kv_blocks_.can_reserve(request_id, accounted, num_tokens)) {
+            const std::uint64_t accounted = prefix_lookup.cached_tokens > 0
+                                                ? prefix_lookup.cached_tokens
+                                                : kv_accounted_tokens(value);
+            const bool can_reserve =
+                kv_blocks_.prefix_cache_enabled() &&
+                        !value.is_prefill_complete()
+                    ? kv_blocks_.can_admit(request_id, value.session_id(),
+                                           prefix_lookup.cached_tokens,
+                                           num_tokens)
+                    : kv_blocks_.can_reserve(request_id, accounted, num_tokens);
+            if (!can_reserve) {
                 break;
             }
 
             queue.pop_front();
+            if (kv_blocks_.prefix_cache_enabled() &&
+                !value.is_prefill_complete()) {
+                kv_blocks_.admit(request_id, value.session_id(),
+                                 prefix_lookup.cached_tokens, num_tokens);
+                value.restore_prefix_cache_lookup(prefix_lookup.query_blocks,
+                                                  prefix_lookup.hit_blocks,
+                                                  prefix_lookup.cached_tokens);
+                kv_blocks_.record_successful_admission(
+                    prefix_lookup.query_blocks, prefix_lookup.hit_blocks);
+            } else {
+                kv_blocks_.reserve(request_id, accounted, num_tokens);
+            }
             value.on_admitted(time);
-            kv_blocks_.reserve(request_id, accounted, num_tokens);
             value.advance_scheduler_frontier(num_tokens);
             running_.push_back(request_id);
             waiting_scheduled.push_back([&]() {
@@ -556,6 +605,7 @@ bool VllmV1Scheduler::apply_batch_completion(entities::Batch &batch,
         }
         value.on_batch_completion(time, snapshot.scheduled_tokens,
                                   cluster_type());
+        kv_blocks_.mark_blocks_computed(value);
         has_valid_request = true;
         if (cluster_type() == ClusterType::kPrefill &&
             value.is_prefill_complete()) {

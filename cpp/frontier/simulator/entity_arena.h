@@ -24,8 +24,8 @@ namespace frontier::simulator {
 // lifecycle bookkeeping live here.
 class EntityArena {
   public:
-    EntityArena(const std::vector<request_generator::WorkloadRequest> &workload,
-                config::SimulationMode simulation_mode);
+    explicit EntityArena(
+        const std::vector<request_generator::WorkloadRequest> &workload);
 
     [[nodiscard]] std::size_t request_count() const noexcept {
         return requests_.size();
