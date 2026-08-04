@@ -79,6 +79,10 @@ void Request::validate_progress() const {
     if (scheduler_num_computed_tokens_ > total_tokens()) {
         throw RequestError("scheduler frontier exceeds total tokens");
     }
+    if (preemption_recomputed_prefill_tokens_ > scheduled_prefill_tokens_) {
+        throw RequestError(
+            "preemption-recomputed PREFILL exceeds scheduled PREFILL");
+    }
     if (completed() && num_processed_tokens_ != total_tokens()) {
         throw RequestError("completed request has incomplete token progress");
     }
@@ -156,10 +160,58 @@ void Request::restore_prefix_cache_lookup(
         cached_prefill_tokens_ = cached_tokens;
         prefix_cache_query_blocks_ = query_blocks;
         prefix_cache_hit_blocks_ = hit_blocks;
+        gpu_prefix_hit_blocks_ = hit_blocks;
         prefix_cache_key_mode_ = key_mode;
         prefix_cache_lookup_recorded_ = true;
     }
     validate_progress();
+}
+
+void Request::record_cpu_restore_transfer(std::uint64_t blocks,
+                                          std::uint64_t bytes,
+                                          double queue_time_ms,
+                                          double service_time_ms) {
+    if (!std::isfinite(queue_time_ms) || queue_time_ms < 0.0 ||
+        !std::isfinite(service_time_ms) || service_time_ms < 0.0 ||
+        cpu_restore_transferred_blocks_ != 0 || cpu_restore_bytes_ != 0) {
+        throw RequestError("invalid or duplicate CPU restore transfer metrics");
+    }
+    cpu_restore_transferred_blocks_ = blocks;
+    cpu_restore_bytes_ = bytes;
+    cpu_restore_queue_time_s_ = queue_time_ms / 1e3;
+    cpu_restore_service_time_s_ = service_time_ms / 1e3;
+}
+
+void Request::record_cpu_prefix_admission(
+    std::uint64_t gpu_hit_blocks, std::uint64_t cpu_query_blocks,
+    std::uint64_t cpu_consumed_blocks, std::uint64_t cpu_restored_tokens) {
+    if (cpu_prefix_admission_recorded_) {
+        return;
+    }
+    if (cpu_consumed_blocks > cpu_query_blocks ||
+        cpu_consumed_blocks > cpu_restore_transferred_blocks_ ||
+        cpu_restored_tokens > num_prefill_tokens_) {
+        throw RequestError("invalid or duplicate CPU prefix admission metrics");
+    }
+    gpu_prefix_hit_blocks_ = gpu_hit_blocks;
+    cpu_prefix_query_blocks_ = cpu_query_blocks;
+    cpu_prefix_hit_blocks_ = cpu_consumed_blocks;
+    cpu_restore_consumed_blocks_ = cpu_consumed_blocks;
+    cpu_restored_tokens_ = cpu_restored_tokens;
+    cpu_prefix_admission_recorded_ = true;
+}
+
+void Request::record_cpu_offload_transfer(std::uint64_t bytes,
+                                          double queue_time_ms,
+                                          double service_time_ms) {
+    if (!std::isfinite(queue_time_ms) || queue_time_ms < 0.0 ||
+        !std::isfinite(service_time_ms) || service_time_ms < 0.0 ||
+        cpu_offload_bytes_ != 0) {
+        throw RequestError("invalid or duplicate CPU offload transfer metrics");
+    }
+    cpu_offload_bytes_ = bytes;
+    cpu_offload_queue_time_s_ = queue_time_ms / 1e3;
+    cpu_offload_service_time_s_ = service_time_ms / 1e3;
 }
 
 void Request::advance_scheduler_frontier(std::uint64_t scheduled_tokens) {
@@ -193,9 +245,27 @@ void Request::on_batch_completion(SimTime time, std::uint64_t scheduled_tokens,
         if (scheduled_tokens > remaining_prefill) {
             throw RequestError("prefill batch exceeds remaining prompt tokens");
         }
+        if (scheduled_prefill_tokens_ >
+            std::numeric_limits<std::uint64_t>::max() - scheduled_tokens) {
+            throw RequestError("scheduled PREFILL token count overflows uint64");
+        }
+        if (prefill_recompute_pending_ &&
+            preemption_recomputed_prefill_tokens_ >
+                std::numeric_limits<std::uint64_t>::max() - scheduled_tokens) {
+            throw RequestError(
+                "recomputed PREFILL token count overflows uint64");
+        }
+        scheduled_prefill_tokens_ += scheduled_tokens;
+        if (prefill_recompute_pending_) {
+            preemption_recomputed_prefill_tokens_ += scheduled_tokens;
+        }
         num_processed_tokens_ += scheduled_tokens;
         if (num_processed_tokens_ == num_prefill_tokens_) {
             is_prefill_complete_ = true;
+            // All PREFILL work after the preemption has now been accounted for;
+            // a later decode preemption does not retroactively classify decode
+            // work as recomputed PREFILL.
+            prefill_recompute_pending_ = false;
             if (!prefill_completed_at_.valid()) {
                 prefill_completed_at_ = time;
             }
@@ -236,6 +306,12 @@ void Request::on_preempted(SimTime time, ClusterType cluster_type) {
     ++preemption_count_;
     ++runtime_epoch_;
     ++execution_epoch_;
+    if (cluster_type != ClusterType::kDecode) {
+        // PREFILL preemption requires replaying the prompt.  In monolithic
+        // mode this also covers a decode preemption because committed decode
+        // context is folded back into the replay-PREFILL boundary below.
+        prefill_recompute_pending_ = true;
+    }
     if (cluster_type == ClusterType::kDecode) {
         // Production Python vLLM V1 recompute preemption resets both token
         // frontiers to zero even in the unified DECODE cluster, while retaining

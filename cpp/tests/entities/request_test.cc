@@ -43,6 +43,9 @@ void test_monolithic_prefill_boundary_grants_first_token() {
            "first token must complete at monolithic prefill boundary");
     expect(request.cumulative_waiting_time_s() == 0.25,
            "initial queue waiting time must accumulate");
+    expect(request.scheduled_prefill_tokens() == 4 &&
+               request.preemption_recomputed_prefill_tokens() == 0,
+           "cached-free prefill completion must count scheduled prompt work");
 }
 
 void test_chunked_prefill_and_decode_progress() {
@@ -105,6 +108,9 @@ void test_preemption_resets_recompute_progress_and_epochs() {
            "replay-prefill plus the remaining decode token must complete");
     expect(request.prefill_completed_at() == original_ttft,
            "canonical first prefill timestamp must be write-once");
+    expect(request.scheduled_prefill_tokens() == 9 &&
+               request.preemption_recomputed_prefill_tokens() == 5,
+           "replayed prefill work must be counted exactly once");
 }
 
 void test_partial_and_repeated_prefill_replay_boundaries() {
@@ -144,6 +150,19 @@ void test_partial_and_repeated_prefill_replay_boundaries() {
            "preempting an incomplete replay must not shrink its boundary");
 }
 
+void test_cached_prefill_is_not_scheduled_work() {
+    Request request = make_request(8, 1);
+    request.on_arrival(SimTime::from_seconds(0.0));
+    request.restore_prefix_cache_lookup(2, 2, 4);
+    request.on_admitted(SimTime::from_seconds(0.0));
+    request.advance_scheduler_frontier(4);
+    request.on_batch_completion(SimTime::from_seconds(0.1), 4);
+    expect(request.scheduled_prefill_tokens() == 4,
+           "cached prompt tokens must not be counted as scheduled PREFILL");
+    expect(request.preemption_recomputed_prefill_tokens() == 0,
+           "cache restoration without preemption is not replay work");
+}
+
 void test_invalid_transitions_are_rejected() {
     Request request = make_request();
     expect_throws<RequestError>(
@@ -170,6 +189,9 @@ int main() {
     failures += frontier::test::run(
         "partial and repeated replay boundaries",
         test_partial_and_repeated_prefill_replay_boundaries);
+    failures += frontier::test::run(
+        "cached prefill is excluded from scheduled work",
+        test_cached_prefill_is_not_scheduled_work);
     failures += frontier::test::run("invalid request transitions are rejected",
                                     test_invalid_transitions_are_rejected);
     return failures == 0 ? 0 : 1;

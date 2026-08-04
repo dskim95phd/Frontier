@@ -89,7 +89,8 @@ Simulator::Simulator(
         const config::PddClustersConfig &clusters = config_.pdd().clusters;
         kv_cache_transfer_predictor_ =
             kv_cache_transfer::make_kv_cache_transfer_predictor(
-                config_.pdd().kv_cache_transfer);
+                config_.pdd().kv_cache_transfer,
+                clusters.prefill.parallelism.tensor_parallel_size);
         clusters_.emplace(
             ClusterType::kPrefill,
             entities::Cluster{ClusterType::kPrefill, clusters.prefill});
@@ -117,7 +118,10 @@ Simulator::Simulator(
     global_scheduler_ = std::make_unique<scheduler::GlobalScheduler>(
         clusters_, entities_.requests(), predictors_,
         kv_cache_transfer_predictor_, config_.cluster_scheduler,
-        config_.prefix_cache);
+        config_.prefix_cache,
+        config_.cpu_kv_cache.enabled
+            ? config::resolve_cpu_kv_cache_target(config_)
+            : config::ResolvedCpuKVCacheTargetConfig{});
 
     session_successors_.resize(entities_.request_count());
     std::vector<bool> has_predecessor(entities_.request_count(), false);
@@ -456,6 +460,52 @@ void Simulator::finalize() {
                     scheduler::ReplicaTarget{replica_id, dp_id}, cluster_type,
                     cluster_entity.runtime_config().scheduler.block_size,
                     config_.prefix_cache.key_mode);
+            }
+            if (const auto *cpu_manager =
+                    replica_scheduler.cpu_kv_cache_manager()) {
+                const auto *cpu_config =
+                    replica_scheduler.cpu_kv_cache_target_config();
+                if (cpu_config == nullptr) {
+                    throw std::runtime_error(
+                        "CPU KV-cache manager has no resolved target config");
+                }
+                const auto diagnostics = cpu_manager->diagnostics();
+                const auto offloads =
+                    replica_scheduler.cpu_kv_cache_offload_operations();
+                const auto restores =
+                    replica_scheduler.cpu_kv_cache_restore_operations();
+                const auto transfer_is_pending = [](const auto &operation) {
+                    const auto state = operation.state();
+                    return state ==
+                               entities::CpuKVCacheTransferState::kPending ||
+                           state ==
+                               entities::CpuKVCacheTransferState::kInFlight;
+                };
+                if (diagnostics.active_reservations != 0 ||
+                    diagnostics.active_restore_leases != 0 ||
+                    replica_scheduler.pending_cpu_restore_count() != 0 ||
+                    replica_scheduler.staged_cpu_restore_count() != 0 ||
+                    std::any_of(offloads.begin(), offloads.end(),
+                                transfer_is_pending) ||
+                    std::any_of(restores.begin(), restores.end(),
+                                transfer_is_pending)) {
+                    throw std::runtime_error(
+                        "simulation quiesced with nonterminal CPU KV-cache "
+                        "ownership or transfer state");
+                }
+                metrics_.record_cpu_kv_cache_target(
+                    *cpu_config, cpu_manager->stats(), diagnostics,
+                    scheduler::ReplicaTarget{replica_id, dp_id}, cluster_type,
+                    replica_scheduler.pending_cpu_restore_count(),
+                    replica_scheduler.staged_cpu_restore_count());
+                for (const auto &operation : offloads) {
+                    metrics_.record_cpu_kv_cache_offload(
+                        operation, cluster_type, cpu_config->bytes_per_block);
+                }
+                for (const auto &operation : restores) {
+                    metrics_.record_cpu_kv_cache_restore(
+                        operation, cluster_type, cpu_config->bytes_per_block);
+                }
             }
             for (std::uint64_t stage = 0;
                  stage < replica_scheduler.pipeline_parallel_size(); ++stage) {

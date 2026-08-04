@@ -1,5 +1,7 @@
 #include "frontier/events/event_handlers.h"
 
+#include <utility>
+
 #include "frontier/events/event_helpers.h"
 #include "frontier/simulator/simulator.h"
 
@@ -31,6 +33,13 @@ void handle_event(const ClusterBatchEndPayload &payload, SimTime time,
                     request.state() !=
                         entities::RequestState::kTransferPending) {
                     continue;
+                }
+                static_cast<void>(replica.prepare_cpu_kv_cache_offload(
+                    snapshot.request_id, time));
+                for (scheduler::ScheduledAuxiliaryEvent &auxiliary :
+                     replica.drain_auxiliary_events()) {
+                    simulator.event_queue().push(
+                        auxiliary.time, std::move(auxiliary.payload));
                 }
                 const TransferId transfer_id =
                     simulator.create_kv_cache_transfer(

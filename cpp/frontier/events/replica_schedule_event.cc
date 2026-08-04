@@ -1,5 +1,7 @@
 #include "frontier/events/event_handlers.h"
 
+#include <utility>
+
 #include "frontier/events/event_helpers.h"
 #include "frontier/simulator/simulator.h"
 
@@ -18,6 +20,11 @@ void handle_event(const ReplicaSchedulePayload &payload, SimTime time,
         scheduler::ScheduleResult schedule = replica.schedule(time);
         simulator.metrics().record_scheduler_trace(schedule, target,
                                                    payload.cluster_type);
+        for (scheduler::ScheduledAuxiliaryEvent &auxiliary :
+             replica.drain_auxiliary_events()) {
+            simulator.event_queue().push(auxiliary.time,
+                                         std::move(auxiliary.payload));
+        }
         if (schedule.scheduled_requests.empty()) {
             returned_empty_schedule = true;
             break;

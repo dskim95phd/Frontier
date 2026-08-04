@@ -13,6 +13,7 @@ Implemented behavior includes:
 - multiple replicas plus TP, PP, and DP;
 - fixed per-stage and configurable Rubin/GB300 analytical execution models;
 - sequential prefill/decode clusters with analytical KV-cache transfer;
+- finite target-local PREFILL CPU KV-cache offload/restore for sequential PDD;
 - strict JSON configuration and CSV workload contracts; and
 - CTest plus production-Python differential tests.
 
@@ -74,10 +75,13 @@ fixtures:
 
 ```powershell
 python cpp/examples/run_example.py hello `
-  --binary .build-step4/frontier_sim.exe
+  --binary .build-step5/frontier_sim.exe
 
 python cpp/examples/run_example.py pdd `
-  --binary .build-step4/frontier_sim.exe
+  --binary .build-step5/frontier_sim.exe
+
+python cpp/examples/run_example.py cpu-kv-online `
+  --binary .build-step5/frontier_sim.exe
 ```
 
 The example runner writes normalized inputs and analysis-ready artifacts under
@@ -90,7 +94,7 @@ Pass an output directory to avoid emitting the entire detailed trace to
 stdout:
 
 ```powershell
-.build-step4/frontier_sim.exe `
+.build-step5/frontier_sim.exe `
   --config cpp/examples/configs/03_sequential_pdd.json `
   --workload cpp/examples/workloads/00_tiny.csv `
   --output-dir outputs/my-pdd-run `
@@ -144,10 +148,28 @@ Common top-level fields are:
 }
 ```
 
-All fields are required. Unknown fields and unsupported values are rejected.
+The fields shown above are required. The additional top-level `cpu_kv_cache`
+object may be omitted and then normalizes to the disabled default. Unknown
+fields and unsupported values are rejected.
 `enable_parallel_clusters` must currently be `false`. Session prefix caching
 is supported with `prefix_cache.enabled=true`, `key_mode="session"`, and a
 sticky cluster scheduler when more than one replica/DP target is available.
+
+### CPU KV-cache tiering
+
+CPU tiering is an opt-in sequential-PDD feature. It requires session prefix
+caching, `sticky_round_robin`, a PREFILL `vllm_v1` scheduler, and
+`enable_parallel_clusters=false`. Each PREFILL `(replica_id, dp_id)` target
+owns an independent finite store and one serialized queue per transfer
+direction; D2H and H2D may overlap.
+
+Start from
+`cpp/examples/configs/06_cpu_kv_cache_pdd_online.json` or the matching offline
+config. The normalized top-level object selects either direct capacity or a
+static per-GPU slice and configures analytical transfer bandwidth/latency plus
+`prefix_fit` or `skip_offload` pressure behavior. Full output includes
+`cpu_kv_cache`, `cpu_kv_cache_targets`, and `cpu_kv_cache_transfers`; request
+records distinguish restored blocks transferred, consumed, and discarded.
 
 ### Co-location clusters
 

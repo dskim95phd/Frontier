@@ -51,8 +51,20 @@ void validate_request_metrics(const std::vector<RequestMetricsRecord> &requests,
                 std::to_string(request.request_id.value()));
         }
         if (request.num_prefill_tokens == 0 || request.num_decode_tokens == 0 ||
+            request.preemption_recomputed_prefill_tokens >
+                request.scheduled_prefill_tokens ||
             request.prefix_cache_hit_blocks >
                 request.prefix_cache_query_blocks ||
+            request.cpu_prefix_hit_blocks > request.cpu_prefix_query_blocks ||
+            request.cpu_restore_consumed_blocks >
+                request.cpu_restore_transferred_blocks ||
+            request.cpu_restore_discarded_blocks !=
+                request.cpu_restore_transferred_blocks -
+                    request.cpu_restore_consumed_blocks ||
+            request.cpu_prefix_hit_blocks !=
+                request.cpu_restore_consumed_blocks ||
+            request.gpu_prefix_hit_blocks + request.cpu_prefix_hit_blocks !=
+                request.prefix_cache_hit_blocks ||
             request.cached_prefill_tokens > request.num_prefill_tokens) {
             throw std::invalid_argument(
                 "request prefix-cache metrics are invalid");
@@ -124,9 +136,31 @@ OrderedJson serialize_request(const RequestMetricsRecord &request,
     }
     json["num_prefill_tokens"] = request.num_prefill_tokens;
     json["num_decode_tokens"] = request.num_decode_tokens;
+    json["scheduled_prefill_tokens"] = request.scheduled_prefill_tokens;
+    json["preemption_recomputed_prefill_tokens"] =
+        request.preemption_recomputed_prefill_tokens;
     json["cached_prefill_tokens"] = request.cached_prefill_tokens;
     json["prefix_cache_query_blocks"] = request.prefix_cache_query_blocks;
     json["prefix_cache_hit_blocks"] = request.prefix_cache_hit_blocks;
+    json["gpu_prefix_hit_blocks"] = request.gpu_prefix_hit_blocks;
+    json["cpu_prefix_query_blocks"] = request.cpu_prefix_query_blocks;
+    json["cpu_prefix_hit_blocks"] = request.cpu_prefix_hit_blocks;
+    json["cpu_restore_transferred_blocks"] =
+        request.cpu_restore_transferred_blocks;
+    json["cpu_restore_consumed_blocks"] = request.cpu_restore_consumed_blocks;
+    json["cpu_restore_discarded_blocks"] =
+        request.cpu_restore_discarded_blocks;
+    json["cpu_restored_tokens"] = request.cpu_restored_tokens;
+    json["cpu_restore_bytes"] = request.cpu_restore_bytes;
+    json["cpu_restore_queue_time_ms"] =
+        request.cpu_restore_queue_time_s * 1e3;
+    json["cpu_restore_service_time_ms"] =
+        request.cpu_restore_service_time_s * 1e3;
+    json["cpu_offload_bytes"] = request.cpu_offload_bytes;
+    json["cpu_offload_queue_time_ms"] =
+        request.cpu_offload_queue_time_s * 1e3;
+    json["cpu_offload_service_time_ms"] =
+        request.cpu_offload_service_time_s * 1e3;
     json["prefix_cache_key_mode"] =
         config::to_string(request.prefix_cache_key_mode);
     json["arrived_at_s"] = request.arrived_at.seconds();
@@ -210,6 +244,9 @@ OrderedJson serialize_event(const Event &event) {
             }
             if constexpr (detail::has_generation<Payload>::value) {
                 json["generation"] = payload.generation.value();
+            }
+            if constexpr (detail::has_cpu_generation<Payload>::value) {
+                json["cpu_generation"] = payload.cpu_generation.value();
             }
             if constexpr (detail::has_sync_generation<Payload>::value) {
                 json["sync_generation"] = payload.sync_generation.value();
@@ -583,6 +620,14 @@ std::string_view to_string(EventType event_type) noexcept {
         return "decode_sync";
     case EventType::kDecodeSyncCollective:
         return "decode_sync_collective";
+    case EventType::kCpuKvCacheOffloadStart:
+        return "cpu_kv_cache_offload_start";
+    case EventType::kCpuKvCacheOffloadEnd:
+        return "cpu_kv_cache_offload_end";
+    case EventType::kCpuKvCacheRestoreStart:
+        return "cpu_kv_cache_restore_start";
+    case EventType::kCpuKvCacheRestoreEnd:
+        return "cpu_kv_cache_restore_end";
     }
     return "unknown";
 }
@@ -698,6 +743,127 @@ std::string serialize_simulation_output_json(const SimulationOutput &output) {
         }));
     }
 
+    const CpuKVCacheMetricsAggregate &cpu = output.aggregate.cpu_kv_cache;
+    root["cpu_kv_cache"] = OrderedJson::object({
+        {"target_count", cpu.target_count},
+        {"capacity_bytes", cpu.capacity_bytes},
+        {"capacity_blocks", cpu.capacity_blocks},
+        {"bytes_per_block", cpu.bytes_per_block},
+        {"offload_operations", cpu.offload_operations},
+        {"offload_blocks", cpu.offload_blocks},
+        {"offload_bytes", cpu.offload_bytes},
+        {"restore_operations", cpu.restore_operations},
+        {"restore_blocks", cpu.restore_blocks},
+        {"restore_bytes", cpu.restore_bytes},
+        {"d2h_queue_time_ms", cpu.d2h_queue_time_ms},
+        {"d2h_service_time_ms", cpu.d2h_service_time_ms},
+        {"h2d_queue_time_ms", cpu.h2d_queue_time_ms},
+        {"h2d_service_time_ms", cpu.h2d_service_time_ms},
+        {"source_gpu_hold_time_ms", cpu.source_gpu_hold_time_ms},
+        {"query_blocks", cpu.query_blocks},
+        {"hit_blocks", cpu.hit_blocks},
+        {"hit_rate", cpu.query_blocks == 0
+                         ? 0.0
+                         : static_cast<double>(cpu.hit_blocks) /
+                               static_cast<double>(cpu.query_blocks)},
+        {"resident_bytes", cpu.resident_bytes},
+        {"resident_blocks", cpu.resident_blocks},
+        {"reserved_bytes", cpu.reserved_bytes},
+        {"reserved_blocks", cpu.reserved_blocks},
+        {"free_bytes", cpu.free_bytes},
+        {"free_blocks", cpu.free_blocks},
+        {"peak_resident_bytes", cpu.peak_resident_bytes},
+        {"peak_resident_blocks", cpu.peak_resident_blocks},
+        {"peak_reserved_bytes", cpu.peak_reserved_bytes},
+        {"peak_reserved_blocks", cpu.peak_reserved_blocks},
+        {"resident_sessions", cpu.resident_sessions},
+        {"evicted_blocks", cpu.evicted_blocks},
+        {"evicted_sessions", cpu.evicted_sessions},
+        {"evicted_bytes", cpu.evicted_bytes},
+        {"skipped_offloads", cpu.skipped_offloads},
+        {"truncated_offloads", cpu.truncated_offloads},
+        {"stale_generation_completions",
+         cpu.stale_generation_completions},
+        {"sessions_with_cpu_hits", cpu.sessions_with_cpu_hits},
+        {"pending_restore_operations", cpu.pending_restore_operations},
+        {"staged_restore_payloads", cpu.staged_restore_payloads},
+        {"active_restore_leases", cpu.active_restore_leases},
+        {"active_offload_reservations",
+         cpu.active_offload_reservations},
+    });
+    root["cpu_kv_cache_targets"] = OrderedJson::array();
+    for (const auto &target : output.cpu_kv_cache_targets) {
+        root["cpu_kv_cache_targets"].push_back(OrderedJson::object({
+            {"cluster_type", to_string(target.cluster_type)},
+            {"replica_id", target.replica_id.value()},
+            {"dp_id", target.dp_id.value()},
+            {"capacity_bytes", target.capacity_bytes},
+            {"capacity_blocks", target.capacity_blocks},
+            {"bytes_per_block", target.bytes_per_block},
+            {"resident_bytes", target.resident_bytes},
+            {"resident_blocks", target.resident_blocks},
+            {"reserved_bytes", target.reserved_bytes},
+            {"reserved_blocks", target.reserved_blocks},
+            {"free_bytes", target.free_bytes},
+            {"free_blocks", target.free_blocks},
+            {"peak_resident_bytes", target.peak_resident_bytes},
+            {"peak_resident_blocks", target.peak_resident_blocks},
+            {"peak_reserved_bytes", target.peak_reserved_bytes},
+            {"peak_reserved_blocks", target.peak_reserved_blocks},
+            {"resident_sessions", target.resident_sessions},
+            {"evicted_sessions", target.evicted_sessions},
+            {"evicted_blocks", target.evicted_blocks},
+            {"evicted_bytes", target.evicted_bytes},
+            {"skipped_offloads", target.skipped_offloads},
+            {"truncated_offloads", target.truncated_offloads},
+            {"stale_generation_completions",
+             target.stale_generation_completions},
+            {"cpu_query_blocks", target.cpu_query_blocks},
+            {"cpu_hit_blocks", target.cpu_hit_blocks},
+            {"sessions_with_cpu_hits", target.sessions_with_cpu_hits},
+            {"pending_restore_operations",
+             target.pending_restore_operations},
+            {"staged_restore_payloads", target.staged_restore_payloads},
+            {"active_restore_leases", target.active_restore_leases},
+            {"active_offload_reservations",
+             target.active_offload_reservations},
+        }));
+    }
+    root["cpu_kv_cache_transfers"] = OrderedJson::array();
+    for (const auto &transfer : output.cpu_kv_cache_transfers) {
+        root["cpu_kv_cache_transfers"].push_back(OrderedJson::object({
+            {"transfer_id", transfer.transfer_id.value()},
+            {"kind", transfer.kind == CpuKVCacheTransferKind::kOffload
+                         ? "offload"
+                         : "restore"},
+            {"request_id", transfer.request_id.value()},
+            {"cluster_type", to_string(transfer.cluster_type)},
+            {"replica_id", transfer.replica_id.value()},
+            {"dp_id", transfer.dp_id.value()},
+            {"blocks", transfer.blocks},
+            {"size_bytes", transfer.size_bytes},
+            {"submitted_at_s", transfer.submitted_at.seconds()},
+            {"started_at_s", transfer.started_at.seconds()},
+            {"completed_at_s", transfer.completed_at.seconds()},
+            {"queue_time_ms", transfer.queue_time_ms},
+            {"service_time_ms", transfer.service_time_ms},
+            {"source_gpu_hold_ms", transfer.source_gpu_hold_ms},
+        }));
+    }
+
+    std::uint64_t total_scheduled_prefill_tokens = 0;
+    std::uint64_t total_recomputed_prefill_tokens = 0;
+    for (const RequestMetricsRecord &request : output.requests) {
+        total_scheduled_prefill_tokens += request.scheduled_prefill_tokens;
+        total_recomputed_prefill_tokens +=
+            request.preemption_recomputed_prefill_tokens;
+    }
+    root["prefill_work"] = OrderedJson::object({
+        {"scheduled_prefill_tokens", total_scheduled_prefill_tokens},
+        {"preemption_recomputed_prefill_tokens",
+         total_recomputed_prefill_tokens},
+    });
+
     return root.dump(2) + '\n';
 }
 
@@ -751,6 +917,8 @@ std::string serialize_simulation_summary_json(const SimulationOutput &output,
     double last_completion_s = 0.0;
     std::uint64_t total_prefill_tokens = 0;
     std::uint64_t total_decode_tokens = 0;
+    std::uint64_t total_scheduled_prefill_tokens = 0;
+    std::uint64_t total_recomputed_prefill_tokens = 0;
     std::uint64_t total_preemptions = 0;
     for (const RequestMetricsRecord &request : output.requests) {
         first_arrival_s =
@@ -759,6 +927,9 @@ std::string serialize_simulation_summary_json(const SimulationOutput &output,
             std::max(last_completion_s, request.completed_at.seconds());
         total_prefill_tokens += request.num_prefill_tokens;
         total_decode_tokens += request.num_decode_tokens;
+        total_scheduled_prefill_tokens += request.scheduled_prefill_tokens;
+        total_recomputed_prefill_tokens +=
+            request.preemption_recomputed_prefill_tokens;
         total_preemptions += request.preemption_count;
         scheduling_delay_ms.push_back(
             milliseconds_between(request.first_scheduled_at, request.arrived_at,
@@ -788,6 +959,23 @@ std::string serialize_simulation_summary_json(const SimulationOutput &output,
                    : 0.0;
     };
 
+    std::uint64_t aggregate_prefill_scheduled_tokens = 0;
+    for (const auto &[cluster_type, aggregate] :
+         output.aggregate.batches_by_cluster) {
+        static_cast<void>(cluster_type);
+        aggregate_prefill_scheduled_tokens +=
+            aggregate.prefill_scheduled_tokens;
+    }
+    // A caller may construct a full SimulationOutput directly (as contract
+    // tests and a few analysis tools do) without first feeding batches through
+    // MetricsStore.  Preserve a useful summary in that case by deriving the
+    // same total from the compact per-batch PREFILL counts.
+    if (output.aggregate.batches_by_cluster.empty()) {
+        for (const BatchMetricsRecord &batch : output.batches) {
+            aggregate_prefill_scheduled_tokens += batch.num_prefill_tokens;
+        }
+    }
+
     OrderedJson root = OrderedJson::object();
     root["schema_version"] = 1;
     root["run"] = OrderedJson::object({
@@ -807,6 +995,12 @@ std::string serialize_simulation_summary_json(const SimulationOutput &output,
         {"events", output.aggregate.event_count},
         {"kv_cache_transfers", output.aggregate.kv_cache_transfer_count},
         {"preemptions", total_preemptions},
+        {"prefill_scheduled_tokens", aggregate_prefill_scheduled_tokens},
+    });
+    root["prefill_work"] = OrderedJson::object({
+        {"scheduled_prefill_tokens", total_scheduled_prefill_tokens},
+        {"preemption_recomputed_prefill_tokens",
+         total_recomputed_prefill_tokens},
     });
     root["throughput"] = OrderedJson::object({
         {"requests_per_second", rate(output.requests.size())},
@@ -839,6 +1033,10 @@ std::string serialize_simulation_summary_json(const SimulationOutput &output,
                      : static_cast<double>(aggregate.request_slots) /
                            static_cast<double>(aggregate.batch_count)},
                 {"predicted_execution_ms", aggregate.predicted_execution_ms},
+                {"prefill_scheduled_tokens",
+                 aggregate.prefill_scheduled_tokens},
+                {"preemption_recomputed_prefill_tokens",
+                 aggregate.preemption_recomputed_prefill_tokens},
                 {"batch_size_histogram", std::move(histogram)},
             });
     }
@@ -867,6 +1065,54 @@ std::string serialize_simulation_summary_json(const SimulationOutput &output,
         {"evicted_blocks", cache.evicted_blocks},
         {"evicted_sessions", cache.evicted_sessions},
     });
+    const CpuKVCacheMetricsAggregate &cpu = output.aggregate.cpu_kv_cache;
+    root["cpu_kv_cache"] = OrderedJson::object({
+        {"target_count", cpu.target_count},
+        {"capacity_bytes", cpu.capacity_bytes},
+        {"capacity_blocks", cpu.capacity_blocks},
+        {"bytes_per_block", cpu.bytes_per_block},
+        {"offload_operations", cpu.offload_operations},
+        {"offload_blocks", cpu.offload_blocks},
+        {"offload_bytes", cpu.offload_bytes},
+        {"restore_operations", cpu.restore_operations},
+        {"restore_blocks", cpu.restore_blocks},
+        {"restore_bytes", cpu.restore_bytes},
+        {"d2h_queue_time_ms", cpu.d2h_queue_time_ms},
+        {"d2h_service_time_ms", cpu.d2h_service_time_ms},
+        {"h2d_queue_time_ms", cpu.h2d_queue_time_ms},
+        {"h2d_service_time_ms", cpu.h2d_service_time_ms},
+        {"source_gpu_hold_time_ms", cpu.source_gpu_hold_time_ms},
+        {"query_blocks", cpu.query_blocks},
+        {"hit_blocks", cpu.hit_blocks},
+        {"hit_rate", cpu.query_blocks == 0
+                         ? 0.0
+                         : static_cast<double>(cpu.hit_blocks) /
+                               static_cast<double>(cpu.query_blocks)},
+        {"resident_bytes", cpu.resident_bytes},
+        {"resident_blocks", cpu.resident_blocks},
+        {"reserved_bytes", cpu.reserved_bytes},
+        {"reserved_blocks", cpu.reserved_blocks},
+        {"free_bytes", cpu.free_bytes},
+        {"free_blocks", cpu.free_blocks},
+        {"peak_resident_bytes", cpu.peak_resident_bytes},
+        {"peak_resident_blocks", cpu.peak_resident_blocks},
+        {"peak_reserved_bytes", cpu.peak_reserved_bytes},
+        {"peak_reserved_blocks", cpu.peak_reserved_blocks},
+        {"resident_sessions", cpu.resident_sessions},
+        {"evicted_blocks", cpu.evicted_blocks},
+        {"evicted_sessions", cpu.evicted_sessions},
+        {"evicted_bytes", cpu.evicted_bytes},
+        {"skipped_offloads", cpu.skipped_offloads},
+        {"truncated_offloads", cpu.truncated_offloads},
+        {"stale_generation_completions",
+         cpu.stale_generation_completions},
+        {"sessions_with_cpu_hits", cpu.sessions_with_cpu_hits},
+        {"pending_restore_operations", cpu.pending_restore_operations},
+        {"staged_restore_payloads", cpu.staged_restore_payloads},
+        {"active_restore_leases", cpu.active_restore_leases},
+        {"active_offload_reservations",
+         cpu.active_offload_reservations},
+    });
     return root.dump(2) + '\n';
 }
 
@@ -881,16 +1127,32 @@ serialize_request_metrics_csv(const std::vector<RequestMetricsRecord> &requests,
     if (!is_pdd(architecture)) {
         output << "request_id,session_id,num_prefill_tokens,num_decode_tokens,"
                   "cached_prefill_tokens,prefix_cache_query_blocks,"
-                  "prefix_cache_hit_blocks,prefix_cache_key_mode,arrived_at_s,"
+                  "prefix_cache_hit_blocks,gpu_prefix_hit_blocks,"
+                  "cpu_prefix_query_blocks,cpu_prefix_hit_blocks,"
+                  "cpu_restore_transferred_blocks,cpu_restore_consumed_blocks,"
+                  "cpu_restore_discarded_blocks,cpu_restored_tokens,"
+                  "cpu_restore_bytes,cpu_restore_queue_time_ms,"
+                  "cpu_restore_service_time_ms,cpu_offload_bytes,"
+                  "cpu_offload_queue_time_ms,cpu_offload_service_time_ms,"
+                  "prefix_cache_key_mode,arrived_at_s,"
                   "first_scheduled_at_s,"
                   "prefill_completed_at_s,first_token_completed_at_s,"
                   "completed_at_s,scheduling_delay_ms,prefill_latency_ms,"
                   "ttft_ms,e2e_ms,"
-                  "num_processed_tokens,preemption_count,replica_id,dp_id\n";
+                  "num_processed_tokens,preemption_count,replica_id,dp_id,"
+                  "scheduled_prefill_tokens,"
+                  "preemption_recomputed_prefill_tokens\n";
     } else {
         output << "request_id,session_id,num_prefill_tokens,num_decode_tokens,"
                   "cached_prefill_tokens,prefix_cache_query_blocks,"
-                  "prefix_cache_hit_blocks,prefix_cache_key_mode,arrived_at_s,"
+                  "prefix_cache_hit_blocks,gpu_prefix_hit_blocks,"
+                  "cpu_prefix_query_blocks,cpu_prefix_hit_blocks,"
+                  "cpu_restore_transferred_blocks,cpu_restore_consumed_blocks,"
+                  "cpu_restore_discarded_blocks,cpu_restored_tokens,"
+                  "cpu_restore_bytes,cpu_restore_queue_time_ms,"
+                  "cpu_restore_service_time_ms,cpu_offload_bytes,"
+                  "cpu_offload_queue_time_ms,cpu_offload_service_time_ms,"
+                  "prefix_cache_key_mode,arrived_at_s,"
                   "first_scheduled_at_s,"
                   "prefill_completed_at_s,first_token_completed_at_s,"
                   "completed_at_s,scheduling_delay_ms,prefill_latency_ms,"
@@ -900,7 +1162,9 @@ serialize_request_metrics_csv(const std::vector<RequestMetricsRecord> &requests,
                   "dp_id,"
                   "transfer_id,kv_cache_transfer_start_time_s,"
                   "kv_cache_transfer_end_time_s,kv_cache_transfer_time_ms,"
-                  "kv_cache_transfer_size_bytes,decode_arrived_at_s\n";
+                  "kv_cache_transfer_size_bytes,decode_arrived_at_s,"
+                  "scheduled_prefill_tokens,"
+                  "preemption_recomputed_prefill_tokens\n";
     }
 
     for (const RequestMetricsRecord &request : requests) {
@@ -913,6 +1177,19 @@ serialize_request_metrics_csv(const std::vector<RequestMetricsRecord> &requests,
                << request.cached_prefill_tokens << ','
                << request.prefix_cache_query_blocks << ','
                << request.prefix_cache_hit_blocks << ','
+               << request.gpu_prefix_hit_blocks << ','
+               << request.cpu_prefix_query_blocks << ','
+               << request.cpu_prefix_hit_blocks << ','
+               << request.cpu_restore_transferred_blocks << ','
+               << request.cpu_restore_consumed_blocks << ','
+               << request.cpu_restore_discarded_blocks << ','
+               << request.cpu_restored_tokens << ','
+               << request.cpu_restore_bytes << ','
+               << request.cpu_restore_queue_time_s * 1e3 << ','
+               << request.cpu_restore_service_time_s * 1e3 << ','
+               << request.cpu_offload_bytes << ','
+               << request.cpu_offload_queue_time_s * 1e3 << ','
+               << request.cpu_offload_service_time_s * 1e3 << ','
                << config::to_string(request.prefix_cache_key_mode) << ','
                << request.arrived_at.seconds() << ',';
         output << request.first_scheduled_at.seconds() << ',';
@@ -936,7 +1213,9 @@ serialize_request_metrics_csv(const std::vector<RequestMetricsRecord> &requests,
                << request.preemption_count;
         if (!is_pdd(architecture)) {
             output << ',' << request.replica_id.value() << ','
-                   << request.dp_id.value();
+                   << request.dp_id.value() << ','
+                   << request.scheduled_prefill_tokens << ','
+                   << request.preemption_recomputed_prefill_tokens;
         } else {
             output << ',' << request.prefill_replica_id.value() << ','
                    << request.prefill_dp_id.value() << ','
@@ -949,7 +1228,9 @@ serialize_request_metrics_csv(const std::vector<RequestMetricsRecord> &requests,
                        request.kv_cache_transfer_start_time.seconds()) *
                           1e3
                    << ',' << request.kv_cache_transfer_size_bytes << ','
-                   << request.decode_arrived_at.seconds();
+                   << request.decode_arrived_at.seconds() << ','
+                   << request.scheduled_prefill_tokens << ','
+                   << request.preemption_recomputed_prefill_tokens;
         }
         output << '\n';
     }

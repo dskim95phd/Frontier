@@ -83,7 +83,9 @@ add_library(
   frontier/entities/cluster.cc
   frontier/entities/replica.cc
   frontier/entities/kv_cache_transfer_info.cc
+  frontier/entities/cpu_kv_cache_transfer_info.cc
   frontier/kv_cache/replica_kv_cache_manager.cc
+  frontier/kv_cache/cpu_kv_cache_manager.cc
   frontier/events/batch_stage_arrival_event.cc
   frontier/events/batch_stage_end_event.cc
   frontier/events/cluster_batch_end_event.cc
@@ -94,6 +96,10 @@ add_library(
   frontier/events/global_schedule_event.cc
   frontier/events/kv_cache_transfer_end_event.cc
   frontier/events/kv_cache_transfer_start_event.cc
+  frontier/events/cpu_kv_cache_offload_start_event.cc
+  frontier/events/cpu_kv_cache_offload_end_event.cc
+  frontier/events/cpu_kv_cache_restore_start_event.cc
+  frontier/events/cpu_kv_cache_restore_end_event.cc
   frontier/events/replica_schedule_event.cc
   frontier/events/replica_stage_schedule_event.cc
   frontier/events/request_arrival_event.cc
@@ -105,6 +111,7 @@ add_library(
   frontier/execution_time_predictor/fixed_execution_time_predictor.cc
   frontier/execution_time_predictor/analytical_roofline_execution_time_predictor.cc
   frontier/kv_cache_transfer/analytical_transfer.cc
+  frontier/cpu_kv_cache_transfer/analytical_transfer.cc
   frontier/metrics/output_contract.cc
   frontier/metrics/metrics_store.cc
   frontier/request_generator/workload.cc
@@ -366,6 +373,34 @@ if(BUILD_TESTING)
   )
 
   add_executable(
+    frontier_cpu_kv_cache_manager_test
+    tests/kv_cache/cpu_kv_cache_manager_test.cc
+  )
+  target_link_libraries(
+    frontier_cpu_kv_cache_manager_test
+    PRIVATE frontier_core
+  )
+  frontier_enable_warnings(frontier_cpu_kv_cache_manager_test)
+  add_test(
+    NAME frontier_kv_cache.cpu_manager
+    COMMAND $<TARGET_FILE:frontier_cpu_kv_cache_manager_test>
+  )
+
+  add_executable(
+    frontier_cpu_kv_cache_transfer_test
+    tests/cpu_kv_cache_transfer/analytical_transfer_test.cc
+  )
+  target_link_libraries(
+    frontier_cpu_kv_cache_transfer_test
+    PRIVATE frontier_core
+  )
+  frontier_enable_warnings(frontier_cpu_kv_cache_transfer_test)
+  add_test(
+    NAME frontier_cpu_kv_cache_transfer.analytical
+    COMMAND $<TARGET_FILE:frontier_cpu_kv_cache_transfer_test>
+  )
+
+  add_executable(
     frontier_vllm_v1_scheduler_test
     tests/scheduler/vllm_v1_scheduler_test.cc
   )
@@ -473,6 +508,108 @@ if(BUILD_TESTING)
   add_test(
     NAME frontier_simulator.prefix_cache
     COMMAND $<TARGET_FILE:frontier_prefix_cache_integration_test>
+  )
+
+  add_executable(
+    frontier_cpu_kv_cache_integration_test
+    tests/simulator/cpu_kv_cache_integration_test.cc
+  )
+  target_compile_definitions(
+    frontier_cpu_kv_cache_integration_test
+    PRIVATE
+      FRONTIER_EXAMPLE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/examples"
+  )
+  target_link_libraries(
+    frontier_cpu_kv_cache_integration_test
+    PRIVATE frontier_core
+  )
+  frontier_enable_warnings(frontier_cpu_kv_cache_integration_test)
+  add_test(
+    NAME frontier_simulator.cpu_kv_cache
+    COMMAND $<TARGET_FILE:frontier_cpu_kv_cache_integration_test>
+  )
+  find_package(Python3 COMPONENTS Interpreter QUIET)
+  if(Python3_Interpreter_FOUND)
+    add_test(
+      NAME frontier_simulator.cpu_kv_cache_python_diff
+      COMMAND
+        ${Python3_EXECUTABLE}
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/differential/cpu_kv_cache_logical_diff.py"
+        --binary $<TARGET_FILE:frontier_sim>
+        --repo-root "${CMAKE_CURRENT_SOURCE_DIR}/.."
+    )
+  endif()
+
+  add_executable(
+    frontier_cpu_kv_cache_stress_test
+    tests/simulator/cpu_kv_cache_stress_test.cc
+  )
+  target_compile_definitions(
+    frontier_cpu_kv_cache_stress_test
+    PRIVATE
+      FRONTIER_EXAMPLE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/examples"
+  )
+  target_link_libraries(
+    frontier_cpu_kv_cache_stress_test
+    PRIVATE frontier_core
+  )
+  frontier_enable_warnings(frontier_cpu_kv_cache_stress_test)
+  add_test(
+    NAME frontier_simulator.cpu_kv_cache_stress
+    COMMAND $<TARGET_FILE:frontier_cpu_kv_cache_stress_test>
+  )
+  set_tests_properties(
+    frontier_simulator.cpu_kv_cache_stress
+    PROPERTIES
+      LABELS stress
+      RUN_SERIAL TRUE
+      TIMEOUT 180
+  )
+
+  add_executable(
+    frontier_cpu_kv_cache_topology_matrix_test
+    tests/simulator/cpu_kv_cache_topology_matrix_test.cc
+  )
+  target_compile_definitions(
+    frontier_cpu_kv_cache_topology_matrix_test
+    PRIVATE
+      FRONTIER_EXAMPLE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/examples"
+      FRONTIER_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures"
+  )
+  target_link_libraries(
+    frontier_cpu_kv_cache_topology_matrix_test
+    PRIVATE frontier_core
+  )
+  frontier_enable_warnings(frontier_cpu_kv_cache_topology_matrix_test)
+  add_test(
+    NAME frontier_simulator.cpu_kv_cache_topology_matrix
+    COMMAND $<TARGET_FILE:frontier_cpu_kv_cache_topology_matrix_test>
+  )
+
+  add_executable(
+    frontier_cpu_kv_cache_stress_matrix_test
+    tests/simulator/cpu_kv_cache_stress_matrix_test.cc
+  )
+  target_compile_definitions(
+    frontier_cpu_kv_cache_stress_matrix_test
+    PRIVATE
+      FRONTIER_EXAMPLE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/examples"
+  )
+  target_link_libraries(
+    frontier_cpu_kv_cache_stress_matrix_test
+    PRIVATE frontier_core
+  )
+  frontier_enable_warnings(frontier_cpu_kv_cache_stress_matrix_test)
+  add_test(
+    NAME frontier_simulator.cpu_kv_cache_stress_matrix
+    COMMAND $<TARGET_FILE:frontier_cpu_kv_cache_stress_matrix_test>
+  )
+  set_tests_properties(
+    frontier_simulator.cpu_kv_cache_stress_matrix
+    PROPERTIES
+      LABELS stress
+      RUN_SERIAL TRUE
+      TIMEOUT 300
   )
 
   add_executable(

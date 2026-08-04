@@ -32,6 +32,7 @@ struct RunOptions {
     std::filesystem::path workload;
     std::optional<std::filesystem::path> output_dir;
     OutputMode output_mode = OutputMode::kSummary;
+    bool runtime_validation = true;
 };
 
 void print_usage(std::ostream &stream) {
@@ -45,7 +46,8 @@ void print_usage(std::ostream &stream) {
         << "  " << kProgramName
         << " --config <config.json> --workload <workload.csv> "
            "--output-dir <directory> "
-           "[--output-mode summary|requests|full]\n\n"
+           "[--output-mode summary|requests|full] "
+           "[--runtime-validation true|false]\n\n"
         << "Without --output-dir, the complete deterministic JSON trace is "
            "written to stdout.\n"
         << "With --output-dir, normalized inputs and summary.json are always "
@@ -104,6 +106,7 @@ std::optional<RunOptions> parse_run_options(int argc, char *argv[]) {
     std::optional<std::filesystem::path> workload_path;
     std::optional<std::filesystem::path> output_dir;
     std::optional<OutputMode> output_mode;
+    std::optional<bool> runtime_validation;
     for (int index = 1; index < argc; index += 2) {
         const std::string_view option{argv[index]};
         const std::string_view value{argv[index + 1]};
@@ -116,6 +119,15 @@ std::optional<RunOptions> parse_run_options(int argc, char *argv[]) {
         } else if (option == "--output-mode" && !output_mode.has_value()) {
             output_mode = parse_output_mode(value);
             if (!output_mode.has_value()) {
+                return std::nullopt;
+            }
+        } else if (option == "--runtime-validation" &&
+                   !runtime_validation.has_value()) {
+            if (value == "true") {
+                runtime_validation = true;
+            } else if (value == "false") {
+                runtime_validation = false;
+            } else {
                 return std::nullopt;
             }
         } else {
@@ -132,6 +144,7 @@ std::optional<RunOptions> parse_run_options(int argc, char *argv[]) {
     result.workload = std::move(workload_path.value());
     result.output_dir = std::move(output_dir);
     result.output_mode = output_mode.value_or(OutputMode::kSummary);
+    result.runtime_validation = runtime_validation.value_or(true);
     return result;
 }
 
@@ -218,6 +231,8 @@ int main(int argc, char *argv[]) {
 
         const auto started_at = std::chrono::steady_clock::now();
         frontier::simulator::Simulator simulator{config, workload};
+        simulator.set_runtime_validation_enabled(
+            options->runtime_validation);
         if (options->output_dir.has_value() &&
             options->output_mode != OutputMode::kFull) {
             simulator.metrics().set_detailed_traces_enabled(false);

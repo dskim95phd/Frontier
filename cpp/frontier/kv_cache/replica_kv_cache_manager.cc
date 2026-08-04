@@ -208,6 +208,77 @@ void ReplicaKVCacheManager::admit(RequestId request_id, SessionId session_id,
     validate_accounting();
 }
 
+bool ReplicaKVCacheManager::can_admit_tiered(
+    RequestId request_id, SessionId session_id,
+    std::uint64_t reusable_frontier_blocks,
+    std::uint64_t scheduled_tokens) const {
+    if (!prefix_cache_enabled_ || !session_id.valid() ||
+        allocations_.find(request_id) != allocations_.end() ||
+        scheduled_tokens == 0 ||
+        reusable_frontier_blocks >
+            std::numeric_limits<std::uint64_t>::max() / block_size_) {
+        return false;
+    }
+    const auto position = sessions_.find(session_id);
+    const std::uint64_t resident =
+        position == sessions_.end() ? 0
+                                    : position->second.resident_prefix_blocks;
+    if (position != sessions_.end() &&
+        position->second.active_request.valid()) {
+        return false;
+    }
+    if (reusable_frontier_blocks < resident) {
+        return false;
+    }
+    const std::uint64_t reusable_tokens = reusable_frontier_blocks * block_size_;
+    if (reusable_tokens >
+        std::numeric_limits<std::uint64_t>::max() - scheduled_tokens) {
+        return false;
+    }
+    const std::uint64_t required =
+        ceil_div(reusable_tokens + scheduled_tokens, block_size_);
+    if (required < reusable_frontier_blocks || required < resident ||
+        required > available_blocks()) {
+        return false;
+    }
+    return available_blocks() - required >= watermark_blocks_;
+}
+
+void ReplicaKVCacheManager::admit_tiered(
+    RequestId request_id, SessionId session_id,
+    std::uint64_t reusable_frontier_blocks,
+    std::uint64_t scheduled_tokens) {
+    if (!can_admit_tiered(request_id, session_id, reusable_frontier_blocks,
+                          scheduled_tokens)) {
+        throw ReplicaKVCacheError(
+            "tiered KV admission exceeds capacity or watermark");
+    }
+    SessionCacheEntry &session = sessions_[session_id];
+    const std::uint64_t resident = session.resident_prefix_blocks;
+    if (resident > 0) {
+        remove_from_evictable_lru(session);
+    }
+    const std::uint64_t reusable_tokens = reusable_frontier_blocks * block_size_;
+    const std::uint64_t required =
+        ceil_div(reusable_tokens + scheduled_tokens, block_size_);
+    consume_available_blocks(required - resident);
+    active_blocks_ += required;
+    resident_blocks_ += reusable_frontier_blocks - resident;
+    if (resident == 0 && reusable_frontier_blocks > 0) {
+        ++sessions_with_nonzero_frontier_;
+    }
+    session.resident_prefix_blocks = reusable_frontier_blocks;
+    session.active_request = request_id;
+    if (!allocations_
+             .emplace(request_id,
+                      RequestKVAllocation{session_id, required,
+                                          reusable_frontier_blocks})
+             .second) {
+        throw ReplicaKVCacheError("tiered request already owns KV blocks");
+    }
+    validate_accounting();
+}
+
 void ReplicaKVCacheManager::record_successful_admission(
     std::uint64_t query_blocks, std::uint64_t hit_blocks) {
     if (!prefix_cache_enabled_ || hit_blocks > query_blocks) {

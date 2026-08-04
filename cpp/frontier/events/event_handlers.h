@@ -38,5 +38,13 @@ void handle_event(const DecodeSyncPayload &payload, SimTime time,
                   simulator::Simulator &simulator);
 void handle_event(const DecodeSyncCollectivePayload &payload, SimTime time,
                   simulator::Simulator &simulator);
+void handle_event(const CpuKVCacheOffloadStartPayload &payload, SimTime time,
+                  simulator::Simulator &simulator);
+void handle_event(const CpuKVCacheOffloadEndPayload &payload, SimTime time,
+                  simulator::Simulator &simulator);
+void handle_event(const CpuKVCacheRestoreStartPayload &payload, SimTime time,
+                  simulator::Simulator &simulator);
+void handle_event(const CpuKVCacheRestoreEndPayload &payload, SimTime time,
+                  simulator::Simulator &simulator);
 
 } // namespace frontier::events

@@ -127,6 +127,20 @@ SimulationOutput make_output() {
                     return value;
                 }(),
             },
+            Event{
+                SimTime::from_seconds(0.5),
+                EventSequence{2},
+                [&]() {
+                    frontier::CpuKVCacheOffloadStartPayload value{};
+                    value.transfer_id = frontier::CpuKvTransferId{3};
+                    value.request_id = RequestId{0};
+                    value.replica_id = ReplicaId{0};
+                    value.dp_id = DataParallelId{0};
+                    value.cpu_generation = frontier::CpuOffloadGeneration{7};
+                    value.cluster_type = frontier::ClusterType::kPrefill;
+                    return value;
+                }(),
+            },
         };
         value.analytical_diagnostics = {};
         value.kv_cache_transfers = {};
@@ -167,8 +181,12 @@ void test_json_contract() {
                    .at(0)
                    .at("decision_result") == "ADMISSION",
            "scheduler decision sequence must serialize");
-    expect(json.at("requests").at(0).at("num_prefill_tokens") == 4,
+        expect(json.at("requests").at(0).at("num_prefill_tokens") == 4,
            "prefix-cache request shape must serialize");
+    expect(json.at("requests").at(0).at("scheduled_prefill_tokens") == 0 &&
+               json.at("requests").at(0)
+                       .at("preemption_recomputed_prefill_tokens") == 0,
+           "compact scheduled-PREFILL request fields must serialize");
     expect(json.at("requests").at(0).at("prefill_latency_ms") == 1.0 &&
                json.at("requests").at(0).at("ttft_ms") == 1.5,
            "TTFT must end at first-token completion while prefill latency is "
@@ -186,6 +204,10 @@ void test_json_contract() {
            "analytical target counters must serialize");
     expect(!json.at("prefix_cache").contains("physical_evictions"),
            "removed physical allocator metrics must not leak into output");
+    expect(json.at("event_trace").at(1).at("type") ==
+                   "cpu_kv_cache_offload_start" &&
+               json.at("event_trace").at(1).at("cpu_generation") == 7,
+           "CPU offload trace must serialize its CPU generation");
 }
 
 void test_csv_contract() {
@@ -198,8 +220,8 @@ void test_csv_contract() {
            "CSV must expose canonical scheduling fields");
     expect(csv.find("prefill_latency_ms,ttft_ms") != std::string::npos,
            "CSV must distinguish prefill latency from TTFT");
-    expect(csv.find(",6,1,0,0\n") != std::string::npos,
-           "CSV must include progress, preemption, and target fields");
+    expect(csv.find(",6,1,0,0,0,0\n") != std::string::npos,
+           "CSV must include progress, preemption, target, and PREFILL work fields");
 }
 
 void test_summary_contract() {
@@ -210,6 +232,9 @@ void test_summary_contract() {
            "summary must use first-token TTFT semantics");
     expect(json.at("latency_ms").at("tpot").at("mean") == 0.5,
            "summary must derive TPOT from the post-first-token decode tail");
+    expect(json.at("prefill_work").at("scheduled_prefill_tokens") == 0 &&
+               json.at("counts").at("prefill_scheduled_tokens") == 4,
+           "summary must expose compact scheduled-PREFILL totals");
 }
 
 } // namespace

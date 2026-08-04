@@ -27,9 +27,27 @@ struct RequestMetricsRecord {
     SessionId session_id;
     std::uint64_t num_prefill_tokens = 0;
     std::uint64_t num_decode_tokens = 0;
+    // Actual prompt tokens executed by completed PREFILL batches.  Prefix
+    // cache hits are deliberately excluded; retries after preemption are
+    // included once per completed replay batch.
+    std::uint64_t scheduled_prefill_tokens = 0;
+    std::uint64_t preemption_recomputed_prefill_tokens = 0;
     std::uint64_t cached_prefill_tokens = 0;
     std::uint64_t prefix_cache_query_blocks = 0;
     std::uint64_t prefix_cache_hit_blocks = 0;
+    std::uint64_t gpu_prefix_hit_blocks = 0;
+    std::uint64_t cpu_prefix_query_blocks = 0;
+    std::uint64_t cpu_prefix_hit_blocks = 0;
+    std::uint64_t cpu_restore_transferred_blocks = 0;
+    std::uint64_t cpu_restore_consumed_blocks = 0;
+    std::uint64_t cpu_restore_discarded_blocks = 0;
+    std::uint64_t cpu_restored_tokens = 0;
+    std::uint64_t cpu_restore_bytes = 0;
+    double cpu_restore_queue_time_s = 0.0;
+    double cpu_restore_service_time_s = 0.0;
+    std::uint64_t cpu_offload_bytes = 0;
+    double cpu_offload_queue_time_s = 0.0;
+    double cpu_offload_service_time_s = 0.0;
     config::PrefixCachingKeyMode prefix_cache_key_mode =
         config::PrefixCachingKeyMode::kSession;
     SimTime arrived_at;
@@ -161,6 +179,10 @@ struct MoERoutingMetricsRecord {
 struct BatchMetricsAggregate {
     std::uint64_t batch_count = 0;
     std::uint64_t request_slots = 0;
+    // Sum of prompt tokens in completed batches for this cluster.  For a
+    // monolithic cluster this excludes decode-only portions of mixed batches.
+    std::uint64_t prefill_scheduled_tokens = 0;
+    std::uint64_t preemption_recomputed_prefill_tokens = 0;
     double predicted_execution_ms = 0.0;
     double batch_size_execution_ms = 0.0;
     std::map<std::size_t, std::uint64_t> batch_size_histogram;
@@ -191,6 +213,100 @@ struct PrefixCacheMetricsAggregate {
     std::uint64_t evicted_sessions = 0;
 };
 
+enum class CpuKVCacheTransferKind { kOffload, kRestore };
+
+struct CpuKVCacheTransferMetricsRecord {
+    CpuKvTransferId transfer_id;
+    CpuKVCacheTransferKind kind = CpuKVCacheTransferKind::kOffload;
+    RequestId request_id;
+    ClusterType cluster_type = ClusterType::kPrefill;
+    ReplicaId replica_id{0};
+    DataParallelId dp_id{0};
+    std::uint64_t blocks = 0;
+    std::uint64_t size_bytes = 0;
+    SimTime submitted_at;
+    SimTime started_at;
+    SimTime completed_at;
+    double queue_time_ms = 0.0;
+    double service_time_ms = 0.0;
+    double source_gpu_hold_ms = 0.0;
+};
+
+struct CpuKVCacheTargetMetricsRecord {
+    ClusterType cluster_type = ClusterType::kPrefill;
+    ReplicaId replica_id{0};
+    DataParallelId dp_id{0};
+    std::uint64_t capacity_bytes = 0;
+    std::uint64_t capacity_blocks = 0;
+    std::uint64_t bytes_per_block = 0;
+    std::uint64_t resident_bytes = 0;
+    std::uint64_t resident_blocks = 0;
+    std::uint64_t reserved_bytes = 0;
+    std::uint64_t reserved_blocks = 0;
+    std::uint64_t free_bytes = 0;
+    std::uint64_t free_blocks = 0;
+    std::uint64_t peak_resident_bytes = 0;
+    std::uint64_t peak_resident_blocks = 0;
+    std::uint64_t peak_reserved_bytes = 0;
+    std::uint64_t peak_reserved_blocks = 0;
+    std::uint64_t resident_sessions = 0;
+    std::uint64_t evicted_sessions = 0;
+    std::uint64_t evicted_blocks = 0;
+    std::uint64_t evicted_bytes = 0;
+    std::uint64_t skipped_offloads = 0;
+    std::uint64_t truncated_offloads = 0;
+    std::uint64_t stale_generation_completions = 0;
+    std::uint64_t cpu_query_blocks = 0;
+    std::uint64_t cpu_hit_blocks = 0;
+    std::uint64_t sessions_with_cpu_hits = 0;
+    std::uint64_t pending_restore_operations = 0;
+    std::uint64_t staged_restore_payloads = 0;
+    std::uint64_t active_restore_leases = 0;
+    std::uint64_t active_offload_reservations = 0;
+};
+
+struct CpuKVCacheMetricsAggregate {
+    std::uint64_t target_count = 0;
+    std::uint64_t capacity_bytes = 0;
+    std::uint64_t capacity_blocks = 0;
+    std::uint64_t bytes_per_block = 0;
+    std::uint64_t offload_operations = 0;
+    std::uint64_t offload_blocks = 0;
+    std::uint64_t offload_bytes = 0;
+    std::uint64_t restore_operations = 0;
+    std::uint64_t restore_blocks = 0;
+    std::uint64_t restore_bytes = 0;
+    double d2h_queue_time_ms = 0.0;
+    double d2h_service_time_ms = 0.0;
+    double h2d_queue_time_ms = 0.0;
+    double h2d_service_time_ms = 0.0;
+    double source_gpu_hold_time_ms = 0.0;
+    std::uint64_t query_blocks = 0;
+    std::uint64_t hit_blocks = 0;
+    std::uint64_t resident_bytes = 0;
+    std::uint64_t resident_blocks = 0;
+    std::uint64_t reserved_bytes = 0;
+    std::uint64_t reserved_blocks = 0;
+    std::uint64_t free_bytes = 0;
+    std::uint64_t free_blocks = 0;
+    std::uint64_t peak_resident_bytes = 0;
+    std::uint64_t peak_resident_blocks = 0;
+    std::uint64_t peak_reserved_bytes = 0;
+    std::uint64_t peak_reserved_blocks = 0;
+    std::uint64_t resident_sessions = 0;
+    std::uint64_t evicted_blocks = 0;
+    std::uint64_t evicted_sessions = 0;
+    std::uint64_t evicted_bytes = 0;
+    std::uint64_t skipped_offloads = 0;
+    std::uint64_t truncated_offloads = 0;
+    std::uint64_t stale_generation_completions = 0;
+    std::uint64_t sessions_with_cpu_hits = 0;
+    std::uint64_t pending_restore_operations = 0;
+    std::uint64_t staged_restore_payloads = 0;
+    std::uint64_t active_restore_leases = 0;
+    std::uint64_t active_offload_reservations = 0;
+};
+
 struct MetricsAggregate {
     std::uint64_t event_count = 0;
     std::uint64_t batch_count = 0;
@@ -200,6 +316,7 @@ struct MetricsAggregate {
     std::uint64_t moe_routing_count = 0;
     std::uint64_t kv_cache_transfer_count = 0;
     PrefixCacheMetricsAggregate prefix_cache;
+    CpuKVCacheMetricsAggregate cpu_kv_cache;
     std::map<ClusterType, BatchMetricsAggregate> batches_by_cluster;
 };
 
@@ -215,6 +332,8 @@ struct SimulationOutput {
     std::vector<MoERoutingMetricsRecord> moe_routing;
     std::vector<KVCacheTransferMetricsRecord> kv_cache_transfers;
     std::vector<PrefixCacheTargetMetricsRecord> prefix_cache_targets;
+    std::vector<CpuKVCacheTargetMetricsRecord> cpu_kv_cache_targets;
+    std::vector<CpuKVCacheTransferMetricsRecord> cpu_kv_cache_transfers;
     MetricsAggregate aggregate;
 };
 

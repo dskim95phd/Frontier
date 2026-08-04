@@ -545,6 +545,66 @@ struct KvCacheTransferConfig {
     }
 };
 
+enum class CpuKVCacheEvictionPolicy { kSessionLruSuffix };
+
+enum class CpuKVCacheCapacityPressurePolicy { kPrefixFit, kSkipOffload };
+
+enum class CpuKVCacheTransferConcurrency { kFullDuplexSerialized };
+
+struct CpuKVCacheConfig {
+    bool enabled = false;
+    std::uint64_t capacity_bytes = 0;
+    bool static_slice_per_gpu = false;
+    std::uint64_t capacity_bytes_per_gpu = 750'000'000'000ULL;
+    double dram_bandwidth_gbps_per_gpu = 4'800.0;
+    double c2c_bandwidth_gbps_per_gpu = 3'600.0;
+    double write_bandwidth_gbps = 64.0;
+    double write_latency_ms = 0.01;
+    double read_bandwidth_gbps = 64.0;
+    double read_latency_ms = 0.01;
+    CpuKVCacheEvictionPolicy eviction_policy =
+        CpuKVCacheEvictionPolicy::kSessionLruSuffix;
+    CpuKVCacheCapacityPressurePolicy capacity_pressure_policy =
+        CpuKVCacheCapacityPressurePolicy::kPrefixFit;
+    CpuKVCacheTransferConcurrency transfer_concurrency =
+        CpuKVCacheTransferConcurrency::kFullDuplexSerialized;
+
+    friend bool operator==(const CpuKVCacheConfig &lhs,
+                           const CpuKVCacheConfig &rhs) {
+        return std::tie(
+                   lhs.enabled, lhs.capacity_bytes,
+                   lhs.static_slice_per_gpu, lhs.capacity_bytes_per_gpu,
+                   lhs.dram_bandwidth_gbps_per_gpu,
+                   lhs.c2c_bandwidth_gbps_per_gpu,
+                   lhs.write_bandwidth_gbps, lhs.write_latency_ms,
+                   lhs.read_bandwidth_gbps, lhs.read_latency_ms,
+                   lhs.eviction_policy, lhs.capacity_pressure_policy,
+                   lhs.transfer_concurrency) ==
+               std::tie(
+                   rhs.enabled, rhs.capacity_bytes,
+                   rhs.static_slice_per_gpu, rhs.capacity_bytes_per_gpu,
+                   rhs.dram_bandwidth_gbps_per_gpu,
+                   rhs.c2c_bandwidth_gbps_per_gpu,
+                   rhs.write_bandwidth_gbps, rhs.write_latency_ms,
+                   rhs.read_bandwidth_gbps, rhs.read_latency_ms,
+                   rhs.eviction_policy, rhs.capacity_pressure_policy,
+                   rhs.transfer_concurrency);
+    }
+};
+
+struct ResolvedCpuKVCacheTargetConfig {
+    bool enabled = false;
+    std::uint64_t capacity_bytes = 0;
+    std::uint64_t capacity_blocks = 0;
+    std::uint64_t bytes_per_block = 0;
+    double d2h_bandwidth_gbps = 0.0;
+    double d2h_latency_ms = 0.0;
+    double h2d_bandwidth_gbps = 0.0;
+    double h2d_latency_ms = 0.0;
+    CpuKVCacheCapacityPressurePolicy capacity_pressure_policy =
+        CpuKVCacheCapacityPressurePolicy::kPrefixFit;
+};
+
 struct PddRuntimeConfig {
     PddClustersConfig clusters;
     KvCacheTransferConfig kv_cache_transfer;
@@ -570,6 +630,7 @@ struct SimulationConfig {
     SystemArchitecture system_architecture;
     bool enable_parallel_clusters;
     PrefixCacheConfig prefix_cache;
+    CpuKVCacheConfig cpu_kv_cache;
     ClusterSchedulerConfig cluster_scheduler;
     RuntimeConfig runtime;
 
@@ -582,10 +643,12 @@ struct SimulationConfig {
                            const SimulationConfig &rhs) {
         return std::tie(lhs.schema_version, lhs.run_id, lhs.simulation_mode,
                         lhs.system_architecture, lhs.enable_parallel_clusters,
-                        lhs.prefix_cache, lhs.cluster_scheduler, lhs.runtime) ==
+                        lhs.prefix_cache, lhs.cpu_kv_cache,
+                        lhs.cluster_scheduler, lhs.runtime) ==
                std::tie(rhs.schema_version, rhs.run_id, rhs.simulation_mode,
                         rhs.system_architecture, rhs.enable_parallel_clusters,
-                        rhs.prefix_cache, rhs.cluster_scheduler, rhs.runtime);
+                        rhs.prefix_cache, rhs.cpu_kv_cache,
+                        rhs.cluster_scheduler, rhs.runtime);
     }
 };
 
@@ -602,6 +665,15 @@ to_string(PrefixCachingKeyMode key_mode) noexcept;
 [[nodiscard]] std::string_view
 to_string(MoeRoutingDistribution distribution) noexcept;
 [[nodiscard]] std::string_view to_string(ExecutionModelType type) noexcept;
+[[nodiscard]] std::string_view
+to_string(CpuKVCacheEvictionPolicy policy) noexcept;
+[[nodiscard]] std::string_view
+to_string(CpuKVCacheCapacityPressurePolicy policy) noexcept;
+[[nodiscard]] std::string_view
+to_string(CpuKVCacheTransferConcurrency concurrency) noexcept;
+
+[[nodiscard]] ResolvedCpuKVCacheTargetConfig
+resolve_cpu_kv_cache_target(const SimulationConfig &config);
 
 [[nodiscard]] SimulationConfig
 parse_simulation_config_json(std::string_view json_text);

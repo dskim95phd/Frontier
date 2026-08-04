@@ -85,6 +85,19 @@ class Request {
     [[nodiscard]] std::uint64_t preemption_count() const noexcept {
         return preemption_count_;
     }
+    // Cumulative prompt work that completed in PREFILL batches.  This is
+    // intentionally separate from num_prefill_tokens(): cached prefix tokens
+    // are already present and are therefore not scheduled work.
+    [[nodiscard]] std::uint64_t scheduled_prefill_tokens() const noexcept {
+        return scheduled_prefill_tokens_;
+    }
+    // Portion of scheduled PREFILL work replayed after a preemption.  A
+    // request can be preempted repeatedly; each successfully completed replay
+    // batch contributes once to this counter.
+    [[nodiscard]] std::uint64_t
+    preemption_recomputed_prefill_tokens() const noexcept {
+        return preemption_recomputed_prefill_tokens_;
+    }
     [[nodiscard]] const std::vector<std::uint64_t> &
     tokens_at_preemption() const noexcept {
         return tokens_at_preemption_;
@@ -129,6 +142,45 @@ class Request {
     [[nodiscard]] std::uint64_t prefix_cache_hit_blocks() const noexcept {
         return prefix_cache_hit_blocks_;
     }
+    [[nodiscard]] std::uint64_t gpu_prefix_hit_blocks() const noexcept {
+        return gpu_prefix_hit_blocks_;
+    }
+    [[nodiscard]] std::uint64_t cpu_prefix_query_blocks() const noexcept {
+        return cpu_prefix_query_blocks_;
+    }
+    [[nodiscard]] std::uint64_t cpu_prefix_hit_blocks() const noexcept {
+        return cpu_prefix_hit_blocks_;
+    }
+    [[nodiscard]] std::uint64_t cpu_restore_transferred_blocks() const noexcept {
+        return cpu_restore_transferred_blocks_;
+    }
+    [[nodiscard]] std::uint64_t cpu_restore_consumed_blocks() const noexcept {
+        return cpu_restore_consumed_blocks_;
+    }
+    [[nodiscard]] std::uint64_t cpu_restore_discarded_blocks() const noexcept {
+        return cpu_restore_transferred_blocks_ - cpu_restore_consumed_blocks_;
+    }
+    [[nodiscard]] std::uint64_t cpu_restored_tokens() const noexcept {
+        return cpu_restored_tokens_;
+    }
+    [[nodiscard]] std::uint64_t cpu_restore_bytes() const noexcept {
+        return cpu_restore_bytes_;
+    }
+    [[nodiscard]] double cpu_restore_queue_time_s() const noexcept {
+        return cpu_restore_queue_time_s_;
+    }
+    [[nodiscard]] double cpu_restore_service_time_s() const noexcept {
+        return cpu_restore_service_time_s_;
+    }
+    [[nodiscard]] std::uint64_t cpu_offload_bytes() const noexcept {
+        return cpu_offload_bytes_;
+    }
+    [[nodiscard]] double cpu_offload_queue_time_s() const noexcept {
+        return cpu_offload_queue_time_s_;
+    }
+    [[nodiscard]] double cpu_offload_service_time_s() const noexcept {
+        return cpu_offload_service_time_s_;
+    }
     [[nodiscard]] config::PrefixCachingKeyMode
     prefix_cache_key_mode() const noexcept {
         return prefix_cache_key_mode_;
@@ -146,6 +198,17 @@ class Request {
                                 std::uint64_t cached_tokens,
                                 config::PrefixCachingKeyMode key_mode =
                                     config::PrefixCachingKeyMode::kSession);
+    void record_cpu_restore_transfer(std::uint64_t blocks,
+                                     std::uint64_t bytes,
+                                     double queue_time_ms,
+                                     double service_time_ms);
+    void record_cpu_prefix_admission(std::uint64_t gpu_hit_blocks,
+                                     std::uint64_t cpu_query_blocks,
+                                     std::uint64_t cpu_consumed_blocks,
+                                     std::uint64_t cpu_restored_tokens);
+    void record_cpu_offload_transfer(std::uint64_t bytes,
+                                     double queue_time_ms,
+                                     double service_time_ms);
     void advance_scheduler_frontier(std::uint64_t scheduled_tokens);
     void
     on_batch_completion(SimTime time, std::uint64_t scheduled_tokens,
@@ -181,6 +244,9 @@ class Request {
     std::uint64_t runtime_epoch_ = 0;
     std::uint64_t execution_epoch_ = 0;
     std::uint64_t preemption_count_ = 0;
+    std::uint64_t scheduled_prefill_tokens_ = 0;
+    std::uint64_t preemption_recomputed_prefill_tokens_ = 0;
+    bool prefill_recompute_pending_ = false;
     std::vector<std::uint64_t> tokens_at_preemption_;
 
     SimTime first_scheduled_at_;
@@ -197,6 +263,19 @@ class Request {
     std::uint64_t cached_prefill_tokens_ = 0;
     std::uint64_t prefix_cache_query_blocks_ = 0;
     std::uint64_t prefix_cache_hit_blocks_ = 0;
+    std::uint64_t gpu_prefix_hit_blocks_ = 0;
+    std::uint64_t cpu_prefix_query_blocks_ = 0;
+    std::uint64_t cpu_prefix_hit_blocks_ = 0;
+    std::uint64_t cpu_restore_transferred_blocks_ = 0;
+    std::uint64_t cpu_restore_consumed_blocks_ = 0;
+    std::uint64_t cpu_restored_tokens_ = 0;
+    std::uint64_t cpu_restore_bytes_ = 0;
+    double cpu_restore_queue_time_s_ = 0.0;
+    double cpu_restore_service_time_s_ = 0.0;
+    std::uint64_t cpu_offload_bytes_ = 0;
+    double cpu_offload_queue_time_s_ = 0.0;
+    double cpu_offload_service_time_s_ = 0.0;
+    bool cpu_prefix_admission_recorded_ = false;
     config::PrefixCachingKeyMode prefix_cache_key_mode_ =
         config::PrefixCachingKeyMode::kSession;
     bool prefix_cache_lookup_recorded_ = false;

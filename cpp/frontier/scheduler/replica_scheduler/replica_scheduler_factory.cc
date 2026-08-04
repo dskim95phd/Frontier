@@ -14,12 +14,13 @@ std::unique_ptr<BaseReplicaScheduler> make_replica_scheduler(
     std::vector<entities::Request> &requests,
     execution_time_predictor::ExecutionTimePredictorPtr predictor,
     const entities::Replica &replica, DataParallelId dp_id,
-    ClusterType cluster_type, config::PrefixCacheConfig prefix_cache_config) {
+    ClusterType cluster_type, config::PrefixCacheConfig prefix_cache_config,
+    config::ResolvedCpuKVCacheTargetConfig cpu_kv_cache_config) {
     switch (config.type) {
     case config::SchedulerType::kVllmV1:
         return std::make_unique<VllmV1Scheduler>(
             config, requests, std::move(predictor), replica, dp_id,
-            cluster_type, prefix_cache_config);
+            cluster_type, prefix_cache_config, cpu_kv_cache_config);
     }
     throw SchedulerError("unsupported replica scheduler type");
 }

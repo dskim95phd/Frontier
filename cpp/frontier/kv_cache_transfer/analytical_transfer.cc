@@ -37,33 +37,77 @@ std::uint64_t dense_kv_cache_size_bytes(std::uint64_t num_tokens,
 std::uint64_t model_kv_cache_size_bytes(std::uint64_t num_tokens,
                                         const config::ModelConfig &model,
                                         double kv_cache_dtype_size_bytes) {
+    return model_kv_cache_size_bytes(num_tokens, model,
+                                     kv_cache_dtype_size_bytes, 1);
+}
+
+std::uint64_t model_kv_cache_size_bytes(
+    std::uint64_t num_tokens, const config::ModelConfig &model,
+    double kv_cache_dtype_size_bytes,
+    std::uint64_t attention_tensor_parallel_size) {
     if (!std::isfinite(kv_cache_dtype_size_bytes) ||
         kv_cache_dtype_size_bytes <= 0.0) {
         throw TransferModelError("KV dtype size must be finite and positive");
     }
-    if (model.use_mla) {
-        try {
-            return attention::mla_kv_cache_size_bytes(
-                num_tokens, model.num_layers,
-                attention::MlaKvCacheLayout{
-                    model.kv_lora_rank,
-                    model.qk_rope_head_dim,
-                    kv_cache_dtype_size_bytes,
-                    2.0,
-                });
-        } catch (const attention::MlaLayoutError &error) {
-            throw TransferModelError(error.what());
-        }
+    if (attention_tensor_parallel_size == 0) {
+        throw TransferModelError(
+            "attention tensor parallel size must be positive");
     }
-    return dense_kv_cache_size_bytes(num_tokens, [&]() {
-        DenseKvLayout value{};
-        value.num_layers = model.num_layers;
-        value.num_kv_heads_per_worker = model.runtime_num_kv_heads();
-        value.head_dim = model.runtime_head_size();
-        value.kv_factor = model.kv_factor();
-        value.dtype_size_bytes = kv_cache_dtype_size_bytes;
-        return value;
-    }());
+
+    const std::uint64_t one_copy_bytes = [&]() {
+        if (model.use_mla) {
+            try {
+                return attention::mla_kv_cache_size_bytes(
+                    num_tokens, model.num_layers,
+                    attention::MlaKvCacheLayout{
+                        model.kv_lora_rank,
+                        model.qk_rope_head_dim,
+                        kv_cache_dtype_size_bytes,
+                        2.0,
+                    });
+            } catch (const attention::MlaLayoutError &error) {
+                throw TransferModelError(error.what());
+            }
+        }
+        return dense_kv_cache_size_bytes(num_tokens, [&]() {
+            DenseKvLayout value{};
+            value.num_layers = model.num_layers;
+            value.num_kv_heads_per_worker = model.runtime_num_kv_heads();
+            value.head_dim = model.runtime_head_size();
+            value.kv_factor = model.kv_factor();
+            value.dtype_size_bytes = kv_cache_dtype_size_bytes;
+            return value;
+        }());
+    }();
+
+    // MLA stores complete latent KV on every attention TP rank.  Keep the
+    // existing dense/GQA/MQA accounting unchanged.
+    if (!model.use_mla || attention_tensor_parallel_size == 1) {
+        return one_copy_bytes;
+    }
+    if (one_copy_bytes >
+        std::numeric_limits<std::uint64_t>::max() /
+            attention_tensor_parallel_size) {
+        throw TransferModelError(
+            "target-physical KV cache size overflows uint64");
+    }
+    return one_copy_bytes * attention_tensor_parallel_size;
+}
+
+std::uint64_t model_kv_cache_size_bytes_one_copy(
+    std::uint64_t num_tokens, const config::ModelConfig &model,
+    double kv_cache_dtype_size_bytes) {
+    return model_kv_cache_size_bytes(num_tokens, model,
+                                     kv_cache_dtype_size_bytes, 1);
+}
+
+std::uint64_t model_kv_cache_size_bytes_target_physical(
+    std::uint64_t num_tokens, const config::ModelConfig &model,
+    double kv_cache_dtype_size_bytes,
+    std::uint64_t attention_tensor_parallel_size) {
+    return model_kv_cache_size_bytes(num_tokens, model,
+                                     kv_cache_dtype_size_bytes,
+                                     attention_tensor_parallel_size);
 }
 
 TransferPrediction predict_transfer(std::uint64_t size_bytes,
@@ -101,13 +145,22 @@ TransferPrediction predict_transfer(std::uint64_t size_bytes,
 }
 
 AnalyticalKVCacheTransferPredictor::AnalyticalKVCacheTransferPredictor(
-    config::KvCacheTransferConfig config)
-    : config_(std::move(config)) {}
+    config::KvCacheTransferConfig config,
+    std::uint64_t attention_tensor_parallel_size)
+    : config_(std::move(config)),
+      attention_tensor_parallel_size_(attention_tensor_parallel_size) {
+    if (attention_tensor_parallel_size_ == 0) {
+        throw TransferModelError(
+            "attention tensor parallel size must be positive");
+    }
+}
 
 TransferPrediction AnalyticalKVCacheTransferPredictor::predict(
     std::uint64_t num_tokens, const config::ModelConfig &model) const {
-    const std::uint64_t size_bytes = model_kv_cache_size_bytes(
-        num_tokens, model, config_.kv_cache_dtype_size_bytes);
+    const std::uint64_t size_bytes =
+        model_kv_cache_size_bytes_target_physical(
+            num_tokens, model, config_.kv_cache_dtype_size_bytes,
+            attention_tensor_parallel_size_);
     return predict_transfer(size_bytes, [&]() {
         TransferConfig value{};
         value.network_bandwidth_gbps = config_.network_bandwidth_gbps;
@@ -119,8 +172,11 @@ TransferPrediction AnalyticalKVCacheTransferPredictor::predict(
 }
 
 std::shared_ptr<const BaseKVCacheTransferPredictor>
-make_kv_cache_transfer_predictor(const config::KvCacheTransferConfig &config) {
-    return std::make_shared<AnalyticalKVCacheTransferPredictor>(config);
+make_kv_cache_transfer_predictor(
+    const config::KvCacheTransferConfig &config,
+    std::uint64_t attention_tensor_parallel_size) {
+    return std::make_shared<AnalyticalKVCacheTransferPredictor>(
+        config, attention_tensor_parallel_size);
 }
 
 } // namespace frontier::kv_cache_transfer

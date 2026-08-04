@@ -8,6 +8,7 @@
 #include <utility>
 
 #include "frontier/attention/ops.h"
+#include "frontier/kv_cache_transfer/analytical_transfer.h"
 
 #ifndef FRONTIER_TEST_FIXTURE_DIR
 #error "FRONTIER_TEST_FIXTURE_DIR must be defined for contract tests"
@@ -17,6 +18,7 @@ namespace {
 
 using frontier::config::ConfigError;
 using frontier::config::ExecutionModelType;
+using frontier::config::ClusterSchedulerType;
 using frontier::config::kSchemaVersion;
 using frontier::config::parse_simulation_config_json;
 using frontier::config::PddRuntimeConfig;
@@ -481,6 +483,120 @@ void test_cluster_parallelism_is_not_limited_to_one_nvl72_domain() {
            "cluster parallelism above 72 accelerators must parse");
 }
 
+void test_cpu_kv_cache_contract_and_resolution() {
+    auto config = load("fixed_sequential_pdd.json");
+    expect(!config.cpu_kv_cache.enabled,
+           "omitted CPU KV cache config must default to disabled");
+    const std::string disabled = serialize_simulation_config_json(config);
+    expect(disabled.find("\"cpu_kv_cache\"") != std::string::npos &&
+               parse_simulation_config_json(disabled) == config,
+           "normalized config must emit the disabled CPU KV cache object");
+
+    config.prefix_cache.enabled = true;
+    config.cluster_scheduler.type = ClusterSchedulerType::kStickyRoundRobin;
+    config.cpu_kv_cache.enabled = true;
+    config.cpu_kv_cache.capacity_bytes = 1'000'000'000ULL;
+    config.cpu_kv_cache.write_bandwidth_gbps = 80.0;
+    config.cpu_kv_cache.read_bandwidth_gbps = 40.0;
+    const auto parsed =
+        parse_simulation_config_json(serialize_simulation_config_json(config));
+    const auto resolved =
+        frontier::config::resolve_cpu_kv_cache_target(parsed);
+    const auto expected_block =
+        frontier::kv_cache_transfer::model_kv_cache_size_bytes(
+            parsed.pdd().clusters.prefill.scheduler.block_size,
+            parsed.pdd().clusters.prefill.model,
+            parsed.pdd().kv_cache_transfer.kv_cache_dtype_size_bytes);
+    expect(parsed == config && resolved.enabled &&
+               resolved.capacity_bytes == 1'000'000'000ULL &&
+               resolved.bytes_per_block == expected_block &&
+               resolved.capacity_blocks ==
+                   1'000'000'000ULL / expected_block &&
+               resolved.d2h_bandwidth_gbps == 80.0 &&
+               resolved.h2d_bandwidth_gbps == 40.0,
+           "direct CPU KV cache config must round-trip and resolve by model");
+
+    auto kimi_target = parsed;
+    kimi_target.cpu_kv_cache.capacity_bytes = 10'000'000ULL;
+    kimi_target.pdd().clusters.prefill.model =
+        frontier::config::load_model_config("moonshotai/Kimi-K2-Instruct");
+    kimi_target.pdd().clusters.prefill.parallelism.tensor_parallel_size = 4;
+    kimi_target.pdd().clusters.prefill.scheduler.block_size = 16;
+    kimi_target.pdd().kv_cache_transfer.kv_cache_dtype_size_bytes = 1.0;
+    const auto kimi_resolved =
+        frontier::config::resolve_cpu_kv_cache_target(kimi_target);
+    expect(kimi_resolved.bytes_per_block == 2'498'560ULL &&
+               kimi_resolved.capacity_blocks ==
+                   10'000'000ULL / 2'498'560ULL,
+           "CPU KV cache must use TP-replicated MLA target bytes per block");
+
+    config.cpu_kv_cache.static_slice_per_gpu = true;
+    config.cpu_kv_cache.capacity_bytes_per_gpu = 2'000'000'000ULL;
+    config.cpu_kv_cache.dram_bandwidth_gbps_per_gpu = 500.0;
+    config.cpu_kv_cache.c2c_bandwidth_gbps_per_gpu = 300.0;
+    config.pdd().clusters.prefill.parallelism.tensor_parallel_size = 2;
+    config.pdd().clusters.prefill.parallelism.pipeline_parallel_size = 2;
+    config.pdd().clusters.prefill.execution_model.fixed.stage_latencies_ms =
+        {1.0, 1.0};
+    const auto static_parsed =
+        parse_simulation_config_json(serialize_simulation_config_json(config));
+    const auto static_resolved =
+        frontier::config::resolve_cpu_kv_cache_target(static_parsed);
+    expect(static_resolved.capacity_bytes == 8'000'000'000ULL &&
+               static_resolved.d2h_bandwidth_gbps == 1'200.0 &&
+               static_resolved.h2d_bandwidth_gbps == 1'200.0,
+           "static per-GPU CPU slices must scale by PREFILL TP times PP");
+}
+
+void test_cpu_kv_cache_invalid_combinations() {
+    auto config = load("fixed_sequential_pdd.json");
+    config.cpu_kv_cache.enabled = true;
+    config.cpu_kv_cache.capacity_bytes = 1'000'000'000ULL;
+    expect_throws<ConfigError>(
+        [&config] {
+            static_cast<void>(parse_simulation_config_json(
+                serialize_simulation_config_json(config)));
+        },
+        "CPU KV cache must require session prefix caching");
+
+    config.prefix_cache.enabled = true;
+    expect_throws<ConfigError>(
+        [&config] {
+            static_cast<void>(parse_simulation_config_json(
+                serialize_simulation_config_json(config)));
+        },
+        "CPU KV cache must require sticky target affinity");
+
+    config.cluster_scheduler.type = ClusterSchedulerType::kStickyRoundRobin;
+    config.cpu_kv_cache.capacity_bytes = 1;
+    expect_throws<ConfigError>(
+        [&config] {
+            static_cast<void>(parse_simulation_config_json(
+                serialize_simulation_config_json(config)));
+        },
+        "CPU capacity smaller than one logical block must fail");
+
+    config.cpu_kv_cache.capacity_bytes = 1'000'000'000ULL;
+    std::string unknown = serialize_simulation_config_json(config);
+    const std::string policy = "\"prefix_fit\"";
+    unknown.replace(unknown.find(policy), policy.size(), "\"unknown\"");
+    expect_throws<ConfigError>(
+        [&unknown] {
+            static_cast<void>(parse_simulation_config_json(unknown));
+        },
+        "unknown CPU capacity policies must fail");
+
+    auto colocation = load("fixed_parallel_colocation.json");
+    colocation.cpu_kv_cache.enabled = true;
+    colocation.cpu_kv_cache.capacity_bytes = 1'000'000'000ULL;
+    expect_throws<ConfigError>(
+        [&colocation] {
+            static_cast<void>(parse_simulation_config_json(
+                serialize_simulation_config_json(colocation)));
+        },
+        "co-location CPU tiering must fail fast");
+}
+
 } // namespace
 
 int main() {
@@ -517,5 +633,10 @@ int main() {
     failures += frontier::test::run(
         "cluster parallelism above NVL72 parses",
         test_cluster_parallelism_is_not_limited_to_one_nvl72_domain);
+    failures += frontier::test::run("CPU KV cache contract and resolution",
+                                    test_cpu_kv_cache_contract_and_resolution);
+    failures += frontier::test::run(
+        "CPU KV cache invalid combinations",
+        test_cpu_kv_cache_invalid_combinations);
     return failures == 0 ? 0 : 1;
 }

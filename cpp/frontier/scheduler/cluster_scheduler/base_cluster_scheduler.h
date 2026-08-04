@@ -105,7 +105,8 @@ class BaseClusterScheduler {
         execution_time_predictor::ExecutionTimePredictorPtr predictor,
         std::shared_ptr<const kv_cache_transfer::BaseKVCacheTransferPredictor>
             kv_cache_transfer_predictor,
-        config::PrefixCacheConfig prefix_cache_config);
+        config::PrefixCacheConfig prefix_cache_config,
+        config::ResolvedCpuKVCacheTargetConfig cpu_kv_cache_config = {});
 
     [[nodiscard]] std::uint64_t num_replicas() const noexcept {
         return cluster_->parallelism().num_replicas;

@@ -1,0 +1,156 @@
+{
+  "schema_version": 1,
+  "run_id": "kimi-k2-cpu-dram-base",
+  "simulation_mode": "online",
+  "system_architecture": "pd-disaggregation",
+  "enable_parallel_clusters": false,
+  "prefix_cache": {
+    "enabled": true,
+    "key_mode": "session"
+  },
+  "cluster_scheduler": {
+    "type": "sticky_round_robin"
+  },
+  "cpu_kv_cache": {
+    "enabled": false,
+    "capacity_bytes": 1000000000,
+    "static_slice_per_gpu": true,
+    "capacity_bytes_per_gpu": 250000000000,
+    "dram_bandwidth_gbps_per_gpu": 1555.56,
+    "c2c_bandwidth_gbps_per_gpu": 3600.0,
+    "write_bandwidth_gbps": 64.0,
+    "write_latency_ms": 0.01,
+    "read_bandwidth_gbps": 64.0,
+    "read_latency_ms": 0.01,
+    "eviction_policy": "session_lru_suffix",
+    "capacity_pressure_policy": "prefix_fit",
+    "transfer_concurrency": "full_duplex_serialized"
+  },
+  "clusters": {
+    "prefill": {
+      "parallelism": {
+        "num_replicas": 1,
+        "tensor_parallel_size": 4,
+        "pipeline_parallel_size": 1,
+        "data_parallel_size": 4,
+        "moe_tensor_parallel_size": 1,
+        "moe_expert_parallel_size": 16
+      },
+      "scheduler": {
+        "type": "vllm_v1",
+        "scheduling_policy": "fcfs",
+        "batch_size_cap": 64,
+        "max_tokens_in_batch": 131072,
+        "enable_preemption": true,
+        "enable_chunked_prefill": true,
+        "long_prefill_token_threshold": 0,
+        "block_size": 16,
+        "num_blocks": 304175,
+        "watermark_blocks_fraction": 0.0,
+        "num_preallocate_tokens": 0
+      },
+      "execution_model": {
+        "type": "analytical",
+        "device": "gb300",
+        "precision": "fp8",
+        "network_bandwidth_gbps": 38400.0,
+        "network_latency_us": 1.0,
+        "intra_node_bandwidth_gbps": 14400.0,
+        "moe_layer_event_mode": "first_layer_scaled",
+        "operator_precisions": {
+          "attention": "fp8",
+          "dense": "fp8",
+          "moe_expert": "fp8",
+          "moe_router": "fp8",
+          "kv_cache": "fp8",
+          "communication": "fp8",
+          "attention_weight": "fp8",
+          "attention_activation": "fp8",
+          "dense_weight": "fp8",
+          "dense_activation": "fp8",
+          "moe_expert_weight": "fp8",
+          "moe_expert_activation": "fp8",
+          "moe_router_weight": "fp8",
+          "moe_router_activation": "fp8",
+          "lm_head": "fp8",
+          "lm_head_weight": "fp8",
+          "lm_head_activation": "fp8"
+        }
+      },
+      "model_name": "moonshotai/Kimi-K2-Instruct",
+      "total_expert_num": 384,
+      "router_topk": 8,
+      "moe_routing": {
+        "mode": "simulation",
+        "distribution": "balanced",
+        "seed": 42
+      }
+    },
+    "decode": {
+      "parallelism": {
+        "num_replicas": 1,
+        "tensor_parallel_size": 4,
+        "pipeline_parallel_size": 1,
+        "data_parallel_size": 4,
+        "moe_tensor_parallel_size": 1,
+        "moe_expert_parallel_size": 16
+      },
+      "scheduler": {
+        "type": "vllm_v1",
+        "scheduling_policy": "fcfs",
+        "batch_size_cap": 32,
+        "max_tokens_in_batch": 8192,
+        "enable_preemption": true,
+        "enable_chunked_prefill": false,
+        "long_prefill_token_threshold": 0,
+        "block_size": 16,
+        "num_blocks": 304175,
+        "watermark_blocks_fraction": 0.0,
+        "num_preallocate_tokens": 0
+      },
+      "execution_model": {
+        "type": "analytical",
+        "device": "gb300",
+        "precision": "fp8",
+        "network_bandwidth_gbps": 38400.0,
+        "network_latency_us": 1.0,
+        "intra_node_bandwidth_gbps": 14400.0,
+        "moe_layer_event_mode": "first_layer_scaled",
+        "operator_precisions": {
+          "attention": "fp8",
+          "dense": "fp8",
+          "moe_expert": "fp8",
+          "moe_router": "fp8",
+          "kv_cache": "fp8",
+          "communication": "fp8",
+          "attention_weight": "fp8",
+          "attention_activation": "fp8",
+          "dense_weight": "fp8",
+          "dense_activation": "fp8",
+          "moe_expert_weight": "fp8",
+          "moe_expert_activation": "fp8",
+          "moe_router_weight": "fp8",
+          "moe_router_activation": "fp8",
+          "lm_head": "fp8",
+          "lm_head_weight": "fp8",
+          "lm_head_activation": "fp8"
+        }
+      },
+      "model_name": "moonshotai/Kimi-K2-Instruct",
+      "total_expert_num": 384,
+      "router_topk": 8,
+      "moe_routing": {
+        "mode": "simulation",
+        "distribution": "balanced",
+        "seed": 42
+      }
+    }
+  },
+  "kv_cache_transfer": {
+    "type": "analytical",
+    "network_bandwidth_gbps": 38400.0,
+    "network_latency_ms": 0.02,
+    "kv_cache_dtype_size_bytes": 1,
+    "enable_compression": false
+  }
+}

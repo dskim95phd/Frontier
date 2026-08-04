@@ -66,6 +66,10 @@ enum class EventType : std::uint8_t {
     kPrefillSyncCollective,
     kDecodeSync,
     kDecodeSyncCollective,
+    kCpuKvCacheOffloadStart,
+    kCpuKvCacheOffloadEnd,
+    kCpuKvCacheRestoreStart,
+    kCpuKvCacheRestoreEnd,
 };
 
 enum class MoESyncPhase : std::uint8_t {
@@ -220,13 +224,55 @@ struct DecodeSyncCollectivePayload {
     ClusterType cluster_type;
 };
 
+struct CpuKVCacheOffloadStartPayload {
+    static constexpr EventType kType = EventType::kCpuKvCacheOffloadStart;
+    CpuKvTransferId transfer_id;
+    RequestId request_id;
+    ReplicaId replica_id;
+    DataParallelId dp_id;
+    CpuOffloadGeneration cpu_generation;
+    ClusterType cluster_type;
+};
+
+struct CpuKVCacheOffloadEndPayload {
+    static constexpr EventType kType = EventType::kCpuKvCacheOffloadEnd;
+    CpuKvTransferId transfer_id;
+    RequestId request_id;
+    ReplicaId replica_id;
+    DataParallelId dp_id;
+    CpuOffloadGeneration cpu_generation;
+    ClusterType cluster_type;
+};
+
+struct CpuKVCacheRestoreStartPayload {
+    static constexpr EventType kType = EventType::kCpuKvCacheRestoreStart;
+    CpuKvTransferId transfer_id;
+    RequestId request_id;
+    ReplicaId replica_id;
+    DataParallelId dp_id;
+    Generation generation;
+    ClusterType cluster_type;
+};
+
+struct CpuKVCacheRestoreEndPayload {
+    static constexpr EventType kType = EventType::kCpuKvCacheRestoreEnd;
+    CpuKvTransferId transfer_id;
+    RequestId request_id;
+    ReplicaId replica_id;
+    DataParallelId dp_id;
+    Generation generation;
+    ClusterType cluster_type;
+};
+
 using EventPayload = std::variant<
     RequestArrivalPayload, GlobalSchedulePayload, ClusterSchedulePayload,
     ReplicaSchedulePayload, BatchStageArrivalPayload,
     ReplicaStageSchedulePayload, BatchStageEndPayload, ClusterBatchEndPayload,
     GlobalBatchEndPayload, KVCacheTransferStartPayload,
     KVCacheTransferEndPayload, PrefillSyncPayload, PrefillSyncCollectivePayload,
-    DecodeSyncPayload, DecodeSyncCollectivePayload>;
+    DecodeSyncPayload, DecodeSyncCollectivePayload,
+    CpuKVCacheOffloadStartPayload, CpuKVCacheOffloadEndPayload,
+    CpuKVCacheRestoreStartPayload, CpuKVCacheRestoreEndPayload>;
 
 namespace detail {
 
@@ -244,6 +290,7 @@ FRONTIER_DEFINE_FIELD_TRAIT(replica_id);
 FRONTIER_DEFINE_FIELD_TRAIT(dp_id);
 FRONTIER_DEFINE_FIELD_TRAIT(stage_id);
 FRONTIER_DEFINE_FIELD_TRAIT(generation);
+FRONTIER_DEFINE_FIELD_TRAIT(cpu_generation);
 FRONTIER_DEFINE_FIELD_TRAIT(sync_generation);
 FRONTIER_DEFINE_FIELD_TRAIT(cluster_type);
 FRONTIER_DEFINE_FIELD_TRAIT(transfer_id);

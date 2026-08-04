@@ -16,6 +16,8 @@ EXAMPLES = {
     "pdd": ("03_sequential_pdd.json", "00_tiny.csv"),
     "moe": ("04_moe_expert_parallel.json", "00_tiny.csv"),
     "prefix-cache": ("05_session_prefix_cache.json", "05_sessions.csv"),
+    "cpu-kv-online": ("06_cpu_kv_cache_pdd_online.json", "06_cpu_kv_cache_sessions.csv"),
+    "cpu-kv-offline": ("07_cpu_kv_cache_pdd_offline.json", "06_cpu_kv_cache_sessions.csv"),
 }
 
 
@@ -67,6 +69,14 @@ def main() -> int:
     )
     print(f"preemptions: {summary['counts']['preemptions']}")
     print(f"prefix hit rate: {summary['prefix_cache']['hit_rate']:.3f}")
+    if summary["cpu_kv_cache"]["target_count"]:
+        cpu = summary["cpu_kv_cache"]
+        print(
+            "CPU KV: "
+            f"offload={cpu['offload_operations']} ops/{cpu['offload_bytes']} B, "
+            f"restore={cpu['restore_operations']} ops/{cpu['restore_bytes']} B, "
+            f"hit_rate={cpu['hit_rate']:.3f}"
+        )
     return 0
 
 

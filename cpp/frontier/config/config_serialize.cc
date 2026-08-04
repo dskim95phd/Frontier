@@ -35,6 +35,26 @@ OrderedJson serialize_prefix_cache(const PrefixCacheConfig &config) {
     });
 }
 
+OrderedJson serialize_cpu_kv_cache(const CpuKVCacheConfig &config) {
+    return OrderedJson::object({
+        {"enabled", config.enabled},
+        {"capacity_bytes", config.capacity_bytes},
+        {"static_slice_per_gpu", config.static_slice_per_gpu},
+        {"capacity_bytes_per_gpu", config.capacity_bytes_per_gpu},
+        {"dram_bandwidth_gbps_per_gpu",
+         config.dram_bandwidth_gbps_per_gpu},
+        {"c2c_bandwidth_gbps_per_gpu", config.c2c_bandwidth_gbps_per_gpu},
+        {"write_bandwidth_gbps", config.write_bandwidth_gbps},
+        {"write_latency_ms", config.write_latency_ms},
+        {"read_bandwidth_gbps", config.read_bandwidth_gbps},
+        {"read_latency_ms", config.read_latency_ms},
+        {"eviction_policy", to_string(config.eviction_policy)},
+        {"capacity_pressure_policy",
+         to_string(config.capacity_pressure_policy)},
+        {"transfer_concurrency", to_string(config.transfer_concurrency)},
+    });
+}
+
 OrderedJson serialize_scheduler(const SchedulerConfig &scheduler) {
     return OrderedJson::object({
         {"type", to_string(scheduler.type)},
@@ -215,6 +235,7 @@ std::string serialize_simulation_config_json(const SimulationConfig &config) {
     root["system_architecture"] = to_string(config.system_architecture);
     root["enable_parallel_clusters"] = config.enable_parallel_clusters;
     root["prefix_cache"] = serialize_prefix_cache(config.prefix_cache);
+    root["cpu_kv_cache"] = serialize_cpu_kv_cache(config.cpu_kv_cache);
     root["cluster_scheduler"] =
         serialize_cluster_scheduler(config.cluster_scheduler);
 

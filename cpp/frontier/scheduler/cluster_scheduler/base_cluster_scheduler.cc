@@ -147,7 +147,8 @@ BaseClusterScheduler::BaseClusterScheduler(
     execution_time_predictor::ExecutionTimePredictorPtr predictor,
     std::shared_ptr<const kv_cache_transfer::BaseKVCacheTransferPredictor>
         kv_cache_transfer_predictor,
-    config::PrefixCacheConfig prefix_cache_config)
+    config::PrefixCacheConfig prefix_cache_config,
+    config::ResolvedCpuKVCacheTargetConfig cpu_kv_cache_config)
     : cluster_(&cluster), requests_(&requests),
       kv_cache_transfer_predictor_(std::move(kv_cache_transfer_predictor)) {
     const std::uint64_t num_replicas = cluster.parallelism().num_replicas;
@@ -170,7 +171,10 @@ BaseClusterScheduler::BaseClusterScheduler(
             replica_schedulers_.push_back(make_replica_scheduler(
                 runtime.scheduler, requests, predictor,
                 cluster.replica(ReplicaId{replica}), DataParallelId{dp},
-                cluster.type(), prefix_cache_config));
+                cluster.type(), prefix_cache_config,
+                cluster.type() == ClusterType::kPrefill
+                    ? cpu_kv_cache_config
+                    : config::ResolvedCpuKVCacheTargetConfig{}));
         }
     }
     for (std::uint64_t replica = 0; replica < num_replicas; ++replica) {

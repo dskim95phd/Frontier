@@ -67,6 +67,11 @@ struct TransferIdTag;
 struct MoESyncGroupIdTag;
 struct MoEParticipantIdTag;
 struct LayerIdTag;
+struct CpuBlockIdTag;
+struct CpuOffloadReservationIdTag;
+struct CpuRestoreLeaseIdTag;
+struct CpuKvTransferIdTag;
+struct CpuOffloadGenerationTag;
 
 using EventSequence = StrongId<EventSequenceTag>;
 using RequestId = StrongId<RequestIdTag>;
@@ -82,5 +87,10 @@ using TransferId = StrongId<TransferIdTag>;
 using MoESyncGroupId = StrongId<MoESyncGroupIdTag>;
 using MoEParticipantId = StrongId<MoEParticipantIdTag>;
 using LayerId = StrongId<LayerIdTag>;
+using CpuBlockId = StrongId<CpuBlockIdTag>;
+using CpuOffloadReservationId = StrongId<CpuOffloadReservationIdTag>;
+using CpuRestoreLeaseId = StrongId<CpuRestoreLeaseIdTag>;
+using CpuKvTransferId = StrongId<CpuKvTransferIdTag>;
+using CpuOffloadGeneration = StrongId<CpuOffloadGenerationTag>;
 
 } // namespace frontier

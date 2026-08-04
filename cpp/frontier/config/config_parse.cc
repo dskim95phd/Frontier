@@ -349,6 +349,92 @@ PrefixCacheConfig parse_prefix_cache(const Json &root) {
     }();
 }
 
+CpuKVCacheConfig parse_cpu_kv_cache(const Json &root) {
+    if (!root.contains("cpu_kv_cache")) {
+        return CpuKVCacheConfig{};
+    }
+    const Json &cpu = root.at("cpu_kv_cache");
+    require_exact_keys(
+        cpu,
+        {
+            "enabled",
+            "capacity_bytes",
+            "static_slice_per_gpu",
+            "capacity_bytes_per_gpu",
+            "dram_bandwidth_gbps_per_gpu",
+            "c2c_bandwidth_gbps_per_gpu",
+            "write_bandwidth_gbps",
+            "write_latency_ms",
+            "read_bandwidth_gbps",
+            "read_latency_ms",
+            "eviction_policy",
+            "capacity_pressure_policy",
+            "transfer_concurrency",
+        },
+        "config.cpu_kv_cache");
+    CpuKVCacheConfig result{};
+    result.enabled = require_bool(cpu, "enabled", "config.cpu_kv_cache");
+    result.capacity_bytes =
+        require_uint64(cpu, "capacity_bytes", "config.cpu_kv_cache");
+    result.static_slice_per_gpu = require_bool(
+        cpu, "static_slice_per_gpu", "config.cpu_kv_cache");
+    result.capacity_bytes_per_gpu = require_uint64(
+        cpu, "capacity_bytes_per_gpu", "config.cpu_kv_cache");
+    result.dram_bandwidth_gbps_per_gpu = require_finite_number(
+        cpu, "dram_bandwidth_gbps_per_gpu", "config.cpu_kv_cache");
+    result.c2c_bandwidth_gbps_per_gpu = require_finite_number(
+        cpu, "c2c_bandwidth_gbps_per_gpu", "config.cpu_kv_cache");
+    result.write_bandwidth_gbps = require_finite_number(
+        cpu, "write_bandwidth_gbps", "config.cpu_kv_cache");
+    result.write_latency_ms = require_finite_number(
+        cpu, "write_latency_ms", "config.cpu_kv_cache");
+    result.read_bandwidth_gbps = require_finite_number(
+        cpu, "read_bandwidth_gbps", "config.cpu_kv_cache");
+    result.read_latency_ms = require_finite_number(
+        cpu, "read_latency_ms", "config.cpu_kv_cache");
+
+    const std::string eviction =
+        require_string(cpu, "eviction_policy", "config.cpu_kv_cache");
+    if (eviction != "session_lru_suffix") {
+        throw ConfigError("config.cpu_kv_cache.eviction_policy must be "
+                          "'session_lru_suffix'");
+    }
+    const std::string pressure = require_string(
+        cpu, "capacity_pressure_policy", "config.cpu_kv_cache");
+    if (pressure == "prefix_fit") {
+        result.capacity_pressure_policy =
+            CpuKVCacheCapacityPressurePolicy::kPrefixFit;
+    } else if (pressure == "skip_offload") {
+        result.capacity_pressure_policy =
+            CpuKVCacheCapacityPressurePolicy::kSkipOffload;
+    } else {
+        throw ConfigError("config.cpu_kv_cache.capacity_pressure_policy must "
+                          "be 'prefix_fit' or 'skip_offload'");
+    }
+    const std::string concurrency = require_string(
+        cpu, "transfer_concurrency", "config.cpu_kv_cache");
+    if (concurrency != "full_duplex_serialized") {
+        throw ConfigError("config.cpu_kv_cache.transfer_concurrency must be "
+                          "'full_duplex_serialized'");
+    }
+    if (result.capacity_bytes_per_gpu == 0 ||
+        result.dram_bandwidth_gbps_per_gpu <= 0.0 ||
+        result.c2c_bandwidth_gbps_per_gpu <= 0.0 ||
+        result.write_bandwidth_gbps <= 0.0 ||
+        result.read_bandwidth_gbps <= 0.0 || result.write_latency_ms < 0.0 ||
+        result.read_latency_ms < 0.0) {
+        throw ConfigError(
+            "config.cpu_kv_cache requires positive capacities/bandwidths and "
+            "nonnegative latencies");
+    }
+    if (result.enabled && !result.static_slice_per_gpu &&
+        result.capacity_bytes == 0) {
+        throw ConfigError("enabled direct CPU KV cache capacity must be "
+                          "positive");
+    }
+    return result;
+}
+
 SchedulerConfig parse_scheduler(const Json &root) {
     const Json &scheduler = root.at("scheduler");
     require_exact_keys(scheduler,
@@ -882,6 +968,7 @@ struct CommonConfigFields {
     SystemArchitecture system_architecture;
     bool enable_parallel_clusters;
     PrefixCacheConfig prefix_cache;
+    CpuKVCacheConfig cpu_kv_cache;
 };
 
 void require_schema_version(int schema_version) {
@@ -920,6 +1007,7 @@ CommonConfigFields parse_common_fields(const Json &root) {
             require_string(root, "system_architecture", "config"));
         value.enable_parallel_clusters = enable_parallel_clusters;
         value.prefix_cache = parse_prefix_cache(root);
+        value.cpu_kv_cache = parse_cpu_kv_cache(root);
         return value;
     }();
 }
@@ -937,7 +1025,7 @@ SimulationConfig make_pdd_config(const Json &root, CommonConfigFields common) {
                      "clusters",
                      "kv_cache_transfer",
                  },
-                 {}, "config");
+                 {"cpu_kv_cache"}, "config");
     if (common.system_architecture != SystemArchitecture::kPdDisaggregation) {
         throw ConfigError(
             "PDD config requires system_architecture='pd-disaggregation'");
@@ -974,8 +1062,21 @@ SimulationConfig make_pdd_config(const Json &root, CommonConfigFields common) {
         value.system_architecture = common.system_architecture;
         value.enable_parallel_clusters = common.enable_parallel_clusters;
         value.prefix_cache = common.prefix_cache;
+        value.cpu_kv_cache = common.cpu_kv_cache;
         value.cluster_scheduler = parse_cluster_scheduler(root);
         value.runtime = std::move(runtime);
+        if (value.cpu_kv_cache.enabled) {
+            if (!value.prefix_cache.enabled) {
+                throw ConfigError(
+                    "CPU KV cache requires prefix_cache.enabled=true");
+            }
+            if (value.cluster_scheduler.type !=
+                ClusterSchedulerType::kStickyRoundRobin) {
+                throw ConfigError("CPU KV cache requires "
+                                  "cluster_scheduler.type='sticky_round_robin'");
+            }
+            static_cast<void>(resolve_cpu_kv_cache_target(value));
+        }
         return value;
     }();
 }
@@ -993,7 +1094,7 @@ SimulationConfig make_single_cluster_config(const Json &root,
                      "cluster_scheduler",
                      "clusters",
                  },
-                 {}, "config");
+                 {"cpu_kv_cache"}, "config");
     if (common.system_architecture != SystemArchitecture::kCoLocation) {
         throw ConfigError("single-cluster config requires "
                           "system_architecture='co-location'");
@@ -1009,8 +1110,13 @@ SimulationConfig make_single_cluster_config(const Json &root,
         value.system_architecture = common.system_architecture;
         value.enable_parallel_clusters = common.enable_parallel_clusters;
         value.prefix_cache = common.prefix_cache;
+        value.cpu_kv_cache = common.cpu_kv_cache;
         value.cluster_scheduler = parse_cluster_scheduler(root);
         value.runtime = parse_cluster_runtime(clusters, "monolithic");
+        if (value.cpu_kv_cache.enabled) {
+            throw ConfigError(
+                "CPU KV cache is supported only for sequential PDD");
+        }
         return value;
     }();
 }

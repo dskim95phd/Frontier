@@ -472,7 +472,28 @@ void test_mla_kv_layout_splits_latent_and_rope() {
     const auto kimi =
         frontier::config::load_model_config("moonshotai/Kimi-K2-Instruct");
     expect(kv_transfer::model_kv_cache_size_bytes(10, kimi, 1.0) == 390'400,
-           "Kimi PDD transfer must use the shared MLA KV layout");
+           "Kimi one-copy KV size must use the shared MLA KV layout");
+    expect(kv_transfer::model_kv_cache_size_bytes_target_physical(
+               10, kimi, 1.0, 4) == 1'561'600,
+           "Kimi TP4 target KV size must include MLA replication");
+    expect(kv_transfer::model_kv_cache_size_bytes_one_copy(
+               16, kimi, 1.0) == 624'640,
+           "Kimi one-copy block size must remain rank-local");
+    expect(kv_transfer::model_kv_cache_size_bytes_target_physical(
+               16, kimi, 1.0, 4) == 2'498'560,
+           "Kimi TP4 target block size must include MLA replication");
+    expect(kv_transfer::model_kv_cache_size_bytes_target_physical(
+               65'536, kimi, 1.0, 4) == 10'234'101'760ULL,
+           "Kimi TP4 target 64Ki footprint must match the physical contract");
+
+    frontier::config::KvCacheTransferConfig transfer_config{};
+    transfer_config.network_bandwidth_gbps = 200.0;
+    transfer_config.network_latency_ms = 0.5;
+    transfer_config.kv_cache_dtype_size_bytes = 1.0;
+    const auto predictor = kv_transfer::make_kv_cache_transfer_predictor(
+        transfer_config, 4);
+    expect(predictor->predict(16, kimi).size_bytes == 2'498'560,
+           "PDD predictor must report target-physical MLA bytes");
 }
 
 void test_mfa_models_shared_q_projection_path() {

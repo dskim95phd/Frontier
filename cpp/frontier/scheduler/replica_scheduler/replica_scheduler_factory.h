@@ -22,6 +22,7 @@ class BaseReplicaScheduler;
     execution_time_predictor::ExecutionTimePredictorPtr predictor,
     const entities::Replica &replica, DataParallelId dp_id,
     ClusterType cluster_type,
-    config::PrefixCacheConfig prefix_cache_config = {});
+    config::PrefixCacheConfig prefix_cache_config = {},
+    config::ResolvedCpuKVCacheTargetConfig cpu_kv_cache_config = {});
 
 } // namespace frontier::scheduler

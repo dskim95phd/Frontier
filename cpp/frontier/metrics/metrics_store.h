@@ -16,6 +16,8 @@ namespace frontier::entities {
 class Batch;
 class BatchStage;
 class KVCacheTransferInfo;
+class CpuKVCacheOffloadInfo;
+class CpuKVCacheRestoreInfo;
 class Request;
 } // namespace frontier::entities
 
@@ -31,6 +33,8 @@ struct ScheduleResult;
 namespace frontier::kv_cache {
 struct PrefixCacheStats;
 struct PrefixCacheDiagnostics;
+struct CpuKVCacheStats;
+struct CpuKVCacheDiagnostics;
 } // namespace frontier::kv_cache
 
 namespace frontier::metrics {
@@ -74,6 +78,18 @@ class MetricsStore {
         const kv_cache::PrefixCacheDiagnostics &diagnostics,
         scheduler::ReplicaTarget target, ClusterType cluster_type,
         std::uint64_t block_size, config::PrefixCachingKeyMode key_mode);
+    void record_cpu_kv_cache_target(
+        const config::ResolvedCpuKVCacheTargetConfig &config,
+        const kv_cache::CpuKVCacheStats &stats,
+        const kv_cache::CpuKVCacheDiagnostics &diagnostics,
+        scheduler::ReplicaTarget target, ClusterType cluster_type,
+        std::size_t pending_restores, std::size_t staged_restores);
+    void record_cpu_kv_cache_offload(
+        const entities::CpuKVCacheOffloadInfo &operation,
+        ClusterType cluster_type, std::uint64_t bytes_per_block);
+    void record_cpu_kv_cache_restore(
+        const entities::CpuKVCacheRestoreInfo &operation,
+        ClusterType cluster_type, std::uint64_t bytes_per_block);
 
     [[nodiscard]] SimulationOutput take_output() noexcept;
 

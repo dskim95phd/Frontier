@@ -323,14 +323,17 @@ queue both matches the release contract and removes synchronization overhead.
      [Step 4 session-scoped GPU prefix-cache plan](cpp-porting-step4-session-prefix-cache.md).
 
 5. **CPU KV-cache tiering**
-   - Add analytical GPU-to-CPU offload and CPU-to-GPU restore events only after
-     the GPU-resident session cache has parity.
-   - Add a bounded CPU block pool, session-aware CPU cache lookup/eviction,
-     restore admission, and tiered-cache metrics.
-   - Preserve the Python reservation, lease, pin, generation, cancellation,
-     and committed-frontier state transitions.
-   - Validate GPU-only hit, CPU-cache hit plus restore, miss, eviction, and
-     capacity-pressure cases independently from PDD.
+   - Implemented analytical GPU-to-CPU offload and CPU-to-GPU restore events
+     on the validated GPU-resident session-cache path.
+   - Implemented a bounded CPU block pool, session-aware CPU cache
+     lookup/eviction, deferred restore admission, and tiered-cache metrics.
+   - Preserves the Python reservation, lease, pin, generation, cancellation,
+     and committed-frontier state transitions at the logical contract level.
+   - Validated GPU-only hit, CPU-cache hit plus restore, miss, eviction,
+     capacity pressure, PDD integration, topology, stress, and differential
+     cases.
+   - Follow the detailed
+     [Step 5 prefill-side CPU KV-cache tiering plan](cpp-porting-step5-cpu-kv-cache-tiering.md).
 
 6. **Hardening and performance**
    - Add differential/regression tests, fixed seeds, profiling, allocation

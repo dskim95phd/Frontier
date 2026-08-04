@@ -39,6 +39,10 @@ Detailed implementation plans and records:
     implemented target-local analytical session ranges, session-suffix LRU,
     sticky affinity, vLLM V1 integration, resident-versus-evicted semantics,
     metrics, and co-location/PDD validation.
+  - [Step 5: prefill-side CPU KV-cache tiering](cpp-porting-step5-cpu-kv-cache-tiering.md) -
+    implemented bounded target-local CPU store, analytical D2H/H2D events,
+    deferred restore allocation, PREFILL export barriers, tiered-cache metrics,
+    and Python-guided validation.
 
 - [NVIDIA Vera Rubin NVL72 analytical modeling](vera-rubin-nvl72-analytical-modeling-plan.md) -
   proposed profile-free MVP covering roofline-based operator timing, a logical

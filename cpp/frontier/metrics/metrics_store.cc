@@ -1,15 +1,18 @@
 #include "frontier/metrics/metrics_store.h"
 
 #include <stdexcept>
+#include <limits>
 #include <string>
 #include <utility>
 
 #include "frontier/entities/batch.h"
 #include "frontier/entities/batch_stage.h"
 #include "frontier/entities/kv_cache_transfer_info.h"
+#include "frontier/entities/cpu_kv_cache_transfer_info.h"
 #include "frontier/entities/request.h"
 #include "frontier/execution_time_predictor/base_execution_time_predictor.h"
 #include "frontier/kv_cache/replica_kv_cache_manager.h"
+#include "frontier/kv_cache/cpu_kv_cache_manager.h"
 #include "frontier/scheduler/replica_scheduler/base_replica_scheduler.h"
 #include "frontier/scheduler/scheduler_types.h"
 #include "frontier/simulator/entity_arena.h"
@@ -62,6 +65,25 @@ void MetricsStore::record_batch(const entities::Batch &batch,
     aggregate.batch_size_execution_ms +=
         static_cast<double>(batch_size) * predicted_execution_ms;
     ++aggregate.batch_size_histogram[batch_size];
+    // Count only work that was part of a PREFILL phase at scheduling time.
+    // `processed_tokens` is captured in the batch snapshot before execution;
+    // comparing it with the request's current replay boundary also handles
+    // monolithic preemption, where committed decode context is replayed as
+    // PREFILL.  Cached prefix tokens are already reflected in
+    // `processed_tokens`, so they never enter this sum.
+    for (const entities::RequestBatchSnapshot &snapshot : batch.requests()) {
+        const entities::Request &request =
+            requests.at(static_cast<std::size_t>(snapshot.request_id.value()));
+        if (snapshot.processed_tokens < request.num_prefill_tokens()) {
+            if (aggregate.prefill_scheduled_tokens >
+                std::numeric_limits<std::uint64_t>::max() -
+                    snapshot.scheduled_tokens) {
+                throw std::overflow_error(
+                    "aggregate PREFILL token count overflows uint64");
+            }
+            aggregate.prefill_scheduled_tokens += snapshot.scheduled_tokens;
+        }
+    }
     if (!detailed_traces_enabled_) {
         return;
     }
@@ -268,10 +290,34 @@ void MetricsStore::collect_completed_requests(
             value.session_id = request.session_id();
             value.num_prefill_tokens = request.initial_num_prefill_tokens();
             value.num_decode_tokens = request.initial_num_decode_tokens();
+            value.scheduled_prefill_tokens =
+                request.scheduled_prefill_tokens();
+            value.preemption_recomputed_prefill_tokens =
+                request.preemption_recomputed_prefill_tokens();
             value.cached_prefill_tokens = request.cached_prefill_tokens();
             value.prefix_cache_query_blocks =
                 request.prefix_cache_query_blocks();
             value.prefix_cache_hit_blocks = request.prefix_cache_hit_blocks();
+            value.gpu_prefix_hit_blocks = request.gpu_prefix_hit_blocks();
+            value.cpu_prefix_query_blocks = request.cpu_prefix_query_blocks();
+            value.cpu_prefix_hit_blocks = request.cpu_prefix_hit_blocks();
+            value.cpu_restore_transferred_blocks =
+                request.cpu_restore_transferred_blocks();
+            value.cpu_restore_consumed_blocks =
+                request.cpu_restore_consumed_blocks();
+            value.cpu_restore_discarded_blocks =
+                request.cpu_restore_discarded_blocks();
+            value.cpu_restored_tokens = request.cpu_restored_tokens();
+            value.cpu_restore_bytes = request.cpu_restore_bytes();
+            value.cpu_restore_queue_time_s =
+                request.cpu_restore_queue_time_s();
+            value.cpu_restore_service_time_s =
+                request.cpu_restore_service_time_s();
+            value.cpu_offload_bytes = request.cpu_offload_bytes();
+            value.cpu_offload_queue_time_s =
+                request.cpu_offload_queue_time_s();
+            value.cpu_offload_service_time_s =
+                request.cpu_offload_service_time_s();
             value.prefix_cache_key_mode = request.prefix_cache_key_mode();
             value.arrived_at = request.arrived_at();
             value.prefill_completed_at = request.prefill_completed_at();
@@ -312,6 +358,23 @@ void MetricsStore::collect_completed_requests(
             record.kv_cache_transfer_size_bytes =
                 request.kv_cache_transfer_size_bytes();
         }
+        // Replay attribution is request-owned (it spans batches and can
+        // include work after a monolithic decode preemption).  Fold it into
+        // the logical PREFILL cluster once, when completed requests are
+        // collected, so compact output does not depend on detailed batch
+        // traces being retained.
+        const ClusterType prefill_cluster =
+            is_pdd ? ClusterType::kPrefill : ClusterType::kMonolithic;
+        BatchMetricsAggregate &prefill_aggregate =
+            output_.aggregate.batches_by_cluster[prefill_cluster];
+        if (prefill_aggregate.preemption_recomputed_prefill_tokens >
+            std::numeric_limits<std::uint64_t>::max() -
+                request.preemption_recomputed_prefill_tokens()) {
+            throw std::overflow_error(
+                "aggregate recomputed PREFILL token count overflows uint64");
+        }
+        prefill_aggregate.preemption_recomputed_prefill_tokens +=
+            request.preemption_recomputed_prefill_tokens();
         record_request(std::move(record));
     }
 }
@@ -338,6 +401,163 @@ void MetricsStore::record_prefix_cache_target(
         diagnostics.active_blocks, diagnostics.resident_blocks,
         diagnostics.evictable_blocks, diagnostics.evictable_sessions,
         diagnostics.sessions_with_nonzero_frontier});
+}
+
+void MetricsStore::record_cpu_kv_cache_target(
+    const config::ResolvedCpuKVCacheTargetConfig &config,
+    const kv_cache::CpuKVCacheStats &stats,
+    const kv_cache::CpuKVCacheDiagnostics &diagnostics,
+    scheduler::ReplicaTarget target, ClusterType cluster_type,
+    std::size_t pending_restores, std::size_t staged_restores) {
+    const auto bytes = [&](std::uint64_t blocks) {
+        if (blocks > std::numeric_limits<std::uint64_t>::max() /
+                         config.bytes_per_block) {
+            throw std::overflow_error("CPU KV-cache metric bytes overflow");
+        }
+        return blocks * config.bytes_per_block;
+    };
+    const std::uint64_t used = diagnostics.resident_blocks +
+                               diagnostics.reserved_blocks;
+    if (used > diagnostics.capacity_blocks) {
+        throw std::logic_error("CPU KV-cache target exceeds capacity");
+    }
+    CpuKVCacheTargetMetricsRecord record{};
+    record.cluster_type = cluster_type;
+    record.replica_id = target.replica_id;
+    record.dp_id = target.dp_id;
+    record.capacity_bytes = config.capacity_bytes;
+    record.capacity_blocks = diagnostics.capacity_blocks;
+    record.bytes_per_block = config.bytes_per_block;
+    record.resident_blocks = diagnostics.resident_blocks;
+    record.resident_bytes = bytes(record.resident_blocks);
+    record.reserved_blocks = diagnostics.reserved_blocks;
+    record.reserved_bytes = bytes(record.reserved_blocks);
+    record.free_blocks = diagnostics.capacity_blocks - used;
+    record.free_bytes = bytes(record.free_blocks);
+    record.peak_resident_blocks = stats.peak_resident_blocks;
+    record.peak_resident_bytes = bytes(record.peak_resident_blocks);
+    record.peak_reserved_blocks = stats.peak_reserved_blocks;
+    record.peak_reserved_bytes = bytes(record.peak_reserved_blocks);
+    record.resident_sessions = diagnostics.sessions;
+    record.evicted_sessions = stats.evicted_sessions;
+    record.evicted_blocks = stats.evicted_blocks;
+    record.evicted_bytes = bytes(stats.evicted_blocks);
+    record.skipped_offloads = stats.skipped_offloads;
+    record.truncated_offloads = stats.truncated_offloads;
+    record.stale_generation_completions =
+        stats.stale_generation_completions;
+    record.cpu_query_blocks = stats.query_blocks;
+    record.cpu_hit_blocks = stats.hit_blocks;
+    record.sessions_with_cpu_hits = stats.sessions_with_hits;
+    record.pending_restore_operations = pending_restores;
+    record.staged_restore_payloads = staged_restores;
+    record.active_restore_leases = diagnostics.active_restore_leases;
+    record.active_offload_reservations = diagnostics.active_reservations;
+    output_.cpu_kv_cache_targets.push_back(record);
+
+    CpuKVCacheMetricsAggregate &aggregate = output_.aggregate.cpu_kv_cache;
+    ++aggregate.target_count;
+    aggregate.capacity_bytes += record.capacity_bytes;
+    aggregate.capacity_blocks += record.capacity_blocks;
+    if (aggregate.bytes_per_block == 0) {
+        aggregate.bytes_per_block = record.bytes_per_block;
+    } else if (aggregate.bytes_per_block != record.bytes_per_block) {
+        throw std::logic_error(
+            "CPU KV-cache targets reported inconsistent block sizes");
+    }
+    aggregate.query_blocks += record.cpu_query_blocks;
+    aggregate.hit_blocks += record.cpu_hit_blocks;
+    aggregate.resident_bytes += record.resident_bytes;
+    aggregate.resident_blocks += record.resident_blocks;
+    aggregate.reserved_bytes += record.reserved_bytes;
+    aggregate.reserved_blocks += record.reserved_blocks;
+    aggregate.free_bytes += record.free_bytes;
+    aggregate.free_blocks += record.free_blocks;
+    aggregate.peak_resident_bytes += record.peak_resident_bytes;
+    aggregate.peak_resident_blocks += record.peak_resident_blocks;
+    aggregate.peak_reserved_bytes += record.peak_reserved_bytes;
+    aggregate.peak_reserved_blocks += record.peak_reserved_blocks;
+    aggregate.resident_sessions += record.resident_sessions;
+    aggregate.evicted_blocks += record.evicted_blocks;
+    aggregate.evicted_sessions += record.evicted_sessions;
+    aggregate.evicted_bytes += record.evicted_bytes;
+    aggregate.skipped_offloads += record.skipped_offloads;
+    aggregate.truncated_offloads += record.truncated_offloads;
+    aggregate.stale_generation_completions +=
+        record.stale_generation_completions;
+    aggregate.sessions_with_cpu_hits += record.sessions_with_cpu_hits;
+    aggregate.pending_restore_operations +=
+        record.pending_restore_operations;
+    aggregate.staged_restore_payloads += record.staged_restore_payloads;
+    aggregate.active_restore_leases += record.active_restore_leases;
+    aggregate.active_offload_reservations +=
+        record.active_offload_reservations;
+}
+
+void MetricsStore::record_cpu_kv_cache_offload(
+    const entities::CpuKVCacheOffloadInfo &operation,
+    ClusterType cluster_type, std::uint64_t bytes_per_block) {
+    if (operation.state() != entities::CpuKVCacheTransferState::kCompleted) {
+        return;
+    }
+    const auto &timing = operation.timing();
+    CpuKVCacheTransferMetricsRecord record{};
+    record.transfer_id = operation.transfer_id();
+    record.kind = CpuKVCacheTransferKind::kOffload;
+    record.request_id = operation.request_id();
+    record.cluster_type = cluster_type;
+    record.replica_id = operation.replica_id();
+    record.dp_id = operation.dp_id();
+    record.blocks = timing.size_bytes / bytes_per_block;
+    record.size_bytes = timing.size_bytes;
+    record.submitted_at = timing.submitted_at;
+    record.started_at = timing.started_at;
+    record.completed_at = timing.completed_at;
+    record.queue_time_ms = timing.queue_time_ms;
+    record.service_time_ms = timing.service_time_ms;
+    record.source_gpu_hold_ms = operation.attributable_source_hold_ms();
+    auto &aggregate = output_.aggregate.cpu_kv_cache;
+    ++aggregate.offload_operations;
+    aggregate.offload_blocks += record.blocks;
+    aggregate.offload_bytes += record.size_bytes;
+    aggregate.d2h_queue_time_ms += record.queue_time_ms;
+    aggregate.d2h_service_time_ms += record.service_time_ms;
+    aggregate.source_gpu_hold_time_ms += record.source_gpu_hold_ms;
+    if (detailed_traces_enabled_) {
+        output_.cpu_kv_cache_transfers.push_back(record);
+    }
+}
+
+void MetricsStore::record_cpu_kv_cache_restore(
+    const entities::CpuKVCacheRestoreInfo &operation,
+    ClusterType cluster_type, std::uint64_t bytes_per_block) {
+    if (operation.state() != entities::CpuKVCacheTransferState::kCompleted) {
+        return;
+    }
+    const auto &timing = operation.timing();
+    CpuKVCacheTransferMetricsRecord record{};
+    record.transfer_id = operation.transfer_id();
+    record.kind = CpuKVCacheTransferKind::kRestore;
+    record.request_id = operation.request_id();
+    record.cluster_type = cluster_type;
+    record.replica_id = operation.replica_id();
+    record.dp_id = operation.dp_id();
+    record.blocks = timing.size_bytes / bytes_per_block;
+    record.size_bytes = timing.size_bytes;
+    record.submitted_at = timing.submitted_at;
+    record.started_at = timing.started_at;
+    record.completed_at = timing.completed_at;
+    record.queue_time_ms = timing.queue_time_ms;
+    record.service_time_ms = timing.service_time_ms;
+    auto &aggregate = output_.aggregate.cpu_kv_cache;
+    ++aggregate.restore_operations;
+    aggregate.restore_blocks += record.blocks;
+    aggregate.restore_bytes += record.size_bytes;
+    aggregate.h2d_queue_time_ms += record.queue_time_ms;
+    aggregate.h2d_service_time_ms += record.service_time_ms;
+    if (detailed_traces_enabled_) {
+        output_.cpu_kv_cache_transfers.push_back(record);
+    }
 }
 
 SimulationOutput MetricsStore::take_output() noexcept {

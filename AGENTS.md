@@ -8,6 +8,10 @@
 - The PDD example suite also uses `--cc_backend_config_type analytical` and `--no-enable_parallel_clusters` for one-click sequential smoke runs.
 - collective_sim is optional. Initialize and build its submodule only when you explicitly select `--cc_backend_config_type collective_sim`.
 
+## Agent Delegation
+
+독립된 큰 작업은 `luna_worker`에게 병렬로 맡긴다. 각 작업의 파일 범위와 기대 결과를 따로 전달한다.
+
 Frontier is a modular **discrete-event simulator (DES)** for large language model (LLM) inference. This `pre-release-v0.2` branch supports the **co-location** architecture, where prefill and decode run in a single monolithic cluster, and sequential **PDD / `pd-disaggregation`**, where prefill and decode run in separate clusters with KV cache transfer between them.
 
 The supported PDD path requires sequential cluster execution. If a user selects `pd-disaggregation` with parallel clusters enabled, Frontier fails fast with message.

@@ -61,6 +61,13 @@ class ReplicaKVCacheManager {
                                  std::uint64_t scheduled_tokens) const;
     void admit(RequestId request_id, SessionId session_id,
                std::uint64_t cached_tokens, std::uint64_t scheduled_tokens);
+    [[nodiscard]] bool can_admit_tiered(
+        RequestId request_id, SessionId session_id,
+        std::uint64_t reusable_frontier_blocks,
+        std::uint64_t scheduled_tokens) const;
+    void admit_tiered(RequestId request_id, SessionId session_id,
+                      std::uint64_t reusable_frontier_blocks,
+                      std::uint64_t scheduled_tokens);
     void record_successful_admission(std::uint64_t query_blocks,
                                      std::uint64_t hit_blocks);
 

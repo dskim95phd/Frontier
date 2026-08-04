@@ -72,6 +72,40 @@ bool BaseReplicaScheduler::request_is_active(RequestId request_id) const {
     return active_requests_.find(request_id) != active_requests_.end();
 }
 
+void BaseReplicaScheduler::on_cpu_kv_cache_offload_start(
+    CpuKvTransferId transfer_id, CpuOffloadGeneration generation,
+    SimTime time) {
+    static_cast<void>(transfer_id);
+    static_cast<void>(generation);
+    static_cast<void>(time);
+    throw SchedulerError("replica scheduler has no CPU offload support");
+}
+
+bool BaseReplicaScheduler::on_cpu_kv_cache_offload_end(
+    CpuKvTransferId transfer_id, CpuOffloadGeneration generation,
+    SimTime time) {
+    static_cast<void>(transfer_id);
+    static_cast<void>(generation);
+    static_cast<void>(time);
+    throw SchedulerError("replica scheduler has no CPU offload support");
+}
+
+void BaseReplicaScheduler::on_cpu_kv_cache_restore_start(
+    CpuKvTransferId transfer_id, Generation generation, SimTime time) {
+    static_cast<void>(transfer_id);
+    static_cast<void>(generation);
+    static_cast<void>(time);
+    throw SchedulerError("replica scheduler has no CPU restore support");
+}
+
+bool BaseReplicaScheduler::on_cpu_kv_cache_restore_end(
+    CpuKvTransferId transfer_id, Generation generation, SimTime time) {
+    static_cast<void>(transfer_id);
+    static_cast<void>(generation);
+    static_cast<void>(time);
+    throw SchedulerError("replica scheduler has no CPU restore support");
+}
+
 void BaseReplicaScheduler::add_request(RequestId request_id) {
     entities::Request &value = request(request_id);
     if (value.state() != entities::RequestState::kWaiting) {
