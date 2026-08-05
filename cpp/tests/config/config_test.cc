@@ -24,6 +24,7 @@ using frontier::config::parse_simulation_config_json;
 using frontier::config::PddRuntimeConfig;
 using frontier::config::serialize_simulation_config_json;
 using frontier::config::SystemArchitecture;
+using frontier::ClusterType;
 using frontier::test::expect;
 using frontier::test::expect_throws;
 using frontier::test::read_text_file;
@@ -62,6 +63,48 @@ void test_pdd_contract_round_trip() {
     expect(parse_simulation_config_json(
                serialize_simulation_config_json(config)) == config,
            "PDD config must round-trip deterministically");
+}
+
+void test_stage_specific_cluster_scheduler_overrides() {
+    auto config = load("fixed_sequential_pdd.json");
+    expect(config.cluster_scheduler.type_for_cluster(ClusterType::kPrefill) ==
+                   ClusterSchedulerType::kRoundRobin &&
+               config.cluster_scheduler.type_for_cluster(ClusterType::kDecode) ==
+                   ClusterSchedulerType::kRoundRobin,
+           "legacy cluster scheduler type must fall back for both PDD stages");
+
+    config.cluster_scheduler.type = ClusterSchedulerType::kStickyRoundRobin;
+    config.cluster_scheduler.prefill_type =
+        ClusterSchedulerType::kStickyRoundRobin;
+    config.cluster_scheduler.decode_type =
+        ClusterSchedulerType::kVllmQueueAware;
+    config.cluster_scheduler.cache_threshold = 0.625;
+    config.cluster_scheduler.balance_abs_threshold = 17;
+    config.cluster_scheduler.balance_rel_threshold = 1.25;
+    const auto parsed = parse_simulation_config_json(
+        serialize_simulation_config_json(config));
+    expect(parsed.cluster_scheduler.prefill_type.has_value() &&
+               parsed.cluster_scheduler.decode_type.has_value() &&
+               parsed.cluster_scheduler.type_for_cluster(ClusterType::kPrefill) ==
+                   ClusterSchedulerType::kStickyRoundRobin &&
+               parsed.cluster_scheduler.type_for_cluster(ClusterType::kDecode) ==
+                   ClusterSchedulerType::kVllmQueueAware &&
+               parsed.cluster_scheduler.cache_threshold == 0.625 &&
+               parsed.cluster_scheduler.balance_abs_threshold == 17 &&
+               parsed.cluster_scheduler.balance_rel_threshold == 1.25,
+           "PDD stage scheduler overrides must parse and round-trip");
+
+    auto colocation = load("fixed_parallel_colocation.json");
+    colocation.cluster_scheduler.type = ClusterSchedulerType::kRoundRobin;
+    colocation.cluster_scheduler.prefill_type =
+        ClusterSchedulerType::kKvAware;
+    colocation.cluster_scheduler.decode_type =
+        ClusterSchedulerType::kVllmQueueAware;
+    const auto parsed_colocation = parse_simulation_config_json(
+        serialize_simulation_config_json(colocation));
+    expect(parsed_colocation.cluster_scheduler.type_for_cluster(
+               ClusterType::kMonolithic) == ClusterSchedulerType::kRoundRobin,
+           "stage overrides must not change co-location legacy routing");
 }
 
 void test_analytical_contract_round_trip() {
@@ -516,6 +559,15 @@ void test_cpu_kv_cache_contract_and_resolution() {
                resolved.h2d_bandwidth_gbps == 40.0,
            "direct CPU KV cache config must round-trip and resolve by model");
 
+    auto cache_aware = config;
+    cache_aware.cluster_scheduler.prefill_type =
+        ClusterSchedulerType::kCacheAware;
+    cache_aware.cluster_scheduler.decode_type =
+        ClusterSchedulerType::kVllmQueueAware;
+    expect(parse_simulation_config_json(
+               serialize_simulation_config_json(cache_aware)) == cache_aware,
+           "CPU KV cache must allow actual-cache-aware PREFILL routing");
+
     auto kimi_target = parsed;
     kimi_target.cpu_kv_cache.capacity_bytes = 10'000'000ULL;
     kimi_target.pdd().clusters.prefill.model =
@@ -529,6 +581,69 @@ void test_cpu_kv_cache_contract_and_resolution() {
                kimi_resolved.capacity_blocks ==
                    10'000'000ULL / 2'498'560ULL,
            "CPU KV cache must use TP-replicated MLA target bytes per block");
+
+    kimi_target.pdd()
+        .clusters.prefill.parallelism.decode_context_parallel_size = 4;
+    expect_throws<ConfigError>(
+        [&kimi_target] {
+            static_cast<void>(
+                frontier::config::resolve_cpu_kv_cache_target(kimi_target));
+        },
+        "PDD PREFILL must reject DCP greater than one");
+    expect_throws<ConfigError>(
+        [&kimi_target] {
+            static_cast<void>(parse_simulation_config_json(
+                serialize_simulation_config_json(kimi_target)));
+        },
+        "PDD parser must force PREFILL DCP to one");
+    kimi_target.pdd()
+        .clusters.prefill.parallelism.decode_context_parallel_size = 1;
+    kimi_target.pdd().clusters.decode.model =
+        kimi_target.pdd().clusters.prefill.model;
+    kimi_target.pdd().clusters.decode.parallelism.tensor_parallel_size = 4;
+    kimi_target.pdd()
+        .clusters.decode.parallelism.decode_context_parallel_size = 4;
+    kimi_target.pdd()
+        .clusters.prefill.parallelism.moe_expert_parallel_size = 4;
+    kimi_target.pdd().clusters.decode.parallelism.moe_expert_parallel_size = 4;
+    const auto kimi_dcp_round_trip = parse_simulation_config_json(
+        serialize_simulation_config_json(kimi_target));
+    expect(kimi_dcp_round_trip.pdd()
+                   .clusters.prefill.parallelism
+                   .decode_context_parallel_size == 1 &&
+               kimi_dcp_round_trip.pdd()
+                       .clusters.decode.parallelism
+                       .decode_context_parallel_size == 4,
+           "PDD must keep PREFILL DCP1 and round-trip DECODE DCP");
+
+    kimi_target.pdd()
+        .clusters.decode.parallelism.decode_context_parallel_size = 3;
+    expect_throws<ConfigError>(
+        [&kimi_target] {
+            static_cast<void>(parse_simulation_config_json(
+                serialize_simulation_config_json(kimi_target)));
+        },
+        "MLA DCP size must divide TP size");
+
+    kimi_target.pdd()
+        .clusters.decode.parallelism.decode_context_parallel_size = 0;
+    expect_throws<ConfigError>(
+        [&kimi_target] {
+            static_cast<void>(parse_simulation_config_json(
+                serialize_simulation_config_json(kimi_target)));
+        },
+        "MLA DCP size must be positive");
+
+    auto dense_dcp = parsed;
+    dense_dcp.pdd().clusters.decode.parallelism.tensor_parallel_size = 2;
+    dense_dcp.pdd()
+        .clusters.decode.parallelism.decode_context_parallel_size = 2;
+    expect_throws<ConfigError>(
+        [&dense_dcp] {
+            static_cast<void>(parse_simulation_config_json(
+                serialize_simulation_config_json(dense_dcp)));
+        },
+        "DCP must reject non-MLA models");
 
     config.cpu_kv_cache.static_slice_per_gpu = true;
     config.cpu_kv_cache.capacity_bytes_per_gpu = 2'000'000'000ULL;
@@ -605,6 +720,9 @@ int main() {
                                     test_colocation_contract_round_trip);
     failures += frontier::test::run("PDD contract round trip",
                                     test_pdd_contract_round_trip);
+    failures += frontier::test::run(
+        "stage-specific cluster scheduler overrides",
+        test_stage_specific_cluster_scheduler_overrides);
     failures += frontier::test::run("analytical contract round trip",
                                     test_analytical_contract_round_trip);
     failures +=

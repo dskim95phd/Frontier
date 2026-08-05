@@ -152,14 +152,17 @@ The fields shown above are required. The additional top-level `cpu_kv_cache`
 object may be omitted and then normalizes to the disabled default. Unknown
 fields and unsupported values are rejected.
 `enable_parallel_clusters` must currently be `false`. Session prefix caching
-is supported with `prefix_cache.enabled=true`, `key_mode="session"`, and a
-sticky cluster scheduler when more than one replica/DP target is available.
+is supported with `prefix_cache.enabled=true`, `key_mode="session"`, and
+either `sticky_round_robin` or `cache_aware` when more than one replica/DP
+target is available. `cache_aware` queries the actual GPU-resident prefix and
+may migrate to a least-loaded target; migration discards the old target's
+session KV.
 
 ### CPU KV-cache tiering
 
 CPU tiering is an opt-in sequential-PDD feature. It requires session prefix
-caching, `sticky_round_robin`, a PREFILL `vllm_v1` scheduler, and
-`enable_parallel_clusters=false`. Each PREFILL `(replica_id, dp_id)` target
+caching, `sticky_round_robin` or `cache_aware`, a PREFILL `vllm_v1` scheduler,
+and `enable_parallel_clusters=false`. Each PREFILL `(replica_id, dp_id)` target
 owns an independent finite store and one serialized queue per transfer
 direction; D2H and H2D may overlap.
 
@@ -182,6 +185,7 @@ Co-location has exactly one `monolithic` cluster:
       "parallelism": {
         "num_replicas": 2,
         "tensor_parallel_size": 2,
+        "decode_context_parallel_size": 1,
         "pipeline_parallel_size": 2,
         "data_parallel_size": 2,
         "moe_tensor_parallel_size": 1,
@@ -216,6 +220,18 @@ Co-location has exactly one `monolithic` cluster:
   }
 }
 ```
+
+For MLA models, set `decode_context_parallel_size` to a divisor of
+`tensor_parallel_size` to model vLLM-style token-interleaved DCP. DCP reuses
+the TP ranks and does not add GPUs. A token at global position `i` is stored on
+DCP rank `i % decode_context_parallel_size`; for example, TP4/DCP4 removes the
+four-way latent-KV replication while adding decode attention collectives.
+The analytical diagnostics keep `kv_cache_bytes_per_token_per_layer` as the
+logical one-copy size and expose the per-GPU value separately as
+`kv_cache_rank_local_bytes_per_token_per_layer`.
+For `pd-disaggregation`, PREFILL must set
+`decode_context_parallel_size` to `1`; DCP is allowed only on the DECODE
+cluster. PDD KV-transfer sizing follows the DECODE target layout.
 
 The number of fixed stage latencies must equal
 `pipeline_parallel_size`.

@@ -5,19 +5,33 @@ in [`docs/experiments/kimi-k2-gb300-cpu-dram-capacity-study.md`](../../../docs/e
 It does not change the simulator.  The harness uses the current C++ CLI and
 keeps every capacity case paired to the same generated workload for a seed.
 
+The separate TraceLab cache-aware arrival-rate experiment uses 8 PREFILL and
+24 DECODE GPUs and sweeps 0.10 down to 0.05 new source sessions/s.  Its frozen
+configuration, server commands, resume behavior, measurement horizons, and
+detailed result collector are documented in
+[`docs/experiments/tracelab-cache-aware-arrival-sweep.md`](../../../docs/experiments/tracelab-cache-aware-arrival-sweep.md).
+
 The frozen topology in `configs/base_pdd.json` is sequential online PDD:
 
-| side | GPUs | replicas | attention TP | PP | DP | MoE TP | EP |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| PREFILL | 16 | 1 | 4 | 1 | 4 | 1 | 16 |
-| DECODE | 16 | 1 | 4 | 1 | 4 | 1 | 16 |
+| side | GPUs | replicas | attention TP | DCP | PP | DP | MoE TP | EP |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| PREFILL | 16 | 1 | 4 | 1 | 1 | 4 | 1 | 16 |
+| DECODE | 16 | 1 | 4 | 4 | 1 | 4 | 1 | 16 |
 
 It uses `moonshotai/Kimi-K2-Instruct`, analytical `gb300`, FP8 KV, balanced
-MoE routing, `first_layer_scaled`, sticky session prefix caching, and
-`enable_parallel_clusters=false`.  The byte contract is recorded in every
-phase manifest: 39,040 one-copy bytes/token, 156,160 target-physical
+MoE routing, `first_layer_scaled`, actual-GPU-cache-aware PREFILL routing,
+vLLM-like least-outstanding DECODE routing, and
+`enable_parallel_clusters=false`. PREFILL retains session affinity while its
+actual GPU-prefix hit ratio is at least 0.5 and the target loads are balanced.
+It switches to the least-loaded target when both the absolute load gap exceeds
+32 and the relative gap exceeds 1.1, or when the GPU hit ratio is below 0.5.
+Migration discards all old-target GPU KV for that session. PREFILL is TP-only
+(`DCP=1`); only DECODE uses token-interleaved DCP. The byte contract is
+recorded in every phase manifest. PREFILL uses 39,040 rank-local and 156,160 target-physical
 bytes/token, 2,498,560 target-physical bytes/block, and 304,175 GPU KV blocks
-per DP target from the 190 GB one-copy budget.
+per DP target. DECODE uses 9,760 rank-local and 39,040 target-physical
+bytes/token, 624,640 target-physical bytes/block, and 1,216,700 GPU KV blocks
+per DP target. Both capacities use the same 190 GB per-GPU budget.
 
 ## 1. Generate paired workloads
 
@@ -48,6 +62,68 @@ implementation minimum (`new input + previous decode + one 16-token block`).
 The generated materialized prompt is recorded as a calibration baseline; it is
 replaced with actual scheduled PREFILL when a simulator requests output is
 joined.
+
+### TraceLab v0.0.2 workload
+
+`convert_tracelab_workload.py` converts the released TraceLab DuckDB directly
+to the same six-column C++ workload format.  One TraceLab row is one agent/LLM
+step (including tool-result continuations), not necessarily one human turn.
+The default mapping is:
+
+* `--session-arrival-rate` is required explicitly (there is no converter
+  default); retained source sessions are seed-shuffled and roots are placed in
+  deterministic strata at `index / session_arrival_rate` seconds;
+* successor `think_time` is the time from the previous step's last model-output
+  event to the current step's first input event;
+* `OSL = output_tokens`; and
+* successor `ISL = current_input_total - previous_input_total -
+  previous_output_tokens`.  This is the logical new input expected by
+  Frontier's prefix-cache materializer, rather than TraceLab's provider-side
+  cache-accounting field `newly_append_tokens`.
+
+TraceLab context-max and tokenizer metadata are intentionally ignored.  When a
+context reduction/compaction makes that ISL nonpositive or timing is missing,
+the current row begins a new numeric simulator session and its full observed
+input becomes the new root ISL.  A negative timestamp gap is clamped to
+`think_time=0` while retaining the session.  At the first non-adjacent
+`round_index`, that row and all later rows in the source session are discarded:
+the missing requests make their compute time and context evolution
+unobservable.
+
+Split segment roots are not reset to `t=0`.  They are placed at the shuffled
+source-root arrival plus source-relative elapsed time from the original first
+input to the segment's first input.  If that input timestamp is missing, the
+previous segment's final model-output time is used as a conservative fallback.
+Frontier has no completion dependency between different simulator sessions,
+so this preserves the observed chronology as closely as the workload contract
+allows but cannot force a split root to wait for predecessor completion under
+simulator queueing.  Metadata records the anchor and any fallback.
+
+Using the isolated TraceLab environment and the v0.0.2 dataset downloaded
+under `outputs/`:
+
+```powershell
+# A deterministic 100-source-session sample
+.\outputs\tools\tracelab-venv\Scripts\python.exe `
+  .\cpp\experiments\kimi_k2_cpu_dram\convert_tracelab_workload.py `
+  --db .\outputs\datasets\tracelab\v0.0.2\syfi_coding_trace.duckdb `
+  --output .\outputs\datasets\tracelab\v0.0.2\frontier\sample100.csv `
+  --sample-sessions 100 --seed 20260804 `
+  --session-arrival-rate 1.0
+
+# Validate without running a simulation
+.\cpp\build\Release\frontier_sim.exe --normalize-workload `
+  .\outputs\datasets\tracelab\v0.0.2\frontier\sample100.csv
+```
+
+Omit `--sample-sessions` for the complete trace.  Exact `--provider`,
+`--model`, and `--session-id` filters can be repeated or comma-separated.  A
+metadata JSON and Kimi-study-compatible manifest CSV are written beside the
+workload by default (override the manifest with `--manifest-output`).  The
+metadata separates pre-sampling and post-sampling session/round counters and
+records the seeded shuffle, root-arrival rate, segment anchors, and timing
+fallbacks.  The manifest includes `final_context_tokens`, allowing the shared
+capacity runner to calculate an unbounded-oracle capacity directly.
 
 ## 2. CPU-OFF calibration (Phase W)
 
@@ -90,6 +166,12 @@ The frozen parameters passed validation-only CPU-OFF runs on seeds 20260803,
 rate was 0.7852% and no request was preempted.  The experiment runner disables
 expensive per-event structural validation; unit/integration tests and final
 CPU-cache diagnostics retain full invariant validation.
+
+Those calibration numbers were produced by the earlier all-stage
+`sticky_round_robin` configuration. They are retained as historical evidence,
+not as results for the new `cache_aware` PREFILL / `vllm_queue_aware` DECODE
+configuration. Re-run Phase W and re-check the 2.80--3.20 gate before using
+the updated routing policy for a capacity sweep.
 
 ## 3. Pilot, coarse, and fine sweeps
 

@@ -115,6 +115,8 @@ class BaseClusterScheduler {
         return cluster_->parallelism().data_parallel_size;
     }
     [[nodiscard]] SessionId request_session_id(RequestId request_id) const;
+    [[nodiscard]] const entities::Request &
+    request(RequestId request_id) const;
 
     std::vector<QueuedRequest> request_queue_;
 

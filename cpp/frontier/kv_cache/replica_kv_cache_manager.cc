@@ -340,6 +340,25 @@ std::uint64_t ReplicaKVCacheManager::free(RequestId request_id) {
             throw ReplicaKVCacheError("active session allocation is corrupt");
         }
         SessionCacheEntry &entry = session->second;
+        const bool discard =
+            discard_on_release_.erase(value.session_id) != 0;
+        if (discard) {
+            if (entry.resident_prefix_blocks > resident_blocks_) {
+                throw ReplicaKVCacheError(
+                    "discarded session resident accounting is corrupt");
+            }
+            resident_blocks_ -= entry.resident_prefix_blocks;
+            if (entry.resident_prefix_blocks > 0) {
+                --sessions_with_nonzero_frontier_;
+                stats_.evicted_blocks += entry.resident_prefix_blocks;
+                ++stats_.evicted_sessions;
+            }
+            blank_blocks_ += value.allocated_blocks;
+            sessions_.erase(session);
+            allocations_.erase(allocation);
+            validate_accounting();
+            return value.allocated_blocks;
+        }
         entry.resident_prefix_blocks = value.published_blocks;
         entry.active_request = RequestId{};
         blank_blocks_ += value.allocated_blocks - value.published_blocks;
@@ -354,6 +373,42 @@ std::uint64_t ReplicaKVCacheManager::free(RequestId request_id) {
     allocations_.erase(allocation);
     validate_accounting();
     return value.allocated_blocks;
+}
+
+std::uint64_t
+ReplicaKVCacheManager::discard_session(SessionId session_id) {
+    if (!prefix_cache_enabled_ || !session_id.valid()) {
+        return 0;
+    }
+    auto position = sessions_.find(session_id);
+    if (position == sessions_.end()) {
+        discard_on_release_.erase(session_id);
+        return 0;
+    }
+    SessionCacheEntry &entry = position->second;
+    if (entry.active_request.valid()) {
+        discard_on_release_.insert(session_id);
+        return 0;
+    }
+    if (!entry.in_evictable_lru || entry.resident_prefix_blocks == 0) {
+        throw ReplicaKVCacheError(
+            "inactive discarded session is not evictable");
+    }
+    const std::uint64_t discarded = entry.resident_prefix_blocks;
+    remove_from_evictable_lru(entry);
+    if (discarded > resident_blocks_) {
+        throw ReplicaKVCacheError(
+            "discarded session exceeds resident accounting");
+    }
+    resident_blocks_ -= discarded;
+    blank_blocks_ += discarded;
+    --sessions_with_nonzero_frontier_;
+    stats_.evicted_blocks += discarded;
+    ++stats_.evicted_sessions;
+    sessions_.erase(position);
+    discard_on_release_.erase(session_id);
+    validate_accounting();
+    return discarded;
 }
 
 void ReplicaKVCacheManager::mark_blocks_computed(
@@ -442,6 +497,14 @@ void ReplicaKVCacheManager::validate_accounting() const {
         observed_sessions != evictable_lru_.size() ||
         sessions_with_nonzero_frontier_ != observed_nonzero_sessions) {
         throw ReplicaKVCacheError("analytical session LRU accounting diverged");
+    }
+    for (const SessionId session_id : discard_on_release_) {
+        const auto position = sessions_.find(session_id);
+        if (position == sessions_.end() ||
+            !position->second.active_request.valid()) {
+            throw ReplicaKVCacheError(
+                "deferred session discard has no active owner");
+        }
     }
 #endif
 }

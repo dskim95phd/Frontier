@@ -76,6 +76,14 @@ def test_capacity_contract_and_config() -> None:
         assert parallelism["data_parallel_size"] == 4
         assert parallelism["moe_tensor_parallel_size"] == 1
         assert parallelism["moe_expert_parallel_size"] == 16
+        assert parallelism["decode_context_parallel_size"] == (
+            4 if name == "decode" else 1
+        )
+        assert config["clusters"][name]["scheduler"]["num_blocks"] == (
+            run_sweep.DECODE_GPU_KV_BLOCKS
+            if name == "decode"
+            else run_sweep.PREFILL_GPU_KV_BLOCKS
+        )
         assert parallelism["num_replicas"] * parallelism["tensor_parallel_size"] * parallelism["pipeline_parallel_size"] * parallelism["data_parallel_size"] == 16
     labels = ["off", "cpu32", "cpu64", "cpu128", "cpu256", "cpu500", "oracle_unbounded_cpu"]
     order = run_sweep._execution_order("coarse", labels, 20260803)

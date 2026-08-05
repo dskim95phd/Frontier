@@ -468,6 +468,14 @@ void test_mla_kv_layout_splits_latent_and_rope() {
                                640.0, "MLA KV bytes per token");
     expect(attention::mla_kv_cache_size_bytes(10, 61, layout) == 390'400,
            "MLA KV size must use FP8 latent and BF16 RoPE components");
+    expect(attention::mla_dcp_local_token_count(10, 4, 0) == 3 &&
+               attention::mla_dcp_local_token_count(10, 4, 1) == 3 &&
+               attention::mla_dcp_local_token_count(10, 4, 2) == 2 &&
+               attention::mla_dcp_local_token_count(10, 4, 3) == 2,
+           "MLA DCP must interleave tokens across ranks");
+    expect(attention::mla_dcp_rank_kv_cache_size_bytes(10, 61, layout, 4,
+                                                       0) == 117'120,
+           "MLA DCP rank-local KV size must use the local token count");
 
     const auto kimi =
         frontier::config::load_model_config("moonshotai/Kimi-K2-Instruct");
@@ -476,6 +484,15 @@ void test_mla_kv_layout_splits_latent_and_rope() {
     expect(kv_transfer::model_kv_cache_size_bytes_target_physical(
                10, kimi, 1.0, 4) == 1'561'600,
            "Kimi TP4 target KV size must include MLA replication");
+    expect(kv_transfer::model_kv_cache_size_bytes_target_physical(
+               10, kimi, 1.0, 4, 4) == 390'400,
+           "Kimi TP4/DCP4 target KV size must contain one physical copy");
+    expect(kv_transfer::model_kv_cache_size_bytes_target_physical(
+               16, kimi, 1.0, 4, 2) == 1'249'280,
+           "Kimi TP4/DCP2 target KV size must contain two physical copies");
+    expect(kv_transfer::model_kv_cache_size_bytes_rank_local(
+               10, kimi, 1.0, 4, 0) == 117'120,
+           "Kimi TP4/DCP4 rank-local KV must contain only assigned tokens");
     expect(kv_transfer::model_kv_cache_size_bytes_one_copy(
                16, kimi, 1.0) == 624'640,
            "Kimi one-copy block size must remain rank-local");
@@ -485,15 +502,90 @@ void test_mla_kv_layout_splits_latent_and_rope() {
     expect(kv_transfer::model_kv_cache_size_bytes_target_physical(
                65'536, kimi, 1.0, 4) == 10'234'101'760ULL,
            "Kimi TP4 target 64Ki footprint must match the physical contract");
+    expect(kv_transfer::model_kv_cache_size_bytes_target_physical(
+               65'536, kimi, 1.0, 4, 2) == 5'117'050'880ULL,
+           "Kimi TP4/DCP2 target 64Ki footprint must keep two copies");
 
     frontier::config::KvCacheTransferConfig transfer_config{};
     transfer_config.network_bandwidth_gbps = 200.0;
     transfer_config.network_latency_ms = 0.5;
     transfer_config.kv_cache_dtype_size_bytes = 1.0;
     const auto predictor = kv_transfer::make_kv_cache_transfer_predictor(
-        transfer_config, 4);
-    expect(predictor->predict(16, kimi).size_bytes == 2'498'560,
+        transfer_config, 4, 4);
+    expect(predictor->predict(16, kimi).size_bytes == 624'640,
+           "PDD predictor must transfer one TP4/DCP4 MLA copy");
+    const auto replicated_predictor =
+        kv_transfer::make_kv_cache_transfer_predictor(transfer_config, 4);
+    expect(replicated_predictor->predict(16, kimi).size_bytes == 2'498'560,
            "PDD predictor must report target-physical MLA bytes");
+}
+
+void test_mla_dcp_shards_decode_context_work() {
+    analytical::DenseModel model{};
+    model.hidden_size = 7'168;
+    model.intermediate_size = 18'432;
+    model.num_query_heads = 64;
+    model.num_kv_heads = 64;
+    model.head_dim = 128;
+    model.tensor_parallel_size = 4;
+    model.gated_mlp = true;
+    model.fused_add_norm = true;
+    model.use_mla = true;
+    model.q_lora_rank = 1'536;
+    model.kv_lora_rank = 512;
+    model.qk_nope_head_dim = 128;
+    model.qk_rope_head_dim = 64;
+    model.qk_head_dim = 192;
+    model.v_head_dim = 128;
+
+    analytical::DenseBatch batch{};
+    batch.total_tokens = 1;
+    batch.decode_requests = {{1, 8'192}};
+    const auto replicated = analytical::predict_dense_layer(
+        analytical::DeviceCeilings::rubin(), analytical::AnalyticalConfig{},
+        model, batch, analytical::Precision::kFp16);
+    model.decode_context_parallel_size = 4;
+    const auto sharded = analytical::predict_dense_layer(
+        analytical::DeviceCeilings::rubin(), analytical::AnalyticalConfig{},
+        model, batch, analytical::Precision::kFp16);
+    expect_approximately_equal(
+        sharded.kv_cache_save_ms, replicated.kv_cache_save_ms,
+        "a single new token still has one critical-rank KV write");
+    expect(sharded.decode_attention_ms < replicated.decode_attention_ms,
+           "MLA DCP must reduce rank-local latent-cache read traffic");
+
+    analytical::DenseBatch decode_write_batch{};
+    decode_write_batch.total_tokens = 65'536;
+    decode_write_batch.decode_requests = {{65'536, 8'192}};
+    model.decode_context_parallel_size = 1;
+    const auto replicated_decode_write = analytical::predict_dense_layer(
+        analytical::DeviceCeilings::rubin(), analytical::AnalyticalConfig{},
+        model, decode_write_batch, analytical::Precision::kFp16);
+    model.decode_context_parallel_size = 4;
+    const auto sharded_decode_write = analytical::predict_dense_layer(
+        analytical::DeviceCeilings::rubin(), analytical::AnalyticalConfig{},
+        model, decode_write_batch, analytical::Precision::kFp16);
+    expect(sharded_decode_write.kv_cache_save_ms <
+               replicated_decode_write.kv_cache_save_ms,
+           "MLA DCP must shard persistent KV writes produced by decode");
+
+    analytical::DenseBatch prefill_batch{};
+    prefill_batch.total_tokens = 65'536;
+    prefill_batch.prefill_requests = {{65'536, 0}};
+    model.decode_context_parallel_size = 1;
+    const auto replicated_prefill = analytical::predict_dense_layer(
+        analytical::DeviceCeilings::rubin(), analytical::AnalyticalConfig{},
+        model, prefill_batch, analytical::Precision::kFp16);
+    model.decode_context_parallel_size = 4;
+    const auto sharded_prefill = analytical::predict_dense_layer(
+        analytical::DeviceCeilings::rubin(), analytical::AnalyticalConfig{},
+        model, prefill_batch, analytical::Precision::kFp16);
+    expect_approximately_equal(sharded_prefill.prefill_attention_ms,
+                               replicated_prefill.prefill_attention_ms,
+                               "MLA DCP prefill attention compute");
+    expect(sharded_prefill.kv_cache_save_ms <
+               replicated_prefill.kv_cache_save_ms,
+           "MLA DCP must shard persistent KV writes produced by prefill");
 }
 
 void test_mfa_models_shared_q_projection_path() {
@@ -800,6 +892,69 @@ void test_kimi_k2_uneven_pipeline_and_lm_head() {
            "only the final PP stage must execute the LM-head projection");
 }
 
+void test_kimi_k2_dcp_adds_decode_collectives() {
+    frontier::config::ParallelismConfig replicated_parallelism{};
+    replicated_parallelism.tensor_parallel_size = 4;
+    replicated_parallelism.data_parallel_size = 4;
+    replicated_parallelism.moe_tensor_parallel_size = 1;
+    replicated_parallelism.moe_expert_parallel_size = 16;
+    auto dcp_parallelism = replicated_parallelism;
+    dcp_parallelism.decode_context_parallel_size = 4;
+
+    frontier::config::AnalyticalExecutionModelConfig execution{};
+    execution.precision = "fp8";
+    const auto model_config =
+        frontier::config::load_model_config("moonshotai/Kimi-K2-Instruct");
+    const predictor::AnalyticalRooflineExecutionTimePredictor replicated{
+        execution, replicated_parallelism, model_config,
+        frontier::config::MoeRoutingConfig{}};
+    const predictor::AnalyticalRooflineExecutionTimePredictor dcp{
+        execution, dcp_parallelism, model_config,
+        frontier::config::MoeRoutingConfig{}};
+
+    std::vector<Request> requests;
+    requests.emplace_back([&]() {
+        WorkloadRequest value{};
+        value.request_id = RequestId{0};
+        value.session_start_at = SimTime::from_seconds(0.0);
+        value.num_prefill_tokens = 8'192;
+        value.num_decode_tokens = 2;
+        return value;
+    }());
+    const SimTime now = SimTime::from_seconds(0.0);
+    requests.front().on_arrival(now);
+    requests.front().on_admitted(now);
+    requests.front().advance_scheduler_frontier(8'192);
+    requests.front().on_batch_completion(
+        now, 8'192, frontier::ClusterType::kPrefill);
+    requests.front().advance_scheduler_frontier(1);
+    RequestBatchSnapshot snapshot{};
+    snapshot.request_id = RequestId{0};
+    snapshot.scheduled_tokens = 1;
+    snapshot.processed_tokens = 8'192;
+    snapshot.scheduler_frontier = 8'193;
+    const Batch batch{BatchId{0}, IterationId{0}, {snapshot}, now,
+                      Generation{0}};
+
+    const auto replicated_stage = replicated.predict_stage_execution_time(
+        batch, requests, frontier::StageId{0});
+    const auto dcp_stage = dcp.predict_stage_execution_time(
+        batch, requests, frontier::StageId{0});
+    expect(diagnostic_value(replicated_stage,
+                            "dcp_attention_communication_ms") == 0.0 &&
+               diagnostic_value(dcp_stage,
+                                "dcp_attention_communication_ms") > 0.0 &&
+               dcp_stage.execution_time.tp_communication_ms >
+                   replicated_stage.execution_time.tp_communication_ms,
+           "MLA DCP decode must add all-gather/reduce-scatter communication");
+    expect_approximately_equal(
+        diagnostic_value(dcp_stage,
+                         "kv_cache_rank_local_bytes_per_token_per_layer"),
+        diagnostic_value(dcp_stage, "kv_cache_bytes_per_token_per_layer") /
+            4.0,
+        "MLA DCP diagnostics must expose per-rank KV-cache bytes");
+}
+
 void test_kimi_k2_first_layer_scaled_prediction() {
     frontier::config::ParallelismConfig parallelism{};
     parallelism.tensor_parallel_size = 4;
@@ -952,6 +1107,8 @@ int main() {
                                     test_mla_uses_latent_cache_context_costs);
     failures += frontier::test::run("MLA KV layout splits latent and RoPE",
                                     test_mla_kv_layout_splits_latent_and_rope);
+    failures += frontier::test::run("MLA DCP shards decode context work",
+                                    test_mla_dcp_shards_decode_context_work);
     failures += frontier::test::run("MFA models shared-Q projection path",
                                     test_mfa_models_shared_q_projection_path);
     failures += frontier::test::run("batch model matches Python golden",
@@ -962,6 +1119,8 @@ int main() {
                                     test_kv_transfer_matches_python_golden);
     failures += frontier::test::run("Kimi K2 uneven pipeline and LM head",
                                     test_kimi_k2_uneven_pipeline_and_lm_head);
+    failures += frontier::test::run("Kimi K2 DCP decode collectives",
+                                    test_kimi_k2_dcp_adds_decode_collectives);
     failures += frontier::test::run("Kimi K2 first-layer-scaled prediction",
                                     test_kimi_k2_first_layer_scaled_prediction);
     failures +=

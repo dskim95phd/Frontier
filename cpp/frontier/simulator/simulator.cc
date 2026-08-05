@@ -2,12 +2,16 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cctype>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
+#include <variant>
 
 #include "frontier/events/event_dispatcher.h"
 #include "frontier/execution_time_predictor/execution_time_predictor_factory.h"
@@ -37,6 +41,12 @@ void validate_inputs(
         throw SimulationError(
             "system architecture has an incompatible runtime config");
     }
+    if (is_pdd && config.pdd()
+                          .clusters.prefill.parallelism
+                          .decode_context_parallel_size != 1) {
+        throw SimulationError(
+            "PDD PREFILL decode_context_parallel_size must be 1");
+    }
     for (std::size_t index = 0; index < workload.size(); ++index) {
         const request_generator::WorkloadRequest &request = workload[index];
         if (!request.request_id.valid() ||
@@ -58,14 +68,68 @@ void validate_inputs(
         const std::uint64_t cache_targets =
             is_pdd ? target_count(config.pdd().clusters.prefill)
                    : target_count(config.cluster());
+        const config::ClusterSchedulerType cache_scheduler_type =
+            is_pdd
+                ? config.cluster_scheduler.type_for_cluster(
+                      ClusterType::kPrefill)
+                : config.cluster_scheduler.type;
         if (cache_targets > 1 &&
-            config.cluster_scheduler.type !=
-                config::ClusterSchedulerType::kStickyRoundRobin) {
+            cache_scheduler_type !=
+                config::ClusterSchedulerType::kStickyRoundRobin &&
+            cache_scheduler_type !=
+                config::ClusterSchedulerType::kCacheAware) {
             throw SimulationError(
                 "multi-target session prefix caching requires "
-                "cluster_scheduler.type='sticky_round_robin'");
+                "a cache-affine PREFILL cluster scheduler "
+                "(cluster_scheduler.prefill_type='sticky_round_robin' or "
+                "'cache_aware')");
         }
     }
+}
+
+double kv_cache_dtype_size_bytes(const config::ClusterRuntimeConfig &runtime,
+                                 const config::SimulationConfig &config) {
+    if (config.system_architecture ==
+        config::SystemArchitecture::kPdDisaggregation) {
+        return config.pdd().kv_cache_transfer.kv_cache_dtype_size_bytes;
+    }
+    if (runtime.execution_model.type != config::ExecutionModelType::kAnalytical) {
+        // Fixed-latency configs do not carry a precision declaration.  The
+        // historical simulator contract uses BF16-sized KV by default.
+        return 2.0;
+    }
+    const std::string &precision =
+        runtime.execution_model.analytical.kv_cache_precision();
+    if (precision == "fp32") {
+        return 4.0;
+    }
+    if (precision == "fp16" || precision == "bf16") {
+        return 2.0;
+    }
+    if (precision == "fp8" || precision == "int8") {
+        return 1.0;
+    }
+    if (precision == "fp4" || precision == "int4") {
+        return 0.5;
+    }
+    throw SimulationError("unsupported KV-cache precision: " + precision);
+}
+
+std::optional<std::uint64_t>
+total_hbm_bytes_per_gpu(const config::ClusterRuntimeConfig &runtime) {
+    if (runtime.execution_model.type != config::ExecutionModelType::kAnalytical) {
+        return std::nullopt;
+    }
+    std::string device = runtime.execution_model.analytical.device;
+    std::transform(device.begin(), device.end(), device.begin(),
+                   [](unsigned char value) {
+                       return static_cast<char>(std::tolower(value));
+                   });
+    if (device.find("gb300") != std::string::npos) {
+        // NVIDIA GB300 nominal HBM capacity used by the experiment contract.
+        return 288'000'000'000ULL;
+    }
+    return std::nullopt;
 }
 
 std::vector<request_generator::WorkloadRequest> prepare_workload(
@@ -90,7 +154,8 @@ Simulator::Simulator(
         kv_cache_transfer_predictor_ =
             kv_cache_transfer::make_kv_cache_transfer_predictor(
                 config_.pdd().kv_cache_transfer,
-                clusters.prefill.parallelism.tensor_parallel_size);
+                clusters.decode.parallelism.tensor_parallel_size,
+                clusters.decode.parallelism.decode_context_parallel_size);
         clusters_.emplace(
             ClusterType::kPrefill,
             entities::Cluster{ClusterType::kPrefill, clusters.prefill});
@@ -193,6 +258,57 @@ void Simulator::enqueue_request_arrival(RequestId request_id,
             is_pdd ? ClusterType::kPrefill : ClusterType::kMonolithic;
         return value;
     }());
+}
+
+void Simulator::record_gpu_kv_occupancy_for_event(const Event &event) {
+    const auto sample = [&](ClusterType cluster_type, ReplicaId replica_id,
+                            DataParallelId dp_id) {
+        const auto &cluster_scheduler = cluster(cluster_type);
+        const scheduler::BaseReplicaScheduler &replica_scheduler =
+            cluster_scheduler.get_replica_scheduler(replica_id, dp_id);
+        const config::ClusterRuntimeConfig &runtime =
+            runtime_config(cluster_type);
+        const std::uint64_t bytes_per_block =
+            kv_cache_transfer::model_kv_cache_size_bytes_rank_local(
+                runtime.scheduler.block_size, runtime.model,
+                kv_cache_dtype_size_bytes(runtime, config_),
+                runtime.parallelism.decode_context_parallel_size);
+        metrics_.record_gpu_kv_cache_occupancy(
+            event.time, replica_scheduler, bytes_per_block,
+            total_hbm_bytes_per_gpu(runtime));
+    };
+
+    std::visit(
+        [&](const auto &payload) {
+            using Payload =
+                std::remove_cv_t<std::remove_reference_t<decltype(payload)>>;
+            if constexpr (std::is_same_v<Payload, ReplicaSchedulePayload> ||
+                          std::is_same_v<Payload, ClusterBatchEndPayload> ||
+                          std::is_same_v<Payload, GlobalBatchEndPayload>) {
+                sample(payload.cluster_type, payload.replica_id,
+                       payload.dp_id);
+            } else if constexpr (std::is_same_v<Payload,
+                                                KVCacheTransferEndPayload>) {
+                // The event payload addresses the decode target.  Source KV
+                // is released during dispatch, so sample its actual retained
+                // PREFILL owner from the transfer record.
+                const entities::KVCacheTransferInfo &transfer =
+                    kv_cache_transfer(payload.transfer_id);
+                sample(ClusterType::kPrefill,
+                       transfer.source_replica_id(),
+                       transfer.source_dp_id());
+            } else if constexpr (
+                std::is_same_v<Payload, CpuKVCacheOffloadEndPayload> ||
+                std::is_same_v<Payload, CpuKVCacheRestoreEndPayload>) {
+                // Offload completion can release the PREFILL source
+                // allocation without scheduling another event on an otherwise
+                // idle target.  Restore completion is sampled as well so the
+                // same-time restore/schedule transition remains explicit.
+                sample(payload.cluster_type, payload.replica_id,
+                       payload.dp_id);
+            }
+        },
+        event.payload);
 }
 
 scheduler::BaseClusterScheduler &Simulator::cluster(ClusterType cluster_type) {
@@ -452,6 +568,16 @@ void Simulator::finalize() {
                 throw std::runtime_error(
                     "simulation quiesced with non-idle replica target");
             }
+            const config::ClusterRuntimeConfig &runtime =
+                cluster_entity.runtime_config();
+            const std::uint64_t bytes_per_block =
+                kv_cache_transfer::model_kv_cache_size_bytes_rank_local(
+                    runtime.scheduler.block_size, runtime.model,
+                    kv_cache_dtype_size_bytes(runtime, config_),
+                    runtime.parallelism.decode_context_parallel_size);
+            metrics_.record_gpu_kv_cache_occupancy(
+                last_event_time_, replica_scheduler, bytes_per_block,
+                total_hbm_bytes_per_gpu(runtime), true);
             if (config_.prefix_cache.enabled &&
                 cluster_type != ClusterType::kDecode) {
                 metrics_.record_prefix_cache_target(
@@ -548,10 +674,36 @@ metrics::SimulationOutput Simulator::run() {
     const events::EventDispatcher dispatcher;
     while (!event_queue_.empty()) {
         Event event = event_queue_.pop();
+        last_event_time_ = event.time;
         metrics_.record_event(event);
         dispatcher.dispatch(event, *this);
+        // Scheduler mutations (admission, preemption, completion, and PDD
+        // transfer release) are visible only after dispatch.  Sampling here
+        // keeps the occupancy stream event-driven and coalesces same-time
+        // transitions in MetricsStore.
+        record_gpu_kv_occupancy_for_event(event);
     }
     finalize();
+    return take_output();
+}
+
+metrics::SimulationOutput Simulator::run_until(SimTime end_time) {
+    if (!end_time.valid() || end_time.seconds() <= 0.0) {
+        throw SimulationError("simulation end time must be finite and positive");
+    }
+    const events::EventDispatcher dispatcher;
+    while (!event_queue_.empty() && event_queue_.top().time <= end_time) {
+        Event event = event_queue_.pop();
+        last_event_time_ = event.time;
+        metrics_.record_event(event);
+        dispatcher.dispatch(event, *this);
+        record_gpu_kv_occupancy_for_event(event);
+    }
+    // A bounded experiment intentionally leaves future session turns and
+    // possibly in-flight requests outside the observation horizon.  Export
+    // only requests that reached canonical completion; do not run quiescence
+    // validation or emit terminal cache diagnostics for this partial state.
+    metrics_.collect_completed_requests(config_, entities_);
     return take_output();
 }
 

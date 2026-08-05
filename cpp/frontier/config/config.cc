@@ -58,6 +58,12 @@ std::string_view to_string(ClusterSchedulerType type) noexcept {
         return "round_robin";
     case ClusterSchedulerType::kStickyRoundRobin:
         return "sticky_round_robin";
+    case ClusterSchedulerType::kVllmQueueAware:
+        return "vllm_queue_aware";
+    case ClusterSchedulerType::kKvAware:
+        return "kv_aware";
+    case ClusterSchedulerType::kCacheAware:
+        return "cache_aware";
     }
     return "unknown";
 }
@@ -147,6 +153,10 @@ resolve_cpu_kv_cache_target(const SimulationConfig &config) {
         throw ConfigError("CPU KV cache requires sequential PDD");
     }
     const auto &prefill = config.pdd().clusters.prefill;
+    if (prefill.parallelism.decode_context_parallel_size != 1) {
+        throw ConfigError(
+            "PDD PREFILL decode_context_parallel_size must be 1");
+    }
     const auto &cpu = config.cpu_kv_cache;
     result.capacity_pressure_policy = cpu.capacity_pressure_policy;
     if (prefill.parallelism.tensor_parallel_size >
@@ -186,7 +196,8 @@ resolve_cpu_kv_cache_target(const SimulationConfig &config) {
             kv_cache_transfer::model_kv_cache_size_bytes_target_physical(
                 prefill.scheduler.block_size, prefill.model,
                 config.pdd().kv_cache_transfer.kv_cache_dtype_size_bytes,
-                prefill.parallelism.tensor_parallel_size);
+                prefill.parallelism.tensor_parallel_size,
+                prefill.parallelism.decode_context_parallel_size);
     } catch (const kv_cache_transfer::TransferModelError &error) {
         throw ConfigError(std::string{"invalid CPU KV cache block layout: "} +
                           error.what());

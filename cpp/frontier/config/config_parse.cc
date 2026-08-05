@@ -237,8 +237,19 @@ ClusterSchedulerType parse_cluster_scheduler_type(std::string_view value) {
     if (value == "sticky_round_robin") {
         return ClusterSchedulerType::kStickyRoundRobin;
     }
-    throw ConfigError("config.cluster_scheduler.type must be 'round_robin' or "
-                      "'sticky_round_robin', got '" +
+    if (value == "vllm_queue_aware") {
+        return ClusterSchedulerType::kVllmQueueAware;
+    }
+    if (value == "kv_aware") {
+        return ClusterSchedulerType::kKvAware;
+    }
+    if (value == "cache_aware") {
+        return ClusterSchedulerType::kCacheAware;
+    }
+    throw ConfigError(
+        "config.cluster_scheduler.type must be 'round_robin', "
+        "'sticky_round_robin', 'vllm_queue_aware', 'kv_aware', or "
+        "'cache_aware', got '" +
                       std::string{value} + "'");
 }
 
@@ -510,22 +521,27 @@ SchedulerConfig parse_scheduler(const Json &root) {
 ParallelismConfig parse_parallelism(const Json &root,
                                     const ModelConfig &model) {
     const Json &parallelism = root.at("parallelism");
-    require_exact_keys(parallelism,
-                       {
-                           "num_replicas",
-                           "tensor_parallel_size",
-                           "pipeline_parallel_size",
-                           "data_parallel_size",
-                           "moe_tensor_parallel_size",
-                           "moe_expert_parallel_size",
-                       },
-                       "config.parallelism");
+    require_keys(parallelism,
+                 {
+                     "num_replicas",
+                     "tensor_parallel_size",
+                     "pipeline_parallel_size",
+                     "data_parallel_size",
+                     "moe_tensor_parallel_size",
+                     "moe_expert_parallel_size",
+                 },
+                 {"decode_context_parallel_size"}, "config.parallelism");
     ParallelismConfig parsed = [&]() {
         ParallelismConfig value{};
         value.num_replicas =
             require_uint64(parallelism, "num_replicas", "config.parallelism");
         value.tensor_parallel_size = require_uint64(
             parallelism, "tensor_parallel_size", "config.parallelism");
+        if (parallelism.contains("decode_context_parallel_size")) {
+            value.decode_context_parallel_size = require_uint64(
+                parallelism, "decode_context_parallel_size",
+                "config.parallelism");
+        }
         value.pipeline_parallel_size = require_uint64(
             parallelism, "pipeline_parallel_size", "config.parallelism");
         value.data_parallel_size = require_uint64(
@@ -537,6 +553,7 @@ ParallelismConfig parse_parallelism(const Json &root,
         return value;
     }();
     if (parsed.num_replicas == 0 || parsed.tensor_parallel_size == 0 ||
+        parsed.decode_context_parallel_size == 0 ||
         parsed.pipeline_parallel_size == 0 || parsed.data_parallel_size == 0 ||
         parsed.moe_tensor_parallel_size == 0 ||
         parsed.moe_expert_parallel_size == 0) {
@@ -546,6 +563,18 @@ ParallelismConfig parse_parallelism(const Json &root,
         parsed.tensor_parallel_size != 4 && parsed.tensor_parallel_size != 8) {
         throw ConfigError("config.parallelism.tensor_parallel_size must be one "
                           "of 1, 2, 4, 8");
+    }
+    if (parsed.tensor_parallel_size %
+            parsed.decode_context_parallel_size !=
+        0) {
+        throw ConfigError(
+            "config.parallelism.tensor_parallel_size must be divisible by "
+            "decode_context_parallel_size");
+    }
+    if (parsed.decode_context_parallel_size > 1 && !model.use_mla) {
+        throw ConfigError(
+            "config.parallelism.decode_context_parallel_size > 1 is "
+            "currently supported only for MLA models");
     }
     if (parsed.pipeline_parallel_size > model.num_layers) {
         throw ConfigError("config.parallelism.pipeline_parallel_size must not "
@@ -598,11 +627,48 @@ ParallelismConfig parse_parallelism(const Json &root,
 
 ClusterSchedulerConfig parse_cluster_scheduler(const Json &root) {
     const Json &scheduler = root.at("cluster_scheduler");
-    require_exact_keys(scheduler, {"type"}, "config.cluster_scheduler");
+    require_keys(scheduler, {"type"},
+                 {"prefill_type", "decode_type", "cache_threshold",
+                  "balance_abs_threshold", "balance_rel_threshold"},
+                 "config.cluster_scheduler");
     return [&]() {
         ClusterSchedulerConfig value{};
         value.type = parse_cluster_scheduler_type(
             require_string(scheduler, "type", "config.cluster_scheduler"));
+        if (scheduler.contains("prefill_type")) {
+            value.prefill_type = parse_cluster_scheduler_type(require_string(
+                scheduler, "prefill_type", "config.cluster_scheduler"));
+        }
+        if (scheduler.contains("decode_type")) {
+            value.decode_type = parse_cluster_scheduler_type(require_string(
+                scheduler, "decode_type", "config.cluster_scheduler"));
+        }
+        if (scheduler.contains("cache_threshold")) {
+            value.cache_threshold = require_finite_number(
+                scheduler, "cache_threshold", "config.cluster_scheduler");
+        }
+        if (scheduler.contains("balance_abs_threshold")) {
+            value.balance_abs_threshold = require_uint64(
+                scheduler, "balance_abs_threshold",
+                "config.cluster_scheduler");
+        }
+        if (scheduler.contains("balance_rel_threshold")) {
+            value.balance_rel_threshold = require_finite_number(
+                scheduler, "balance_rel_threshold",
+                "config.cluster_scheduler");
+        }
+        if (!std::isfinite(value.cache_threshold) ||
+            value.cache_threshold < 0.0 || value.cache_threshold > 1.0) {
+            throw ConfigError(
+                "config.cluster_scheduler.cache_threshold must be finite "
+                "and in [0, 1]");
+        }
+        if (!std::isfinite(value.balance_rel_threshold) ||
+            value.balance_rel_threshold < 1.0) {
+            throw ConfigError(
+                "config.cluster_scheduler.balance_rel_threshold must be "
+                "finite and >= 1");
+        }
         return value;
     }();
 }
@@ -911,6 +977,12 @@ PddClustersConfig parse_pdd_clusters(const Json &root) {
         value.decode = parse_cluster_runtime(clusters, "decode");
         return value;
     }();
+    if (parsed.prefill.parallelism.decode_context_parallel_size != 1) {
+        throw ConfigError(
+            "config.clusters.prefill.parallelism."
+            "decode_context_parallel_size must be 1 for "
+            "pd-disaggregation");
+    }
     if (parsed.prefill.model != parsed.decode.model) {
         throw ConfigError(
             "PDD PREFILL and DECODE must use the same model and expert "
@@ -1070,10 +1142,15 @@ SimulationConfig make_pdd_config(const Json &root, CommonConfigFields common) {
                 throw ConfigError(
                     "CPU KV cache requires prefix_cache.enabled=true");
             }
-            if (value.cluster_scheduler.type !=
-                ClusterSchedulerType::kStickyRoundRobin) {
+            const ClusterSchedulerType prefill_scheduler =
+                value.cluster_scheduler.type_for_cluster(
+                    ClusterType::kPrefill);
+            if (prefill_scheduler !=
+                    ClusterSchedulerType::kStickyRoundRobin &&
+                prefill_scheduler != ClusterSchedulerType::kCacheAware) {
                 throw ConfigError("CPU KV cache requires "
-                                  "cluster_scheduler.type='sticky_round_robin'");
+                                  "PREFILL cluster scheduler to be "
+                                  "'sticky_round_robin' or 'cache_aware'");
             }
             static_cast<void>(resolve_cpu_kv_cache_target(value));
         }

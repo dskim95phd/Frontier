@@ -102,6 +102,7 @@ class TopologyConfig:
     prefill_pipeline_parallel_size: int | None = None
     prefill_data_parallel_size: int | None = None
     prefill_num_replicas: int | None = None
+    decode_context_parallel_size: int = 1
     moe_tensor_parallel_size: int = 1
     moe_expert_parallel_size: int = 1
     prefill_moe_tensor_parallel_size: int | None = None
@@ -139,6 +140,11 @@ class TopologyConfig:
             or self.moe_expert_parallel_size,
         )
 
+    def dcp_size(self, *, decode: bool) -> int:
+        if self.system_architecture == "pd-disaggregation" and not decode:
+            return 1
+        return self.decode_context_parallel_size
+
     @property
     def gpu_count_per_cluster(self) -> int:
         return math.prod(self.parallelism(decode=True))
@@ -165,8 +171,10 @@ class TopologyConfig:
             # elements per token and layer. Account for the largest PP stage.
             _, _, pipeline_parallel, _ = self.parallelism(decode=True)
             layers_per_stage = math.ceil(61 / pipeline_parallel)
-            return round(
-                layers_per_stage * (512 * dtype_size_bytes + 64 * 2.0)
+            return math.ceil(
+                layers_per_stage
+                * (512 * dtype_size_bytes + 64 * 2.0)
+                / self.dcp_size(decode=True)
             )
         # Llama-2-7B: 32 layers, 32 KV heads, head_dim 128, K+V.
         byte_count = (
@@ -227,6 +235,7 @@ TOPOLOGIES = {
         prefill_pipeline_parallel_size=4,
         prefill_data_parallel_size=1,
         prefill_num_replicas=4,
+        decode_context_parallel_size=4,
         prefill_moe_tensor_parallel_size=1,
         prefill_moe_expert_parallel_size=4,
         model_name="moonshotai/Kimi-K2-Instruct",
@@ -423,6 +432,9 @@ def write_config(
             {
                 "num_replicas": replicas,
                 "tensor_parallel_size": tensor_parallel,
+                "decode_context_parallel_size": topology.dcp_size(
+                    decode=decode
+                ),
                 "pipeline_parallel_size": pipeline_parallel,
                 "data_parallel_size": data_parallel,
                 "moe_tensor_parallel_size": moe_tensor_parallel,
@@ -1332,6 +1344,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             "prefill_num_replicas": topology.parallelism(decode=False)[0],
             "decode_num_replicas": topology.parallelism(decode=True)[0],
             "tensor_parallel_size": topology.tensor_parallel_size,
+            "decode_context_parallel_size": (
+                topology.decode_context_parallel_size
+            ),
+            "prefill_decode_context_parallel_size": topology.dcp_size(
+                decode=False
+            ),
             "pipeline_parallel_size": topology.pipeline_parallel_size,
             "data_parallel_size": topology.data_parallel_size,
             "gpu_count_per_cluster": topology.gpu_count_per_cluster,

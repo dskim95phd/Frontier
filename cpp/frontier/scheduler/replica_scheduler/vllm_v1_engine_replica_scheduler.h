@@ -100,6 +100,13 @@ class VllmV1Scheduler final : public BaseReplicaScheduler {
     [[nodiscard]] std::uint64_t allocated_kv_blocks() const noexcept override {
         return kv_blocks_.total_allocated_blocks();
     }
+    [[nodiscard]] std::uint64_t available_kv_blocks() const noexcept override {
+        return kv_blocks_.available_blocks();
+    }
+    [[nodiscard]] std::uint64_t kv_block_size() const noexcept override {
+        return kv_blocks_.block_size();
+    }
+    [[nodiscard]] std::uint64_t queued_kv_blocks() const noexcept override;
     [[nodiscard]] const std::deque<RequestId> &waiting_queue() const noexcept {
         return waiting_;
     }

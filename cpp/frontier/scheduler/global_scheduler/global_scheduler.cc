@@ -3,7 +3,10 @@
 #include <utility>
 
 #include "frontier/scheduler/cluster_scheduler/round_robin_cluster_scheduler.h"
+#include "frontier/scheduler/cluster_scheduler/actual_cache_aware_cluster_scheduler.h"
 #include "frontier/scheduler/cluster_scheduler/sticky_round_robin_cluster_scheduler.h"
+#include "frontier/scheduler/cluster_scheduler/vllm_queue_aware_cluster_scheduler.h"
+#include "frontier/scheduler/cluster_scheduler/kv_aware_cluster_scheduler.h"
 
 namespace frontier::scheduler {
 
@@ -28,7 +31,9 @@ GlobalScheduler::GlobalScheduler(
                 "global scheduler is missing a cluster predictor");
         }
         std::unique_ptr<BaseClusterScheduler> cluster_scheduler;
-        switch (scheduler_config.type) {
+        const config::ClusterSchedulerType scheduler_type =
+            scheduler_config.type_for_cluster(cluster_type);
+        switch (scheduler_type) {
         case config::ClusterSchedulerType::kRoundRobin:
             cluster_scheduler = std::make_unique<RoundRobinClusterScheduler>(
                 cluster, requests, predictor->second,
@@ -41,6 +46,26 @@ GlobalScheduler::GlobalScheduler(
                     cluster, requests, predictor->second,
                     kv_cache_transfer_predictor_, prefix_cache_config,
                     cpu_kv_cache_config);
+            break;
+        case config::ClusterSchedulerType::kVllmQueueAware:
+            cluster_scheduler =
+                std::make_unique<VllmQueueAwareClusterScheduler>(
+                    cluster, requests, predictor->second,
+                    kv_cache_transfer_predictor_, prefix_cache_config,
+                    cpu_kv_cache_config);
+            break;
+        case config::ClusterSchedulerType::kKvAware:
+            cluster_scheduler = std::make_unique<KvAwareClusterScheduler>(
+                cluster, requests, predictor->second,
+                kv_cache_transfer_predictor_, prefix_cache_config,
+                cpu_kv_cache_config);
+            break;
+        case config::ClusterSchedulerType::kCacheAware:
+            cluster_scheduler =
+                std::make_unique<CacheAwareClusterScheduler>(
+                    cluster, requests, predictor->second,
+                    kv_cache_transfer_predictor_, prefix_cache_config,
+                    cpu_kv_cache_config, scheduler_config);
             break;
         }
         if (cluster_scheduler == nullptr ||

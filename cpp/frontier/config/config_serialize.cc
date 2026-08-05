@@ -81,6 +81,10 @@ OrderedJson serialize_parallelism(const ParallelismConfig &parallelism) {
     return OrderedJson::object({
         {"num_replicas", parallelism.num_replicas},
         {"tensor_parallel_size", parallelism.tensor_parallel_size},
+        {
+            "decode_context_parallel_size",
+            parallelism.decode_context_parallel_size,
+        },
         {"pipeline_parallel_size", parallelism.pipeline_parallel_size},
         {"data_parallel_size", parallelism.data_parallel_size},
         {
@@ -104,9 +108,19 @@ OrderedJson serialize_moe_routing(const MoeRoutingConfig &routing) {
 
 OrderedJson
 serialize_cluster_scheduler(const ClusterSchedulerConfig &scheduler) {
-    return OrderedJson::object({
+    OrderedJson result = OrderedJson::object({
         {"type", to_string(scheduler.type)},
+        {"cache_threshold", scheduler.cache_threshold},
+        {"balance_abs_threshold", scheduler.balance_abs_threshold},
+        {"balance_rel_threshold", scheduler.balance_rel_threshold},
     });
+    if (scheduler.prefill_type.has_value()) {
+        result["prefill_type"] = to_string(*scheduler.prefill_type);
+    }
+    if (scheduler.decode_type.has_value()) {
+        result["decode_type"] = to_string(*scheduler.decode_type);
+    }
+    return result;
 }
 
 OrderedJson serialize_execution_model(const ExecutionModelConfig &execution) {

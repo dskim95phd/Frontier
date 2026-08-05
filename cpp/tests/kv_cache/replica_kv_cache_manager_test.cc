@@ -149,6 +149,34 @@ void test_active_session_is_not_shareable() {
     static_cast<void>(cache.free(first.id()));
 }
 
+void test_explicit_session_discard_is_immediate_or_deferred() {
+    ReplicaKVCacheManager cache = manager(8);
+    Request resident = make_request(0, 8, 1, 21);
+    admit_and_complete(cache, resident, 0.0);
+    expect(cache.discard_session(SessionId{21}) == 2 &&
+               cache.gpu_cache_valid_prefix_blocks(SessionId{21}) == 0 &&
+               cache.diagnostics().resident_blocks == 0,
+           "inactive session migration must immediately discard all GPU KV");
+
+    Request active = make_request(1, 8, 1, 22);
+    active.on_arrival(active.arrived_at());
+    cache.admit(active.id(), active.session_id(), 0, 8);
+    active.restore_prefix_cache_lookup(2, 0, 0);
+    active.on_admitted(SimTime::from_seconds(0.01));
+    active.advance_scheduler_frontier(8);
+    active.on_batch_completion(SimTime::from_seconds(0.011), 8);
+    cache.mark_blocks_computed(active);
+    expect(cache.discard_session(SessionId{22}) == 0 &&
+               cache.gpu_cache_valid_prefix_blocks(SessionId{22}) == 2,
+           "active session migration must defer deletion until release");
+    static_cast<void>(cache.free(active.id()));
+    expect(cache.gpu_cache_valid_prefix_blocks(SessionId{22}) == 0 &&
+               cache.diagnostics().resident_blocks == 0 &&
+               cache.stats().evicted_blocks == 4 &&
+               cache.stats().evicted_sessions == 2,
+           "deferred migration deletion must run atomically at release");
+}
+
 void test_partial_prefill_preemption_reuses_resident_range() {
     ReplicaKVCacheManager cache = manager(4);
     Request request = make_request(0, 10, 2, 11);
@@ -249,6 +277,9 @@ int main() {
                             test_all_hit_recompute_reuses_one_logical_slot);
     failures += frontier::test::run("active session is not shareable",
                                     test_active_session_is_not_shareable);
+    failures += frontier::test::run(
+        "explicit session discard is immediate or deferred",
+        test_explicit_session_discard_is_immediate_or_deferred);
     failures += frontier::test::run(
         "partial prefill reuses analytical resident range",
         test_partial_prefill_preemption_reuses_resident_range);

@@ -176,6 +176,59 @@ bool VllmV1Scheduler::contains_request(RequestId request_id) const {
            staged_cpu_restores_.find(request_id) != staged_cpu_restores_.end();
 }
 
+std::uint64_t VllmV1Scheduler::queued_kv_blocks() const noexcept {
+    // Do not use the request's declared future decode length here.  Routing
+    // can only observe the current scheduler frontier of queued requests.
+    // This keeps placement stable for online arrivals whose eventual output
+    // length is not known to the serving scheduler.
+    const std::uint64_t block_size = kv_blocks_.block_size();
+    if (block_size == 0 || requests_ == nullptr) {
+        return std::numeric_limits<std::uint64_t>::max();
+    }
+
+    std::uint64_t total = 0;
+    const auto add = [&](RequestId request_id) {
+        if (!request_id.valid() || request_id.index() >= requests_->size()) {
+            total = std::numeric_limits<std::uint64_t>::max();
+            return;
+        }
+        try {
+            const entities::Request &value = requests_->at(request_id.index());
+            const std::uint64_t tokens = kv_accounted_tokens(value);
+            std::uint64_t blocks = tokens / block_size;
+            if (tokens % block_size != 0) {
+                if (blocks == std::numeric_limits<std::uint64_t>::max()) {
+                    total = std::numeric_limits<std::uint64_t>::max();
+                    return;
+                }
+                ++blocks;
+            }
+            if (blocks > std::numeric_limits<std::uint64_t>::max() - total) {
+                total = std::numeric_limits<std::uint64_t>::max();
+            } else {
+                total += blocks;
+            }
+        } catch (...) {
+            // Scheduler state is validated at lifecycle boundaries.  If a
+            // caller observes a malformed request while routing, treat it as
+            // maximally loaded rather than allowing a noexcept telemetry
+            // accessor to terminate the process.
+            total = std::numeric_limits<std::uint64_t>::max();
+        }
+    };
+    for (const RequestId request_id : preempted_) {
+        add(request_id);
+    }
+    for (const RequestId request_id : waiting_) {
+        add(request_id);
+    }
+    for (const auto &[request_id, unused] : pending_cpu_restores_) {
+        static_cast<void>(unused);
+        add(request_id);
+    }
+    return total;
+}
+
 std::uint64_t
 VllmV1Scheduler::next_num_tokens(const entities::Request &value) const {
     if (value.completed()) {

@@ -32,13 +32,45 @@ BASE_CONFIG_PATH = HERE / "configs" / "base_pdd.json"
 
 BLOCK_SIZE = 16
 ONE_COPY_BYTES_PER_TOKEN = 39_040
-TARGET_PHYSICAL_BYTES_PER_TOKEN = 156_160
-ONE_COPY_BYTES_PER_BLOCK = ONE_COPY_BYTES_PER_TOKEN * BLOCK_SIZE
-TARGET_PHYSICAL_BYTES_PER_BLOCK = TARGET_PHYSICAL_BYTES_PER_TOKEN * BLOCK_SIZE
-GPU_KV_BUDGET_BYTES = 190_000_000_000
-GPU_KV_BLOCKS = GPU_KV_BUDGET_BYTES // ONE_COPY_BYTES_PER_BLOCK
-GPU_KV_TOKENS = GPU_KV_BLOCKS * BLOCK_SIZE
 ATTENTION_TP = 4
+PREFILL_CONTEXT_PARALLEL_SIZE = 1
+DECODE_CONTEXT_PARALLEL_SIZE = 4
+PREFILL_RANK_LOCAL_BYTES_PER_TOKEN = ONE_COPY_BYTES_PER_TOKEN
+DECODE_RANK_LOCAL_BYTES_PER_TOKEN = math.ceil(
+    ONE_COPY_BYTES_PER_TOKEN / DECODE_CONTEXT_PARALLEL_SIZE
+)
+PREFILL_TARGET_PHYSICAL_BYTES_PER_TOKEN = (
+    ONE_COPY_BYTES_PER_TOKEN
+    * ATTENTION_TP
+    // PREFILL_CONTEXT_PARALLEL_SIZE
+)
+DECODE_TARGET_PHYSICAL_BYTES_PER_TOKEN = (
+    ONE_COPY_BYTES_PER_TOKEN
+    * ATTENTION_TP
+    // DECODE_CONTEXT_PARALLEL_SIZE
+)
+ONE_COPY_BYTES_PER_BLOCK = ONE_COPY_BYTES_PER_TOKEN * BLOCK_SIZE
+PREFILL_RANK_LOCAL_BYTES_PER_BLOCK = (
+    PREFILL_RANK_LOCAL_BYTES_PER_TOKEN * BLOCK_SIZE
+)
+DECODE_RANK_LOCAL_BYTES_PER_BLOCK = (
+    DECODE_RANK_LOCAL_BYTES_PER_TOKEN * BLOCK_SIZE
+)
+PREFILL_TARGET_PHYSICAL_BYTES_PER_BLOCK = (
+    PREFILL_TARGET_PHYSICAL_BYTES_PER_TOKEN * BLOCK_SIZE
+)
+DECODE_TARGET_PHYSICAL_BYTES_PER_BLOCK = (
+    DECODE_TARGET_PHYSICAL_BYTES_PER_TOKEN * BLOCK_SIZE
+)
+GPU_KV_BUDGET_BYTES = 190_000_000_000
+PREFILL_GPU_KV_BLOCKS = (
+    GPU_KV_BUDGET_BYTES // PREFILL_RANK_LOCAL_BYTES_PER_BLOCK
+)
+DECODE_GPU_KV_BLOCKS = (
+    GPU_KV_BUDGET_BYTES // DECODE_RANK_LOCAL_BYTES_PER_BLOCK
+)
+PREFILL_GPU_KV_TOKENS = PREFILL_GPU_KV_BLOCKS * BLOCK_SIZE
+DECODE_GPU_KV_TOKENS = DECODE_GPU_KV_BLOCKS * BLOCK_SIZE
 PREFILL_DP = 4
 CPU_SLICES_PER_TARGET = ATTENTION_TP  # TP4 * PP1
 DECIMAL_GB = 1_000_000_000
@@ -138,10 +170,14 @@ def estimate_oracle_capacity_bytes(manifest_csv: Path | None) -> int:
             snapshots[session_id] = max(snapshots.get(session_id, 0), int(row["final_context_tokens"]))
     if not snapshots:
         return 10_000 * DECIMAL_GB
-    target = sum(math.ceil(tokens / BLOCK_SIZE) * TARGET_PHYSICAL_BYTES_PER_BLOCK for tokens in snapshots.values())
+    target = sum(
+        math.ceil(tokens / BLOCK_SIZE)
+        * PREFILL_TARGET_PHYSICAL_BYTES_PER_BLOCK
+        for tokens in snapshots.values()
+    )
     # Add one block per session to make the no-eviction oracle insensitive to
     # block-frontier timing.
-    target += len(snapshots) * TARGET_PHYSICAL_BYTES_PER_BLOCK
+    target += len(snapshots) * PREFILL_TARGET_PHYSICAL_BYTES_PER_BLOCK
     return max(target, 10_000 * DECIMAL_GB)
 
 
@@ -199,6 +235,11 @@ def _cluster_config(*, decode: bool) -> dict[str, object]:
         "parallelism": {
             "num_replicas": 1,
             "tensor_parallel_size": 4,
+            "decode_context_parallel_size": (
+                DECODE_CONTEXT_PARALLEL_SIZE
+                if decode
+                else PREFILL_CONTEXT_PARALLEL_SIZE
+            ),
             "pipeline_parallel_size": 1,
             "data_parallel_size": 4,
             "moe_tensor_parallel_size": 1,
@@ -213,7 +254,9 @@ def _cluster_config(*, decode: bool) -> dict[str, object]:
             "enable_chunked_prefill": not decode,
             "long_prefill_token_threshold": 0,
             "block_size": BLOCK_SIZE,
-            "num_blocks": GPU_KV_BLOCKS,
+            "num_blocks": (
+                DECODE_GPU_KV_BLOCKS if decode else PREFILL_GPU_KV_BLOCKS
+            ),
             "watermark_blocks_fraction": 0.0,
             "num_preallocate_tokens": 0,
         },
@@ -271,7 +314,14 @@ def build_config(
     config["system_architecture"] = "pd-disaggregation"
     config["enable_parallel_clusters"] = False
     config["prefix_cache"] = {"enabled": True, "key_mode": "session"}
-    config["cluster_scheduler"] = {"type": "sticky_round_robin"}
+    config["cluster_scheduler"] = {
+        "type": "sticky_round_robin",
+        "prefill_type": "cache_aware",
+        "decode_type": "vllm_queue_aware",
+        "cache_threshold": 0.5,
+        "balance_abs_threshold": 32,
+        "balance_rel_threshold": 1.1,
+    }
     config["clusters"] = {"prefill": _cluster_config(decode=False), "decode": _cluster_config(decode=True)}
     if capacity.oracle:
         target_bytes = oracle_target_capacity_bytes
@@ -456,6 +506,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             "prefill_gpus": 16,
             "decode_gpus": 16,
             "attention_tensor_parallel": 4,
+            "prefill_context_parallel": PREFILL_CONTEXT_PARALLEL_SIZE,
+            "decode_context_parallel": DECODE_CONTEXT_PARALLEL_SIZE,
             "pipeline_parallel": 1,
             "data_parallel": 4,
             "moe_tensor_parallel": 1,
@@ -467,12 +519,36 @@ def main(argv: Sequence[str] | None = None) -> int:
         },
         "kv_contract": {
             "one_copy_bytes_per_token": ONE_COPY_BYTES_PER_TOKEN,
-            "target_physical_bytes_per_token": TARGET_PHYSICAL_BYTES_PER_TOKEN,
+            "prefill_rank_local_bytes_per_token": (
+                PREFILL_RANK_LOCAL_BYTES_PER_TOKEN
+            ),
+            "decode_rank_local_bytes_per_token": (
+                DECODE_RANK_LOCAL_BYTES_PER_TOKEN
+            ),
+            "prefill_target_physical_bytes_per_token": (
+                PREFILL_TARGET_PHYSICAL_BYTES_PER_TOKEN
+            ),
+            "decode_target_physical_bytes_per_token": (
+                DECODE_TARGET_PHYSICAL_BYTES_PER_TOKEN
+            ),
             "one_copy_bytes_per_block": ONE_COPY_BYTES_PER_BLOCK,
-            "target_physical_bytes_per_block": TARGET_PHYSICAL_BYTES_PER_BLOCK,
+            "prefill_rank_local_bytes_per_block": (
+                PREFILL_RANK_LOCAL_BYTES_PER_BLOCK
+            ),
+            "decode_rank_local_bytes_per_block": (
+                DECODE_RANK_LOCAL_BYTES_PER_BLOCK
+            ),
+            "prefill_target_physical_bytes_per_block": (
+                PREFILL_TARGET_PHYSICAL_BYTES_PER_BLOCK
+            ),
+            "decode_target_physical_bytes_per_block": (
+                DECODE_TARGET_PHYSICAL_BYTES_PER_BLOCK
+            ),
             "gpu_kv_budget_bytes": GPU_KV_BUDGET_BYTES,
-            "gpu_kv_blocks_per_dp_target": GPU_KV_BLOCKS,
-            "gpu_kv_tokens_per_dp_target": GPU_KV_TOKENS,
+            "prefill_gpu_kv_blocks_per_dp_target": PREFILL_GPU_KV_BLOCKS,
+            "decode_gpu_kv_blocks_per_dp_target": DECODE_GPU_KV_BLOCKS,
+            "prefill_gpu_kv_tokens_per_dp_target": PREFILL_GPU_KV_TOKENS,
+            "decode_gpu_kv_tokens_per_dp_target": DECODE_GPU_KV_TOKENS,
         },
     }
     _write_json(phase_root / "phase_manifest.json", root_manifest)

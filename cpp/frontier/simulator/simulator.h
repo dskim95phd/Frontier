@@ -31,6 +31,7 @@ class Simulator {
               const std::vector<request_generator::WorkloadRequest> &workload);
 
     [[nodiscard]] metrics::SimulationOutput run();
+    [[nodiscard]] metrics::SimulationOutput run_until(SimTime end_time);
     [[nodiscard]] const config::SimulationConfig &config() const noexcept {
         return config_;
     }
@@ -109,6 +110,7 @@ class Simulator {
 
   private:
     void enqueue_request_arrival(RequestId request_id, SimTime ready_at);
+    void record_gpu_kv_occupancy_for_event(const Event &event);
 
     config::SimulationConfig config_;
     EntityArena entities_;
@@ -123,6 +125,7 @@ class Simulator {
     EventQueue event_queue_;
     metrics::MetricsStore metrics_;
     std::unique_ptr<scheduler::GlobalScheduler> global_scheduler_;
+    SimTime last_event_time_ = SimTime::from_seconds(0.0);
 };
 
 [[nodiscard]] metrics::SimulationOutput

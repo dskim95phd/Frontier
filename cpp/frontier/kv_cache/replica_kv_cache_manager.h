@@ -5,6 +5,7 @@
 #include <optional>
 #include <stdexcept>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "frontier/config/config.h"
 #include "frontier/core/ids.h"
@@ -77,6 +78,10 @@ class ReplicaKVCacheManager {
     void reserve(RequestId request_id, std::uint64_t kv_accounted_tokens,
                  std::uint64_t scheduled_tokens);
     [[nodiscard]] std::uint64_t free(RequestId request_id);
+    // Drop every GPU-resident block for a session. If the session still has
+    // an active request, the drop is deferred until that request releases its
+    // allocation so routing can migrate without corrupting in-flight work.
+    [[nodiscard]] std::uint64_t discard_session(SessionId session_id);
     void mark_blocks_computed(const entities::Request &request);
 
     [[nodiscard]] std::uint64_t
@@ -148,6 +153,8 @@ class ReplicaKVCacheManager {
         allocations_;
     std::unordered_map<SessionId, SessionCacheEntry, StrongIdHash<SessionId>>
         sessions_;
+    std::unordered_set<SessionId, StrongIdHash<SessionId>>
+        discard_on_release_;
     PrefixCacheStats stats_;
 };
 

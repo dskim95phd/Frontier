@@ -40,6 +40,30 @@ double milliseconds_between(SimTime end, SimTime start,
     return (end.seconds() - start.seconds()) * 1e3;
 }
 
+OrderedJson serialize_execution_time_components(
+    const entities::ExecutionTime &execution) {
+    return OrderedJson::object({
+        {"dense_compute_ms", execution.dense_compute_ms},
+        {"lm_head_ms", execution.lm_head_ms},
+        {"tp_communication_ms", execution.tp_communication_ms},
+        {"pp_communication_ms", execution.pp_communication_ms},
+        {"moe_gating_linear_ms", execution.moe_gating_linear_ms},
+        {"moe_gating_routing_topk_ms",
+         execution.moe_gating_routing_topk_ms},
+        {"moe_grouped_gemm_ms", execution.moe_grouped_gemm_ms},
+        {"moe_shuffling_ms", execution.moe_shuffling_ms},
+        {"moe_post_attention_norm_ms",
+         execution.moe_post_attention_norm_ms},
+        {"moe_tp_communication_ms", execution.moe_tp_communication_ms},
+        {"ep_dispatch_ms", execution.ep_dispatch_ms},
+        {"ep_combine_ms", execution.ep_combine_ms},
+        {"dp_input_communication_ms", execution.dp_input_communication_ms},
+        {"dp_output_communication_ms", execution.dp_output_communication_ms},
+        {"synchronization_wait_ms", execution.synchronization_wait_ms},
+        {"total_ms", execution.total_ms()},
+    });
+}
+
 void validate_request_metrics(const std::vector<RequestMetricsRecord> &requests,
                               config::SystemArchitecture architecture) {
     std::unordered_set<std::uint64_t> request_ids;
@@ -674,6 +698,32 @@ std::string serialize_simulation_output_json(const SimulationOutput &output) {
         root["batches"].push_back(
             serialize_batch(batch, output.run.system_architecture));
     }
+    root["gpu_kv_occupancy"] = OrderedJson::array();
+    for (const GpuKVCacheOccupancyRecord &record : output.gpu_kv_occupancy) {
+        OrderedJson value = OrderedJson::object({
+            {"time_s", record.time.seconds()},
+            {"cluster_type", to_string(record.cluster_type)},
+            {"replica_id", record.replica_id.value()},
+            {"dp_id", record.dp_id.value()},
+            {"active_blocks", record.active_blocks},
+            {"capacity_blocks", record.capacity_blocks},
+            {"active_bytes_per_gpu", record.active_bytes_per_gpu},
+            {"active_fraction_of_kv_budget",
+             record.active_fraction_of_kv_budget},
+        });
+        if (record.hbm_fraction.has_value()) {
+            value["hbm_fraction"] = record.hbm_fraction.value();
+        } else {
+            value["hbm_fraction"] = nullptr;
+        }
+        if (record.active_fraction_of_total_hbm.has_value()) {
+            value["active_fraction_of_total_hbm"] =
+                record.active_fraction_of_total_hbm.value();
+        } else {
+            value["active_fraction_of_total_hbm"] = nullptr;
+        }
+        root["gpu_kv_occupancy"].push_back(std::move(value));
+    }
     root["scheduler_trace"] = OrderedJson::array();
     for (const SchedulerTraceRecord &trace : output.scheduler_trace) {
         root["scheduler_trace"].push_back(
@@ -1032,13 +1082,42 @@ std::string serialize_simulation_summary_json(const SimulationOutput &output,
                      ? 0.0
                      : static_cast<double>(aggregate.request_slots) /
                            static_cast<double>(aggregate.batch_count)},
-                {"predicted_execution_ms", aggregate.predicted_execution_ms},
-                {"prefill_scheduled_tokens",
+                 {"predicted_execution_ms", aggregate.predicted_execution_ms},
+                 {"execution_time_components_ms",
+                  serialize_execution_time_components(
+                      aggregate.execution_time)},
+                 {"prefill_scheduled_tokens",
                  aggregate.prefill_scheduled_tokens},
                 {"preemption_recomputed_prefill_tokens",
                  aggregate.preemption_recomputed_prefill_tokens},
                 {"batch_size_histogram", std::move(histogram)},
             });
+    }
+
+    constexpr std::uint64_t kBatchTimeBucketSeconds = 60;
+    root["batch_time_bucket_seconds"] = kBatchTimeBucketSeconds;
+    root["batch_summary_by_cluster_time_bucket"] = OrderedJson::object();
+    for (const auto &[cluster_type, buckets] :
+         output.aggregate.batch_time_buckets_by_cluster) {
+        OrderedJson values = OrderedJson::array();
+        for (const auto &[bucket_index, aggregate] : buckets) {
+            values.push_back(OrderedJson::object({
+                {"start_time_s", bucket_index * kBatchTimeBucketSeconds},
+                {"end_time_s", (bucket_index + 1) * kBatchTimeBucketSeconds},
+                {"batch_count", aggregate.batch_count},
+                {"mean_batch_size",
+                 aggregate.batch_count == 0
+                     ? 0.0
+                     : static_cast<double>(aggregate.request_slots) /
+                           static_cast<double>(aggregate.batch_count)},
+                 {"predicted_execution_ms", aggregate.predicted_execution_ms},
+                 {"execution_time_components_ms",
+                  serialize_execution_time_components(
+                      aggregate.execution_time)},
+             }));
+        }
+        root["batch_summary_by_cluster_time_bucket"]
+            [std::string{to_string(cluster_type)}] = std::move(values);
     }
 
     std::vector<double> transfer_latency_ms;
@@ -1231,6 +1310,76 @@ serialize_request_metrics_csv(const std::vector<RequestMetricsRecord> &requests,
                    << request.decode_arrived_at.seconds() << ','
                    << request.scheduled_prefill_tokens << ','
                    << request.preemption_recomputed_prefill_tokens;
+        }
+        output << '\n';
+    }
+    return output.str();
+}
+
+std::string serialize_gpu_kv_occupancy_csv(
+    const std::vector<GpuKVCacheOccupancyRecord> &occupancy) {
+    std::ostringstream output;
+    output.imbue(std::locale::classic());
+    output << std::setprecision(std::numeric_limits<double>::max_digits10);
+    output << "time_s,cluster_type,replica_id,dp_id,active_blocks,"
+              "capacity_blocks,active_bytes_per_gpu,hbm_fraction,"
+              "active_fraction_of_kv_budget,active_fraction_of_total_hbm\n";
+
+    std::map<std::tuple<ClusterType, ReplicaId, DataParallelId>, SimTime>
+        last_time;
+    for (const GpuKVCacheOccupancyRecord &record : occupancy) {
+        require_valid_time(record.time, "gpu_kv_occupancy.time");
+        if (!record.replica_id.valid() || !record.dp_id.valid()) {
+            throw std::invalid_argument(
+                "gpu KV occupancy target IDs must be valid");
+        }
+        if (record.active_blocks > record.capacity_blocks ||
+            !std::isfinite(record.active_fraction_of_kv_budget) ||
+            record.active_fraction_of_kv_budget < 0.0 ||
+            record.active_fraction_of_kv_budget > 1.0) {
+            throw std::invalid_argument(
+                "gpu KV occupancy active fraction is invalid");
+        }
+        if (record.hbm_fraction.has_value() &&
+            (!std::isfinite(record.hbm_fraction.value()) ||
+             record.hbm_fraction.value() < 0.0 ||
+             record.hbm_fraction.value() > 1.0)) {
+            throw std::invalid_argument(
+                "gpu KV occupancy total-HBM fraction is invalid");
+        }
+        if (record.active_fraction_of_total_hbm.has_value() &&
+            (!std::isfinite(record.active_fraction_of_total_hbm.value()) ||
+             record.active_fraction_of_total_hbm.value() < 0.0 ||
+             record.active_fraction_of_total_hbm.value() > 1.0)) {
+            throw std::invalid_argument(
+                "gpu KV occupancy total-HBM fraction is invalid");
+        }
+        if (record.hbm_fraction.has_value() &&
+            record.active_fraction_of_total_hbm.has_value() &&
+            record.hbm_fraction.value() !=
+                record.active_fraction_of_total_hbm.value()) {
+            throw std::invalid_argument(
+                "gpu KV occupancy total-HBM fractions disagree");
+        }
+        const auto key = std::make_tuple(record.cluster_type,
+                                         record.replica_id, record.dp_id);
+        const auto previous = last_time.find(key);
+        if (previous != last_time.end() && record.time < previous->second) {
+            throw std::invalid_argument(
+                "gpu KV occupancy samples are not time ordered");
+        }
+        last_time[key] = record.time;
+        output << record.time.seconds() << ',' << to_string(record.cluster_type)
+               << ',' << record.replica_id.value() << ','
+               << record.dp_id.value() << ',' << record.active_blocks << ','
+               << record.capacity_blocks << ','
+               << record.active_bytes_per_gpu << ',';
+        if (record.hbm_fraction.has_value()) {
+            output << record.hbm_fraction.value();
+        }
+        output << ',' << record.active_fraction_of_kv_budget << ',';
+        if (record.active_fraction_of_total_hbm.has_value()) {
+            output << record.active_fraction_of_total_hbm.value();
         }
         output << '\n';
     }

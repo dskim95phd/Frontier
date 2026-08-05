@@ -1,7 +1,8 @@
 #include "frontier/metrics/metrics_store.h"
 
-#include <stdexcept>
+#include <cmath>
 #include <limits>
+#include <stdexcept>
 #include <string>
 #include <utility>
 
@@ -18,6 +19,28 @@
 #include "frontier/simulator/entity_arena.h"
 
 namespace frontier::metrics {
+namespace {
+
+void accumulate_execution_time(entities::ExecutionTime &total,
+                               const entities::ExecutionTime &value) {
+    total.dense_compute_ms += value.dense_compute_ms;
+    total.lm_head_ms += value.lm_head_ms;
+    total.tp_communication_ms += value.tp_communication_ms;
+    total.pp_communication_ms += value.pp_communication_ms;
+    total.moe_gating_linear_ms += value.moe_gating_linear_ms;
+    total.moe_gating_routing_topk_ms += value.moe_gating_routing_topk_ms;
+    total.moe_grouped_gemm_ms += value.moe_grouped_gemm_ms;
+    total.moe_shuffling_ms += value.moe_shuffling_ms;
+    total.moe_post_attention_norm_ms += value.moe_post_attention_norm_ms;
+    total.moe_tp_communication_ms += value.moe_tp_communication_ms;
+    total.ep_dispatch_ms += value.ep_dispatch_ms;
+    total.ep_combine_ms += value.ep_combine_ms;
+    total.dp_input_communication_ms += value.dp_input_communication_ms;
+    total.dp_output_communication_ms += value.dp_output_communication_ms;
+    total.synchronization_wait_ms += value.synchronization_wait_ms;
+}
+
+} // namespace
 
 MetricsStore::MetricsStore(const config::SimulationConfig &config,
                            std::size_t expected_request_count)
@@ -65,6 +88,15 @@ void MetricsStore::record_batch(const entities::Batch &batch,
     aggregate.batch_size_execution_ms +=
         static_cast<double>(batch_size) * predicted_execution_ms;
     ++aggregate.batch_size_histogram[batch_size];
+    constexpr double kBatchTimeBucketSeconds = 60.0;
+    const auto bucket_index = static_cast<std::uint64_t>(
+        std::floor(batch.scheduled_at().seconds() / kBatchTimeBucketSeconds));
+    BatchTimeBucketAggregate &time_bucket =
+        output_.aggregate.batch_time_buckets_by_cluster[batch.cluster_type()]
+                                                        [bucket_index];
+    ++time_bucket.batch_count;
+    time_bucket.request_slots += batch_size;
+    time_bucket.predicted_execution_ms += predicted_execution_ms;
     // Count only work that was part of a PREFILL phase at scheduling time.
     // `processed_tokens` is captured in the batch snapshot before execution;
     // comparing it with the request's current replay boundary also handles
@@ -128,6 +160,18 @@ void MetricsStore::record_batch_stage(
     const entities::BatchStage &batch_stage, const entities::Batch &batch,
     const config::ClusterRuntimeConfig &runtime) {
     ++output_.aggregate.batch_stage_count;
+    BatchMetricsAggregate &aggregate =
+        output_.aggregate.batches_by_cluster[batch.cluster_type()];
+    accumulate_execution_time(aggregate.execution_time,
+                              batch_stage.execution_time());
+    constexpr double kBatchTimeBucketSeconds = 60.0;
+    const auto bucket_index = static_cast<std::uint64_t>(
+        std::floor(batch.scheduled_at().seconds() / kBatchTimeBucketSeconds));
+    BatchTimeBucketAggregate &time_bucket =
+        output_.aggregate.batch_time_buckets_by_cluster[batch.cluster_type()]
+                                                        [bucket_index];
+    accumulate_execution_time(time_bucket.execution_time,
+                              batch_stage.execution_time());
     if (!detailed_traces_enabled_) {
         return;
     }
@@ -558,6 +602,86 @@ void MetricsStore::record_cpu_kv_cache_restore(
     if (detailed_traces_enabled_) {
         output_.cpu_kv_cache_transfers.push_back(record);
     }
+}
+
+void MetricsStore::record_gpu_kv_cache_occupancy(
+    SimTime time, const scheduler::BaseReplicaScheduler &scheduler,
+    std::uint64_t bytes_per_block, std::optional<std::uint64_t> total_hbm_bytes,
+    bool force) {
+    if (!gpu_kv_occupancy_enabled_) {
+        return;
+    }
+    if (!time.valid()) {
+        throw std::invalid_argument(
+            "GPU KV occupancy time must be finite and nonnegative");
+    }
+    if (bytes_per_block == 0) {
+        throw std::invalid_argument(
+            "GPU KV occupancy bytes_per_block must be positive");
+    }
+    const kv_cache::PrefixCacheDiagnostics diagnostics =
+        scheduler.prefix_cache_diagnostics();
+    if (diagnostics.active_blocks > diagnostics.capacity_blocks) {
+        throw std::logic_error("GPU KV occupancy exceeds target capacity");
+    }
+    if (diagnostics.active_blocks >
+        std::numeric_limits<std::uint64_t>::max() / bytes_per_block) {
+        throw std::overflow_error(
+            "GPU KV occupancy byte count overflows uint64");
+    }
+    if (total_hbm_bytes.has_value() && total_hbm_bytes.value() == 0) {
+        throw std::invalid_argument(
+            "GPU KV occupancy total HBM bytes must be positive");
+    }
+
+    GpuKVCacheOccupancyRecord record{};
+    record.time = time;
+    record.cluster_type = scheduler.cluster_type();
+    record.replica_id = scheduler.replica_id();
+    record.dp_id = scheduler.dp_id();
+    record.active_blocks = diagnostics.active_blocks;
+    record.capacity_blocks = diagnostics.capacity_blocks;
+    record.active_bytes_per_gpu = diagnostics.active_blocks * bytes_per_block;
+    record.active_fraction_of_kv_budget =
+        diagnostics.capacity_blocks == 0
+            ? 0.0
+            : static_cast<double>(diagnostics.active_blocks) /
+                  static_cast<double>(diagnostics.capacity_blocks);
+    if (total_hbm_bytes.has_value()) {
+        const double total_hbm_fraction =
+            static_cast<double>(record.active_bytes_per_gpu) /
+            static_cast<double>(total_hbm_bytes.value());
+        record.hbm_fraction = total_hbm_fraction;
+        record.active_fraction_of_total_hbm = total_hbm_fraction;
+    }
+
+    const OccupancyTarget key{record.cluster_type, record.replica_id,
+                              record.dp_id};
+    const auto previous = occupancy_positions_.find(key);
+    if (previous != occupancy_positions_.end()) {
+        GpuKVCacheOccupancyRecord &last =
+            output_.gpu_kv_occupancy.at(previous->second);
+        const bool same_state =
+            last.active_blocks == record.active_blocks &&
+            last.capacity_blocks == record.capacity_blocks &&
+            last.active_bytes_per_gpu == record.active_bytes_per_gpu &&
+            last.active_fraction_of_kv_budget ==
+                record.active_fraction_of_kv_budget &&
+            last.hbm_fraction == record.hbm_fraction &&
+            last.active_fraction_of_total_hbm ==
+                record.active_fraction_of_total_hbm;
+        if (last.time == time) {
+            // Multiple scheduler mutations can occur at one simulation time;
+            // retain only the final target state for that timestamp.
+            last = record;
+            return;
+        }
+        if (!force && same_state) {
+            return;
+        }
+    }
+    occupancy_positions_[key] = output_.gpu_kv_occupancy.size();
+    output_.gpu_kv_occupancy.push_back(std::move(record));
 }
 
 SimulationOutput MetricsStore::take_output() noexcept {

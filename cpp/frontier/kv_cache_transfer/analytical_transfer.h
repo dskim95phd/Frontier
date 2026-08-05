@@ -38,13 +38,19 @@ model_kv_cache_size_bytes(std::uint64_t num_tokens,
                           double kv_cache_dtype_size_bytes);
 // Return model KV bytes for a target with the requested attention TP size.
 // Dense/GQA/MQA layouts retain their existing sharding contract.  MLA's
-// latent KV is replicated on every attention TP rank, so target-physical
-// bytes are one-copy bytes multiplied by attention_tensor_parallel_size.
+// latent KV is replicated across TP/DCP groups and token-sharded inside each
+// DCP group.
 [[nodiscard]] std::uint64_t
 model_kv_cache_size_bytes(std::uint64_t num_tokens,
                           const config::ModelConfig &model,
                           double kv_cache_dtype_size_bytes,
                           std::uint64_t attention_tensor_parallel_size);
+[[nodiscard]] std::uint64_t
+model_kv_cache_size_bytes(std::uint64_t num_tokens,
+                          const config::ModelConfig &model,
+                          double kv_cache_dtype_size_bytes,
+                          std::uint64_t attention_tensor_parallel_size,
+                          std::uint64_t decode_context_parallel_size);
 [[nodiscard]] std::uint64_t model_kv_cache_size_bytes_one_copy(
     std::uint64_t num_tokens, const config::ModelConfig &model,
     double kv_cache_dtype_size_bytes);
@@ -52,6 +58,16 @@ model_kv_cache_size_bytes(std::uint64_t num_tokens,
     std::uint64_t num_tokens, const config::ModelConfig &model,
     double kv_cache_dtype_size_bytes,
     std::uint64_t attention_tensor_parallel_size);
+[[nodiscard]] std::uint64_t model_kv_cache_size_bytes_target_physical(
+    std::uint64_t num_tokens, const config::ModelConfig &model,
+    double kv_cache_dtype_size_bytes,
+    std::uint64_t attention_tensor_parallel_size,
+    std::uint64_t decode_context_parallel_size);
+[[nodiscard]] std::uint64_t model_kv_cache_size_bytes_rank_local(
+    std::uint64_t num_tokens, const config::ModelConfig &model,
+    double kv_cache_dtype_size_bytes,
+    std::uint64_t decode_context_parallel_size,
+    std::uint64_t decode_context_parallel_rank = 0);
 [[nodiscard]] TransferPrediction predict_transfer(std::uint64_t size_bytes,
                                                   const TransferConfig &config);
 
@@ -60,7 +76,8 @@ class AnalyticalKVCacheTransferPredictor final
   public:
     explicit AnalyticalKVCacheTransferPredictor(
         config::KvCacheTransferConfig config,
-        std::uint64_t attention_tensor_parallel_size = 1);
+        std::uint64_t attention_tensor_parallel_size = 1,
+        std::uint64_t decode_context_parallel_size = 1);
 
     [[nodiscard]] TransferPrediction
     predict(std::uint64_t num_tokens,
@@ -69,11 +86,13 @@ class AnalyticalKVCacheTransferPredictor final
   private:
     config::KvCacheTransferConfig config_;
     std::uint64_t attention_tensor_parallel_size_ = 1;
+    std::uint64_t decode_context_parallel_size_ = 1;
 };
 
 [[nodiscard]] std::shared_ptr<const BaseKVCacheTransferPredictor>
 make_kv_cache_transfer_predictor(
     const config::KvCacheTransferConfig &config,
-    std::uint64_t attention_tensor_parallel_size = 1);
+    std::uint64_t attention_tensor_parallel_size = 1,
+    std::uint64_t decode_context_parallel_size = 1);
 
 } // namespace frontier::kv_cache_transfer

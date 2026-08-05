@@ -1,7 +1,10 @@
 #pragma once
 
 #include <cstddef>
+#include <map>
+#include <optional>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -26,6 +29,7 @@ struct MoERoutingDiagnostic;
 }
 
 namespace frontier::scheduler {
+class BaseReplicaScheduler;
 struct ReplicaTarget;
 struct ScheduleResult;
 } // namespace frontier::scheduler
@@ -49,6 +53,9 @@ class MetricsStore {
 
     void set_detailed_traces_enabled(bool enabled) noexcept {
         detailed_traces_enabled_ = enabled;
+    }
+    void set_gpu_kv_occupancy_enabled(bool enabled) noexcept {
+        gpu_kv_occupancy_enabled_ = enabled;
     }
 
     void record_event(Event event);
@@ -90,13 +97,23 @@ class MetricsStore {
     void record_cpu_kv_cache_restore(
         const entities::CpuKVCacheRestoreInfo &operation,
         ClusterType cluster_type, std::uint64_t bytes_per_block);
+    void record_gpu_kv_cache_occupancy(
+        SimTime time, const scheduler::BaseReplicaScheduler &scheduler,
+        std::uint64_t bytes_per_block,
+        std::optional<std::uint64_t> total_hbm_bytes = std::nullopt,
+        bool force = false);
 
     [[nodiscard]] SimulationOutput take_output() noexcept;
 
   private:
+    using OccupancyTarget =
+        std::tuple<ClusterType, ReplicaId, DataParallelId>;
+
     void record_request(RequestMetricsRecord record);
     SimulationOutput output_;
     bool detailed_traces_enabled_ = true;
+    bool gpu_kv_occupancy_enabled_ = true;
+    std::map<OccupancyTarget, std::size_t> occupancy_positions_;
 };
 
 } // namespace frontier::metrics

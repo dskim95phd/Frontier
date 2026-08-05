@@ -94,6 +94,8 @@ make_dense_model(const config::ModelConfig &model,
     result.qk_head_dim = model.qk_head_dim;
     result.v_head_dim = model.v_head_dim;
     result.share_q_dim = model.share_q_dim;
+    result.decode_context_parallel_size =
+        parallelism.decode_context_parallel_size;
     return result;
 }
 
@@ -222,6 +224,7 @@ struct MoEStageContext {
     config::PipelineStageLayerRange stage_layers;
     const detail::DenseLayerTimes &dense_layer;
     double allreduce_ms;
+    double dcp_attention_communication_ms;
     double communication_element_bytes;
     entities::ExecutionTime base_execution_time;
 
@@ -234,7 +237,11 @@ struct MoEStageContext {
     }
 
     [[nodiscard]] double tp_layer_ms() const noexcept {
-        return 2.0 * allreduce_ms;
+        return 2.0 * allreduce_ms + dcp_attention_communication_ms;
+    }
+
+    [[nodiscard]] double attention_communication_ms() const noexcept {
+        return allreduce_ms + dcp_attention_communication_ms;
     }
 };
 
@@ -278,7 +285,8 @@ MoEStagePrediction predict_selected_moe_layer_execution(
                 pending_dense_compute_ms + context.attention_compute_ms();
             result.execution_time.dense_compute_ms += pre_moe_compute_ms;
             result.execution_time.tp_communication_ms +=
-                pending_tp_communication_ms + context.allreduce_ms;
+                pending_tp_communication_ms +
+                context.attention_communication_ms();
             const detail::RoutingAllocation allocation = detail::route_tokens(
                 batch_info.dense_batch.total_tokens, model.router_topk,
                 model.total_expert_num,
@@ -384,7 +392,8 @@ MoEStagePrediction predict_moe_stage_execution(const MoEStageContext &context) {
             continue;
         }
         result.execution_time.dense_compute_ms += attention_compute_ms;
-        result.execution_time.tp_communication_ms += context.allreduce_ms;
+        result.execution_time.tp_communication_ms +=
+            context.attention_communication_ms();
         ++result.logical_moe_layer_count;
         if (first_layer_scaled && repeated_lane_prediction.has_value()) {
             const detail::MoELayerTime &critical =
@@ -552,6 +561,11 @@ AnalyticalRooflineExecutionTimePredictor::
         model_.attention.memory_layout ==
             attention::AttentionMemoryLayout::kFrozenDsa ||
         parallelism_.tensor_parallel_size == 0 ||
+        parallelism_.decode_context_parallel_size == 0 ||
+        parallelism_.tensor_parallel_size %
+                parallelism_.decode_context_parallel_size !=
+            0 ||
+        (parallelism_.decode_context_parallel_size > 1 && !model_.use_mla) ||
         parallelism_.pipeline_parallel_size == 0 ||
         parallelism_.pipeline_parallel_size > model_.num_layers) {
         throw ExecutionTimePredictorError(
@@ -625,8 +639,38 @@ AnalyticalRooflineExecutionTimePredictor::predict_execution(
             ? communication_backend_->allreduce_ms(
                   activation_bytes, parallelism_.tensor_parallel_size, true)
             : 0.0;
+    double dcp_attention_communication_ms = 0.0;
+    if (model_.use_mla &&
+        parallelism_.decode_context_parallel_size > 1 &&
+        !dense_batch.decode_requests.empty()) {
+        const std::uint64_t local_query_heads =
+            model_.num_query_heads / parallelism_.tensor_parallel_size;
+        std::uint64_t decode_tokens = 0;
+        for (const detail::AttentionRequestSlice &request :
+             dense_batch.decode_requests) {
+            decode_tokens += request.query_tokens;
+        }
+        const std::uint64_t query_bytes = activation_payload_bytes(
+            decode_tokens, local_query_heads *
+                               (model_.kv_lora_rank +
+                                model_.qk_rope_head_dim),
+            communication_element_bytes);
+        const std::uint64_t gathered_output_bytes = activation_payload_bytes(
+            decode_tokens,
+            local_query_heads * parallelism_.decode_context_parallel_size *
+                model_.v_head_dim,
+            communication_element_bytes);
+        dcp_attention_communication_ms =
+            communication_backend_->allgather_ms(
+                query_bytes, parallelism_.decode_context_parallel_size,
+                true) +
+            communication_backend_->reduce_scatter_ms(
+                gathered_output_bytes,
+                parallelism_.decode_context_parallel_size, true);
+    }
     const double dense_layer_compute_ms = layer.total_ms();
-    const double tp_layer_ms = 2.0 * allreduce_ms;
+    const double tp_layer_ms =
+        2.0 * allreduce_ms + dcp_attention_communication_ms;
     const config::PipelineStageLayerRange stage_layers =
         config::pipeline_stage_layer_range(model_.num_layers,
                                            parallelism_.pipeline_parallel_size,
@@ -675,6 +719,7 @@ AnalyticalRooflineExecutionTimePredictor::predict_execution(
             stage_layers,
             layer,
             allreduce_ms,
+            dcp_attention_communication_ms,
             communication_element_bytes,
             execution_time,
         };
@@ -700,6 +745,12 @@ AnalyticalRooflineExecutionTimePredictor::predict_execution(
     }
     const double kv_cache_bytes_per_token =
         kv_cache_bytes_per_token_per_layer(model_, dense_precisions.kv_cache);
+    const double kv_cache_rank_local_bytes_per_token =
+        model_.use_mla
+            ? kv_cache_bytes_per_token /
+                  static_cast<double>(
+                      parallelism_.decode_context_parallel_size)
+            : kv_cache_bytes_per_token;
 
     ExecutionTimePrediction result{};
     result.duration_ms = duration_ms;
@@ -726,8 +777,14 @@ AnalyticalRooflineExecutionTimePredictor::predict_execution(
         {"kv_cache_element_bytes",
          detail::bytes_per_element(dense_precisions.kv_cache)},
         {"kv_cache_bytes_per_token_per_layer", kv_cache_bytes_per_token},
+        {"kv_cache_rank_local_bytes_per_token_per_layer",
+         kv_cache_rank_local_bytes_per_token},
         {"communication_element_bytes", communication_element_bytes},
         {"tp_allreduce_ms", allreduce_ms},
+        {"dcp_attention_communication_ms",
+         dcp_attention_communication_ms},
+        {"decode_context_parallel_size",
+         static_cast<double>(parallelism_.decode_context_parallel_size)},
         {
             "dense_layer_total_ms",
             dense_layer_compute_ms + tp_layer_ms,
@@ -1268,6 +1325,17 @@ void validate_dense_layer_inputs(const AnalyticalConfig &config,
     if (model.use_mla && model.use_mfa) {
         throw AnalyticalModelError("MLA and MFA are mutually exclusive");
     }
+    if (model.decode_context_parallel_size == 0 ||
+        model.tensor_parallel_size % model.decode_context_parallel_size != 0) {
+        throw AnalyticalModelError(
+            "tensor parallel size must be divisible by decode context "
+            "parallel size");
+    }
+    if (model.decode_context_parallel_size > 1 && !model.use_mla) {
+        throw AnalyticalModelError(
+            "decode context parallelism is currently supported only for "
+            "MLA models");
+    }
     if (model.use_mla &&
         (model.kv_lora_rank == 0 || model.qk_nope_head_dim == 0 ||
          model.qk_rope_head_dim == 0 || model.qk_head_dim == 0 ||
@@ -1397,6 +1465,36 @@ KernelWork mla_unabsorbed_kv_expansion_work(const DenseLayerContext &context,
     };
 }
 
+std::uint64_t mla_dcp_busiest_new_token_count(
+    const DenseBatch &batch, std::uint64_t decode_context_parallel_size) {
+    std::vector<std::uint64_t> tokens_by_rank(
+        static_cast<std::size_t>(decode_context_parallel_size), 0);
+    const auto add_requests = [&](const auto &requests) {
+        for (const AttentionRequestSlice &request : requests) {
+            if (request.query_tokens >
+                std::numeric_limits<std::uint64_t>::max() -
+                    request.past_context) {
+                throw AnalyticalModelError(
+                    "MLA DCP token interval overflows uint64");
+            }
+            const std::uint64_t end = request.past_context +
+                                      request.query_tokens;
+            for (std::uint64_t rank = 0;
+                 rank < decode_context_parallel_size; ++rank) {
+                tokens_by_rank[static_cast<std::size_t>(rank)] +=
+                    attention::mla_dcp_local_token_count(
+                        end, decode_context_parallel_size, rank) -
+                    attention::mla_dcp_local_token_count(
+                        request.past_context,
+                        decode_context_parallel_size, rank);
+            }
+        }
+    };
+    add_requests(batch.prefill_requests);
+    add_requests(batch.decode_requests);
+    return *std::max_element(tokens_by_rank.begin(), tokens_by_rank.end());
+}
+
 AttentionLayerWork
 predict_mla_attention_work(const DenseLayerContext &context) {
     constexpr double kMlaRopeCacheElementBytes = 2.0;
@@ -1487,18 +1585,32 @@ predict_mla_attention_work(const DenseLayerContext &context) {
             context.kv_cache_element_bytes,
             kMlaRopeCacheElementBytes,
         });
+    const double rank_local_cache_tokens = static_cast<double>(
+        mla_dcp_busiest_new_token_count(
+            context.batch, context.model.decode_context_parallel_size));
     work.kv_cache_save = KernelWork{
         0.0,
-        tokens * (static_cast<double>(latent_and_rope_dim) *
-                      context.attention_element_bytes +
-                  mla_cache_bytes_per_token),
+        tokens * static_cast<double>(latent_and_rope_dim) *
+                context.attention_element_bytes +
+            rank_local_cache_tokens * mla_cache_bytes_per_token,
     };
     work.prefill_attention = mla_unabsorbed_attention_work(
         context.batch.prefill_requests, context.local_query_heads,
         model.qk_nope_head_dim, model.qk_rope_head_dim, model.v_head_dim,
         context.attention_element_bytes, kMlaRopeCacheElementBytes);
+    std::vector<AttentionRequestSlice> dcp_decode_requests =
+        context.batch.decode_requests;
+    if (context.model.decode_context_parallel_size > 1) {
+        for (AttentionRequestSlice &request : dcp_decode_requests) {
+            request.past_context = attention::mla_dcp_local_token_count(
+                request.past_context,
+                context.model.decode_context_parallel_size, 0);
+        }
+    }
     work.decode_attention = mla_absorbed_attention_work(
-        context.batch.decode_requests, context.local_query_heads,
+        dcp_decode_requests,
+        context.local_query_heads *
+            context.model.decode_context_parallel_size,
         model.kv_lora_rank, model.qk_rope_head_dim,
         context.attention_element_bytes, context.kv_cache_element_bytes,
         kMlaRopeCacheElementBytes);

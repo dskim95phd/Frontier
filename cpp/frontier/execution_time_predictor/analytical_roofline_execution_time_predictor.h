@@ -128,6 +128,7 @@ struct DenseModel {
     std::uint64_t qk_head_dim = 0;
     std::uint64_t v_head_dim = 0;
     std::uint64_t share_q_dim = 0;
+    std::uint64_t decode_context_parallel_size = 1;
 
     [[nodiscard]] static constexpr DenseModel llama2_7b_tp8() noexcept {
         return llama2_7b(8);

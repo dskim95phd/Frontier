@@ -152,6 +152,26 @@ struct KVCacheTransferMetricsRecord {
     SimTime completed_at = SimTime::from_seconds(0.0);
 };
 
+// Compact event-driven occupancy samples for the scheduler's active KV
+// allocations.  `active_blocks` intentionally excludes resident/evictable
+// prefix-cache blocks.  Bytes are one-copy bytes per GPU (for MLA this is the
+// 624,640-byte Kimi K2 block at block_size=16, rather than TP-replicated
+// transfer bytes).
+struct GpuKVCacheOccupancyRecord {
+    SimTime time = SimTime::from_seconds(0.0);
+    ClusterType cluster_type = ClusterType::kMonolithic;
+    ReplicaId replica_id{0};
+    DataParallelId dp_id{0};
+    std::uint64_t active_blocks = 0;
+    std::uint64_t capacity_blocks = 0;
+    std::uint64_t active_bytes_per_gpu = 0;
+    // Fraction of total physical HBM on the GPU.  This is absent when the
+    // configured device does not expose a total-HBM capacity.
+    std::optional<double> hbm_fraction;
+    double active_fraction_of_kv_budget = 0.0;
+    std::optional<double> active_fraction_of_total_hbm;
+};
+
 struct AnalyticalDiagnostic {
     std::string name;
     std::vector<std::pair<std::string, double>> values;
@@ -185,7 +205,18 @@ struct BatchMetricsAggregate {
     std::uint64_t preemption_recomputed_prefill_tokens = 0;
     double predicted_execution_ms = 0.0;
     double batch_size_execution_ms = 0.0;
+    // Compact sum of completed stage component ledgers.  This is retained
+    // even when detailed traces are disabled so long simulations can expose
+    // analytical execution-time breakdowns without one record per stage.
+    entities::ExecutionTime execution_time;
     std::map<std::size_t, std::uint64_t> batch_size_histogram;
+};
+
+struct BatchTimeBucketAggregate {
+    std::uint64_t batch_count = 0;
+    std::uint64_t request_slots = 0;
+    double predicted_execution_ms = 0.0;
+    entities::ExecutionTime execution_time;
 };
 
 struct PrefixCacheTargetMetricsRecord {
@@ -318,6 +349,10 @@ struct MetricsAggregate {
     PrefixCacheMetricsAggregate prefix_cache;
     CpuKVCacheMetricsAggregate cpu_kv_cache;
     std::map<ClusterType, BatchMetricsAggregate> batches_by_cluster;
+    // Compact 60-second buckets support steady-state batch analysis without
+    // retaining one detailed record per decode iteration.
+    std::map<ClusterType, std::map<std::uint64_t, BatchTimeBucketAggregate>>
+        batch_time_buckets_by_cluster;
 };
 
 struct SimulationOutput {
@@ -331,6 +366,7 @@ struct SimulationOutput {
     std::vector<AnalyticalDiagnostic> analytical_diagnostics;
     std::vector<MoERoutingMetricsRecord> moe_routing;
     std::vector<KVCacheTransferMetricsRecord> kv_cache_transfers;
+    std::vector<GpuKVCacheOccupancyRecord> gpu_kv_occupancy;
     std::vector<PrefixCacheTargetMetricsRecord> prefix_cache_targets;
     std::vector<CpuKVCacheTargetMetricsRecord> cpu_kv_cache_targets;
     std::vector<CpuKVCacheTransferMetricsRecord> cpu_kv_cache_transfers;
@@ -347,5 +383,7 @@ serialize_simulation_summary_json(const SimulationOutput &output,
 serialize_request_metrics_csv(const std::vector<RequestMetricsRecord> &requests,
                               config::SystemArchitecture architecture =
                                   config::SystemArchitecture::kCoLocation);
+[[nodiscard]] std::string serialize_gpu_kv_occupancy_csv(
+    const std::vector<GpuKVCacheOccupancyRecord> &occupancy);
 
 } // namespace frontier::metrics

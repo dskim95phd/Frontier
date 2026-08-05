@@ -203,6 +203,20 @@ SessionId BaseClusterScheduler::request_session_id(RequestId request_id) const {
     return requests_->at(request_id.index()).session_id();
 }
 
+const entities::Request &
+BaseClusterScheduler::request(RequestId request_id) const {
+    if (!request_id.valid() || request_id.index() >= requests_->size()) {
+        throw ClusterSchedulerError(
+            "cluster scheduler references an unknown request");
+    }
+    const entities::Request &value = requests_->at(request_id.index());
+    if (value.id() != request_id) {
+        throw ClusterSchedulerError(
+            "cluster scheduler request arena ID/index invariant failed");
+    }
+    return value;
+}
+
 kv_cache_transfer::TransferPrediction
 BaseClusterScheduler::predict_kv_cache_transfer(
     std::uint64_t num_tokens) const {

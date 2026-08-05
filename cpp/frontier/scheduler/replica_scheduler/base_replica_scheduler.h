@@ -145,6 +145,33 @@ class BaseReplicaScheduler {
     [[nodiscard]] virtual std::size_t running_count() const noexcept = 0;
     [[nodiscard]] virtual std::uint64_t
     allocated_kv_blocks() const noexcept = 0;
+    [[nodiscard]] virtual std::uint64_t
+    available_kv_blocks() const noexcept {
+        return 0;
+    }
+    [[nodiscard]] virtual std::uint64_t kv_block_size() const noexcept {
+        return 0;
+    }
+    // KV footprint of requests waiting for admission (including
+    // preempted/restore-pending requests).  Cluster routing policies may use
+    // this observable value to avoid placing work behind a long sequence.
+    // The default keeps third-party schedulers source-compatible; the C++
+    // vLLM V1 implementation overrides it with block-accurate accounting.
+    [[nodiscard]] virtual std::uint64_t queued_kv_blocks() const noexcept {
+        return 0;
+    }
+    [[nodiscard]] kv_cache::PrefixLookupResult
+    gpu_prefix_cache_lookup(const entities::Request &request) const {
+        return kv_blocks_.lookup(request);
+    }
+    [[nodiscard]] std::uint64_t
+    discard_gpu_prefix_cache_session(SessionId session_id) {
+        return kv_blocks_.discard_session(session_id);
+    }
+    [[nodiscard]] std::uint64_t
+    gpu_cache_valid_prefix_blocks(SessionId session_id) const noexcept {
+        return kv_blocks_.gpu_cache_valid_prefix_blocks(session_id);
+    }
     [[nodiscard]] virtual const kv_cache::PrefixCacheStats &
     prefix_cache_stats() const noexcept = 0;
     [[nodiscard]] virtual kv_cache::PrefixCacheDiagnostics

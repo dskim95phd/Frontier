@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "frontier/attention/ops.h"
+#include "frontier/core/cluster_type.h"
 
 namespace frontier::config {
 
@@ -51,6 +52,17 @@ enum class SchedulingPolicy {
 enum class ClusterSchedulerType {
     kRoundRobin,
     kStickyRoundRobin,
+    // Select the target with the fewest observable running + waiting
+    // requests.  This mirrors vLLM's queue-aware placement contract without
+    // consulting workload fields that are not visible to a live scheduler.
+    kVllmQueueAware,
+    // Select the target with the smallest observable KV footprint.  The
+    // scheduler uses allocated blocks plus queued/current-frontier blocks.
+    kKvAware,
+    // Prefer the session's target while enough of its actual GPU prefix is
+    // resident, but abandon affinity when load is imbalanced or the hit ratio
+    // is too low.
+    kCacheAware,
 };
 
 enum class ModelKind {
@@ -212,6 +224,11 @@ struct ParallelismConfig {
     std::uint64_t data_parallel_size = 1;
     std::uint64_t moe_tensor_parallel_size = 1;
     std::uint64_t moe_expert_parallel_size = 1;
+    // DCP reuses ranks inside each TP group and shards KV entries along the
+    // token axis. It therefore does not contribute to accelerator count.
+    // Keep this extension last so positional aggregate initialization of the
+    // legacy fields remains source-compatible.
+    std::uint64_t decode_context_parallel_size = 1;
 
     [[nodiscard]] std::uint64_t attention_parallel_size() const noexcept {
         return tensor_parallel_size * data_parallel_size;
@@ -225,20 +242,47 @@ struct ParallelismConfig {
         return std::tie(lhs.num_replicas, lhs.tensor_parallel_size,
                         lhs.pipeline_parallel_size, lhs.data_parallel_size,
                         lhs.moe_tensor_parallel_size,
-                        lhs.moe_expert_parallel_size) ==
+                        lhs.moe_expert_parallel_size,
+                        lhs.decode_context_parallel_size) ==
                std::tie(rhs.num_replicas, rhs.tensor_parallel_size,
                         rhs.pipeline_parallel_size, rhs.data_parallel_size,
                         rhs.moe_tensor_parallel_size,
-                        rhs.moe_expert_parallel_size);
+                        rhs.moe_expert_parallel_size,
+                        rhs.decode_context_parallel_size);
     }
 };
 
 struct ClusterSchedulerConfig {
     ClusterSchedulerType type = ClusterSchedulerType::kRoundRobin;
+    // PDD-only stage overrides.  A missing override intentionally falls back
+    // to `type` so every existing co-location/PDD config remains valid.
+    std::optional<ClusterSchedulerType> prefill_type;
+    std::optional<ClusterSchedulerType> decode_type;
+    double cache_threshold = 0.5;
+    std::uint64_t balance_abs_threshold = 32;
+    double balance_rel_threshold = 1.1;
+
+    [[nodiscard]] ClusterSchedulerType
+    type_for_cluster(::frontier::ClusterType cluster_type) const noexcept {
+        if (cluster_type == ::frontier::ClusterType::kPrefill &&
+            prefill_type.has_value()) {
+            return *prefill_type;
+        }
+        if (cluster_type == ::frontier::ClusterType::kDecode &&
+            decode_type.has_value()) {
+            return *decode_type;
+        }
+        return type;
+    }
 
     friend bool operator==(const ClusterSchedulerConfig &lhs,
                            const ClusterSchedulerConfig &rhs) {
-        return lhs.type == rhs.type;
+        return std::tie(lhs.type, lhs.prefill_type, lhs.decode_type,
+                        lhs.cache_threshold, lhs.balance_abs_threshold,
+                        lhs.balance_rel_threshold) ==
+               std::tie(rhs.type, rhs.prefill_type, rhs.decode_type,
+                        rhs.cache_threshold, rhs.balance_abs_threshold,
+                        rhs.balance_rel_threshold);
     }
 };
 

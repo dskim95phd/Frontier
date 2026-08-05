@@ -116,8 +116,11 @@ add_library(
   frontier/metrics/metrics_store.cc
   frontier/request_generator/workload.cc
   frontier/scheduler/cluster_scheduler/base_cluster_scheduler.cc
+  frontier/scheduler/cluster_scheduler/actual_cache_aware_cluster_scheduler.cc
+  frontier/scheduler/cluster_scheduler/kv_aware_cluster_scheduler.cc
   frontier/scheduler/cluster_scheduler/round_robin_cluster_scheduler.cc
   frontier/scheduler/cluster_scheduler/sticky_round_robin_cluster_scheduler.cc
+  frontier/scheduler/cluster_scheduler/vllm_queue_aware_cluster_scheduler.cc
   frontier/scheduler/global_scheduler/global_scheduler.cc
   frontier/scheduler/kv_block_accounting.cc
   frontier/scheduler/replica_scheduler/base_replica_scheduler.cc

@@ -1,3 +1,5 @@
 __pycache__/
 tests/__pycache__/
 workloads_perf/
+workloads/
+workloads_profiles/
