@@ -40,26 +40,30 @@ double milliseconds_between(SimTime end, SimTime start,
     return (end.seconds() - start.seconds()) * 1e3;
 }
 
-OrderedJson serialize_execution_time_components(
-    const entities::ExecutionTime &execution) {
+OrderedJson
+serialize_execution_time_components(const entities::ExecutionTime &execution) {
     return OrderedJson::object({
         {"dense_compute_ms", execution.dense_compute_ms},
         {"lm_head_ms", execution.lm_head_ms},
         {"tp_communication_ms", execution.tp_communication_ms},
         {"pp_communication_ms", execution.pp_communication_ms},
         {"moe_gating_linear_ms", execution.moe_gating_linear_ms},
-        {"moe_gating_routing_topk_ms",
-         execution.moe_gating_routing_topk_ms},
+        {"moe_gating_routing_topk_ms", execution.moe_gating_routing_topk_ms},
         {"moe_grouped_gemm_ms", execution.moe_grouped_gemm_ms},
         {"moe_shuffling_ms", execution.moe_shuffling_ms},
-        {"moe_post_attention_norm_ms",
-         execution.moe_post_attention_norm_ms},
+        {"moe_post_attention_norm_ms", execution.moe_post_attention_norm_ms},
         {"moe_tp_communication_ms", execution.moe_tp_communication_ms},
         {"ep_dispatch_ms", execution.ep_dispatch_ms},
         {"ep_combine_ms", execution.ep_combine_ms},
         {"dp_input_communication_ms", execution.dp_input_communication_ms},
         {"dp_output_communication_ms", execution.dp_output_communication_ms},
         {"synchronization_wait_ms", execution.synchronization_wait_ms},
+        {"moe_pre_barrier_wait_ms", execution.moe_pre_barrier_wait_ms},
+        {"moe_ep_aggregation_extra_ms", execution.moe_ep_aggregation_extra_ms},
+        {"synchronization_unattributed_wait_ms",
+         execution.synchronization_unattributed_wait_ms},
+        {"synchronization_attribution_overlap_ms",
+         execution.synchronization_attribution_overlap_ms},
         {"total_ms", execution.total_ms()},
     });
 }
@@ -172,17 +176,14 @@ OrderedJson serialize_request(const RequestMetricsRecord &request,
     json["cpu_restore_transferred_blocks"] =
         request.cpu_restore_transferred_blocks;
     json["cpu_restore_consumed_blocks"] = request.cpu_restore_consumed_blocks;
-    json["cpu_restore_discarded_blocks"] =
-        request.cpu_restore_discarded_blocks;
+    json["cpu_restore_discarded_blocks"] = request.cpu_restore_discarded_blocks;
     json["cpu_restored_tokens"] = request.cpu_restored_tokens;
     json["cpu_restore_bytes"] = request.cpu_restore_bytes;
-    json["cpu_restore_queue_time_ms"] =
-        request.cpu_restore_queue_time_s * 1e3;
+    json["cpu_restore_queue_time_ms"] = request.cpu_restore_queue_time_s * 1e3;
     json["cpu_restore_service_time_ms"] =
         request.cpu_restore_service_time_s * 1e3;
     json["cpu_offload_bytes"] = request.cpu_offload_bytes;
-    json["cpu_offload_queue_time_ms"] =
-        request.cpu_offload_queue_time_s * 1e3;
+    json["cpu_offload_queue_time_ms"] = request.cpu_offload_queue_time_s * 1e3;
     json["cpu_offload_service_time_ms"] =
         request.cpu_offload_service_time_s * 1e3;
     json["prefix_cache_key_mode"] =
@@ -397,6 +398,10 @@ OrderedJson serialize_batch_stage(const BatchStageMetricsRecord &stage) {
         !std::isfinite(execution.dp_input_communication_ms) ||
         !std::isfinite(execution.dp_output_communication_ms) ||
         !std::isfinite(execution.synchronization_wait_ms) ||
+        !std::isfinite(execution.moe_pre_barrier_wait_ms) ||
+        !std::isfinite(execution.moe_ep_aggregation_extra_ms) ||
+        !std::isfinite(execution.synchronization_unattributed_wait_ms) ||
+        !std::isfinite(execution.synchronization_attribution_overlap_ms) ||
         execution.dense_compute_ms < 0.0 || execution.lm_head_ms < 0.0 ||
         execution.tp_communication_ms < 0.0 ||
         execution.pp_communication_ms < 0.0 ||
@@ -409,7 +414,11 @@ OrderedJson serialize_batch_stage(const BatchStageMetricsRecord &stage) {
         execution.ep_dispatch_ms < 0.0 || execution.ep_combine_ms < 0.0 ||
         execution.dp_input_communication_ms < 0.0 ||
         execution.dp_output_communication_ms < 0.0 ||
-        execution.synchronization_wait_ms < 0.0) {
+        execution.synchronization_wait_ms < 0.0 ||
+        execution.moe_pre_barrier_wait_ms < 0.0 ||
+        execution.moe_ep_aggregation_extra_ms < 0.0 ||
+        execution.synchronization_unattributed_wait_ms < 0.0 ||
+        execution.synchronization_attribution_overlap_ms < 0.0) {
         throw std::invalid_argument("batch stage execution time is invalid");
     }
     OrderedJson json = OrderedJson::object({
@@ -435,6 +444,12 @@ OrderedJson serialize_batch_stage(const BatchStageMetricsRecord &stage) {
         {"dp_input_communication_ms", execution.dp_input_communication_ms},
         {"dp_output_communication_ms", execution.dp_output_communication_ms},
         {"synchronization_wait_ms", execution.synchronization_wait_ms},
+        {"moe_pre_barrier_wait_ms", execution.moe_pre_barrier_wait_ms},
+        {"moe_ep_aggregation_extra_ms", execution.moe_ep_aggregation_extra_ms},
+        {"synchronization_unattributed_wait_ms",
+         execution.synchronization_unattributed_wait_ms},
+        {"synchronization_attribution_overlap_ms",
+         execution.synchronization_attribution_overlap_ms},
         {"duration_ms",
          (stage.completed_at.seconds() - stage.started_at.seconds()) * 1e3},
         {"model_kind", std::string{config::to_string(stage.model_kind)}},
@@ -832,14 +847,12 @@ std::string serialize_simulation_output_json(const SimulationOutput &output) {
         {"evicted_bytes", cpu.evicted_bytes},
         {"skipped_offloads", cpu.skipped_offloads},
         {"truncated_offloads", cpu.truncated_offloads},
-        {"stale_generation_completions",
-         cpu.stale_generation_completions},
+        {"stale_generation_completions", cpu.stale_generation_completions},
         {"sessions_with_cpu_hits", cpu.sessions_with_cpu_hits},
         {"pending_restore_operations", cpu.pending_restore_operations},
         {"staged_restore_payloads", cpu.staged_restore_payloads},
         {"active_restore_leases", cpu.active_restore_leases},
-        {"active_offload_reservations",
-         cpu.active_offload_reservations},
+        {"active_offload_reservations", cpu.active_offload_reservations},
     });
     root["cpu_kv_cache_targets"] = OrderedJson::array();
     for (const auto &target : output.cpu_kv_cache_targets) {
@@ -871,12 +884,10 @@ std::string serialize_simulation_output_json(const SimulationOutput &output) {
             {"cpu_query_blocks", target.cpu_query_blocks},
             {"cpu_hit_blocks", target.cpu_hit_blocks},
             {"sessions_with_cpu_hits", target.sessions_with_cpu_hits},
-            {"pending_restore_operations",
-             target.pending_restore_operations},
+            {"pending_restore_operations", target.pending_restore_operations},
             {"staged_restore_payloads", target.staged_restore_payloads},
             {"active_restore_leases", target.active_restore_leases},
-            {"active_offload_reservations",
-             target.active_offload_reservations},
+            {"active_offload_reservations", target.active_offload_reservations},
         }));
     }
     root["cpu_kv_cache_transfers"] = OrderedJson::array();
@@ -1082,11 +1093,10 @@ std::string serialize_simulation_summary_json(const SimulationOutput &output,
                      ? 0.0
                      : static_cast<double>(aggregate.request_slots) /
                            static_cast<double>(aggregate.batch_count)},
-                 {"predicted_execution_ms", aggregate.predicted_execution_ms},
-                 {"execution_time_components_ms",
-                  serialize_execution_time_components(
-                      aggregate.execution_time)},
-                 {"prefill_scheduled_tokens",
+                {"predicted_execution_ms", aggregate.predicted_execution_ms},
+                {"execution_time_components_ms",
+                 serialize_execution_time_components(aggregate.execution_time)},
+                {"prefill_scheduled_tokens",
                  aggregate.prefill_scheduled_tokens},
                 {"preemption_recomputed_prefill_tokens",
                  aggregate.preemption_recomputed_prefill_tokens},
@@ -1110,11 +1120,10 @@ std::string serialize_simulation_summary_json(const SimulationOutput &output,
                      ? 0.0
                      : static_cast<double>(aggregate.request_slots) /
                            static_cast<double>(aggregate.batch_count)},
-                 {"predicted_execution_ms", aggregate.predicted_execution_ms},
-                 {"execution_time_components_ms",
-                  serialize_execution_time_components(
-                      aggregate.execution_time)},
-             }));
+                {"predicted_execution_ms", aggregate.predicted_execution_ms},
+                {"execution_time_components_ms",
+                 serialize_execution_time_components(aggregate.execution_time)},
+            }));
         }
         root["batch_summary_by_cluster_time_bucket"]
             [std::string{to_string(cluster_type)}] = std::move(values);
@@ -1183,14 +1192,12 @@ std::string serialize_simulation_summary_json(const SimulationOutput &output,
         {"evicted_bytes", cpu.evicted_bytes},
         {"skipped_offloads", cpu.skipped_offloads},
         {"truncated_offloads", cpu.truncated_offloads},
-        {"stale_generation_completions",
-         cpu.stale_generation_completions},
+        {"stale_generation_completions", cpu.stale_generation_completions},
         {"sessions_with_cpu_hits", cpu.sessions_with_cpu_hits},
         {"pending_restore_operations", cpu.pending_restore_operations},
         {"staged_restore_payloads", cpu.staged_restore_payloads},
         {"active_restore_leases", cpu.active_restore_leases},
-        {"active_offload_reservations",
-         cpu.active_offload_reservations},
+        {"active_offload_reservations", cpu.active_offload_reservations},
     });
     return root.dump(2) + '\n';
 }
@@ -1361,8 +1368,8 @@ std::string serialize_gpu_kv_occupancy_csv(
             throw std::invalid_argument(
                 "gpu KV occupancy total-HBM fractions disagree");
         }
-        const auto key = std::make_tuple(record.cluster_type,
-                                         record.replica_id, record.dp_id);
+        const auto key = std::make_tuple(record.cluster_type, record.replica_id,
+                                         record.dp_id);
         const auto previous = last_time.find(key);
         if (previous != last_time.end() && record.time < previous->second) {
             throw std::invalid_argument(
@@ -1372,8 +1379,8 @@ std::string serialize_gpu_kv_occupancy_csv(
         output << record.time.seconds() << ',' << to_string(record.cluster_type)
                << ',' << record.replica_id.value() << ','
                << record.dp_id.value() << ',' << record.active_blocks << ','
-               << record.capacity_blocks << ','
-               << record.active_bytes_per_gpu << ',';
+               << record.capacity_blocks << ',' << record.active_bytes_per_gpu
+               << ',';
         if (record.hbm_fraction.has_value()) {
             output << record.hbm_fraction.value();
         }

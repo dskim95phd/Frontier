@@ -34,6 +34,10 @@ bool valid_execution_time(const ExecutionTime &execution_time) {
         execution_time.dp_input_communication_ms,
         execution_time.dp_output_communication_ms,
         execution_time.synchronization_wait_ms,
+        execution_time.moe_pre_barrier_wait_ms,
+        execution_time.moe_ep_aggregation_extra_ms,
+        execution_time.synchronization_unattributed_wait_ms,
+        execution_time.synchronization_attribution_overlap_ms,
     };
     return std::all_of(values.begin(), values.end(), [](double value) {
         return std::isfinite(value) && value >= 0.0;
@@ -85,6 +89,13 @@ void BatchStage::reconcile_synchronization_wait(SimTime completed_at) {
         execution_time_.total_ms() - execution_time_.synchronization_wait_ms;
     execution_time_.synchronization_wait_ms =
         std::max(0.0, wall_ms - modeled_without_wait);
+    const double unattributed_ms = execution_time_.synchronization_wait_ms -
+                                   execution_time_.moe_pre_barrier_wait_ms -
+                                   execution_time_.moe_ep_aggregation_extra_ms;
+    execution_time_.synchronization_unattributed_wait_ms =
+        std::max(0.0, unattributed_ms);
+    execution_time_.synchronization_attribution_overlap_ms =
+        std::max(0.0, -unattributed_ms);
 }
 
 void BatchStage::accumulate_execution_time(
@@ -95,16 +106,12 @@ void BatchStage::accumulate_execution_time(
     }
     execution_time_.dense_compute_ms += execution_time.dense_compute_ms;
     execution_time_.lm_head_ms += execution_time.lm_head_ms;
-    execution_time_.tp_communication_ms +=
-        execution_time.tp_communication_ms;
-    execution_time_.pp_communication_ms +=
-        execution_time.pp_communication_ms;
-    execution_time_.moe_gating_linear_ms +=
-        execution_time.moe_gating_linear_ms;
+    execution_time_.tp_communication_ms += execution_time.tp_communication_ms;
+    execution_time_.pp_communication_ms += execution_time.pp_communication_ms;
+    execution_time_.moe_gating_linear_ms += execution_time.moe_gating_linear_ms;
     execution_time_.moe_gating_routing_topk_ms +=
         execution_time.moe_gating_routing_topk_ms;
-    execution_time_.moe_grouped_gemm_ms +=
-        execution_time.moe_grouped_gemm_ms;
+    execution_time_.moe_grouped_gemm_ms += execution_time.moe_grouped_gemm_ms;
     execution_time_.moe_shuffling_ms += execution_time.moe_shuffling_ms;
     execution_time_.moe_post_attention_norm_ms +=
         execution_time.moe_post_attention_norm_ms;
@@ -118,6 +125,14 @@ void BatchStage::accumulate_execution_time(
         execution_time.dp_output_communication_ms;
     execution_time_.synchronization_wait_ms +=
         execution_time.synchronization_wait_ms;
+    execution_time_.moe_pre_barrier_wait_ms +=
+        execution_time.moe_pre_barrier_wait_ms;
+    execution_time_.moe_ep_aggregation_extra_ms +=
+        execution_time.moe_ep_aggregation_extra_ms;
+    execution_time_.synchronization_unattributed_wait_ms +=
+        execution_time.synchronization_unattributed_wait_ms;
+    execution_time_.synchronization_attribution_overlap_ms +=
+        execution_time.synchronization_attribution_overlap_ms;
 }
 
 } // namespace frontier::entities

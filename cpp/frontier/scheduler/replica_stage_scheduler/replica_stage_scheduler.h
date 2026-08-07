@@ -45,6 +45,11 @@ class ReplicaStageScheduler {
         execution_time_predictor::ExecutionTimePredictorPtr predictor);
 
     void add_batch(const entities::Batch &batch);
+    // Returns the next queued ticket without claiming the stage.  Cluster
+    // schedulers use this to enforce a shared MoE-domain reservation before a
+    // lane-local schedule event makes the batch active.
+    [[nodiscard]] std::optional<StageBatchTicket>
+    peek_batch_if_not_busy() const;
     [[nodiscard]] std::optional<StageBatchTicket> pop_batch_if_not_busy();
     [[nodiscard]]
     execution_time_predictor::ExecutionTimePrediction
@@ -60,6 +65,9 @@ class ReplicaStageScheduler {
         const entities::Batch &batch,
         const std::vector<entities::Request> &requests,
         std::uint64_t local_moe_layer) const;
+    [[nodiscard]] execution_time_predictor::MoEGroupLayerPrediction
+    predict_moe_group_layer(
+        const execution_time_predictor::MoEGroupLayerInput &input) const;
     void on_stage_end(BatchId batch_id);
 
     [[nodiscard]] ReplicaId replica_id() const noexcept { return replica_id_; }

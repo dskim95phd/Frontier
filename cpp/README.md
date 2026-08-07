@@ -158,6 +158,33 @@ target is available. `cache_aware` queries the actual GPU-resident prefix and
 may migrate to a least-loaded target; migration discards the old target's
 session KV.
 
+### Automatic GPU KV-block capacity
+
+Analytical clusters may omit `scheduler.num_blocks` and provide physical HBM
+capacity instead:
+
+```json
+"gpu_memory": {
+  "capacity_bytes_per_gpu": 288000000000,
+  "runtime_reserve_fraction": 0.10,
+  "runtime_reserve_bytes": 0,
+  "weight_overhead_fraction": 0.0
+}
+```
+
+The parser computes the maximum per-pipeline-stage weight footprint on one
+GPU, accounting for attention TP, MoE TP/EP, embeddings/LM head, model weight
+precisions (including FP4), and replicated weights. It then subtracts weights
+and the runtime reserve from HBM and divides the remainder by the rank-local KV
+block size. KV precision, MLA/GQA layout, block size, and DCP token sharding
+therefore all affect the resolved block count. `config.normalized.json` emits
+`model_weight_bytes_per_gpu`, `kv_cache_budget_bytes_per_gpu`,
+`kv_cache_bytes_per_block`, and the resolved `scheduler.num_blocks` for audit.
+
+Configs without `gpu_memory` retain the explicit legacy contract and must set
+`scheduler.num_blocks`. Automatic sizing is rejected for fixed-latency
+execution models because they do not carry a weight-precision contract.
+
 ### CPU KV-cache tiering
 
 CPU tiering is an opt-in sequential-PDD feature. It requires session prefix

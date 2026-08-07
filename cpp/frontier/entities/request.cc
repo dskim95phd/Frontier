@@ -173,13 +173,24 @@ void Request::record_cpu_restore_transfer(std::uint64_t blocks,
                                           double service_time_ms) {
     if (!std::isfinite(queue_time_ms) || queue_time_ms < 0.0 ||
         !std::isfinite(service_time_ms) || service_time_ms < 0.0 ||
-        cpu_restore_transferred_blocks_ != 0 || cpu_restore_bytes_ != 0) {
-        throw RequestError("invalid or duplicate CPU restore transfer metrics");
+        blocks > std::numeric_limits<std::uint64_t>::max() -
+                     cpu_restore_transferred_blocks_ ||
+        bytes > std::numeric_limits<std::uint64_t>::max() -
+                    cpu_restore_bytes_ ||
+        queue_time_ms / 1e3 >
+            std::numeric_limits<double>::max() - cpu_restore_queue_time_s_ ||
+        service_time_ms / 1e3 > std::numeric_limits<double>::max() -
+                                      cpu_restore_service_time_s_) {
+        throw RequestError("invalid CPU restore transfer metrics");
     }
-    cpu_restore_transferred_blocks_ = blocks;
-    cpu_restore_bytes_ = bytes;
-    cpu_restore_queue_time_s_ = queue_time_ms / 1e3;
-    cpu_restore_service_time_s_ = service_time_ms / 1e3;
+    // A waiting request can be restored more than once when cache-aware
+    // routing moves it to another PREFILL lane before admission.  These are
+    // distinct completed transfers, so request-level diagnostics must retain
+    // their cumulative cost instead of rejecting the later transfer.
+    cpu_restore_transferred_blocks_ += blocks;
+    cpu_restore_bytes_ += bytes;
+    cpu_restore_queue_time_s_ += queue_time_ms / 1e3;
+    cpu_restore_service_time_s_ += service_time_ms / 1e3;
 }
 
 void Request::record_cpu_prefix_admission(

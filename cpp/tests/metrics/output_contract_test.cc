@@ -24,8 +24,8 @@ using frontier::metrics::RequestMetricsRecord;
 using frontier::metrics::RunMetadata;
 using frontier::metrics::SchedulerDecisionRecord;
 using frontier::metrics::SchedulerTraceRecord;
-using frontier::metrics::serialize_request_metrics_csv;
 using frontier::metrics::serialize_gpu_kv_occupancy_csv;
+using frontier::metrics::serialize_request_metrics_csv;
 using frontier::metrics::serialize_simulation_output_json;
 using frontier::metrics::serialize_simulation_summary_json;
 using frontier::metrics::SimulationOutput;
@@ -191,10 +191,15 @@ SimulationOutput make_output() {
         batch_aggregate.execution_time.tp_communication_ms = 0.125;
         batch_aggregate.execution_time.moe_grouped_gemm_ms = 0.5;
         batch_aggregate.execution_time.synchronization_wait_ms = 0.125;
+        batch_aggregate.execution_time.moe_pre_barrier_wait_ms = 0.05;
+        batch_aggregate.execution_time.moe_ep_aggregation_extra_ms = 0.025;
+        batch_aggregate.execution_time.synchronization_unattributed_wait_ms =
+            0.05;
+        batch_aggregate.execution_time.synchronization_attribution_overlap_ms =
+            0.01;
         batch_aggregate.batch_size_histogram[1] = 1;
-        auto &time_bucket =
-            value.aggregate.batch_time_buckets_by_cluster
-                [frontier::ClusterType::kMonolithic][0];
+        auto &time_bucket = value.aggregate.batch_time_buckets_by_cluster
+                                [frontier::ClusterType::kMonolithic][0];
         time_bucket.batch_count = 1;
         time_bucket.request_slots = 1;
         time_bucket.predicted_execution_ms = 1.0;
@@ -230,10 +235,11 @@ void test_json_contract() {
                    .at(0)
                    .at("decision_result") == "ADMISSION",
            "scheduler decision sequence must serialize");
-        expect(json.at("requests").at(0).at("num_prefill_tokens") == 4,
+    expect(json.at("requests").at(0).at("num_prefill_tokens") == 4,
            "prefix-cache request shape must serialize");
     expect(json.at("requests").at(0).at("scheduled_prefill_tokens") == 0 &&
-               json.at("requests").at(0)
+               json.at("requests")
+                       .at(0)
                        .at("preemption_recomputed_prefill_tokens") == 0,
            "compact scheduled-PREFILL request fields must serialize");
     expect(json.at("requests").at(0).at("prefill_latency_ms") == 1.0 &&
@@ -261,10 +267,12 @@ void test_json_contract() {
                json.at("gpu_kv_occupancy").at(0).at("active_blocks") == 2 &&
                json.at("gpu_kv_occupancy").at(0).at("hbm_fraction") ==
                    static_cast<double>(1'249'280) / 288'000'000'000.0 &&
-               json.at("gpu_kv_occupancy").at(1)
-                       .at("active_fraction_of_total_hbm")
-                       .is_null(),
-           "GPU KV occupancy event samples must serialize with optional HBM basis");
+               json.at("gpu_kv_occupancy")
+                   .at(1)
+                   .at("active_fraction_of_total_hbm")
+                   .is_null(),
+           "GPU KV occupancy event samples must serialize with optional HBM "
+           "basis");
 }
 
 void test_csv_contract() {
@@ -278,7 +286,8 @@ void test_csv_contract() {
     expect(csv.find("prefill_latency_ms,ttft_ms") != std::string::npos,
            "CSV must distinguish prefill latency from TTFT");
     expect(csv.find(",6,1,0,0,0,0\n") != std::string::npos,
-           "CSV must include progress, preemption, target, and PREFILL work fields");
+           "CSV must include progress, preemption, target, and PREFILL work "
+           "fields");
     const std::string occupancy_csv =
         serialize_gpu_kv_occupancy_csv(make_output().gpu_kv_occupancy);
     expect(occupancy_csv.rfind(
@@ -288,7 +297,7 @@ void test_csv_contract() {
                0) == 0,
            "GPU KV occupancy CSV must expose per-GPU and fraction fields");
     expect(occupancy_csv.find("0,PREFILL,0,0,2,8,1249280,") !=
-               std::string::npos &&
+                   std::string::npos &&
                occupancy_csv.find("1,PREFILL,0,0,0,8,0,,0,\n") !=
                    std::string::npos,
            "GPU KV occupancy CSV must retain terminal zero snapshots");
@@ -308,13 +317,17 @@ void test_summary_contract() {
     expect(json.at("batch_time_bucket_seconds") == 60 &&
                json.at("batch_summary_by_cluster_time_bucket").is_object(),
            "summary must expose compact batch time buckets");
-    const Json &cluster =
-        json.at("batch_summary_by_cluster").at("MONOLITHIC");
+    const Json &cluster = json.at("batch_summary_by_cluster").at("MONOLITHIC");
     const Json &components = cluster.at("execution_time_components_ms");
     expect(components.at("dense_compute_ms") == 0.25 &&
                components.at("tp_communication_ms") == 0.125 &&
                components.at("moe_grouped_gemm_ms") == 0.5 &&
                components.at("synchronization_wait_ms") == 0.125 &&
+               components.at("moe_pre_barrier_wait_ms") == 0.05 &&
+               components.at("moe_ep_aggregation_extra_ms") == 0.025 &&
+               components.at("synchronization_unattributed_wait_ms") == 0.05 &&
+               components.at("synchronization_attribution_overlap_ms") ==
+                   0.01 &&
                components.at("total_ms") == 1.0,
            "summary must expose compact execution-time component totals");
     const Json &bucket_components =

@@ -194,8 +194,22 @@ OrderedJson serialize_execution_model(const ExecutionModelConfig &execution) {
     return result;
 }
 
-OrderedJson serialize_cluster_runtime(const ClusterRuntimeConfig &cluster) {
+OrderedJson serialize_gpu_memory(const GpuMemoryConfig &memory) {
     return OrderedJson::object({
+        {"capacity_bytes_per_gpu", memory.capacity_bytes_per_gpu},
+        {"runtime_reserve_fraction", memory.runtime_reserve_fraction},
+        {"runtime_reserve_bytes", memory.runtime_reserve_bytes},
+        {"weight_overhead_fraction", memory.weight_overhead_fraction},
+        {"model_weight_bytes_per_gpu",
+         memory.model_weight_bytes_per_gpu},
+        {"kv_cache_budget_bytes_per_gpu",
+         memory.kv_cache_budget_bytes_per_gpu},
+        {"kv_cache_bytes_per_block", memory.kv_cache_bytes_per_block},
+    });
+}
+
+OrderedJson serialize_cluster_runtime(const ClusterRuntimeConfig &cluster) {
+    OrderedJson result = OrderedJson::object({
         {"parallelism", serialize_parallelism(cluster.parallelism)},
         {"scheduler", serialize_scheduler(cluster.scheduler)},
         {
@@ -209,6 +223,10 @@ OrderedJson serialize_cluster_runtime(const ClusterRuntimeConfig &cluster) {
         {"num_shared_experts", cluster.model.num_shared_experts},
         {"moe_routing", serialize_moe_routing(cluster.moe_routing)},
     });
+    if (cluster.gpu_memory.auto_calculate_num_blocks) {
+        result["gpu_memory"] = serialize_gpu_memory(cluster.gpu_memory);
+    }
+    return result;
 }
 
 OrderedJson serialize_pdd_clusters(const PddClustersConfig &clusters) {

@@ -228,6 +228,96 @@ void test_operator_precision_contract_round_trip() {
         "unknown operator precision keys must fail fast");
 }
 
+void test_gpu_memory_auto_block_calculation() {
+    auto config = load("analytical_parallel_colocation.json");
+    auto &cluster = config.cluster();
+    cluster.gpu_memory.auto_calculate_num_blocks = true;
+    cluster.gpu_memory.capacity_bytes_per_gpu = 80'000'000'000ULL;
+    cluster.gpu_memory.runtime_reserve_fraction = 0.10;
+    frontier::config::resolve_gpu_memory_config(cluster);
+
+    expect(cluster.gpu_memory.model_weight_bytes_per_gpu > 0 &&
+               cluster.gpu_memory.kv_cache_budget_bytes_per_gpu > 0 &&
+               cluster.gpu_memory.kv_cache_bytes_per_block > 0 &&
+               cluster.scheduler.num_blocks ==
+                   cluster.gpu_memory.kv_cache_budget_bytes_per_gpu /
+                       cluster.gpu_memory.kv_cache_bytes_per_block,
+           "GPU capacity must resolve weight storage, KV budget, and blocks");
+
+    std::string without_manual_blocks =
+        serialize_simulation_config_json(config);
+    const std::string num_blocks =
+        "\"num_blocks\": " + std::to_string(cluster.scheduler.num_blocks);
+    const auto value_position = without_manual_blocks.find(num_blocks);
+    expect(value_position != std::string::npos,
+           "normalized auto-memory config must expose resolved blocks");
+    const auto line_begin = without_manual_blocks.rfind('\n', value_position);
+    const auto line_end = without_manual_blocks.find('\n', value_position);
+    expect(line_begin != std::string::npos && line_end != std::string::npos,
+           "resolved block field must occupy one JSON line");
+    without_manual_blocks.erase(line_begin + 1, line_end - line_begin);
+    const auto parsed = parse_simulation_config_json(without_manual_blocks);
+    expect(parsed == config,
+           "auto-memory input may omit scheduler.num_blocks and must "
+           "round-trip deterministically");
+
+    auto smaller = config;
+    smaller.cluster().gpu_memory.capacity_bytes_per_gpu = 60'000'000'000ULL;
+    frontier::config::resolve_gpu_memory_config(smaller.cluster());
+    expect(smaller.cluster().scheduler.num_blocks <
+               cluster.scheduler.num_blocks,
+           "smaller HBM capacity must produce fewer KV blocks");
+
+    auto quantized = config;
+    auto &precisions = quantized.cluster()
+                           .execution_model.analytical.operator_precisions;
+    precisions.attention_weight = "fp8";
+    precisions.dense_weight = "fp8";
+    precisions.lm_head_weight = "fp8";
+    frontier::config::resolve_gpu_memory_config(quantized.cluster());
+    expect(quantized.cluster().gpu_memory.model_weight_bytes_per_gpu <
+                   cluster.gpu_memory.model_weight_bytes_per_gpu &&
+               quantized.cluster().gpu_memory.kv_cache_bytes_per_block ==
+                   cluster.gpu_memory.kv_cache_bytes_per_block &&
+               quantized.cluster().scheduler.num_blocks >
+                   cluster.scheduler.num_blocks,
+           "weight-only quantization must free HBM for additional KV blocks");
+
+    auto kimi_prefill = config.cluster();
+    kimi_prefill.model =
+        frontier::config::load_model_config("moonshotai/Kimi-K2-Instruct");
+    kimi_prefill.parallelism.tensor_parallel_size = 1;
+    kimi_prefill.parallelism.decode_context_parallel_size = 1;
+    kimi_prefill.parallelism.pipeline_parallel_size = 1;
+    kimi_prefill.parallelism.data_parallel_size = 8;
+    kimi_prefill.parallelism.moe_tensor_parallel_size = 1;
+    kimi_prefill.parallelism.moe_expert_parallel_size = 8;
+    kimi_prefill.execution_model.analytical.tensor_parallel_size = 1;
+    kimi_prefill.execution_model.analytical.precision = "fp8";
+    kimi_prefill.execution_model.analytical.operator_precisions = {};
+    kimi_prefill.execution_model.analytical.operator_precisions
+        .moe_expert_weight = "fp4";
+    kimi_prefill.gpu_memory.capacity_bytes_per_gpu = 288'000'000'000ULL;
+    kimi_prefill.gpu_memory.runtime_reserve_fraction = 0.10;
+    resolve_gpu_memory_config(kimi_prefill);
+
+    auto kimi_decode = kimi_prefill;
+    kimi_decode.parallelism.tensor_parallel_size = 4;
+    kimi_decode.parallelism.decode_context_parallel_size = 4;
+    kimi_decode.parallelism.data_parallel_size = 6;
+    kimi_decode.parallelism.moe_expert_parallel_size = 24;
+    kimi_decode.execution_model.analytical.tensor_parallel_size = 4;
+    resolve_gpu_memory_config(kimi_decode);
+    expect(kimi_prefill.gpu_memory.model_weight_bytes_per_gpu >
+                   kimi_decode.gpu_memory.model_weight_bytes_per_gpu &&
+               kimi_prefill.gpu_memory.kv_cache_bytes_per_block ==
+                   4 * kimi_decode.gpu_memory.kv_cache_bytes_per_block &&
+               kimi_prefill.scheduler.num_blocks <
+                   kimi_decode.scheduler.num_blocks,
+           "Kimi K2 TP/EP and MLA DCP must change rank-local weights and KV "
+           "capacity");
+}
+
 void test_pdd_kv_precision_matches_transfer_dtype() {
     auto config = load("fixed_sequential_pdd.json");
     auto &runtime = config.pdd();
@@ -728,6 +818,9 @@ int main() {
     failures +=
         frontier::test::run("operator precision contract round trip",
                             test_operator_precision_contract_round_trip);
+    failures += frontier::test::run(
+        "GPU memory auto block calculation",
+        test_gpu_memory_auto_block_calculation);
     failures +=
         frontier::test::run("PDD KV precision matches transfer dtype",
                             test_pdd_kv_precision_matches_transfer_dtype);

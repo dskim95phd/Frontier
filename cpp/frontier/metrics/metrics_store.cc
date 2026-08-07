@@ -8,12 +8,12 @@
 
 #include "frontier/entities/batch.h"
 #include "frontier/entities/batch_stage.h"
-#include "frontier/entities/kv_cache_transfer_info.h"
 #include "frontier/entities/cpu_kv_cache_transfer_info.h"
+#include "frontier/entities/kv_cache_transfer_info.h"
 #include "frontier/entities/request.h"
 #include "frontier/execution_time_predictor/base_execution_time_predictor.h"
-#include "frontier/kv_cache/replica_kv_cache_manager.h"
 #include "frontier/kv_cache/cpu_kv_cache_manager.h"
+#include "frontier/kv_cache/replica_kv_cache_manager.h"
 #include "frontier/scheduler/replica_scheduler/base_replica_scheduler.h"
 #include "frontier/scheduler/scheduler_types.h"
 #include "frontier/simulator/entity_arena.h"
@@ -38,6 +38,12 @@ void accumulate_execution_time(entities::ExecutionTime &total,
     total.dp_input_communication_ms += value.dp_input_communication_ms;
     total.dp_output_communication_ms += value.dp_output_communication_ms;
     total.synchronization_wait_ms += value.synchronization_wait_ms;
+    total.moe_pre_barrier_wait_ms += value.moe_pre_barrier_wait_ms;
+    total.moe_ep_aggregation_extra_ms += value.moe_ep_aggregation_extra_ms;
+    total.synchronization_unattributed_wait_ms +=
+        value.synchronization_unattributed_wait_ms;
+    total.synchronization_attribution_overlap_ms +=
+        value.synchronization_attribution_overlap_ms;
 }
 
 } // namespace
@@ -92,8 +98,8 @@ void MetricsStore::record_batch(const entities::Batch &batch,
     const auto bucket_index = static_cast<std::uint64_t>(
         std::floor(batch.scheduled_at().seconds() / kBatchTimeBucketSeconds));
     BatchTimeBucketAggregate &time_bucket =
-        output_.aggregate.batch_time_buckets_by_cluster[batch.cluster_type()]
-                                                        [bucket_index];
+        output_.aggregate
+            .batch_time_buckets_by_cluster[batch.cluster_type()][bucket_index];
     ++time_bucket.batch_count;
     time_bucket.request_slots += batch_size;
     time_bucket.predicted_execution_ms += predicted_execution_ms;
@@ -168,8 +174,8 @@ void MetricsStore::record_batch_stage(
     const auto bucket_index = static_cast<std::uint64_t>(
         std::floor(batch.scheduled_at().seconds() / kBatchTimeBucketSeconds));
     BatchTimeBucketAggregate &time_bucket =
-        output_.aggregate.batch_time_buckets_by_cluster[batch.cluster_type()]
-                                                        [bucket_index];
+        output_.aggregate
+            .batch_time_buckets_by_cluster[batch.cluster_type()][bucket_index];
     accumulate_execution_time(time_bucket.execution_time,
                               batch_stage.execution_time());
     if (!detailed_traces_enabled_) {
@@ -334,8 +340,7 @@ void MetricsStore::collect_completed_requests(
             value.session_id = request.session_id();
             value.num_prefill_tokens = request.initial_num_prefill_tokens();
             value.num_decode_tokens = request.initial_num_decode_tokens();
-            value.scheduled_prefill_tokens =
-                request.scheduled_prefill_tokens();
+            value.scheduled_prefill_tokens = request.scheduled_prefill_tokens();
             value.preemption_recomputed_prefill_tokens =
                 request.preemption_recomputed_prefill_tokens();
             value.cached_prefill_tokens = request.cached_prefill_tokens();
@@ -353,13 +358,11 @@ void MetricsStore::collect_completed_requests(
                 request.cpu_restore_discarded_blocks();
             value.cpu_restored_tokens = request.cpu_restored_tokens();
             value.cpu_restore_bytes = request.cpu_restore_bytes();
-            value.cpu_restore_queue_time_s =
-                request.cpu_restore_queue_time_s();
+            value.cpu_restore_queue_time_s = request.cpu_restore_queue_time_s();
             value.cpu_restore_service_time_s =
                 request.cpu_restore_service_time_s();
             value.cpu_offload_bytes = request.cpu_offload_bytes();
-            value.cpu_offload_queue_time_s =
-                request.cpu_offload_queue_time_s();
+            value.cpu_offload_queue_time_s = request.cpu_offload_queue_time_s();
             value.cpu_offload_service_time_s =
                 request.cpu_offload_service_time_s();
             value.prefix_cache_key_mode = request.prefix_cache_key_mode();
@@ -460,8 +463,8 @@ void MetricsStore::record_cpu_kv_cache_target(
         }
         return blocks * config.bytes_per_block;
     };
-    const std::uint64_t used = diagnostics.resident_blocks +
-                               diagnostics.reserved_blocks;
+    const std::uint64_t used =
+        diagnostics.resident_blocks + diagnostics.reserved_blocks;
     if (used > diagnostics.capacity_blocks) {
         throw std::logic_error("CPU KV-cache target exceeds capacity");
     }
@@ -488,8 +491,7 @@ void MetricsStore::record_cpu_kv_cache_target(
     record.evicted_bytes = bytes(stats.evicted_blocks);
     record.skipped_offloads = stats.skipped_offloads;
     record.truncated_offloads = stats.truncated_offloads;
-    record.stale_generation_completions =
-        stats.stale_generation_completions;
+    record.stale_generation_completions = stats.stale_generation_completions;
     record.cpu_query_blocks = stats.query_blocks;
     record.cpu_hit_blocks = stats.hit_blocks;
     record.sessions_with_cpu_hits = stats.sessions_with_hits;
@@ -530,17 +532,15 @@ void MetricsStore::record_cpu_kv_cache_target(
     aggregate.stale_generation_completions +=
         record.stale_generation_completions;
     aggregate.sessions_with_cpu_hits += record.sessions_with_cpu_hits;
-    aggregate.pending_restore_operations +=
-        record.pending_restore_operations;
+    aggregate.pending_restore_operations += record.pending_restore_operations;
     aggregate.staged_restore_payloads += record.staged_restore_payloads;
     aggregate.active_restore_leases += record.active_restore_leases;
-    aggregate.active_offload_reservations +=
-        record.active_offload_reservations;
+    aggregate.active_offload_reservations += record.active_offload_reservations;
 }
 
 void MetricsStore::record_cpu_kv_cache_offload(
-    const entities::CpuKVCacheOffloadInfo &operation,
-    ClusterType cluster_type, std::uint64_t bytes_per_block) {
+    const entities::CpuKVCacheOffloadInfo &operation, ClusterType cluster_type,
+    std::uint64_t bytes_per_block) {
     if (operation.state() != entities::CpuKVCacheTransferState::kCompleted) {
         return;
     }
@@ -573,8 +573,8 @@ void MetricsStore::record_cpu_kv_cache_offload(
 }
 
 void MetricsStore::record_cpu_kv_cache_restore(
-    const entities::CpuKVCacheRestoreInfo &operation,
-    ClusterType cluster_type, std::uint64_t bytes_per_block) {
+    const entities::CpuKVCacheRestoreInfo &operation, ClusterType cluster_type,
+    std::uint64_t bytes_per_block) {
     if (operation.state() != entities::CpuKVCacheTransferState::kCompleted) {
         return;
     }

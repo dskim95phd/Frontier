@@ -38,6 +38,23 @@ struct ExecutionTimePrediction {
     bool scaled_moe_layer_prediction = false;
 };
 
+struct MoEGroupLayerInput {
+    LayerId layer_id;
+    std::uint64_t model_layer_id = 0;
+    std::uint64_t input_tokens = 0;
+    std::uint64_t routed_tokens = 0;
+    std::vector<std::uint64_t> global_expert_tokens;
+    // Predictors without a token-sensitive group model may retain their
+    // existing behavior by returning this lane-wise sum.
+    std::vector<double> fallback_lane_times_ms;
+};
+
+struct MoEGroupLayerPrediction {
+    std::vector<double> lane_times_ms;
+    std::uint64_t critical_lane = 0;
+    double critical_lane_time_ms = 0.0;
+};
+
 class ExecutionTimePredictorError : public std::runtime_error {
   public:
     using std::runtime_error::runtime_error;
@@ -53,6 +70,9 @@ class BaseExecutionTimePredictor {
     predict_stage_execution_time(const entities::Batch &batch,
                                  const std::vector<entities::Request> &requests,
                                  StageId stage_id) const = 0;
+
+    [[nodiscard]] virtual MoEGroupLayerPrediction predict_moe_group_layer(
+        const MoEGroupLayerInput &input) const = 0;
 
     [[nodiscard]] virtual bool supports_lazy_moe_prediction() const noexcept {
         return false;

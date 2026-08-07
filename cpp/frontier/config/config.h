@@ -546,19 +546,54 @@ struct ExecutionModelConfig {
     }
 };
 
+struct GpuMemoryConfig {
+    bool auto_calculate_num_blocks = false;
+    std::uint64_t capacity_bytes_per_gpu = 0;
+    double runtime_reserve_fraction = 0.0;
+    std::uint64_t runtime_reserve_bytes = 0;
+    double weight_overhead_fraction = 0.0;
+
+    // Materialized diagnostics. These are emitted in normalized configs and
+    // make the automatic block calculation auditable and reproducible.
+    std::uint64_t model_weight_bytes_per_gpu = 0;
+    std::uint64_t kv_cache_budget_bytes_per_gpu = 0;
+    std::uint64_t kv_cache_bytes_per_block = 0;
+
+    friend bool operator==(const GpuMemoryConfig &lhs,
+                           const GpuMemoryConfig &rhs) {
+        return std::tie(lhs.auto_calculate_num_blocks,
+                        lhs.capacity_bytes_per_gpu,
+                        lhs.runtime_reserve_fraction,
+                        lhs.runtime_reserve_bytes,
+                        lhs.weight_overhead_fraction,
+                        lhs.model_weight_bytes_per_gpu,
+                        lhs.kv_cache_budget_bytes_per_gpu,
+                        lhs.kv_cache_bytes_per_block) ==
+               std::tie(rhs.auto_calculate_num_blocks,
+                        rhs.capacity_bytes_per_gpu,
+                        rhs.runtime_reserve_fraction,
+                        rhs.runtime_reserve_bytes,
+                        rhs.weight_overhead_fraction,
+                        rhs.model_weight_bytes_per_gpu,
+                        rhs.kv_cache_budget_bytes_per_gpu,
+                        rhs.kv_cache_bytes_per_block);
+    }
+};
+
 struct ClusterRuntimeConfig {
     ParallelismConfig parallelism;
     SchedulerConfig scheduler;
     ExecutionModelConfig execution_model;
+    GpuMemoryConfig gpu_memory;
     ModelConfig model;
     MoeRoutingConfig moe_routing;
 
     friend bool operator==(const ClusterRuntimeConfig &lhs,
                            const ClusterRuntimeConfig &rhs) {
         return std::tie(lhs.parallelism, lhs.scheduler, lhs.execution_model,
-                        lhs.model, lhs.moe_routing) ==
+                        lhs.gpu_memory, lhs.model, lhs.moe_routing) ==
                std::tie(rhs.parallelism, rhs.scheduler, rhs.execution_model,
-                        rhs.model, rhs.moe_routing);
+                        rhs.gpu_memory, rhs.model, rhs.moe_routing);
     }
 };
 
@@ -718,6 +753,13 @@ to_string(CpuKVCacheTransferConcurrency concurrency) noexcept;
 
 [[nodiscard]] ResolvedCpuKVCacheTargetConfig
 resolve_cpu_kv_cache_target(const SimulationConfig &config);
+
+// Resolve per-rank model weight storage and the remaining rank-local KV block
+// capacity. If an explicit_num_blocks value is supplied for an automatic
+// config, it is treated as a normalized-config consistency check.
+void resolve_gpu_memory_config(ClusterRuntimeConfig &cluster,
+                               std::optional<std::uint64_t>
+                                   explicit_num_blocks = std::nullopt);
 
 [[nodiscard]] SimulationConfig
 parse_simulation_config_json(std::string_view json_text);

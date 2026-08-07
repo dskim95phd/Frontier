@@ -302,6 +302,60 @@ bool BaseClusterScheduler::requires_moe_synchronization(
            runtime.parallelism.moe_expert_parallel_size > 1;
 }
 
+BaseClusterScheduler::MoEDomainKey
+BaseClusterScheduler::make_moe_domain_key(ReplicaId replica_id,
+                                          StageId stage_id) const noexcept {
+    return MoEDomainKey{cluster_type(), replica_id, stage_id};
+}
+
+bool BaseClusterScheduler::can_schedule_moe_stage(const entities::Batch &batch,
+                                                  StageId stage_id,
+                                                  SimTime time) {
+    if (!time.valid()) {
+        throw ClusterSchedulerError(
+            "MoE stage scheduling time must be finite and nonnegative");
+    }
+    const auto position = moe_domain_reservations_.find(
+        make_moe_domain_key(batch.replica_id(), stage_id));
+    if (position == moe_domain_reservations_.end()) {
+        return true;
+    }
+    const MoEDomainReservation &reservation = position->second;
+    if (reservation.release_at.valid() && time >= reservation.release_at) {
+        moe_domain_reservations_.erase(position);
+        return true;
+    }
+    // Before the first pre-MoE arrival the group is still collecting real
+    // stage registrations.  A lane that has not registered yet may join that
+    // group even though the shared domain is already reserved.
+    const auto group = moe_group_states_.find(reservation.group_key);
+    if (group != moe_group_states_.end() &&
+        !group->second.participants_initialized && batch.is_moe()) {
+        const MoEParticipantId participant{batch.dp_id().value()};
+        if (group->second.participants.find(participant) ==
+            group->second.participants.end()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void BaseClusterScheduler::release_moe_domain_if_ready(ReplicaId replica_id,
+                                                       StageId stage_id,
+                                                       SimTime time) {
+    if (!time.valid()) {
+        throw ClusterSchedulerError(
+            "MoE domain release time must be finite and nonnegative");
+    }
+    const auto position = moe_domain_reservations_.find(
+        make_moe_domain_key(replica_id, stage_id));
+    if (position != moe_domain_reservations_.end() &&
+        position->second.release_at.valid() &&
+        time >= position->second.release_at) {
+        moe_domain_reservations_.erase(position);
+    }
+}
+
 BaseClusterScheduler::MoEGroupKey
 BaseClusterScheduler::make_moe_group_key(const MoEBarrierKey &key,
                                          MoESyncPath path) const noexcept {
@@ -447,9 +501,12 @@ void BaseClusterScheduler::begin_moe_stage(
         MoEParticipantId{batch.dp_id().value()}};
     const bool monolithic_decode = cluster_type() == ClusterType::kMonolithic &&
                                    path == MoESyncPath::kDecode;
-    const std::uint64_t expected =
-        monolithic_decode ? runtime.parallelism.moe_expert_parallel_size
-                          : runtime.parallelism.data_parallel_size;
+    const bool aligned_decode = path == MoESyncPath::kDecode &&
+                                (cluster_type() == ClusterType::kMonolithic ||
+                                 cluster_type() == ClusterType::kDecode);
+    // Barrier participants represent attention-DP lanes. EP lanes remain a
+    // predictor output and must not be materialized as synthetic DP batches.
+    const std::uint64_t expected = runtime.parallelism.data_parallel_size;
     const std::uint64_t predicted_layers = prediction.moe_routing.size();
     if (predicted_layers == 0) {
         throw std::logic_error("MoE synchronization stage has no MoE layers");
@@ -479,28 +536,15 @@ void BaseClusterScheduler::begin_moe_stage(
     const SimTime initial_pre_arrival = SimTime::from_seconds(
         started_at.seconds() +
         prediction.moe_routing.front().pre_moe_compute_ms * 1e-3);
-    const MoECounterKey counter_key = [&]() {
-        MoECounterKey value{};
-        value.replica_id = batch.replica_id();
-        value.stage_id = stage_id;
-        value.path = path;
-        value.lane_id = batch.dp_id();
-        return value;
-    }();
-    const std::uint64_t participant_domain =
-        runtime.parallelism.moe_expert_parallel_size;
     const std::uint64_t maximum_id =
         static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max());
-    const std::uint64_t lane_value =
-        static_cast<std::uint64_t>(batch.dp_id().value());
     std::uint64_t group_value = 0;
-    if (monolithic_decode) {
-        std::uint64_t &ordinal = moe_group_counters_[counter_key];
-        if (ordinal > (maximum_id - lane_value) / participant_domain) {
-            throw std::overflow_error("MoE synchronization group ID overflows");
-        }
-        group_value = ordinal * participant_domain + lane_value;
-        ++ordinal;
+    if (aligned_decode) {
+        // DECODE groups are allocated by this scheduler, not by a
+        // lane-local BatchGlobalId.  The latter is intentionally independent
+        // on each DP target and therefore cannot identify one aligned
+        // forward across lanes in either co-location or PDD.
+        group_value = next_moe_sync_generation_;
     } else {
         group_value = static_cast<std::uint64_t>(batch.global_id().value());
     }
@@ -518,24 +562,23 @@ void BaseClusterScheduler::begin_moe_stage(
         return value;
     }();
     bool joined_open_group = false;
-    if (!monolithic_decode) {
-        for (auto &[candidate_key, candidate] : moe_group_states_) {
-            if (candidate_key.replica_id != selected_group_key.replica_id ||
-                candidate_key.stage_id != selected_group_key.stage_id ||
-                candidate_key.sync_group_id !=
-                    selected_group_key.sync_group_id ||
-                candidate_key.path != selected_group_key.path ||
-                candidate.participants_initialized ||
-                candidate.expected_participants != expected ||
-                candidate.initial_pre_arrival != initial_pre_arrival ||
-                candidate.participants.find(participants.front()) !=
-                    candidate.participants.end()) {
-                continue;
-            }
-            selected_group_key = candidate_key;
-            joined_open_group = true;
-            break;
+    for (auto &[candidate_key, candidate] : moe_group_states_) {
+        if (candidate_key.cluster_type != selected_group_key.cluster_type ||
+            candidate_key.replica_id != selected_group_key.replica_id ||
+            candidate_key.stage_id != selected_group_key.stage_id ||
+            candidate_key.path != selected_group_key.path ||
+            candidate.participants_initialized ||
+            candidate.expected_participants != expected ||
+            (!aligned_decode &&
+             (candidate_key.sync_group_id != selected_group_key.sync_group_id ||
+              candidate.initial_pre_arrival != initial_pre_arrival)) ||
+            candidate.participants.find(participants.front()) !=
+                candidate.participants.end()) {
+            continue;
         }
+        selected_group_key = candidate_key;
+        joined_open_group = true;
+        break;
     }
     if (!joined_open_group) {
         moe_group_states_.emplace(selected_group_key, [&]() {
@@ -546,6 +589,24 @@ void BaseClusterScheduler::begin_moe_stage(
             value.participants = {};
             return value;
         }());
+        if (aligned_decode) {
+            const MoEDomainKey domain_key =
+                make_moe_domain_key(batch.replica_id(), stage_id);
+            const auto reservation_position =
+                moe_domain_reservations_.find(domain_key);
+            if (reservation_position != moe_domain_reservations_.end()) {
+                if (reservation_position->second.release_at.valid() &&
+                    started_at >= reservation_position->second.release_at) {
+                    moe_domain_reservations_.erase(reservation_position);
+                } else {
+                    throw std::logic_error(
+                        "DECODE MoE domain is reserved by another group");
+                }
+            }
+            moe_domain_reservations_.emplace(
+                domain_key,
+                MoEDomainReservation{selected_group_key, SimTime{}});
+        }
         ++next_moe_sync_generation_;
     }
     const MoESyncGroupId sync_group_id = selected_group_key.sync_group_id;
@@ -632,11 +693,16 @@ void BaseClusterScheduler::begin_moe_stage(
              execution.dp_output_communication_ms) /
             static_cast<double>(component_layer_count);
         value.decode_lane_times_ms = std::move(decode_lane_times_ms);
+        value.moe_routing_by_layer = prediction.moe_routing;
         value.suffix_compute_ms = prediction.moe_suffix_compute_ms;
         value.lm_head_ms = execution.lm_head_ms;
         value.pp_ms = execution.pp_communication_ms;
         value.lazy_layer_prediction = lazy_layer_prediction;
         if (scaled_layer_prediction) {
+            value.remaining_scaled_moe_layers =
+                logical_moe_layers - predicted_layers;
+            value.repeated_moe_layer_pre_compute_ms =
+                prediction.repeated_moe_layer_pre_compute_ms;
             const double critical_lane_ms =
                 *std::max_element(value.decode_lane_times_ms.front().begin(),
                                   value.decode_lane_times_ms.front().end());
@@ -654,9 +720,14 @@ void BaseClusterScheduler::begin_moe_stage(
             const double repeated_layer_ms =
                 prediction.repeated_moe_layer_pre_compute_ms +
                 repeated_post_ms + repeated_transition_ms;
-            value.remaining_moe_layer_wait_ms =
-                static_cast<double>(logical_moe_layers - predicted_layers) *
-                repeated_layer_ms;
+            // Aligned decode must use the group-level repeated critical path,
+            // which is known only after all real DP lanes reach the barrier.
+            // Non-decode paths retain the predictor's batch-local scaling.
+            if (!aligned_decode) {
+                value.remaining_moe_layer_wait_ms =
+                    static_cast<double>(value.remaining_scaled_moe_layers) *
+                    repeated_layer_ms;
+            }
         }
         return value;
     }();
@@ -790,6 +861,9 @@ void BaseClusterScheduler::continue_moe_stage(
     MoEGroupState &group = group_position->second;
     const bool monolithic_decode = cluster_type() == ClusterType::kMonolithic &&
                                    path == MoESyncPath::kDecode;
+    const bool aligned_decode = path == MoESyncPath::kDecode &&
+                                (cluster_type() == ClusterType::kMonolithic ||
+                                 cluster_type() == ClusterType::kDecode);
 
     if (key.phase == MoESyncPhase::kPreMoe) {
         const MoEStageState *sample_state = nullptr;
@@ -810,9 +884,169 @@ void BaseClusterScheduler::continue_moe_stage(
             throw std::logic_error(
                 "MoE collective layer index is out of range");
         }
+        std::vector<double> aggregate_lane_times_ms =
+            sample_state->decode_lane_times_ms.at(layer_index);
+        if (aligned_decode) {
+            execution_time_predictor::MoEGroupLayerInput group_input{};
+            group_input.layer_id = key.layer_id;
+            group_input.fallback_lane_times_ms.assign(
+                aggregate_lane_times_ms.size(), 0.0);
+            bool routing_initialized = false;
+            const auto add_checked = [](std::uint64_t &target,
+                                        std::uint64_t value) {
+                if (value >
+                    std::numeric_limits<std::uint64_t>::max() - target) {
+                    throw std::overflow_error(
+                        "aligned DECODE MoE token aggregation overflows");
+                }
+                target += value;
+            };
+            for (const auto &[unused, batch_id] : group.participants) {
+                static_cast<void>(unused);
+                const entities::Batch &owner = simulator.batch(batch_id);
+                if (owner.is_idle()) {
+                    continue;
+                }
+                const MoEStageState &state =
+                    moe_stage_state(batch_id, key.stage_id);
+                if (layer_index >= state.moe_routing_by_layer.size()) {
+                    throw std::logic_error(
+                        "aligned DECODE MoE routing layer is missing");
+                }
+                const auto &routing =
+                    state.moe_routing_by_layer.at(layer_index);
+                if (routing.layer_id != key.layer_id ||
+                    routing.lane_times_ms.size() !=
+                        aggregate_lane_times_ms.size()) {
+                    throw std::logic_error(
+                        "aligned DECODE MoE lane domains do not match");
+                }
+                if (!routing_initialized) {
+                    group_input.model_layer_id = routing.model_layer_id;
+                    group_input.global_expert_tokens.assign(
+                        routing.global_expert_tokens.size(), 0);
+                    routing_initialized = true;
+                } else if (group_input.model_layer_id !=
+                               routing.model_layer_id ||
+                           group_input.global_expert_tokens.size() !=
+                               routing.global_expert_tokens.size()) {
+                    throw std::logic_error(
+                        "aligned DECODE MoE expert domains do not match");
+                }
+                add_checked(group_input.input_tokens, routing.input_tokens);
+                add_checked(group_input.routed_tokens, routing.routed_tokens);
+                for (std::size_t expert = 0;
+                     expert < routing.global_expert_tokens.size(); ++expert) {
+                    add_checked(group_input.global_expert_tokens.at(expert),
+                                routing.global_expert_tokens.at(expert));
+                }
+                for (std::size_t lane = 0;
+                     lane < aggregate_lane_times_ms.size(); ++lane) {
+                    group_input.fallback_lane_times_ms.at(lane) +=
+                        routing.lane_times_ms.at(lane);
+                }
+            }
+            if (!routing_initialized) {
+                throw std::logic_error(
+                    "aligned DECODE MoE group has no routing allocation");
+            }
+            const auto group_prediction =
+                get_replica_scheduler(sample_state->replica_id,
+                                      sample_state->dp_id)
+                    .get_replica_stage_scheduler(sample_state->stage_id)
+                    .predict_moe_group_layer(group_input);
+            if (group_prediction.lane_times_ms.size() !=
+                aggregate_lane_times_ms.size()) {
+                throw std::logic_error(
+                    "group MoE prediction changed the EP lane domain");
+            }
+            aggregate_lane_times_ms = group_prediction.lane_times_ms;
+        }
         const double critical_lane_ms = *std::max_element(
-            sample_state->decode_lane_times_ms.at(layer_index).begin(),
-            sample_state->decode_lane_times_ms.at(layer_index).end());
+            aggregate_lane_times_ms.begin(), aggregate_lane_times_ms.end());
+        if (aligned_decode) {
+            std::optional<std::uint64_t> remaining_scaled_layers;
+            double repeated_pre_transition_ms = 0.0;
+            for (const auto &[unused, batch_id] : group.participants) {
+                static_cast<void>(unused);
+                if (simulator.batch(batch_id).is_idle()) {
+                    continue;
+                }
+                MoEStageState &state = moe_stage_state(batch_id, key.stage_id);
+                if (!remaining_scaled_layers.has_value()) {
+                    remaining_scaled_layers = state.remaining_scaled_moe_layers;
+                } else if (*remaining_scaled_layers !=
+                           state.remaining_scaled_moe_layers) {
+                    throw std::logic_error(
+                        "aligned DECODE scaled layer counts do not match");
+                }
+                if (state.remaining_scaled_moe_layers == 0) {
+                    continue;
+                }
+                repeated_pre_transition_ms =
+                    std::max(repeated_pre_transition_ms,
+                             state.repeated_moe_layer_pre_compute_ms +
+                                 state.decode_ep_communication_ms_per_layer);
+            }
+
+            double maximum_pre_transition_ms = 0.0;
+            for (const MoEBarrierParticipant &participant : participants) {
+                if (!participant.is_idle) {
+                    maximum_pre_transition_ms =
+                        std::max(maximum_pre_transition_ms,
+                                 participant.elapsed_component_ms);
+                }
+            }
+            for (const MoEBarrierParticipant &participant : participants) {
+                if (participant.is_idle) {
+                    continue;
+                }
+                MoEStageState &state =
+                    moe_stage_state(participant.batch_id, key.stage_id);
+                const auto &local_lane_times =
+                    state.decode_lane_times_ms.at(layer_index);
+                const double local_critical_lane_ms = *std::max_element(
+                    local_lane_times.begin(), local_lane_times.end());
+                entities::ExecutionTime synchronization_breakdown{};
+                synchronization_breakdown.moe_pre_barrier_wait_ms =
+                    std::max(0.0, maximum_pre_transition_ms -
+                                      participant.elapsed_component_ms);
+                synchronization_breakdown.moe_ep_aggregation_extra_ms =
+                    std::max(0.0, critical_lane_ms - local_critical_lane_ms);
+                if (state.remaining_scaled_moe_layers > 0) {
+                    const double local_repeated_pre_transition_ms =
+                        state.repeated_moe_layer_pre_compute_ms +
+                        state.decode_ep_communication_ms_per_layer;
+                    synchronization_breakdown.moe_pre_barrier_wait_ms +=
+                        static_cast<double>(state.remaining_scaled_moe_layers) *
+                        std::max(0.0, repeated_pre_transition_ms -
+                                          local_repeated_pre_transition_ms);
+                    synchronization_breakdown.moe_ep_aggregation_extra_ms +=
+                        static_cast<double>(state.remaining_scaled_moe_layers) *
+                        std::max(0.0,
+                                 critical_lane_ms - local_critical_lane_ms);
+                }
+                simulator.batch_stage(state.batch_id, state.stage_id)
+                    .accumulate_execution_time(synchronization_breakdown);
+            }
+            if (remaining_scaled_layers.value_or(0) > 0) {
+                const double repeated_post_ms =
+                    critical_lane_ms +
+                    (monolithic_decode
+                         ? 0.0
+                         : sample_state->decode_dp_communication_ms_per_layer);
+                const double group_remaining_ms =
+                    static_cast<double>(*remaining_scaled_layers) *
+                    (repeated_pre_transition_ms + repeated_post_ms);
+                for (const auto &[unused, batch_id] : group.participants) {
+                    static_cast<void>(unused);
+                    if (!simulator.batch(batch_id).is_idle()) {
+                        moe_stage_state(batch_id, key.stage_id)
+                            .remaining_moe_layer_wait_ms = group_remaining_ms;
+                    }
+                }
+            }
+        }
         for (const bool idle_pass : {false, true}) {
             for (const auto &[participant, batch_id] : group.participants) {
                 const entities::Batch &owner = simulator.batch(batch_id);
@@ -825,15 +1059,9 @@ void BaseClusterScheduler::continue_moe_stage(
                         sample_state->prefill_post_attention_ms_by_layer.at(
                             layer_index);
                 } else if (monolithic_decode) {
-                    if (participant.index() >=
-                        sample_state->decode_lane_times_ms.at(layer_index)
-                            .size()) {
-                        throw std::logic_error(
-                            "decode participant is outside the EP lane domain");
-                    }
-                    component_ms =
-                        sample_state->decode_lane_times_ms.at(layer_index)
-                            .at(participant.index());
+                    // Participants are DP lanes, not EP lanes. Every DP lane
+                    // observes the shared expert critical path.
+                    component_ms = critical_lane_ms;
                 } else {
                     component_ms =
                         critical_lane_ms +
@@ -884,17 +1112,37 @@ void BaseClusterScheduler::continue_moe_stage(
 
     if (has_next_layer) {
         const LayerId next_layer{key.layer_id.value() + 1};
-        for (auto position = group.participants.begin();
-             position != group.participants.end();) {
-            if (simulator.batch(position->second).is_idle()) {
-                simulator.release_batch(position->second);
-                position = group.participants.erase(position);
-            } else {
-                ++position;
+        const bool persistent_decode_idle = aligned_decode;
+        if (!persistent_decode_idle) {
+            for (auto position = group.participants.begin();
+                 position != group.participants.end();) {
+                if (simulator.batch(position->second).is_idle()) {
+                    simulator.release_batch(position->second);
+                    position = group.participants.erase(position);
+                } else {
+                    ++position;
+                }
             }
         }
+        // Missing decode lanes are represented by one persistent dummy batch
+        // for the entire aligned forward. Releasing/recreating it here would
+        // allow a late real batch to replace the lane between MoE layers.
         group.participants_initialized = false;
         for (const auto &[participant, batch_id] : group.participants) {
+            const entities::Batch &owner = simulator.batch(batch_id);
+            if (owner.is_idle() && persistent_decode_idle) {
+                // Monolithic decode keeps its existing compact trace contract:
+                // the persistent dummy is inserted directly into the barrier
+                // after the first real arrival. PDD represents the same dummy
+                // with an explicit DecodeSync event.
+                if (!monolithic_decode) {
+                    enqueue_idle_moe_arrival(group_key, batch_id, participant,
+                                             owner.dp_id(), next_layer,
+                                             MoESyncPhase::kPreMoe, time, 0.0,
+                                             simulator);
+                }
+                continue;
+            }
             MoEStageState &state = moe_stage_state(batch_id, key.stage_id);
             double refreshed_pre_moe_ms = 0.0;
             if (state.lazy_layer_prediction) {
@@ -924,6 +1172,7 @@ void BaseClusterScheduler::continue_moe_stage(
                 state.pre_moe_compute_ms_by_layer.push_back(
                     refreshed_pre_moe_ms);
                 state.decode_lane_times_ms.push_back(diagnostic.lane_times_ms);
+                state.moe_routing_by_layer.push_back(diagnostic);
                 const entities::ExecutionTime &layer_execution =
                     next_prediction.execution_time;
                 const double critical_lane_ms =
@@ -974,6 +1223,7 @@ void BaseClusterScheduler::continue_moe_stage(
         return;
     }
 
+    SimTime domain_release_at;
     for (const MoEStageKey &stage_key : real_states) {
         const MoEStageState &state = moe_stage_states_.at(stage_key);
         const double final_transition_ms =
@@ -982,18 +1232,46 @@ void BaseClusterScheduler::continue_moe_stage(
             (path == MoESyncPath::kDecode
                  ? state.decode_ep_communication_ms_per_layer
                  : 0.0);
-        simulator.event_queue().push(
-            SimTime::from_seconds(time.seconds() + final_transition_ms * 1e-3),
-            [&]() {
-                BatchStageEndPayload value{};
-                value.batch_id = state.batch_id;
-                value.replica_id = state.replica_id;
-                value.dp_id = state.dp_id;
-                value.stage_id = state.stage_id;
-                value.generation = state.batch_generation;
-                value.cluster_type = state.cluster_type;
-                return value;
-            }());
+        const SimTime completion_time =
+            SimTime::from_seconds(time.seconds() + final_transition_ms * 1e-3);
+        if (!domain_release_at.valid() || completion_time > domain_release_at) {
+            domain_release_at = completion_time;
+        }
+        simulator.event_queue().push(completion_time, [&]() {
+            BatchStageEndPayload value{};
+            value.batch_id = state.batch_id;
+            value.replica_id = state.replica_id;
+            value.dp_id = state.dp_id;
+            value.stage_id = state.stage_id;
+            value.generation = state.batch_generation;
+            value.cluster_type = state.cluster_type;
+            return value;
+        }());
+    }
+    if (aligned_decode) {
+        if (!domain_release_at.valid()) {
+            throw std::logic_error(
+                "DECODE MoE collective has no release boundary");
+        }
+        const MoEDomainKey domain_key =
+            make_moe_domain_key(key.replica_id, key.stage_id);
+        const auto reservation_position =
+            moe_domain_reservations_.find(domain_key);
+        if (reservation_position == moe_domain_reservations_.end()) {
+            throw std::logic_error(
+                "DECODE MoE collective lost its domain reservation");
+        }
+        reservation_position->second.release_at = domain_release_at;
+        // A lane-local stage-end event may have observed the still-reserved
+        // domain before the latest real lane completed.  Re-emit the existing
+        // schedule event for every DP lane at the release boundary so queued
+        // work is woken without introducing a new DES event type.
+        for (std::uint64_t dp = 0; dp < group.expected_participants; ++dp) {
+            simulator.event_queue().push(
+                domain_release_at,
+                ReplicaStageSchedulePayload{key.replica_id, DataParallelId{dp},
+                                            key.stage_id, key.cluster_type});
+        }
     }
     for (const MoEStageKey &stage_key : real_states) {
         moe_stage_states_.erase(stage_key);
@@ -1068,12 +1346,8 @@ void BaseClusterScheduler::on_decode_sync(const DecodeSyncPayload &payload,
                             payload.sync_generation};
     ensure_moe_group_participants(key, MoESyncPath::kDecode,
                                   payload.participant_id, time, simulator);
-    const config::ParallelismConfig &parallelism =
-        simulator.parallelism(payload.cluster_type);
     const std::uint64_t expected_participants =
-        payload.cluster_type == ClusterType::kMonolithic
-            ? parallelism.moe_expert_parallel_size
-            : parallelism.data_parallel_size;
+        simulator.parallelism(payload.cluster_type).data_parallel_size;
     auto ready = moe_barrier_.arrive(
         key,
         MoEBarrierParticipant{payload.participant_id, payload.batch_id, time,
@@ -1107,7 +1381,8 @@ void BaseClusterScheduler::on_decode_sync_collective(
 
 void BaseClusterScheduler::require_quiescent() const {
     moe_barrier_.require_empty();
-    if (!moe_stage_states_.empty() || !moe_group_states_.empty()) {
+    if (!moe_stage_states_.empty() || !moe_group_states_.empty() ||
+        !moe_domain_reservations_.empty()) {
         throw std::runtime_error(
             "simulation quiesced with live cluster MoE state");
     }

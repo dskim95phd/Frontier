@@ -580,6 +580,52 @@ AnalyticalRooflineExecutionTimePredictor::predict_stage_execution_time(
     return predict_execution(batch, requests, stage_id, std::nullopt);
 }
 
+MoEGroupLayerPrediction
+AnalyticalRooflineExecutionTimePredictor::predict_moe_group_layer(
+    const MoEGroupLayerInput &input) const {
+    if (!input.layer_id.valid() || input.input_tokens == 0 ||
+        input.global_expert_tokens.size() != model_.total_expert_num ||
+        input.fallback_lane_times_ms.size() !=
+            parallelism_.moe_expert_parallel_size) {
+        throw ExecutionTimePredictorError(
+            "analytical group MoE input has an invalid domain");
+    }
+    std::uint64_t routed_tokens = 0;
+    for (const std::uint64_t count : input.global_expert_tokens) {
+        if (count > std::numeric_limits<std::uint64_t>::max() - routed_tokens) {
+            throw ExecutionTimePredictorError(
+                "analytical group MoE routed token count overflows");
+        }
+        routed_tokens += count;
+    }
+    if (routed_tokens != input.routed_tokens ||
+        input.input_tokens >
+            std::numeric_limits<std::uint64_t>::max() / model_.router_topk ||
+        input.input_tokens * model_.router_topk != input.routed_tokens) {
+        throw ExecutionTimePredictorError(
+            "analytical group MoE token counts are inconsistent");
+    }
+
+    const detail::ExpertParallelDomain domain(
+        model_.total_expert_num, parallelism_.moe_expert_parallel_size);
+    detail::RoutingAllocation allocation{};
+    allocation.input_tokens = input.input_tokens;
+    allocation.routed_tokens = input.routed_tokens;
+    allocation.global_expert_tokens = input.global_expert_tokens;
+    allocation.lane_expert_tokens =
+        domain.partition(allocation.global_expert_tokens);
+    const detail::MoELanePrediction prediction = detail::predict_moe_lanes(
+        device_, detail::AnalyticalConfig{},
+        make_moe_model(model_, parallelism_), allocation, model_.router_topk,
+        make_moe_operator_precisions(config_));
+
+    MoEGroupLayerPrediction result{};
+    result.lane_times_ms = lane_times_ms(prediction);
+    result.critical_lane = prediction.critical_lane;
+    result.critical_lane_time_ms = prediction.critical_lane_time_ms;
+    return result;
+}
+
 ExecutionTimePrediction
 AnalyticalRooflineExecutionTimePredictor::prepare_moe_stage_execution(
     const entities::Batch &batch,

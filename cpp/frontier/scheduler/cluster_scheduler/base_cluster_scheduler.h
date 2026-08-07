@@ -77,6 +77,14 @@ class BaseClusterScheduler {
     [[nodiscard]] bool
     requires_moe_synchronization(const entities::Batch &batch,
                                  const simulator::Simulator &simulator) const;
+    // An aligned DECODE MoE stage uses the same physical GPU domain for every
+    // DP lane. Schedule events for a later group must remain queued while
+    // that domain is reserved, but a not-yet-registered lane of the open
+    // group is allowed to join it.
+    [[nodiscard]] bool can_schedule_moe_stage(
+        const entities::Batch &batch, StageId stage_id, SimTime time);
+    void release_moe_domain_if_ready(ReplicaId replica_id, StageId stage_id,
+                                     SimTime time);
     void begin_moe_stage(
         entities::Batch &batch, StageId stage_id, SimTime started_at,
         const execution_time_predictor::ExecutionTimePrediction &prediction,
@@ -244,26 +252,29 @@ class BaseClusterScheduler {
         }
     };
 
-    struct MoECounterKey {
+    struct MoEDomainKey {
+        ClusterType cluster_type;
         ReplicaId replica_id;
         StageId stage_id;
-        MoESyncPath path;
-        DataParallelId lane_id;
 
-        friend bool operator==(const MoECounterKey &lhs,
-                               const MoECounterKey &rhs) {
-            return std::tie(lhs.replica_id, lhs.stage_id, lhs.path,
-                            lhs.lane_id) == std::tie(rhs.replica_id,
-                                                     rhs.stage_id, rhs.path,
-                                                     rhs.lane_id);
+        friend bool operator==(const MoEDomainKey &lhs,
+                               const MoEDomainKey &rhs) {
+            return std::tie(lhs.cluster_type, lhs.replica_id, lhs.stage_id) ==
+                   std::tie(rhs.cluster_type, rhs.replica_id, rhs.stage_id);
         }
-        friend bool operator<(const MoECounterKey &lhs,
-                              const MoECounterKey &rhs) {
-            return std::tie(lhs.replica_id, lhs.stage_id, lhs.path,
-                            lhs.lane_id) < std::tie(rhs.replica_id,
-                                                    rhs.stage_id, rhs.path,
-                                                    rhs.lane_id);
+        friend bool operator<(const MoEDomainKey &lhs,
+                              const MoEDomainKey &rhs) {
+            return std::tie(lhs.cluster_type, lhs.replica_id, lhs.stage_id) <
+                   std::tie(rhs.cluster_type, rhs.replica_id, rhs.stage_id);
         }
+    };
+
+    struct MoEDomainReservation {
+        MoEGroupKey group_key;
+        // Invalid until the aligned group's final post-MoE collective has
+        // scheduled all real stage-end events.  The reservation is retained
+        // through the latest of those stage-end times.
+        SimTime release_at;
     };
 
     struct BatchCounterKey {
@@ -300,10 +311,14 @@ class BaseClusterScheduler {
         double decode_ep_communication_ms_per_layer = 0.0;
         double decode_dp_communication_ms_per_layer = 0.0;
         std::vector<std::vector<double>> decode_lane_times_ms;
+        std::vector<execution_time_predictor::MoERoutingDiagnostic>
+            moe_routing_by_layer;
         double suffix_compute_ms = 0.0;
         double lm_head_ms = 0.0;
         double pp_ms = 0.0;
         double remaining_moe_layer_wait_ms = 0.0;
+        std::uint64_t remaining_scaled_moe_layers = 0;
+        double repeated_moe_layer_pre_compute_ms = 0.0;
         bool lazy_layer_prediction = false;
     };
 
@@ -319,6 +334,9 @@ class BaseClusterScheduler {
     [[nodiscard]] MoEGroupKey
     make_moe_group_key(const MoEBarrierKey &key,
                        MoESyncPath path) const noexcept;
+    [[nodiscard]] MoEDomainKey make_moe_domain_key(ReplicaId replica_id,
+                                                    StageId stage_id) const
+        noexcept;
     [[nodiscard]] MoEStageState &moe_stage_state(BatchId batch_id,
                                                  StageId stage_id);
     void enqueue_moe_arrival(const MoEStageState &state,
@@ -355,7 +373,7 @@ class BaseClusterScheduler {
     MoEBarrierCoordinator moe_barrier_;
     std::map<MoEStageKey, MoEStageState> moe_stage_states_;
     std::map<MoEGroupKey, MoEGroupState> moe_group_states_;
-    std::map<MoECounterKey, std::uint64_t> moe_group_counters_;
+    std::map<MoEDomainKey, MoEDomainReservation> moe_domain_reservations_;
     std::map<BatchCounterKey, std::uint64_t> batch_counters_;
     std::uint64_t next_moe_sync_generation_ = 1;
 };

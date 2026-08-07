@@ -18,6 +18,8 @@ class FixedExecutionTimePredictor final : public BaseExecutionTimePredictor {
     predict_stage_execution_time(const entities::Batch &batch,
                                  const std::vector<entities::Request> &requests,
                                  StageId stage_id) const override;
+    [[nodiscard]] MoEGroupLayerPrediction predict_moe_group_layer(
+        const MoEGroupLayerInput &input) const override;
 
   private:
     config::FixedExecutionModelConfig config_;

@@ -125,8 +125,10 @@ total_hbm_bytes_per_gpu(const config::ClusterRuntimeConfig &runtime) {
                    [](unsigned char value) {
                        return static_cast<char>(std::tolower(value));
                    });
-    if (device.find("gb300") != std::string::npos) {
-        // NVIDIA GB300 nominal HBM capacity used by the experiment contract.
+    if (device.find("gb300") != std::string::npos ||
+        device.find("rubin") != std::string::npos) {
+        // NVIDIA GB300 and Rubin both expose 288 GB of nominal HBM per GPU
+        // in the experiment hardware contracts.
         return 288'000'000'000ULL;
     }
     return std::nullopt;

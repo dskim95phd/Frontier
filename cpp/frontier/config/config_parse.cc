@@ -448,21 +448,20 @@ CpuKVCacheConfig parse_cpu_kv_cache(const Json &root) {
 
 SchedulerConfig parse_scheduler(const Json &root) {
     const Json &scheduler = root.at("scheduler");
-    require_exact_keys(scheduler,
-                       {
-                           "type",
-                           "scheduling_policy",
-                           "batch_size_cap",
-                           "max_tokens_in_batch",
-                           "enable_preemption",
-                           "enable_chunked_prefill",
-                           "long_prefill_token_threshold",
-                           "block_size",
-                           "num_blocks",
-                           "watermark_blocks_fraction",
-                           "num_preallocate_tokens",
-                       },
-                       "config.scheduler");
+    require_keys(scheduler,
+                 {
+                     "type",
+                     "scheduling_policy",
+                     "batch_size_cap",
+                     "max_tokens_in_batch",
+                     "enable_preemption",
+                     "enable_chunked_prefill",
+                     "long_prefill_token_threshold",
+                     "block_size",
+                     "watermark_blocks_fraction",
+                     "num_preallocate_tokens",
+                 },
+                 {"num_blocks"}, "config.scheduler");
 
     SchedulerConfig parsed = [&]() {
         SchedulerConfig value{};
@@ -482,8 +481,10 @@ SchedulerConfig parse_scheduler(const Json &root) {
             scheduler, "long_prefill_token_threshold", "config.scheduler");
         value.block_size =
             require_uint64(scheduler, "block_size", "config.scheduler");
-        value.num_blocks =
-            require_uint64(scheduler, "num_blocks", "config.scheduler");
+        if (scheduler.contains("num_blocks")) {
+            value.num_blocks =
+                require_uint64(scheduler, "num_blocks", "config.scheduler");
+        }
         value.watermark_blocks_fraction = require_finite_number(
             scheduler, "watermark_blocks_fraction", "config.scheduler");
         value.num_preallocate_tokens = require_uint64(
@@ -501,7 +502,7 @@ SchedulerConfig parse_scheduler(const Json &root) {
     if (parsed.block_size == 0) {
         throw ConfigError("config.scheduler.block_size must be positive");
     }
-    if (parsed.num_blocks == 0) {
+    if (scheduler.contains("num_blocks") && parsed.num_blocks == 0) {
         throw ConfigError("config.scheduler.num_blocks must be positive");
     }
     if (parsed.watermark_blocks_fraction < 0.0 ||
@@ -514,6 +515,41 @@ SchedulerConfig parse_scheduler(const Json &root) {
         throw ConfigError(
             "config.scheduler.long_prefill_token_threshold > 0 requires "
             "enable_chunked_prefill=true");
+    }
+    return parsed;
+}
+
+GpuMemoryConfig parse_gpu_memory(const Json &cluster,
+                                 std::string_view context) {
+    if (!cluster.contains("gpu_memory")) {
+        return GpuMemoryConfig{};
+    }
+    const Json &memory = cluster.at("gpu_memory");
+    const std::string memory_context =
+        std::string{context} + ".gpu_memory";
+    require_keys(memory, {"capacity_bytes_per_gpu"},
+                 {"runtime_reserve_fraction", "runtime_reserve_bytes",
+                  "weight_overhead_fraction",
+                  "model_weight_bytes_per_gpu",
+                  "kv_cache_budget_bytes_per_gpu",
+                  "kv_cache_bytes_per_block"},
+                 memory_context);
+    GpuMemoryConfig parsed{};
+    parsed.auto_calculate_num_blocks = true;
+    parsed.capacity_bytes_per_gpu = require_uint64(
+        memory, "capacity_bytes_per_gpu", memory_context);
+    parsed.runtime_reserve_fraction =
+        memory.contains("runtime_reserve_fraction")
+            ? require_finite_number(memory, "runtime_reserve_fraction",
+                                    memory_context)
+            : 0.1;
+    if (memory.contains("runtime_reserve_bytes")) {
+        parsed.runtime_reserve_bytes = require_uint64(
+            memory, "runtime_reserve_bytes", memory_context);
+    }
+    if (memory.contains("weight_overhead_fraction")) {
+        parsed.weight_overhead_fraction = require_finite_number(
+            memory, "weight_overhead_fraction", memory_context);
     }
     return parsed;
 }
@@ -952,18 +988,26 @@ ClusterRuntimeConfig parse_cluster_runtime(const Json &clusters,
                      "moe_routing",
                  },
                  {"total_expert_num", "router_topk", "first_k_dense_replace",
-                  "num_shared_experts"},
+                  "num_shared_experts", "gpu_memory"},
                  context);
     const ModelConfig model = parse_model(cluster, context);
     const ParallelismConfig parallelism = parse_parallelism(cluster, model);
+    const GpuMemoryConfig gpu_memory = parse_gpu_memory(cluster, context);
+    const std::optional<std::uint64_t> explicit_num_blocks =
+        cluster.at("scheduler").contains("num_blocks")
+            ? std::optional<std::uint64_t>{require_uint64(
+                  cluster.at("scheduler"), "num_blocks", "config.scheduler")}
+            : std::nullopt;
     return [&]() {
         ClusterRuntimeConfig value{};
         value.parallelism = parallelism;
         value.scheduler = parse_scheduler(cluster);
         value.execution_model =
             parse_execution_model(cluster, parallelism, model);
+        value.gpu_memory = gpu_memory;
         value.model = model;
         value.moe_routing = parse_moe_routing(cluster);
+        resolve_gpu_memory_config(value, explicit_num_blocks);
         return value;
     }();
 }

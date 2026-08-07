@@ -50,8 +50,11 @@ struct DeviceCeilings {
     double fp4_tflops;
 
     [[nodiscard]] static constexpr DeviceCeilings rubin() noexcept {
+        // Dense ceilings from NVIDIA's preliminary per-Rubin-GPU contract.
+        // The advertised 50-PFLOPS NVFP4 inference number is sparse, so the
+        // roofline preset intentionally uses the 35-PFLOPS dense value.
         return DeviceCeilings{
-            22.0, 400.0, 4'000.0, 17'500.0, 35'000.0,
+            22.0, 130.0, 4'000.0, 17'500.0, 35'000.0,
         };
     }
 
@@ -402,6 +405,8 @@ class AnalyticalRooflineExecutionTimePredictor final
     predict_stage_execution_time(const entities::Batch &batch,
                                  const std::vector<entities::Request> &requests,
                                  StageId stage_id) const override;
+    [[nodiscard]] MoEGroupLayerPrediction predict_moe_group_layer(
+        const MoEGroupLayerInput &input) const override;
     [[nodiscard]] bool supports_lazy_moe_prediction() const noexcept override {
         return true;
     }

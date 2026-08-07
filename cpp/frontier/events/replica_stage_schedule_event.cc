@@ -14,6 +14,22 @@ void handle_event(const ReplicaStageSchedulePayload &payload, SimTime time,
         simulator.cluster(payload.cluster_type)
             .get_replica_scheduler(payload.replica_id, payload.dp_id)
             .get_replica_stage_scheduler(payload.stage_id);
+    scheduler::BaseClusterScheduler &cluster_scheduler =
+        simulator.cluster(payload.cluster_type);
+    cluster_scheduler.release_moe_domain_if_ready(payload.replica_id,
+                                                  payload.stage_id, time);
+    // An aligned DECODE MoE group reserves the physical replica/stage domain
+    // across all DP lanes.  Inspect the queued batch before popping it so a
+    // later group remains queued instead of becoming an overlapping active
+    // stage.  The open aligned group still admits lanes that have not yet
+    // registered, and the reservation emits a wake schedule event when it is
+    // released.
+    if (const auto pending = stage.peek_batch_if_not_busy();
+        pending.has_value() &&
+        !cluster_scheduler.can_schedule_moe_stage(
+            simulator.batch(pending->batch_id), payload.stage_id, time)) {
+        return;
+    }
     const auto ticket = stage.pop_batch_if_not_busy();
     if (!ticket.has_value()) {
         return;
@@ -41,8 +57,6 @@ void handle_event(const ReplicaStageSchedulePayload &payload, SimTime time,
                             runtime.model.is_moe_layer(model_layer);
         }
     }
-    scheduler::BaseClusterScheduler &cluster_scheduler =
-        simulator.cluster(payload.cluster_type);
     const bool requires_sync =
         stage_has_moe &&
         cluster_scheduler.requires_moe_synchronization(batch, simulator);

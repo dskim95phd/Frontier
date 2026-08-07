@@ -145,4 +145,24 @@ FixedExecutionTimePredictor::predict_stage_execution_time(
     }();
 }
 
+MoEGroupLayerPrediction FixedExecutionTimePredictor::predict_moe_group_layer(
+    const MoEGroupLayerInput &input) const {
+    if (input.fallback_lane_times_ms.empty() ||
+        std::any_of(input.fallback_lane_times_ms.begin(),
+                    input.fallback_lane_times_ms.end(), [](double value) {
+                        return !std::isfinite(value) || value < 0.0;
+                    })) {
+        throw ExecutionTimePredictorError(
+            "fixed group MoE prediction requires valid fallback lane times");
+    }
+    MoEGroupLayerPrediction result{};
+    result.lane_times_ms = input.fallback_lane_times_ms;
+    const auto critical = std::max_element(result.lane_times_ms.begin(),
+                                           result.lane_times_ms.end());
+    result.critical_lane = static_cast<std::uint64_t>(
+        std::distance(result.lane_times_ms.begin(), critical));
+    result.critical_lane_time_ms = *critical;
+    return result;
+}
+
 } // namespace frontier::execution_time_predictor

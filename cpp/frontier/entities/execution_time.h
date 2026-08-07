@@ -20,6 +20,13 @@ struct ExecutionTime {
     double dp_input_communication_ms = 0.0;
     double dp_output_communication_ms = 0.0;
     double synchronization_wait_ms = 0.0;
+    // Diagnostic subcomponents of synchronization_wait_ms. These fields do
+    // not contribute to total_ms() because synchronization_wait_ms already
+    // contains their wall-clock effect.
+    double moe_pre_barrier_wait_ms = 0.0;
+    double moe_ep_aggregation_extra_ms = 0.0;
+    double synchronization_unattributed_wait_ms = 0.0;
+    double synchronization_attribution_overlap_ms = 0.0;
 
     [[nodiscard]] double total_ms() const noexcept {
         return dense_compute_ms + lm_head_ms + tp_communication_ms +
@@ -32,24 +39,30 @@ struct ExecutionTime {
     }
 
     friend bool operator==(const ExecutionTime &lhs, const ExecutionTime &rhs) {
-        return std::tie(lhs.dense_compute_ms, lhs.lm_head_ms,
-                        lhs.tp_communication_ms, lhs.pp_communication_ms,
-                        lhs.moe_gating_linear_ms,
-                        lhs.moe_gating_routing_topk_ms, lhs.moe_grouped_gemm_ms,
-                        lhs.moe_shuffling_ms, lhs.moe_post_attention_norm_ms,
-                        lhs.moe_tp_communication_ms, lhs.ep_dispatch_ms,
-                        lhs.ep_combine_ms, lhs.dp_input_communication_ms,
-                        lhs.dp_output_communication_ms,
-                        lhs.synchronization_wait_ms) ==
-               std::tie(rhs.dense_compute_ms, rhs.lm_head_ms,
-                        rhs.tp_communication_ms, rhs.pp_communication_ms,
-                        rhs.moe_gating_linear_ms,
-                        rhs.moe_gating_routing_topk_ms, rhs.moe_grouped_gemm_ms,
-                        rhs.moe_shuffling_ms, rhs.moe_post_attention_norm_ms,
-                        rhs.moe_tp_communication_ms, rhs.ep_dispatch_ms,
-                        rhs.ep_combine_ms, rhs.dp_input_communication_ms,
-                        rhs.dp_output_communication_ms,
-                        rhs.synchronization_wait_ms);
+        return std::tie(
+                   lhs.dense_compute_ms, lhs.lm_head_ms,
+                   lhs.tp_communication_ms, lhs.pp_communication_ms,
+                   lhs.moe_gating_linear_ms, lhs.moe_gating_routing_topk_ms,
+                   lhs.moe_grouped_gemm_ms, lhs.moe_shuffling_ms,
+                   lhs.moe_post_attention_norm_ms, lhs.moe_tp_communication_ms,
+                   lhs.ep_dispatch_ms, lhs.ep_combine_ms,
+                   lhs.dp_input_communication_ms,
+                   lhs.dp_output_communication_ms, lhs.synchronization_wait_ms,
+                   lhs.moe_pre_barrier_wait_ms, lhs.moe_ep_aggregation_extra_ms,
+                   lhs.synchronization_unattributed_wait_ms,
+                   lhs.synchronization_attribution_overlap_ms) ==
+               std::tie(
+                   rhs.dense_compute_ms, rhs.lm_head_ms,
+                   rhs.tp_communication_ms, rhs.pp_communication_ms,
+                   rhs.moe_gating_linear_ms, rhs.moe_gating_routing_topk_ms,
+                   rhs.moe_grouped_gemm_ms, rhs.moe_shuffling_ms,
+                   rhs.moe_post_attention_norm_ms, rhs.moe_tp_communication_ms,
+                   rhs.ep_dispatch_ms, rhs.ep_combine_ms,
+                   rhs.dp_input_communication_ms,
+                   rhs.dp_output_communication_ms, rhs.synchronization_wait_ms,
+                   rhs.moe_pre_barrier_wait_ms, rhs.moe_ep_aggregation_extra_ms,
+                   rhs.synchronization_unattributed_wait_ms,
+                   rhs.synchronization_attribution_overlap_ms);
     }
 };
 

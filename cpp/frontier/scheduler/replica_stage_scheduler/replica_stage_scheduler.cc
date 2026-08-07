@@ -43,6 +43,14 @@ void ReplicaStageScheduler::add_batch(const entities::Batch &batch) {
     queued_batch_ids_.insert(batch.id());
 }
 
+std::optional<StageBatchTicket>
+ReplicaStageScheduler::peek_batch_if_not_busy() const {
+    if (active_batch_id_.valid() || queue_.empty()) {
+        return std::nullopt;
+    }
+    return queue_.top();
+}
+
 std::optional<StageBatchTicket> ReplicaStageScheduler::pop_batch_if_not_busy() {
     if (active_batch_id_.valid() || queue_.empty()) {
         return std::nullopt;
@@ -91,6 +99,16 @@ ReplicaStageScheduler::predict_moe_layer(
     }
     return predictor_->predict_moe_layer_execution(
         batch, requests, stage_id_, local_moe_layer);
+}
+
+execution_time_predictor::MoEGroupLayerPrediction
+ReplicaStageScheduler::predict_moe_group_layer(
+    const execution_time_predictor::MoEGroupLayerInput &input) const {
+    if (!active_batch_id_.valid()) {
+        throw ReplicaStageSchedulerError(
+            "only an active stage can predict a grouped MoE layer");
+    }
+    return predictor_->predict_moe_group_layer(input);
 }
 
 void ReplicaStageScheduler::on_stage_end(BatchId batch_id) {

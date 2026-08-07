@@ -163,6 +163,20 @@ void test_cached_prefill_is_not_scheduled_work() {
            "cache restoration without preemption is not replay work");
 }
 
+void test_repeated_cpu_restore_transfers_accumulate_metrics() {
+    Request request = make_request(32, 1);
+    request.on_arrival(SimTime::from_seconds(0.0));
+    request.record_cpu_restore_transfer(3, 300, 1.5, 2.5);
+    request.record_cpu_restore_transfer(5, 500, 0.5, 1.0);
+
+    expect(request.cpu_restore_transferred_blocks() == 8 &&
+               request.cpu_restore_bytes() == 800,
+           "repeated CPU restores must accumulate transferred payload");
+    expect(request.cpu_restore_queue_time_s() == 0.002 &&
+               request.cpu_restore_service_time_s() == 0.0035,
+           "repeated CPU restores must accumulate queue and service time");
+}
+
 void test_invalid_transitions_are_rejected() {
     Request request = make_request();
     expect_throws<RequestError>(
@@ -192,6 +206,9 @@ int main() {
     failures += frontier::test::run(
         "cached prefill is excluded from scheduled work",
         test_cached_prefill_is_not_scheduled_work);
+    failures += frontier::test::run(
+        "repeated CPU restore transfers accumulate metrics",
+        test_repeated_cpu_restore_transfers_accumulate_metrics);
     failures += frontier::test::run("invalid request transitions are rejected",
                                     test_invalid_transitions_are_rejected);
     return failures == 0 ? 0 : 1;
