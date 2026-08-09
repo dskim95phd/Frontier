@@ -33,6 +33,138 @@ ReplicaKVCacheManager::ReplicaKVCacheManager(
     }
 }
 
+void ReplicaKVCacheManager::enable_full_sequence_commitments(bool enabled) {
+    if (!enabled && virtual_committed_blocks_ != 0) {
+        throw ReplicaKVCacheError("cannot disable full-sequence commitments "
+                                  "while reservations exist");
+    }
+    full_sequence_commitments_enabled_ = enabled;
+    validate_accounting();
+}
+
+bool ReplicaKVCacheManager::can_commit(
+    RequestId request_id, std::uint64_t full_sequence_tokens) const {
+    if (!full_sequence_commitments_enabled_ || !request_id.valid() ||
+        allocations_.find(request_id) != allocations_.end()) {
+        return false;
+    }
+    const std::uint64_t blocks = full_sequence_blocks(full_sequence_tokens);
+    return can_commit_blocks(blocks);
+}
+
+bool ReplicaKVCacheManager::can_commit(
+    RequestId request_id, SessionId session_id,
+    std::uint64_t full_sequence_tokens) const {
+    if (prefix_cache_enabled_ && session_id.valid()) {
+        const auto session = sessions_.find(session_id);
+        if (session != sessions_.end() &&
+            session->second.active_request.valid() &&
+            session->second.active_request != request_id) {
+            return false;
+        }
+    }
+    return can_commit(request_id, full_sequence_tokens);
+}
+
+void ReplicaKVCacheManager::commit_virtual(RequestId request_id,
+                                           SessionId session_id,
+                                           std::uint64_t full_sequence_tokens) {
+    if (!full_sequence_commitments_enabled_ || !request_id.valid() ||
+        allocations_.find(request_id) != allocations_.end()) {
+        throw ReplicaKVCacheError("invalid full-sequence commitment request");
+    }
+    const std::uint64_t committed = full_sequence_blocks(full_sequence_tokens);
+    if (!can_commit_blocks(committed)) {
+        throw ReplicaKVCacheError(
+            "full-sequence commitment exceeds capacity or watermark");
+    }
+
+    std::uint64_t resident = 0;
+    if (prefix_cache_enabled_ && session_id.valid()) {
+        const auto position = sessions_.find(session_id);
+        if (position != sessions_.end()) {
+            if (position->second.active_request.valid() &&
+                position->second.active_request != request_id) {
+                throw ReplicaKVCacheError(
+                    "session already has an active KV commitment");
+            }
+            resident = position->second.resident_prefix_blocks;
+        }
+    }
+    if (resident > committed) {
+        throw ReplicaKVCacheError(
+            "resident prefix exceeds full-sequence commitment");
+    }
+    const std::uint64_t future = committed - resident;
+    if (future >
+        std::numeric_limits<std::uint64_t>::max() - virtual_committed_blocks_) {
+        throw ReplicaKVCacheError("virtual commitment count overflows uint64");
+    }
+
+    // Pin any GPU-resident prefix before the asynchronous restore starts.  A
+    // resident cache suffix is physical capacity already in the cache, so
+    // converting it to an active allocation preserves the partition while
+    // preventing another request from evicting it during the restore.
+    if (prefix_cache_enabled_ && session_id.valid()) {
+        SessionCacheEntry &entry = sessions_[session_id];
+        resident = entry.resident_prefix_blocks;
+        if (resident > 0 && entry.in_evictable_lru) {
+            remove_from_evictable_lru(entry);
+            active_blocks_ += resident;
+        }
+        entry.active_request = request_id;
+    }
+
+    RequestKVAllocation allocation{};
+    allocation.session_id = session_id;
+    allocation.allocated_blocks = resident;
+    allocation.published_blocks = resident;
+    allocation.committed_blocks = committed;
+    if (!allocations_.emplace(request_id, allocation).second) {
+        throw ReplicaKVCacheError("request already owns KV commitment");
+    }
+    virtual_committed_blocks_ += future;
+    validate_accounting();
+}
+
+void ReplicaKVCacheManager::release_commitment(RequestId request_id) {
+    const auto allocation = allocations_.find(request_id);
+    if (allocation == allocations_.end()) {
+        return;
+    }
+    // If a GPU prefix was pinned while a restore was pending, free() both
+    // unpins those physical blocks and releases the remaining future suffix.
+    if (allocation->second.allocated_blocks > 0) {
+        static_cast<void>(free(request_id));
+        return;
+    }
+    const RequestKVAllocation value = allocation->second;
+    if (value.committed_blocks < value.allocated_blocks ||
+        value.committed_blocks - value.allocated_blocks >
+            virtual_committed_blocks_) {
+        throw ReplicaKVCacheError("invalid virtual commitment accounting");
+    }
+    if (prefix_cache_enabled_ && value.session_id.valid()) {
+        auto session = sessions_.find(value.session_id);
+        if (session != sessions_.end()) {
+            if (session->second.active_request != request_id) {
+                throw ReplicaKVCacheError(
+                    "virtual commitment does not own its session");
+            }
+            session->second.active_request = RequestId{};
+            if (session->second.resident_prefix_blocks > 0) {
+                append_to_evictable_lru(value.session_id, session->second);
+            } else {
+                sessions_.erase(session);
+            }
+        }
+        discard_on_release_.erase(value.session_id);
+    }
+    virtual_committed_blocks_ -= value.committed_blocks;
+    allocations_.erase(allocation);
+    validate_accounting();
+}
+
 std::uint64_t ReplicaKVCacheManager::ceil_div(std::uint64_t numerator,
                                               std::uint64_t denominator) {
     if (denominator == 0) {
@@ -40,6 +172,25 @@ std::uint64_t ReplicaKVCacheManager::ceil_div(std::uint64_t numerator,
     }
     return numerator / denominator +
            static_cast<std::uint64_t>(numerator % denominator != 0);
+}
+
+std::uint64_t ReplicaKVCacheManager::full_sequence_blocks(
+    std::uint64_t full_sequence_tokens) const {
+    if (full_sequence_tokens == 0) {
+        throw ReplicaKVCacheError(
+            "full-sequence commitment requires positive token count");
+    }
+    return ceil_div(full_sequence_tokens, block_size_);
+}
+
+bool ReplicaKVCacheManager::can_commit_blocks(std::uint64_t blocks) const {
+    if (!full_sequence_commitments_enabled_ || blocks == 0 ||
+        blocks >
+            std::numeric_limits<std::uint64_t>::max() - watermark_blocks_) {
+        return false;
+    }
+    const std::uint64_t required = blocks + watermark_blocks_;
+    return required <= available_commitment_blocks();
 }
 
 std::uint64_t ReplicaKVCacheManager::additional_blocks_required(
@@ -90,10 +241,9 @@ ReplicaKVCacheManager::lookup(const entities::Request &request) const {
     return result;
 }
 
-bool ReplicaKVCacheManager::can_admit(RequestId request_id,
-                                      SessionId session_id,
-                                      std::uint64_t cached_tokens,
-                                      std::uint64_t scheduled_tokens) const {
+bool ReplicaKVCacheManager::can_admit(
+    RequestId request_id, SessionId session_id, std::uint64_t cached_tokens,
+    std::uint64_t scheduled_tokens, std::uint64_t full_sequence_tokens) const {
     if (!prefix_cache_enabled_ || !session_id.valid() ||
         allocations_.find(request_id) != allocations_.end() ||
         cached_tokens % block_size_ != 0 || scheduled_tokens == 0 ||
@@ -106,7 +256,8 @@ bool ReplicaKVCacheManager::can_admit(RequestId request_id,
         position == sessions_.end() ? 0
                                     : position->second.resident_prefix_blocks;
     if (position != sessions_.end() &&
-        position->second.active_request.valid()) {
+        position->second.active_request.valid() &&
+        position->second.active_request != request_id) {
         return false;
     }
     const std::uint64_t cached_blocks = cached_tokens / block_size_;
@@ -115,6 +266,16 @@ bool ReplicaKVCacheManager::can_admit(RequestId request_id,
     if (cached_blocks > resident || required < resident ||
         required > available_blocks()) {
         return false;
+    }
+    if (full_sequence_commitments_enabled_ && full_sequence_tokens > 0) {
+        const std::uint64_t committed =
+            full_sequence_blocks(full_sequence_tokens);
+        if (committed < required || !can_commit_blocks(committed)) {
+            return false;
+        }
+        // The full-sequence commitment already accounts for watermark
+        // headroom.  Do not apply it a second time to this first chunk.
+        return true;
     }
     return available_blocks() - required >= watermark_blocks_;
 }
@@ -184,8 +345,10 @@ void ReplicaKVCacheManager::consume_available_blocks(std::uint64_t blocks) {
 
 void ReplicaKVCacheManager::admit(RequestId request_id, SessionId session_id,
                                   std::uint64_t cached_tokens,
-                                  std::uint64_t scheduled_tokens) {
-    if (!can_admit(request_id, session_id, cached_tokens, scheduled_tokens)) {
+                                  std::uint64_t scheduled_tokens,
+                                  std::uint64_t full_sequence_tokens) {
+    if (!can_admit(request_id, session_id, cached_tokens, scheduled_tokens,
+                   full_sequence_tokens)) {
         throw ReplicaKVCacheError(
             "KV prefix admission exceeds capacity or watermark");
     }
@@ -196,12 +359,28 @@ void ReplicaKVCacheManager::admit(RequestId request_id, SessionId session_id,
     }
     const std::uint64_t required =
         ceil_div(cached_tokens + scheduled_tokens, block_size_);
+    const std::uint64_t committed =
+        full_sequence_commitments_enabled_ && full_sequence_tokens > 0
+            ? full_sequence_blocks(full_sequence_tokens)
+            : required;
+    if (committed < required) {
+        throw ReplicaKVCacheError(
+            "full-sequence commitment is smaller than materialization");
+    }
+    const std::uint64_t future = committed - required;
+    if (future >
+        std::numeric_limits<std::uint64_t>::max() - virtual_committed_blocks_) {
+        throw ReplicaKVCacheError("invalid prefix commitment accounting");
+    }
     consume_available_blocks(required - resident);
     active_blocks_ += required;
+    if (future > 0) {
+        virtual_committed_blocks_ += future;
+    }
     session.active_request = request_id;
     if (!allocations_
-             .emplace(request_id,
-                      RequestKVAllocation{session_id, required, resident})
+             .emplace(request_id, RequestKVAllocation{session_id, required,
+                                                      resident, committed})
              .second) {
         throw ReplicaKVCacheError("request already owns KV blocks");
     }
@@ -210,13 +389,20 @@ void ReplicaKVCacheManager::admit(RequestId request_id, SessionId session_id,
 
 bool ReplicaKVCacheManager::can_admit_tiered(
     RequestId request_id, SessionId session_id,
-    std::uint64_t reusable_frontier_blocks,
-    std::uint64_t scheduled_tokens) const {
+    std::uint64_t reusable_frontier_blocks, std::uint64_t scheduled_tokens,
+    std::uint64_t full_sequence_tokens) const {
     if (!prefix_cache_enabled_ || !session_id.valid() ||
-        allocations_.find(request_id) != allocations_.end() ||
         scheduled_tokens == 0 ||
         reusable_frontier_blocks >
             std::numeric_limits<std::uint64_t>::max() / block_size_) {
+        return false;
+    }
+    const auto allocation = allocations_.find(request_id);
+    const bool has_virtual_commitment = allocation != allocations_.end() &&
+                                        full_sequence_commitments_enabled_ &&
+                                        allocation->second.committed_blocks >
+                                            allocation->second.allocated_blocks;
+    if (allocation != allocations_.end() && !has_virtual_commitment) {
         return false;
     }
     const auto position = sessions_.find(session_id);
@@ -224,57 +410,118 @@ bool ReplicaKVCacheManager::can_admit_tiered(
         position == sessions_.end() ? 0
                                     : position->second.resident_prefix_blocks;
     if (position != sessions_.end() &&
-        position->second.active_request.valid()) {
+        position->second.active_request.valid() &&
+        position->second.active_request != request_id) {
         return false;
     }
     if (reusable_frontier_blocks < resident) {
         return false;
     }
-    const std::uint64_t reusable_tokens = reusable_frontier_blocks * block_size_;
+    const std::uint64_t reusable_tokens =
+        reusable_frontier_blocks * block_size_;
     if (reusable_tokens >
         std::numeric_limits<std::uint64_t>::max() - scheduled_tokens) {
         return false;
     }
     const std::uint64_t required =
         ceil_div(reusable_tokens + scheduled_tokens, block_size_);
+    const std::uint64_t allocated =
+        has_virtual_commitment ? allocation->second.allocated_blocks : 0;
     if (required < reusable_frontier_blocks || required < resident ||
-        required > available_blocks()) {
+        required < allocated || required - allocated > available_blocks()) {
         return false;
+    }
+    if (has_virtual_commitment) {
+        if (allocation->second.committed_blocks < required) {
+            return false;
+        }
+        return true;
+    }
+    if (full_sequence_commitments_enabled_ && full_sequence_tokens > 0) {
+        const std::uint64_t committed =
+            full_sequence_blocks(full_sequence_tokens);
+        if (committed < required || !can_commit_blocks(committed)) {
+            return false;
+        }
+        return true;
     }
     return available_blocks() - required >= watermark_blocks_;
 }
 
-void ReplicaKVCacheManager::admit_tiered(
-    RequestId request_id, SessionId session_id,
-    std::uint64_t reusable_frontier_blocks,
-    std::uint64_t scheduled_tokens) {
+void ReplicaKVCacheManager::admit_tiered(RequestId request_id,
+                                         SessionId session_id,
+                                         std::uint64_t reusable_frontier_blocks,
+                                         std::uint64_t scheduled_tokens,
+                                         std::uint64_t full_sequence_tokens) {
     if (!can_admit_tiered(request_id, session_id, reusable_frontier_blocks,
-                          scheduled_tokens)) {
+                          scheduled_tokens, full_sequence_tokens)) {
         throw ReplicaKVCacheError(
             "tiered KV admission exceeds capacity or watermark");
     }
     SessionCacheEntry &session = sessions_[session_id];
     const std::uint64_t resident = session.resident_prefix_blocks;
-    if (resident > 0) {
+    const auto allocation = allocations_.find(request_id);
+    const bool has_virtual_commitment = allocation != allocations_.end() &&
+                                        full_sequence_commitments_enabled_ &&
+                                        allocation->second.committed_blocks >
+                                            allocation->second.allocated_blocks;
+    const std::uint64_t already_allocated =
+        has_virtual_commitment ? allocation->second.allocated_blocks : 0;
+    if (resident > 0 && !has_virtual_commitment) {
         remove_from_evictable_lru(session);
     }
-    const std::uint64_t reusable_tokens = reusable_frontier_blocks * block_size_;
+    const std::uint64_t reusable_tokens =
+        reusable_frontier_blocks * block_size_;
     const std::uint64_t required =
         ceil_div(reusable_tokens + scheduled_tokens, block_size_);
-    consume_available_blocks(required - resident);
-    active_blocks_ += required;
+    const std::uint64_t physical_additional = required - already_allocated;
+    const std::uint64_t committed =
+        full_sequence_commitments_enabled_ && full_sequence_tokens > 0
+            ? full_sequence_blocks(full_sequence_tokens)
+            : (has_virtual_commitment ? allocation->second.committed_blocks
+                                      : required);
+    if (committed < required) {
+        throw ReplicaKVCacheError(
+            "full-sequence commitment is smaller than materialization");
+    }
+    const std::uint64_t future = committed - required;
+    if (has_virtual_commitment) {
+        if (allocation->second.committed_blocks < already_allocated ||
+            allocation->second.committed_blocks - already_allocated <
+                physical_additional ||
+            physical_additional > virtual_committed_blocks_) {
+            throw ReplicaKVCacheError("invalid staged commitment accounting");
+        }
+    } else if (future > std::numeric_limits<std::uint64_t>::max() -
+                            virtual_committed_blocks_) {
+        throw ReplicaKVCacheError("invalid staged commitment accounting");
+    }
+    consume_available_blocks(physical_additional);
+    active_blocks_ += physical_additional;
     resident_blocks_ += reusable_frontier_blocks - resident;
     if (resident == 0 && reusable_frontier_blocks > 0) {
         ++sessions_with_nonzero_frontier_;
     }
     session.resident_prefix_blocks = reusable_frontier_blocks;
     session.active_request = request_id;
-    if (!allocations_
-             .emplace(request_id,
-                      RequestKVAllocation{session_id, required,
-                                          reusable_frontier_blocks})
-             .second) {
-        throw ReplicaKVCacheError("tiered request already owns KV blocks");
+    if (has_virtual_commitment) {
+        RequestKVAllocation &owned = allocation->second;
+        owned.allocated_blocks = required;
+        owned.published_blocks = reusable_frontier_blocks;
+        if (physical_additional > virtual_committed_blocks_) {
+            throw ReplicaKVCacheError("staged commitment underflow");
+        }
+        virtual_committed_blocks_ -= physical_additional;
+    } else {
+        if (!allocations_
+                 .emplace(request_id,
+                          RequestKVAllocation{session_id, required,
+                                              reusable_frontier_blocks,
+                                              committed})
+                 .second) {
+            throw ReplicaKVCacheError("tiered request already owns KV blocks");
+        }
+        virtual_committed_blocks_ += future;
     }
     validate_accounting();
 }
@@ -289,15 +536,29 @@ void ReplicaKVCacheManager::record_successful_admission(
     stats_.hit_blocks += hit_blocks;
 }
 
-bool ReplicaKVCacheManager::can_reserve(RequestId request_id,
-                                        std::uint64_t kv_accounted_tokens,
-                                        std::uint64_t scheduled_tokens) const {
+bool ReplicaKVCacheManager::can_reserve(
+    RequestId request_id, std::uint64_t kv_accounted_tokens,
+    std::uint64_t scheduled_tokens, std::uint64_t full_sequence_tokens) const {
     const std::uint64_t required = additional_blocks_required(
         request_id, kv_accounted_tokens, scheduled_tokens, false);
     if (required > available_blocks()) {
         return false;
     }
-    if (allocations_.find(request_id) != allocations_.end()) {
+    const auto allocation = allocations_.find(request_id);
+    if (allocation != allocations_.end()) {
+        if (full_sequence_commitments_enabled_ && full_sequence_tokens > 0 &&
+            allocation->second.committed_blocks <
+                full_sequence_blocks(full_sequence_tokens)) {
+            return false;
+        }
+        return true;
+    }
+    if (full_sequence_commitments_enabled_ && full_sequence_tokens > 0) {
+        if (!can_commit(request_id, full_sequence_tokens)) {
+            return false;
+        }
+        // Full-sequence admission already reserves watermark headroom.  The
+        // first physical chunk must consume only its own reservation.
         return true;
     }
     return available_blocks() - required >= watermark_blocks_;
@@ -305,19 +566,81 @@ bool ReplicaKVCacheManager::can_reserve(RequestId request_id,
 
 void ReplicaKVCacheManager::reserve(RequestId request_id,
                                     std::uint64_t kv_accounted_tokens,
-                                    std::uint64_t scheduled_tokens) {
-    if (!can_reserve(request_id, kv_accounted_tokens, scheduled_tokens)) {
+                                    std::uint64_t scheduled_tokens,
+                                    std::uint64_t full_sequence_tokens) {
+    if (!can_reserve(request_id, kv_accounted_tokens, scheduled_tokens,
+                     full_sequence_tokens)) {
         throw ReplicaKVCacheError(
             "KV reservation exceeds capacity or watermark");
     }
     const std::uint64_t additional = additional_blocks_required(
         request_id, kv_accounted_tokens, scheduled_tokens, true);
-    auto [position, inserted] =
-        allocations_.try_emplace(request_id, RequestKVAllocation{});
-    static_cast<void>(inserted);
+    auto position = allocations_.find(request_id);
+    const bool inserted = position == allocations_.end();
+    const std::uint64_t old_allocated =
+        inserted ? 0 : position->second.allocated_blocks;
+    const std::uint64_t old_committed =
+        inserted ? 0 : position->second.committed_blocks;
+    const bool had_virtual_suffix = !inserted && old_committed > old_allocated;
+    const std::uint64_t committed = [&]() {
+        if (inserted) {
+            return full_sequence_commitments_enabled_ &&
+                           full_sequence_tokens > 0
+                       ? full_sequence_blocks(full_sequence_tokens)
+                       : additional;
+        }
+        const std::uint64_t old = old_committed;
+        if (had_virtual_suffix) {
+            // A previously committed request is materializing its own
+            // reserved suffix.  Do not grow the target on continuation calls.
+            if (full_sequence_commitments_enabled_ &&
+                full_sequence_tokens > 0) {
+                return std::max(old,
+                                full_sequence_blocks(full_sequence_tokens));
+            }
+            return old;
+        }
+        if (full_sequence_commitments_enabled_ && full_sequence_tokens > 0) {
+            return std::max(old, full_sequence_blocks(full_sequence_tokens));
+        }
+        // Legacy/materialized allocations have no future suffix to preserve;
+        // continuation materialization extends their logical target by the
+        // newly allocated physical blocks.
+        if (old > std::numeric_limits<std::uint64_t>::max() - additional) {
+            throw ReplicaKVCacheError("KV commitment count overflows uint64");
+        }
+        return old + additional;
+    }();
+    if (committed < old_allocated || committed - old_allocated < additional) {
+        throw ReplicaKVCacheError(
+            "KV materialization exceeds full-sequence commitment");
+    }
+    const std::uint64_t future_before = committed - old_allocated;
+    const std::uint64_t future_after = future_before - additional;
+    if (inserted) {
+        if (future_after > std::numeric_limits<std::uint64_t>::max() -
+                               virtual_committed_blocks_) {
+            throw ReplicaKVCacheError(
+                "virtual commitment count overflows uint64");
+        }
+    } else if (had_virtual_suffix && additional > virtual_committed_blocks_) {
+        throw ReplicaKVCacheError(
+            "virtual commitment underflows on materialization");
+    }
     consume_available_blocks(additional);
-    position->second.allocated_blocks += additional;
     active_blocks_ += additional;
+    if (inserted) {
+        const RequestKVAllocation allocation{SessionId{}, additional, 0,
+                                             committed};
+        position = allocations_.emplace(request_id, allocation).first;
+        virtual_committed_blocks_ += future_after;
+    } else {
+        position->second.allocated_blocks += additional;
+        position->second.committed_blocks = committed;
+        if (had_virtual_suffix) {
+            virtual_committed_blocks_ -= additional;
+        }
+    }
     validate_accounting();
 }
 
@@ -328,10 +651,15 @@ std::uint64_t ReplicaKVCacheManager::free(RequestId request_id) {
     }
     const RequestKVAllocation value = allocation->second;
     if (value.allocated_blocks > active_blocks_ ||
-        value.published_blocks > value.allocated_blocks) {
+        value.published_blocks > value.allocated_blocks ||
+        value.committed_blocks < value.allocated_blocks ||
+        value.committed_blocks - value.allocated_blocks >
+            virtual_committed_blocks_) {
         throw ReplicaKVCacheError("request allocation accounting is corrupt");
     }
     active_blocks_ -= value.allocated_blocks;
+    virtual_committed_blocks_ -=
+        value.committed_blocks - value.allocated_blocks;
     if (prefix_cache_enabled_ && value.session_id.valid()) {
         auto session = sessions_.find(value.session_id);
         if (session == sessions_.end() ||
@@ -340,8 +668,7 @@ std::uint64_t ReplicaKVCacheManager::free(RequestId request_id) {
             throw ReplicaKVCacheError("active session allocation is corrupt");
         }
         SessionCacheEntry &entry = session->second;
-        const bool discard =
-            discard_on_release_.erase(value.session_id) != 0;
+        const bool discard = discard_on_release_.erase(value.session_id) != 0;
         if (discard) {
             if (entry.resident_prefix_blocks > resident_blocks_) {
                 throw ReplicaKVCacheError(
@@ -375,8 +702,7 @@ std::uint64_t ReplicaKVCacheManager::free(RequestId request_id) {
     return value.allocated_blocks;
 }
 
-std::uint64_t
-ReplicaKVCacheManager::discard_session(SessionId session_id) {
+std::uint64_t ReplicaKVCacheManager::discard_session(SessionId session_id) {
     if (!prefix_cache_enabled_ || !session_id.valid()) {
         return 0;
     }
@@ -460,8 +786,50 @@ std::uint64_t ReplicaKVCacheManager::gpu_cache_valid_prefix_blocks(
                                       : session->second.resident_prefix_blocks;
 }
 
+bool ReplicaKVCacheManager::session_has_active_request(
+    SessionId session_id) const noexcept {
+    if (!prefix_cache_enabled_ || !session_id.valid()) {
+        return false;
+    }
+    const auto session = sessions_.find(session_id);
+    return session != sessions_.end() &&
+           session->second.active_request.valid();
+}
+
+std::uint64_t ReplicaKVCacheManager::request_committed_blocks(
+    RequestId request_id) const noexcept {
+    const auto allocation = allocations_.find(request_id);
+    return allocation == allocations_.end()
+               ? 0
+               : allocation->second.committed_blocks;
+}
+
+std::uint64_t ReplicaKVCacheManager::request_virtual_committed_blocks(
+    RequestId request_id) const noexcept {
+    const auto allocation = allocations_.find(request_id);
+    if (allocation == allocations_.end() ||
+        allocation->second.committed_blocks <
+            allocation->second.allocated_blocks) {
+        return 0;
+    }
+    return allocation->second.committed_blocks -
+           allocation->second.allocated_blocks;
+}
+
+bool ReplicaKVCacheManager::full_sequence_fits_empty(
+    std::uint64_t full_sequence_tokens) const {
+    if (full_sequence_tokens == 0) {
+        return false;
+    }
+    const std::uint64_t blocks = full_sequence_blocks(full_sequence_tokens);
+    return blocks <=
+               std::numeric_limits<std::uint64_t>::max() - watermark_blocks_ &&
+           blocks + watermark_blocks_ <= capacity_blocks_;
+}
+
 void ReplicaKVCacheManager::validate_accounting() const {
     if (active_blocks_ > capacity_blocks_ ||
+        virtual_committed_blocks_ > capacity_blocks_ - active_blocks_ ||
         blank_blocks_ > capacity_blocks_ - active_blocks_ ||
         evictable_blocks_ !=
             capacity_blocks_ - active_blocks_ - blank_blocks_ ||
@@ -470,6 +838,34 @@ void ReplicaKVCacheManager::validate_accounting() const {
             "analytical KV capacity partition is invalid");
     }
 #ifndef NDEBUG
+    std::uint64_t observed_active = 0;
+    std::uint64_t observed_virtual = 0;
+    for (const auto &[request_id, allocation] : allocations_) {
+        static_cast<void>(request_id);
+        if (allocation.committed_blocks < allocation.allocated_blocks ||
+            allocation.published_blocks > allocation.allocated_blocks) {
+            throw ReplicaKVCacheError(
+                "request commitment is smaller than physical allocation");
+        }
+        if (observed_active > std::numeric_limits<std::uint64_t>::max() -
+                                  allocation.allocated_blocks) {
+            throw ReplicaKVCacheError("active allocation sum overflows uint64");
+        }
+        observed_active += allocation.allocated_blocks;
+        const std::uint64_t future =
+            allocation.committed_blocks - allocation.allocated_blocks;
+        if (observed_virtual >
+            std::numeric_limits<std::uint64_t>::max() - future) {
+            throw ReplicaKVCacheError(
+                "virtual commitment sum overflows uint64");
+        }
+        observed_virtual += future;
+    }
+    if (observed_active != active_blocks_ ||
+        observed_virtual != virtual_committed_blocks_) {
+        throw ReplicaKVCacheError(
+            "request commitment totals diverged from KV accounting");
+    }
     std::uint64_t observed_evictable = 0;
     std::uint64_t observed_resident = 0;
     std::uint64_t observed_nonzero_sessions = 0;
@@ -520,6 +916,9 @@ PrefixCacheDiagnostics ReplicaKVCacheManager::diagnostics() const {
         static_cast<std::uint64_t>(evictable_lru_.size());
     result.resident_blocks = resident_blocks_;
     result.sessions_with_nonzero_frontier = sessions_with_nonzero_frontier_;
+    result.committed_blocks = committed_blocks();
+    result.virtual_committed_blocks = virtual_committed_blocks_;
+    result.available_commitment_blocks = available_commitment_blocks();
     return result;
 }
 

@@ -782,6 +782,15 @@ AnalyticalRooflineExecutionTimePredictor::predict_execution(
             moe_prediction.repeated_moe_layer_pre_compute_ms;
         moe_suffix_compute_ms = moe_prediction.suffix_compute_ms;
     }
+    // A synchronized lazy-MoE stage is assembled from one initial prediction
+    // followed by one prediction per additional MoE layer.  Attribute the
+    // stage-level PREFILL attention demand once, on the initial prediction,
+    // rather than multiplying it by those layer callbacks.  This field is
+    // instrumentation only and does not participate in duration_ms.
+    if (!selected_moe_layer.has_value() || selected_moe_layer.value() == 0) {
+        execution_time.prefill_attention_token_pairs =
+            detail::prefill_attention_token_pairs(dense_batch.prefill_requests);
+    }
     dense_compute_ms = execution_time.dense_compute_ms;
     tp_communication_ms = execution_time.tp_communication_ms;
     const double duration_ms = execution_time.total_ms();
@@ -1143,6 +1152,42 @@ KernelWork streaming_work(double elements_read, double elements_written,
         value.hbm_bytes = (elements_read + elements_written) * element_bytes;
         return value;
     }();
+}
+
+std::uint64_t prefill_attention_token_pairs(
+    const std::vector<AttentionRequestSlice> &requests) {
+    const auto checked_add = [](std::uint64_t lhs, std::uint64_t rhs) {
+        if (lhs > std::numeric_limits<std::uint64_t>::max() - rhs) {
+            throw AnalyticalModelError(
+                "PREFILL attention token-pair count overflows uint64");
+        }
+        return lhs + rhs;
+    };
+    const auto checked_mul = [](std::uint64_t lhs, std::uint64_t rhs) {
+        if (lhs != 0 &&
+            rhs > std::numeric_limits<std::uint64_t>::max() / lhs) {
+            throw AnalyticalModelError(
+                "PREFILL attention token-pair count overflows uint64");
+        }
+        return lhs * rhs;
+    };
+
+    std::uint64_t total = 0;
+    for (const AttentionRequestSlice &request : requests) {
+        // q * (q + 1) / 2 is integral for every integer q.  Divide one
+        // factor before multiplying so this remains exact and cannot
+        // overflow merely while forming q + 1 for an odd uint64 maximum.
+        const std::uint64_t triangular =
+            request.query_tokens % 2 == 0
+                ? checked_mul(request.query_tokens / 2,
+                              request.query_tokens + 1)
+                : checked_mul(request.query_tokens,
+                              request.query_tokens / 2 + 1);
+        const std::uint64_t cached_pairs =
+            checked_mul(request.query_tokens, request.past_context);
+        total = checked_add(total, checked_add(cached_pairs, triangular));
+    }
+    return total;
 }
 
 KernelWork

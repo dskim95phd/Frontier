@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <limits>
 
 namespace frontier::entities {
 namespace {
@@ -133,6 +134,14 @@ void BatchStage::accumulate_execution_time(
         execution_time.synchronization_unattributed_wait_ms;
     execution_time_.synchronization_attribution_overlap_ms +=
         execution_time.synchronization_attribution_overlap_ms;
+    if (execution_time_.prefill_attention_token_pairs >
+        std::numeric_limits<std::uint64_t>::max() -
+            execution_time.prefill_attention_token_pairs) {
+        throw BatchStageError(
+            "PREFILL attention token-pair count overflows uint64");
+    }
+    execution_time_.prefill_attention_token_pairs +=
+        execution_time.prefill_attention_token_pairs;
 }
 
 } // namespace frontier::entities

@@ -85,6 +85,10 @@ CacheAwareClusterScheduler::schedule() {
 
     std::vector<ClusterRequestAssignment> result;
     result.reserve(request_queue_.size());
+    std::vector<QueuedRequest> blocked;
+    blocked.reserve(request_queue_.size());
+    std::vector<SessionId> routed_sessions;
+    routed_sessions.reserve(request_queue_.size());
     const std::vector<Target> ordered_targets = targets();
     const std::uint64_t target_count =
         static_cast<std::uint64_t>(ordered_targets.size());
@@ -97,6 +101,25 @@ CacheAwareClusterScheduler::schedule() {
                 "cache_aware routing requires a valid session_id");
         }
 
+        // A PREFILL request continues to own its session while its decode and
+        // CPU-offload export branches are in flight.  Keep a later request in
+        // the cluster queue until that ownership closes.  Scan every target,
+        // rather than only the affinity target, because migration may leave a
+        // deferred export on the previous target.
+        const bool session_owned =
+            std::find(routed_sessions.begin(), routed_sessions.end(),
+                      session_id) != routed_sessions.end() ||
+            std::any_of(ordered_targets.begin(), ordered_targets.end(),
+                        [&](const Target &target) {
+                            return get_replica_scheduler(target.first,
+                                                         target.second)
+                                .session_has_active_kv_request(session_id);
+                        });
+        if (session_owned) {
+            blocked.push_back(queued);
+            continue;
+        }
+
         const Target least_loaded = pick_least_loaded_target(ordered_targets);
         Target selected = least_loaded;
         const auto mapped = session_to_target_.find(session_id);
@@ -106,7 +129,7 @@ CacheAwareClusterScheduler::schedule() {
                 get_replica_scheduler(mapped->second.first,
                                       mapped->second.second);
             const kv_cache::PrefixLookupResult lookup =
-                cache_target.gpu_prefix_cache_lookup(incoming);
+                cache_target.tiered_prefix_cache_lookup(incoming);
             const double hit_ratio =
                 lookup.query_blocks == 0
                     ? 0.0
@@ -120,18 +143,18 @@ CacheAwareClusterScheduler::schedule() {
         if (mapped != session_to_target_.end() && mapped->second != selected) {
             BaseReplicaScheduler &old_target = get_replica_scheduler(
                 mapped->second.first, mapped->second.second);
-            static_cast<void>(
-                old_target.discard_gpu_prefix_cache_session(session_id));
+            old_target.discard_tiered_prefix_cache_session(session_id);
         }
         session_to_target_[session_id] = selected;
         BaseReplicaScheduler &target =
             get_replica_scheduler(selected.first, selected.second);
         target.add_request(queued.request_id);
+        routed_sessions.push_back(session_id);
         next_tie_target_ = (next_tie_target_ + 1) % target_count;
         result.push_back(ClusterRequestAssignment{
             selected.first, selected.second, queued.request_id});
     }
-    request_queue_.clear();
+    request_queue_ = std::move(blocked);
     return result;
 }
 

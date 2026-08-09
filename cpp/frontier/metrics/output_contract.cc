@@ -64,6 +64,8 @@ serialize_execution_time_components(const entities::ExecutionTime &execution) {
          execution.synchronization_unattributed_wait_ms},
         {"synchronization_attribution_overlap_ms",
          execution.synchronization_attribution_overlap_ms},
+        {"prefill_attention_token_pairs",
+         execution.prefill_attention_token_pairs},
         {"total_ms", execution.total_ms()},
     });
 }
@@ -450,6 +452,8 @@ OrderedJson serialize_batch_stage(const BatchStageMetricsRecord &stage) {
          execution.synchronization_unattributed_wait_ms},
         {"synchronization_attribution_overlap_ms",
          execution.synchronization_attribution_overlap_ms},
+        {"prefill_attention_token_pairs",
+         execution.prefill_attention_token_pairs},
         {"duration_ms",
          (stage.completed_at.seconds() - stage.started_at.seconds()) * 1e3},
         {"model_kind", std::string{config::to_string(stage.model_kind)}},
@@ -924,6 +928,13 @@ std::string serialize_simulation_output_json(const SimulationOutput &output) {
         {"preemption_recomputed_prefill_tokens",
          total_recomputed_prefill_tokens},
     });
+    root["prefill_attention_token_pairs_by_arrival_time_bucket"] =
+        OrderedJson::object();
+    for (const auto &[bucket_index, token_pairs] :
+         output.aggregate.prefill_attention_token_pairs_by_arrival_time_bucket) {
+        root["prefill_attention_token_pairs_by_arrival_time_bucket"]
+            [std::to_string(bucket_index)] = token_pairs;
+    }
 
     return root.dump(2) + '\n';
 }
@@ -1096,6 +1107,8 @@ std::string serialize_simulation_summary_json(const SimulationOutput &output,
                 {"predicted_execution_ms", aggregate.predicted_execution_ms},
                 {"execution_time_components_ms",
                  serialize_execution_time_components(aggregate.execution_time)},
+                {"prefill_attention_token_pairs",
+                 aggregate.prefill_attention_token_pairs},
                 {"prefill_scheduled_tokens",
                  aggregate.prefill_scheduled_tokens},
                 {"preemption_recomputed_prefill_tokens",
@@ -1123,10 +1136,19 @@ std::string serialize_simulation_summary_json(const SimulationOutput &output,
                 {"predicted_execution_ms", aggregate.predicted_execution_ms},
                 {"execution_time_components_ms",
                  serialize_execution_time_components(aggregate.execution_time)},
+                {"prefill_attention_token_pairs",
+                 aggregate.prefill_attention_token_pairs},
             }));
         }
         root["batch_summary_by_cluster_time_bucket"]
             [std::string{to_string(cluster_type)}] = std::move(values);
+    }
+    root["prefill_attention_token_pairs_by_arrival_time_bucket"] =
+        OrderedJson::object();
+    for (const auto &[bucket_index, token_pairs] :
+         output.aggregate.prefill_attention_token_pairs_by_arrival_time_bucket) {
+        root["prefill_attention_token_pairs_by_arrival_time_bucket"]
+            [std::to_string(bucket_index)] = token_pairs;
     }
 
     std::vector<double> transfer_latency_ms;

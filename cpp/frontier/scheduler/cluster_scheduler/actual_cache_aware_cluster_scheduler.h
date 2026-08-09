@@ -10,12 +10,13 @@
 
 namespace frontier::scheduler {
 
-// Actual-GPU-cache-aware routing for append-only multi-turn sessions.
+// Actual tiered-cache-aware routing for append-only multi-turn sessions.
 //
 // Balanced targets keep affinity only when the mapped target still owns at
-// least cache_threshold of the request prefix. Imbalanced targets, or a weak
-// cache match, use least-outstanding routing. Migrating a session explicitly
-// discards its old target's GPU KV (immediately or at active-request release).
+// least cache_threshold of the request prefix in GPU or CPU KV. Imbalanced
+// targets, or a weak cache match, use least-outstanding routing. Migrating a
+// session invalidates both tiers on its old target immediately; physical GPU
+// and CPU blocks remain only while active requests or transfers drain.
 class CacheAwareClusterScheduler final : public BaseClusterScheduler {
   public:
     CacheAwareClusterScheduler(

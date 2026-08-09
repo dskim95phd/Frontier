@@ -1,10 +1,10 @@
-#include "frontier/scheduler/replica_scheduler/vllm_v1_engine_replica_scheduler.h"
 #include "frontier/execution_time_predictor/fixed_execution_time_predictor.h"
+#include "frontier/scheduler/replica_scheduler/vllm_v1_engine_replica_scheduler.h"
 #include "tests/test_support.h"
 
 #include <cstdint>
-#include <memory>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -89,6 +89,11 @@ Batch complete_schedule(VllmV1Scheduler &scheduler,
     return batch;
 }
 
+Batch complete_prefill_schedule(VllmV1Scheduler &scheduler,
+                                std::vector<Request> &requests,
+                                const ScheduleResult &schedule,
+                                double completed_at);
+
 void test_fcfs_continuous_batch_admission_and_order() {
     auto requests = make_requests({{2, 1}, {2, 1}, {2, 1}});
     SchedulerConfig config = scheduler_config();
@@ -165,6 +170,109 @@ void test_chunked_prefill_runs_before_new_waiting_work() {
     expect(third.scheduled_requests[0].num_tokens == 2 &&
                third.scheduled_requests[1].num_tokens == 2,
            "remaining budget must mix waiting and running prefill work");
+}
+
+void test_pdd_chunked_prefill_commits_full_isl_without_self_preemption() {
+    // Each request's first four-token chunk fits in one physical block, but
+    // the two full eight-token prompts require four blocks together.  A
+    // three-block PREFILL replica must therefore admit only the first chunk
+    // and keep the second request waiting.  The first request must continue
+    // through its remaining chunk without being self-preempted.
+    auto requests = make_requests({{8, 1}, {8, 1}});
+    SchedulerConfig config = scheduler_config();
+    config.block_size = 4;
+    config.num_blocks = 3;
+    config.max_tokens_in_batch = 8;
+    config.enable_chunked_prefill = true;
+    config.long_prefill_token_threshold = 4;
+
+    frontier::config::PrefixCacheConfig prefix{};
+    prefix.enabled = false;
+    frontier::config::ParallelismConfig parallelism{};
+    frontier::entities::Replica replica{frontier::ReplicaId{0}, parallelism,
+                                        frontier::config::ModelConfig{}};
+    auto predictor = std::make_shared<
+        frontier::execution_time_predictor::FixedExecutionTimePredictor>(
+        frontier::config::FixedExecutionModelConfig{});
+    VllmV1Scheduler scheduler{config,
+                              requests,
+                              predictor,
+                              replica,
+                              frontier::DataParallelId{0},
+                              frontier::ClusterType::kPrefill,
+                              prefix};
+    arrive_all(scheduler, requests);
+
+    const ScheduleResult first = scheduler.schedule(SimTime::from_seconds(0.0));
+    expect(first.scheduled_requests.size() == 1 &&
+               first.scheduled_requests.front().request_id == RequestId{0} &&
+               first.scheduled_requests.front().num_tokens == 4 &&
+               scheduler.waiting_queue().size() == 1 &&
+               scheduler.waiting_queue().front() == RequestId{1},
+           "full-ISL commitment must reject the second current chunk");
+    expect(requests[0].preemption_count() == 0 &&
+               scheduler.preempted_queue().empty(),
+           "chunked PDD admission must not self-preempt the first request");
+    static_cast<void>(
+        complete_prefill_schedule(scheduler, requests, first, 0.001));
+
+    const ScheduleResult second =
+        scheduler.schedule(SimTime::from_seconds(0.001));
+    expect(second.scheduled_requests.size() == 1 &&
+               second.scheduled_requests.front().request_id == RequestId{0} &&
+               second.scheduled_requests.front().num_tokens == 4 &&
+               scheduler.waiting_queue().size() == 1 &&
+               scheduler.waiting_queue().front() == RequestId{1},
+           "the committed first PREFILL must finish before follower admission");
+    static_cast<void>(
+        complete_prefill_schedule(scheduler, requests, second, 0.002));
+    expect(requests[0].is_prefill_complete() &&
+               requests[0].preemption_count() == 0 &&
+               requests[0].state() ==
+                   frontier::entities::RequestState::kTransferPending &&
+               scheduler.kv_blocks().allocated_blocks(RequestId{0}) == 2,
+           "first PDD PREFILL must reach transfer-pending with both chunks "
+           "resident");
+}
+
+void test_pdd_full_prompt_watermark_overflow_fails_fast() {
+    auto requests = make_requests({{12, 1}});
+    SchedulerConfig config = scheduler_config();
+    config.block_size = 4;
+    config.num_blocks = 3;
+    config.watermark_blocks_fraction = 0.34;
+    config.max_tokens_in_batch = 4;
+    config.enable_chunked_prefill = true;
+    config.long_prefill_token_threshold = 4;
+
+    frontier::config::PrefixCacheConfig prefix{};
+    prefix.enabled = false;
+    frontier::config::ParallelismConfig parallelism{};
+    frontier::entities::Replica replica{frontier::ReplicaId{0}, parallelism,
+                                        frontier::config::ModelConfig{}};
+    auto predictor = std::make_shared<
+        frontier::execution_time_predictor::FixedExecutionTimePredictor>(
+        frontier::config::FixedExecutionModelConfig{});
+    VllmV1Scheduler scheduler{config,
+                              requests,
+                              predictor,
+                              replica,
+                              frontier::DataParallelId{0},
+                              frontier::ClusterType::kPrefill,
+                              prefix};
+    arrive_all(scheduler, requests);
+
+    expect_throws<frontier::scheduler::SchedulerError>(
+        [&]() {
+            static_cast<void>(scheduler.schedule(SimTime::from_seconds(0.0)));
+        },
+        "a full prompt plus watermark larger than an empty replica must fail "
+        "fast");
+    expect(scheduler.waiting_queue().size() == 1 &&
+               scheduler.waiting_queue().front() == RequestId{0} &&
+               scheduler.allocated_kv_blocks() == 0,
+           "failed full-sequence admission must leave queue and KV ownership "
+           "intact");
 }
 
 void test_decode_frontier_grows_kv_at_boundary() {
@@ -543,14 +651,16 @@ void test_cache_disabled_reentry_replays_decode_as_prefill() {
 }
 
 void test_tiered_prefix_plan_first_gap_and_demotion() {
-    const auto gpu_only = frontier::scheduler::build_contiguous_tiered_prefix_plan(
-        4, 3, 2, 16, 64);
+    const auto gpu_only =
+        frontier::scheduler::build_contiguous_tiered_prefix_plan(4, 3, 2, 16,
+                                                                 64);
     expect(gpu_only.cpu_begin_block == gpu_only.cpu_end_block &&
                gpu_only.hit_frontier_blocks == 3,
            "GPU-only hit must not create a CPU restore range");
 
-    const auto cpu_only = frontier::scheduler::build_contiguous_tiered_prefix_plan(
-        4, 0, 3, 16, 64);
+    const auto cpu_only =
+        frontier::scheduler::build_contiguous_tiered_prefix_plan(4, 0, 3, 16,
+                                                                 64);
     expect(cpu_only.cpu_begin_block == 0 && cpu_only.cpu_end_block == 3 &&
                cpu_only.hit_frontier_blocks == 3,
            "CPU-only hit must create one contiguous restore range");
@@ -572,13 +682,14 @@ void test_tiered_prefix_plan_first_gap_and_demotion() {
     staged.query_blocks = 5;
     staged.block_size = 16;
     staged.prompt_tokens = 80;
-    expect(frontier::scheduler::revalidate_contiguous_tiered_prefix_frontier(
-               1, staged) == 1 &&
-               frontier::scheduler::revalidate_contiguous_tiered_prefix_frontier(
-                   3, staged) == 4 &&
-               frontier::scheduler::revalidate_contiguous_tiered_prefix_frontier(
-                   5, staged) == 4,
-           "admission revalidation must stop at a gap and demote all-hit");
+    expect(
+        frontier::scheduler::revalidate_contiguous_tiered_prefix_frontier(
+            1, staged) == 1 &&
+            frontier::scheduler::revalidate_contiguous_tiered_prefix_frontier(
+                3, staged) == 4 &&
+            frontier::scheduler::revalidate_contiguous_tiered_prefix_frontier(
+                5, staged) == 4,
+        "admission revalidation must stop at a gap and demote all-hit");
 }
 
 std::vector<Request> make_cpu_restore_requests(
@@ -592,6 +703,24 @@ std::vector<Request> make_cpu_restore_requests(
         workload.num_decode_tokens = 1;
         workload.session_id = frontier::SessionId{inputs[index].second};
         workload.session_turn_index = 0;
+        requests.emplace_back(workload);
+    }
+    return requests;
+}
+
+std::vector<Request> make_same_session_requests(
+    const std::vector<std::pair<std::uint64_t, std::uint64_t>> &tokens,
+    frontier::SessionId session_id) {
+    std::vector<Request> requests;
+    requests.reserve(tokens.size());
+    for (std::size_t index = 0; index < tokens.size(); ++index) {
+        WorkloadRequest workload{};
+        workload.request_id = RequestId{index};
+        workload.session_start_at = SimTime::from_seconds(0.0);
+        workload.num_prefill_tokens = tokens[index].first;
+        workload.num_decode_tokens = tokens[index].second;
+        workload.session_id = session_id;
+        workload.session_turn_index = index;
         requests.emplace_back(workload);
     }
     return requests;
@@ -614,9 +743,9 @@ void seed_cpu_prefix(VllmV1Scheduler &scheduler, frontier::SessionId session,
                      std::uint64_t blocks) {
     auto *manager = scheduler.cpu_kv_cache_manager();
     expect(manager != nullptr, "PREFILL scheduler must own a CPU manager");
-    const auto reservation = manager->reserve_offload(
-        session, frontier::CpuOffloadGeneration{1}, blocks,
-        SimTime::from_seconds(0.0));
+    const auto reservation =
+        manager->reserve_offload(session, frontier::CpuOffloadGeneration{1},
+                                 blocks, SimTime::from_seconds(0.0));
     expect(reservation.requires_transfer() &&
                manager->commit_offload(reservation.reservation_id,
                                        SimTime::from_seconds(0.001)),
@@ -631,14 +760,18 @@ void test_deferred_restore_lifecycle_and_atomic_admission() {
     frontier::config::PrefixCacheConfig prefix{};
     prefix.enabled = true;
     frontier::config::ParallelismConfig parallelism{};
-    frontier::entities::Replica replica{
-        frontier::ReplicaId{0}, parallelism, frontier::config::ModelConfig{}};
+    frontier::entities::Replica replica{frontier::ReplicaId{0}, parallelism,
+                                        frontier::config::ModelConfig{}};
     auto predictor = std::make_shared<
         frontier::execution_time_predictor::FixedExecutionTimePredictor>(
         frontier::config::FixedExecutionModelConfig{});
-    VllmV1Scheduler scheduler{config, requests, predictor, replica,
+    VllmV1Scheduler scheduler{config,
+                              requests,
+                              predictor,
+                              replica,
                               frontier::DataParallelId{0},
-                              frontier::ClusterType::kPrefill, prefix,
+                              frontier::ClusterType::kPrefill,
+                              prefix,
                               cpu_target_config()};
     seed_cpu_prefix(scheduler, frontier::SessionId{10}, 2);
     arrive_all(scheduler, requests);
@@ -653,14 +786,13 @@ void test_deferred_restore_lifecycle_and_atomic_admission() {
            "restore suspension must emit exactly one start event");
     const auto start = std::get<frontier::CpuKVCacheRestoreStartPayload>(
         starts.front().payload);
-    scheduler.on_cpu_kv_cache_restore_start(start.transfer_id,
-                                            start.generation,
+    scheduler.on_cpu_kv_cache_restore_start(start.transfer_id, start.generation,
                                             starts.front().time);
     auto ends = scheduler.drain_auxiliary_events();
     expect(ends.size() == 1 && scheduler.allocated_kv_blocks() == 0,
            "in-flight restore must still own no GPU pages");
-    const auto end = std::get<frontier::CpuKVCacheRestoreEndPayload>(
-        ends.front().payload);
+    const auto end =
+        std::get<frontier::CpuKVCacheRestoreEndPayload>(ends.front().payload);
     expect(scheduler.on_cpu_kv_cache_restore_end(
                end.transfer_id, end.generation, ends.front().time) &&
                scheduler.pending_cpu_restore_count() == 0 &&
@@ -677,22 +809,163 @@ void test_deferred_restore_lifecycle_and_atomic_admission() {
            "staged restore and GPU allocation must publish atomically");
 }
 
+void test_migration_discard_drains_inflight_cpu_restore() {
+    auto requests = make_cpu_restore_requests({{48, 57}});
+    SchedulerConfig config = scheduler_config();
+    config.block_size = 16;
+    config.num_blocks = 8;
+    frontier::config::PrefixCacheConfig prefix{};
+    prefix.enabled = true;
+    frontier::config::ParallelismConfig parallelism{};
+    frontier::entities::Replica replica{frontier::ReplicaId{0}, parallelism,
+                                        frontier::config::ModelConfig{}};
+    auto predictor = std::make_shared<
+        frontier::execution_time_predictor::FixedExecutionTimePredictor>(
+        frontier::config::FixedExecutionModelConfig{});
+    VllmV1Scheduler scheduler{config,
+                              requests,
+                              predictor,
+                              replica,
+                              frontier::DataParallelId{0},
+                              frontier::ClusterType::kPrefill,
+                              prefix,
+                              cpu_target_config()};
+    seed_cpu_prefix(scheduler, frontier::SessionId{57}, 2);
+    arrive_all(scheduler, requests);
+    const auto suspended = scheduler.schedule(SimTime::from_seconds(1.0));
+    expect(suspended.scheduled_requests.empty() &&
+               scheduler.pending_cpu_restore_count() == 1,
+           "migration restore fixture must suspend for H2D");
+    auto starts = scheduler.drain_auxiliary_events();
+    const auto start = std::get<frontier::CpuKVCacheRestoreStartPayload>(
+        starts.front().payload);
+    scheduler.on_cpu_kv_cache_restore_start(start.transfer_id, start.generation,
+                                            starts.front().time);
+    auto ends = scheduler.drain_auxiliary_events();
+    scheduler.discard_tiered_prefix_cache_session(frontier::SessionId{57});
+    expect(scheduler.cpu_kv_cache_manager()->session_discard_pending(
+               frontier::SessionId{57}),
+           "migration must retire the H2D source before completion");
+
+    const auto end =
+        std::get<frontier::CpuKVCacheRestoreEndPayload>(ends.front().payload);
+    expect(scheduler.on_cpu_kv_cache_restore_end(
+               end.transfer_id, end.generation, ends.front().time) &&
+               scheduler.cpu_kv_cache_manager()->diagnostics().sessions == 0,
+           "retired H2D must finish for its request and then reap CPU KV");
+    const auto admitted = scheduler.schedule(ends.front().time);
+    expect(admitted.scheduled_requests.size() == 1 &&
+               requests[0].cached_prefill_tokens() == 32,
+           "retired H2D payload may serve only the already-bound request");
+    static_cast<void>(complete_prefill_schedule(
+        scheduler, requests, admitted, ends.front().time.seconds() + 0.01));
+    expect(!scheduler.prepare_cpu_kv_cache_offload(
+               RequestId{0},
+               SimTime::from_seconds(ends.front().time.seconds() + 0.01)),
+           "request served by retired H2D must not republish CPU KV");
+    requests[0].on_kv_cache_transfer_start(
+        SimTime::from_seconds(ends.front().time.seconds() + 0.02));
+    requests[0].on_kv_cache_transfer_complete(
+        SimTime::from_seconds(ends.front().time.seconds() + 0.03), 1);
+    scheduler.complete_kv_transfer(RequestId{0});
+    expect(scheduler.gpu_cache_valid_prefix_blocks(
+               frontier::SessionId{57}) == 0 &&
+               scheduler.cpu_kv_cache_manager()->diagnostics().sessions == 0,
+           "retired restore request must leave neither GPU nor CPU cache");
+}
+
+void test_mixed_gpu_cpu_restore_preserves_pinned_gpu_frontier() {
+    auto requests = make_cpu_restore_requests({{32, 12}, {80, 12}});
+    SchedulerConfig config = scheduler_config();
+    config.block_size = 16;
+    config.num_blocks = 8;
+    frontier::config::PrefixCacheConfig prefix{};
+    prefix.enabled = true;
+    frontier::config::ParallelismConfig parallelism{};
+    frontier::entities::Replica replica{frontier::ReplicaId{0}, parallelism,
+                                        frontier::config::ModelConfig{}};
+    auto predictor = std::make_shared<
+        frontier::execution_time_predictor::FixedExecutionTimePredictor>(
+        frontier::config::FixedExecutionModelConfig{});
+    VllmV1Scheduler scheduler{config,
+                              requests,
+                              predictor,
+                              replica,
+                              frontier::DataParallelId{0},
+                              frontier::ClusterType::kPrefill,
+                              prefix,
+                              cpu_target_config()};
+
+    requests[0].on_arrival(requests[0].arrived_at());
+    scheduler.add_request(RequestId{0});
+    const auto seed = scheduler.schedule(SimTime::from_seconds(1.0));
+    static_cast<void>(
+        complete_prefill_schedule(scheduler, requests, seed, 1.1));
+    requests[0].on_kv_cache_transfer_start(SimTime::from_seconds(1.11));
+    requests[0].on_kv_cache_transfer_complete(SimTime::from_seconds(1.12), 1);
+    scheduler.complete_kv_transfer(RequestId{0});
+    expect(scheduler.kv_blocks().gpu_cache_valid_prefix_blocks(
+               frontier::SessionId{12}) == 2,
+           "seed request must leave two reusable GPU prefix blocks");
+
+    seed_cpu_prefix(scheduler, frontier::SessionId{12}, 4);
+    requests[1].on_arrival(requests[1].arrived_at());
+    scheduler.add_request(RequestId{1});
+    const auto suspended = scheduler.schedule(SimTime::from_seconds(2.0));
+    expect(suspended.scheduled_requests.empty() &&
+               scheduler.pending_cpu_restore_count() == 1 &&
+               scheduler.kv_blocks().allocated_blocks(RequestId{1}) == 2,
+           "mixed restore must pin the resident GPU prefix before H2D");
+
+    auto starts = scheduler.drain_auxiliary_events();
+    const auto start = std::get<frontier::CpuKVCacheRestoreStartPayload>(
+        starts.front().payload);
+    scheduler.on_cpu_kv_cache_restore_start(start.transfer_id, start.generation,
+                                            starts.front().time);
+    auto ends = scheduler.drain_auxiliary_events();
+    const auto end =
+        std::get<frontier::CpuKVCacheRestoreEndPayload>(ends.front().payload);
+    expect(scheduler.on_cpu_kv_cache_restore_end(
+               end.transfer_id, end.generation, ends.front().time),
+           "mixed GPU and CPU prefix restore must reach staged state");
+
+    const auto admitted = scheduler.schedule(ends.front().time);
+    expect(admitted.scheduled_requests.size() == 1 &&
+               admitted.scheduled_requests.front().request_id == RequestId{1} &&
+               admitted.scheduled_requests.front().num_tokens == 16 &&
+               requests[1].cached_prefill_tokens() == 64 &&
+               requests[1].prefix_cache_hit_blocks() == 4 &&
+               scheduler.staged_cpu_restore_count() == 0 &&
+               scheduler.kv_blocks().allocated_blocks(RequestId{1}) == 5 &&
+               scheduler.kv_blocks().request_virtual_committed_blocks(
+                   RequestId{1}) == 0,
+           "staged admission must retain GPU blocks and append the CPU suffix");
+}
+
 void test_restore_pending_does_not_head_of_line_block_gpu_admission() {
     auto requests = make_cpu_restore_requests({{48, 20}, {16, 21}});
     SchedulerConfig config = scheduler_config();
     config.block_size = 16;
-    config.num_blocks = 1;
+    // The restore-pending request has a 48-token (three-block) full prompt.
+    // Reserve one additional block so a one-block follower can coexist with
+    // its virtual commitment and the staged payload can later materialize
+    // atomically.
+    config.num_blocks = 4;
     frontier::config::PrefixCacheConfig prefix{};
     prefix.enabled = true;
     frontier::config::ParallelismConfig parallelism{};
-    frontier::entities::Replica replica{
-        frontier::ReplicaId{0}, parallelism, frontier::config::ModelConfig{}};
+    frontier::entities::Replica replica{frontier::ReplicaId{0}, parallelism,
+                                        frontier::config::ModelConfig{}};
     auto predictor = std::make_shared<
         frontier::execution_time_predictor::FixedExecutionTimePredictor>(
         frontier::config::FixedExecutionModelConfig{});
-    VllmV1Scheduler scheduler{config, requests, predictor, replica,
+    VllmV1Scheduler scheduler{config,
+                              requests,
+                              predictor,
+                              replica,
                               frontier::DataParallelId{0},
-                              frontier::ClusterType::kPrefill, prefix,
+                              frontier::ClusterType::kPrefill,
+                              prefix,
                               cpu_target_config()};
     seed_cpu_prefix(scheduler, frontier::SessionId{20}, 2);
     arrive_all(scheduler, requests);
@@ -701,34 +974,100 @@ void test_restore_pending_does_not_head_of_line_block_gpu_admission() {
                schedule.scheduled_requests.front().request_id == RequestId{1} &&
                scheduler.pending_cpu_restore_count() == 1 &&
                scheduler.kv_blocks().allocated_blocks(RequestId{0}) == 0 &&
-               scheduler.kv_blocks().allocated_blocks(RequestId{1}) == 1,
+               scheduler.kv_blocks().allocated_blocks(RequestId{1}) == 1 &&
+               scheduler.queued_kv_blocks() == 0,
            "restore-pending head must not consume watermark or block follower");
     auto starts = scheduler.drain_auxiliary_events();
     const auto start = std::get<frontier::CpuKVCacheRestoreStartPayload>(
         starts.front().payload);
-    scheduler.on_cpu_kv_cache_restore_start(start.transfer_id,
-                                            start.generation,
+    scheduler.on_cpu_kv_cache_restore_start(start.transfer_id, start.generation,
+                                            starts.front().time);
+    auto ends = scheduler.drain_auxiliary_events();
+    const auto end =
+        std::get<frontier::CpuKVCacheRestoreEndPayload>(ends.front().payload);
+    expect(scheduler.on_cpu_kv_cache_restore_end(
+               end.transfer_id, end.generation, ends.front().time),
+           "HOL restore must reach staged state");
+    const auto admitted = scheduler.schedule(ends.front().time);
+    expect(
+        admitted.scheduled_requests.size() == 1 &&
+            admitted.scheduled_requests.front().request_id == RequestId{0} &&
+            admitted.scheduled_requests.front().num_tokens == 16 &&
+            scheduler.staged_cpu_restore_count() == 0 &&
+            scheduler.kv_blocks().allocated_blocks(RequestId{0}) == 3 &&
+            scheduler.kv_blocks().allocated_blocks(RequestId{1}) == 1,
+        "a fitting staged restore must materialize atomically after transfer");
+}
+
+void test_restored_ready_precedes_blocked_fresh_head() {
+    auto requests = make_cpu_restore_requests({{48, 40}, {32, 41}});
+    SchedulerConfig config = scheduler_config();
+    config.block_size = 16;
+    config.num_blocks = 4;
+    config.max_tokens_in_batch = 16;
+    frontier::config::PrefixCacheConfig prefix{};
+    prefix.enabled = true;
+    frontier::config::ParallelismConfig parallelism{};
+    frontier::entities::Replica replica{frontier::ReplicaId{0}, parallelism,
+                                        frontier::config::ModelConfig{}};
+    auto predictor = std::make_shared<
+        frontier::execution_time_predictor::FixedExecutionTimePredictor>(
+        frontier::config::FixedExecutionModelConfig{});
+    VllmV1Scheduler scheduler{config,
+                              requests,
+                              predictor,
+                              replica,
+                              frontier::DataParallelId{0},
+                              frontier::ClusterType::kPrefill,
+                              prefix,
+                              cpu_target_config()};
+
+    // Request 0 owns a three-block full-sequence commitment while its CPU
+    // prefix is restored.  Request 1 arrives later and cannot acquire its
+    // own two-block commitment while request 0 is pending.
+    seed_cpu_prefix(scheduler, frontier::SessionId{40}, 2);
+    requests[0].on_arrival(requests[0].arrived_at());
+    scheduler.add_request(RequestId{0});
+    const auto pending = scheduler.schedule(SimTime::from_seconds(1.0));
+    expect(pending.scheduled_requests.empty() &&
+               scheduler.pending_cpu_restore_count() == 1 &&
+               scheduler.kv_blocks().request_committed_blocks(RequestId{0}) ==
+                   3,
+           "restore request must own its full commitment while H2D is pending");
+
+    requests[1].on_arrival(requests[1].arrived_at());
+    scheduler.add_request(RequestId{1});
+    const auto blocked = scheduler.schedule(SimTime::from_seconds(1.001));
+    expect(blocked.scheduled_requests.empty() &&
+               scheduler.waiting_queue().size() == 1 &&
+               scheduler.waiting_queue().front() == RequestId{1},
+           "fresh head must remain blocked behind the pending restore");
+
+    auto starts = scheduler.drain_auxiliary_events();
+    const auto start = std::get<frontier::CpuKVCacheRestoreStartPayload>(
+        starts.front().payload);
+    scheduler.on_cpu_kv_cache_restore_start(start.transfer_id, start.generation,
                                             starts.front().time);
     auto ends = scheduler.drain_auxiliary_events();
     const auto end = std::get<frontier::CpuKVCacheRestoreEndPayload>(
         ends.front().payload);
     expect(scheduler.on_cpu_kv_cache_restore_end(
-               end.transfer_id, end.generation, ends.front().time),
-           "HOL restore must reach staged state");
-    const auto blocked = scheduler.schedule(ends.front().time);
-    expect(blocked.scheduled_requests.empty() &&
-               scheduler.staged_cpu_restore_count() == 1 &&
-               scheduler.kv_blocks().allocated_blocks(RequestId{0}) == 0,
-           "temporary GPU pressure must retain staged payload atomically");
-    expect(scheduler.cancel_cpu_kv_cache_restore(RequestId{0},
-                                                 ends.front().time) &&
-               !scheduler.cancel_cpu_kv_cache_restore(RequestId{0},
-                                                      ends.front().time) &&
+               end.transfer_id, end.generation, ends.front().time) &&
+               scheduler.restored_ready_queue().size() == 1 &&
+               scheduler.restored_ready_queue().front() == RequestId{0} &&
+               scheduler.waiting_queue().size() == 1 &&
+               scheduler.waiting_queue().front() == RequestId{1},
+           "completed restore must enter the resource-owning ready queue");
+
+    const auto admitted = scheduler.schedule(ends.front().time);
+    expect(admitted.scheduled_requests.size() == 1 &&
+               admitted.scheduled_requests.front().request_id == RequestId{0} &&
+               admitted.scheduled_requests.front().num_tokens == 16 &&
+               scheduler.restored_ready_queue().empty() &&
                scheduler.staged_cpu_restore_count() == 0 &&
-               std::find(scheduler.waiting_queue().begin(),
-                         scheduler.waiting_queue().end(), RequestId{0}) ==
-                   scheduler.waiting_queue().end(),
-           "staged restore cancellation must remove its runnable entry exactly once");
+               scheduler.waiting_queue().size() == 1 &&
+               scheduler.waiting_queue().front() == RequestId{1},
+           "resource-owning restored request must bypass blocked fresh head");
 }
 
 void test_pending_restore_cancellation_removes_start_event() {
@@ -739,15 +1078,23 @@ void test_pending_restore_cancellation_removes_start_event() {
     frontier::config::PrefixCacheConfig prefix{};
     prefix.enabled = true;
     frontier::config::ParallelismConfig parallelism{};
-    frontier::entities::Replica replica{
-        frontier::ReplicaId{0}, parallelism, frontier::config::ModelConfig{}};
+    frontier::entities::Replica replica{frontier::ReplicaId{0}, parallelism,
+                                        frontier::config::ModelConfig{}};
     auto predictor = std::make_shared<
         frontier::execution_time_predictor::FixedExecutionTimePredictor>(
-        frontier::config::FixedExecutionModelConfig{});
-    VllmV1Scheduler scheduler{config, requests, predictor, replica,
+            frontier::config::FixedExecutionModelConfig{});
+    auto cpu_config = cpu_target_config();
+    cpu_config.capacity_blocks = 2;
+    cpu_config.capacity_bytes =
+        cpu_config.capacity_blocks * cpu_config.bytes_per_block;
+    VllmV1Scheduler scheduler{config,
+                              requests,
+                              predictor,
+                              replica,
                               frontier::DataParallelId{0},
-                              frontier::ClusterType::kPrefill, prefix,
-                              cpu_target_config()};
+                              frontier::ClusterType::kPrefill,
+                              prefix,
+                              cpu_config};
     seed_cpu_prefix(scheduler, frontier::SessionId{30}, 2);
     arrive_all(scheduler, requests);
 
@@ -763,12 +1110,33 @@ void test_pending_restore_cancellation_removes_start_event() {
                !scheduler.cancel_cpu_kv_cache_restore(RequestId{0}, now) &&
                scheduler.pending_cpu_restore_count() == 0 &&
                scheduler.drain_auxiliary_events().empty() &&
-               scheduler.cpu_kv_cache_manager()
-                       ->diagnostics()
-                       .active_restore_leases == 0 &&
-               std::count(scheduler.waiting_queue().begin(),
-                          scheduler.waiting_queue().end(), RequestId{0}) == 1,
-           "pending cancellation must release its lease, suppress the start event, and requeue once");
+                scheduler.cpu_kv_cache_manager()
+                        ->diagnostics()
+                        .active_restore_leases == 0 &&
+                scheduler.kv_blocks().request_committed_blocks(RequestId{0}) ==
+                    0 &&
+                std::count(scheduler.waiting_queue().begin(),
+                           scheduler.waiting_queue().end(), RequestId{0}) == 1,
+            "pending cancellation must release its lease, suppress the start "
+            "event and commitment, and requeue once");
+
+    // Replace the cancelled request's CPU prefix before it is reconsidered.
+    // It must then fall back to ordinary GPU admission instead of remaining
+    // blocked behind the stale allocation created for the old restore.
+    seed_cpu_prefix(scheduler, frontier::SessionId{99}, 2);
+    expect(scheduler.cpu_kv_cache_manager()->committed_frontier_blocks(
+               frontier::SessionId{30}) == 0,
+           "CPU pressure must evict the cancelled restore prefix");
+    const auto rescheduled =
+        scheduler.schedule(SimTime::from_seconds(1.001));
+    expect(rescheduled.scheduled_requests.size() == 1 &&
+               rescheduled.scheduled_requests.front().request_id ==
+                   RequestId{0} &&
+               scheduler.pending_cpu_restore_count() == 0 &&
+               scheduler.kv_blocks().request_committed_blocks(RequestId{0}) ==
+                   3,
+           "cancelled restore must reacquire a fresh commitment and resume "
+           "through ordinary prefix admission");
 }
 
 void test_restore_scheduling_failure_restores_queue_ownership() {
@@ -779,24 +1147,27 @@ void test_restore_scheduling_failure_restores_queue_ownership() {
     frontier::config::PrefixCacheConfig prefix{};
     prefix.enabled = true;
     frontier::config::ParallelismConfig parallelism{};
-    frontier::entities::Replica replica{
-        frontier::ReplicaId{0}, parallelism, frontier::config::ModelConfig{}};
+    frontier::entities::Replica replica{frontier::ReplicaId{0}, parallelism,
+                                        frontier::config::ModelConfig{}};
     auto predictor = std::make_shared<
         frontier::execution_time_predictor::FixedExecutionTimePredictor>(
         frontier::config::FixedExecutionModelConfig{});
     auto cpu_config = cpu_target_config();
     cpu_config.bytes_per_block = std::numeric_limits<std::uint64_t>::max();
-    VllmV1Scheduler scheduler{config, requests, predictor, replica,
+    VllmV1Scheduler scheduler{config,
+                              requests,
+                              predictor,
+                              replica,
                               frontier::DataParallelId{0},
-                              frontier::ClusterType::kPrefill, prefix,
+                              frontier::ClusterType::kPrefill,
+                              prefix,
                               cpu_config};
     seed_cpu_prefix(scheduler, frontier::SessionId{31}, 2);
     arrive_all(scheduler, requests);
 
     expect_throws<frontier::scheduler::SchedulerError>(
         [&]() {
-            static_cast<void>(
-                scheduler.schedule(SimTime::from_seconds(1.0)));
+            static_cast<void>(scheduler.schedule(SimTime::from_seconds(1.0)));
         },
         "overflowing restore transfer must fail deterministically");
     const auto diagnostics = scheduler.cpu_kv_cache_manager()->diagnostics();
@@ -818,14 +1189,18 @@ void test_restore_completion_failure_cancels_matching_operation() {
     frontier::config::PrefixCacheConfig prefix{};
     prefix.enabled = true;
     frontier::config::ParallelismConfig parallelism{};
-    frontier::entities::Replica replica{
-        frontier::ReplicaId{0}, parallelism, frontier::config::ModelConfig{}};
+    frontier::entities::Replica replica{frontier::ReplicaId{0}, parallelism,
+                                        frontier::config::ModelConfig{}};
     auto predictor = std::make_shared<
         frontier::execution_time_predictor::FixedExecutionTimePredictor>(
         frontier::config::FixedExecutionModelConfig{});
-    VllmV1Scheduler scheduler{config, requests, predictor, replica,
+    VllmV1Scheduler scheduler{config,
+                              requests,
+                              predictor,
+                              replica,
                               frontier::DataParallelId{0},
-                              frontier::ClusterType::kPrefill, prefix,
+                              frontier::ClusterType::kPrefill,
+                              prefix,
                               cpu_target_config()};
     seed_cpu_prefix(scheduler, frontier::SessionId{32}, 2);
     arrive_all(scheduler, requests);
@@ -834,12 +1209,11 @@ void test_restore_completion_failure_cancels_matching_operation() {
     auto starts = scheduler.drain_auxiliary_events();
     const auto start = std::get<frontier::CpuKVCacheRestoreStartPayload>(
         starts.front().payload);
-    scheduler.on_cpu_kv_cache_restore_start(start.transfer_id,
-                                            start.generation,
+    scheduler.on_cpu_kv_cache_restore_start(start.transfer_id, start.generation,
                                             starts.front().time);
     auto ends = scheduler.drain_auxiliary_events();
-    const auto end = std::get<frontier::CpuKVCacheRestoreEndPayload>(
-        ends.front().payload);
+    const auto end =
+        std::get<frontier::CpuKVCacheRestoreEndPayload>(ends.front().payload);
     expect(scheduler.cpu_kv_cache_manager()->release_restore(
                operation.lease_id(), false, ends.front().time),
            "fixture must invalidate the in-flight restore lease");
@@ -849,14 +1223,15 @@ void test_restore_completion_failure_cancels_matching_operation() {
                 end.transfer_id, end.generation, ends.front().time));
         },
         "terminal lease must fail H2D completion deterministically");
-    expect(scheduler.pending_cpu_restore_count() == 0 &&
-               scheduler.staged_cpu_restore_count() == 0 &&
-               scheduler.allocated_kv_blocks() == 0 &&
-               scheduler.cpu_kv_cache_restore_operations().front().state() ==
-                   frontier::entities::CpuKVCacheTransferState::kCancelled &&
-               !scheduler.on_cpu_kv_cache_restore_end(
-                   end.transfer_id, end.generation, ends.front().time),
-           "H2D completion failure must cancel only its matching operation once");
+    expect(
+        scheduler.pending_cpu_restore_count() == 0 &&
+            scheduler.staged_cpu_restore_count() == 0 &&
+            scheduler.allocated_kv_blocks() == 0 &&
+            scheduler.cpu_kv_cache_restore_operations().front().state() ==
+                frontier::entities::CpuKVCacheTransferState::kCancelled &&
+            !scheduler.on_cpu_kv_cache_restore_end(
+                end.transfer_id, end.generation, ends.front().time),
+        "H2D completion failure must cancel only its matching operation once");
 }
 
 Batch complete_prefill_schedule(VllmV1Scheduler &scheduler,
@@ -871,13 +1246,18 @@ Batch complete_prefill_schedule(VllmV1Scheduler &scheduler,
             value.execution_epoch(), value.num_processed_tokens(),
             value.scheduler_num_computed_tokens()});
     }
-    Batch batch{BatchId{100}, schedule.iteration_id, std::move(snapshots),
-                schedule.simulation_time, Generation{100},
-                frontier::ReplicaId{0}, frontier::DataParallelId{0}, 1,
+    Batch batch{BatchId{100},
+                schedule.iteration_id,
+                std::move(snapshots),
+                schedule.simulation_time,
+                Generation{100},
+                frontier::ReplicaId{0},
+                frontier::DataParallelId{0},
+                1,
                 frontier::ClusterType::kPrefill};
     scheduler.mark_batch_started(batch);
-    expect(scheduler.on_batch_completed(
-               batch, SimTime::from_seconds(completed_at)),
+    expect(scheduler.on_batch_completed(batch,
+                                        SimTime::from_seconds(completed_at)),
            "PREFILL batch must complete before export");
     return batch;
 }
@@ -891,26 +1271,29 @@ void test_cpu_offload_export_barrier_both_orders() {
         frontier::config::PrefixCacheConfig prefix{};
         prefix.enabled = true;
         frontier::config::ParallelismConfig parallelism{};
-        frontier::entities::Replica replica{
-            frontier::ReplicaId{0}, parallelism,
-            frontier::config::ModelConfig{}};
+        frontier::entities::Replica replica{frontier::ReplicaId{0}, parallelism,
+                                            frontier::config::ModelConfig{}};
         auto predictor = std::make_shared<
             frontier::execution_time_predictor::FixedExecutionTimePredictor>(
             frontier::config::FixedExecutionModelConfig{});
-        VllmV1Scheduler scheduler{
-            config, requests, predictor, replica, frontier::DataParallelId{0},
-            frontier::ClusterType::kPrefill, prefix, cpu_target_config()};
+        VllmV1Scheduler scheduler{config,
+                                  requests,
+                                  predictor,
+                                  replica,
+                                  frontier::DataParallelId{0},
+                                  frontier::ClusterType::kPrefill,
+                                  prefix,
+                                  cpu_target_config()};
         arrive_all(scheduler, requests);
         const auto scheduled = scheduler.schedule(SimTime::from_seconds(1.0));
         static_cast<void>(
             complete_prefill_schedule(scheduler, requests, scheduled, 1.1));
         expect(scheduler.allocated_kv_blocks() == 2 &&
-                   scheduler.prepare_cpu_kv_cache_offload(RequestId{0},
-                                                          SimTime::from_seconds(1.1)),
+                   scheduler.prepare_cpu_kv_cache_offload(
+                       RequestId{0}, SimTime::from_seconds(1.1)),
                "real offload must add a CPU export branch");
         auto starts = scheduler.drain_auxiliary_events();
-        expect(starts.size() == 1,
-               "CPU export must emit one D2H start event");
+        expect(starts.size() == 1, "CPU export must emit one D2H start event");
         const auto start = std::get<frontier::CpuKVCacheOffloadStartPayload>(
             starts.front().payload);
 
@@ -926,9 +1309,8 @@ void test_cpu_offload_export_barrier_both_orders() {
             scheduler.on_cpu_kv_cache_offload_start(
                 start.transfer_id, start.cpu_generation, starts.front().time);
             auto ends = scheduler.drain_auxiliary_events();
-            const auto end =
-                std::get<frontier::CpuKVCacheOffloadEndPayload>(
-                    ends.front().payload);
+            const auto end = std::get<frontier::CpuKVCacheOffloadEndPayload>(
+                ends.front().payload);
             expect(scheduler.on_cpu_kv_cache_offload_end(
                        end.transfer_id, end.cpu_generation, ends.front().time),
                    "D2H branch must complete once");
@@ -949,14 +1331,382 @@ void test_cpu_offload_export_barrier_both_orders() {
             complete_decode();
         }
         expect(scheduler.allocated_kv_blocks() == 0 &&
-                   scheduler.cpu_kv_cache_manager()
-                           ->committed_frontier_blocks(frontier::SessionId{30}) ==
-                       2 &&
+                   scheduler.cpu_kv_cache_manager()->committed_frontier_blocks(
+                       frontier::SessionId{30}) == 2 &&
                    scheduler.pending_kv_transfer_count() == 0,
                "last export branch must release GPU and preserve CPU snapshot");
     };
     run_order(true);
     run_order(false);
+}
+
+void test_transfer_pending_gpu_blocks_gate_admission_until_all_exports_finish() {
+    auto requests = make_cpu_restore_requests({{32, 30}, {16, 31}});
+    SchedulerConfig config = scheduler_config();
+    config.block_size = 16;
+    config.num_blocks = 2;
+    frontier::config::PrefixCacheConfig prefix{};
+    prefix.enabled = true;
+    frontier::config::ParallelismConfig parallelism{};
+    frontier::entities::Replica replica{frontier::ReplicaId{0}, parallelism,
+                                        frontier::config::ModelConfig{}};
+    auto predictor = std::make_shared<
+        frontier::execution_time_predictor::FixedExecutionTimePredictor>(
+        frontier::config::FixedExecutionModelConfig{});
+    VllmV1Scheduler scheduler{config,
+                              requests,
+                              predictor,
+                              replica,
+                              frontier::DataParallelId{0},
+                              frontier::ClusterType::kPrefill,
+                              prefix,
+                              cpu_target_config()};
+    arrive_all(scheduler, requests);
+
+    const auto first = scheduler.schedule(SimTime::from_seconds(1.0));
+    expect(first.scheduled_requests.size() == 1 &&
+               first.scheduled_requests.front().request_id == RequestId{0},
+           "PREFILL producer must be admitted before its follower");
+    static_cast<void>(
+        complete_prefill_schedule(scheduler, requests, first, 1.1));
+    expect(requests[0].state() ==
+                   frontier::entities::RequestState::kTransferPending &&
+               scheduler.allocated_kv_blocks() == 2 &&
+               scheduler.waiting_queue().size() == 1,
+           "completed PREFILL must retain both physical source blocks while "
+           "transfer-pending");
+
+    expect(scheduler.prepare_cpu_kv_cache_offload(RequestId{0},
+                                                  SimTime::from_seconds(1.1)),
+           "simultaneous CPU offload must create the second export branch");
+    auto starts = scheduler.drain_auxiliary_events();
+    expect(starts.size() == 1, "CPU offload branch must emit one start event");
+    const auto start = std::get<frontier::CpuKVCacheOffloadStartPayload>(
+        starts.front().payload);
+
+    const auto blocked_before_decode =
+        scheduler.schedule(SimTime::from_seconds(1.11));
+    expect(blocked_before_decode.scheduled_requests.empty() &&
+               scheduler.allocated_kv_blocks() == 2,
+           "decode-pending source blocks must block follower admission");
+
+    requests[0].on_kv_cache_transfer_start(SimTime::from_seconds(1.12));
+    requests[0].on_kv_cache_transfer_complete(SimTime::from_seconds(1.13), 1);
+    scheduler.complete_kv_transfer(RequestId{0});
+    expect(scheduler.pending_kv_transfer_count() == 0 &&
+               scheduler.allocated_kv_blocks() == 2,
+           "decode completion alone must retain blocks while CPU offload is "
+           "pending");
+    const auto blocked_before_cpu =
+        scheduler.schedule(SimTime::from_seconds(1.13));
+    expect(blocked_before_cpu.scheduled_requests.empty() &&
+               scheduler.allocated_kv_blocks() == 2,
+           "CPU-pending source blocks must continue to block admission");
+
+    scheduler.on_cpu_kv_cache_offload_start(
+        start.transfer_id, start.cpu_generation, starts.front().time);
+    auto ends = scheduler.drain_auxiliary_events();
+    expect(ends.size() == 1, "CPU offload must emit one completion event");
+    const auto end =
+        std::get<frontier::CpuKVCacheOffloadEndPayload>(ends.front().payload);
+    expect(scheduler.on_cpu_kv_cache_offload_end(
+               end.transfer_id, end.cpu_generation, ends.front().time),
+           "CPU offload completion must close the second export branch");
+    expect(scheduler.allocated_kv_blocks() == 0 &&
+               scheduler.pending_kv_transfer_count() == 0,
+           "last export completion must release the PREFILL source blocks");
+
+    const auto admitted = scheduler.schedule(ends.front().time);
+    expect(admitted.scheduled_requests.size() == 1 &&
+               admitted.scheduled_requests.front().request_id == RequestId{1} &&
+               scheduler.kv_blocks().allocated_blocks(RequestId{1}) == 1,
+           "follower admission must resume once both export branches finish");
+}
+
+void test_same_session_successor_waits_for_pending_cpu_offload() {
+    constexpr frontier::SessionId kSession{30};
+    auto requests =
+        make_same_session_requests({{16, 1}, {32, 1}, {32, 1}}, kSession);
+    SchedulerConfig config = scheduler_config();
+    config.block_size = 16;
+    config.num_blocks = 4;
+    config.max_tokens_in_batch = 16;
+    config.enable_chunked_prefill = true;
+    config.long_prefill_token_threshold = 16;
+    frontier::config::PrefixCacheConfig prefix{};
+    prefix.enabled = true;
+    frontier::config::ParallelismConfig parallelism{};
+    frontier::entities::Replica replica{frontier::ReplicaId{0}, parallelism,
+                                        frontier::config::ModelConfig{}};
+    auto predictor = std::make_shared<
+        frontier::execution_time_predictor::FixedExecutionTimePredictor>(
+        frontier::config::FixedExecutionModelConfig{});
+    VllmV1Scheduler scheduler{config,
+                              requests,
+                              predictor,
+                              replica,
+                              frontier::DataParallelId{0},
+                              frontier::ClusterType::kPrefill,
+                              prefix,
+                              cpu_target_config()};
+
+    // Materialize an earlier turn through the scheduler so the CPU manager's
+    // generation lane starts at zero.  Drop only its GPU prefix afterwards;
+    // the committed one-block CPU snapshot is the older prefix seen by A/B.
+    requests[0].set_pending_arrival(SimTime::from_seconds(1.0));
+    requests[0].on_arrival(requests[0].arrived_at());
+    scheduler.add_request(RequestId{0});
+    const auto seed = scheduler.schedule(SimTime::from_seconds(1.0));
+    expect(seed.scheduled_requests.size() == 1 &&
+               seed.scheduled_requests.front().request_id == RequestId{0} &&
+               seed.scheduled_requests.front().num_tokens == 16,
+           "older same-session turn must seed one PREFILL block");
+    static_cast<void>(complete_prefill_schedule(scheduler, requests, seed,
+                                                 1.01));
+    expect(scheduler.prepare_cpu_kv_cache_offload(RequestId{0},
+                                                  SimTime::from_seconds(1.01)),
+           "older same-session turn must create its CPU D2H branch");
+    auto seed_starts = scheduler.drain_auxiliary_events();
+    const auto seed_start = std::get<frontier::CpuKVCacheOffloadStartPayload>(
+        seed_starts.front().payload);
+    scheduler.on_cpu_kv_cache_offload_start(
+        seed_start.transfer_id, seed_start.cpu_generation,
+        seed_starts.front().time);
+    auto seed_ends = scheduler.drain_auxiliary_events();
+    const auto seed_end = std::get<frontier::CpuKVCacheOffloadEndPayload>(
+        seed_ends.front().payload);
+    requests[0].on_kv_cache_transfer_start(SimTime::from_seconds(
+        seed_ends.front().time.seconds() - 0.00002));
+    requests[0].on_kv_cache_transfer_complete(SimTime::from_seconds(
+        seed_ends.front().time.seconds() - 0.00001), 1);
+    scheduler.complete_kv_transfer(RequestId{0});
+    expect(scheduler.on_cpu_kv_cache_offload_end(
+               seed_end.transfer_id, seed_end.cpu_generation,
+               seed_ends.front().time),
+           "older same-session CPU D2H must commit");
+    expect(scheduler.cpu_kv_cache_manager()->committed_frontier_blocks(
+               kSession) == 1 &&
+               scheduler.allocated_kv_blocks() == 0,
+           "older same-session turn must leave one CPU block");
+    static_cast<void>(scheduler.discard_gpu_prefix_cache_session(kSession));
+    expect(scheduler.gpu_cache_valid_prefix_blocks(kSession) == 0 &&
+               scheduler.cpu_kv_cache_manager()->committed_frontier_blocks(
+                   kSession) == 1,
+           "fixture must keep the older CPU prefix but clear GPU residency");
+
+    // A is the previous same-session turn.  Its first chunk therefore has to
+    // restore the older CPU suffix before it can own the PREFILL source pages.
+    requests[1].set_pending_arrival(SimTime::from_seconds(2.0));
+    requests[1].on_arrival(requests[1].arrived_at());
+    scheduler.add_request(RequestId{1});
+    const auto waiting_for_restore =
+        scheduler.schedule(SimTime::from_seconds(2.0));
+    expect(waiting_for_restore.scheduled_requests.empty() &&
+               scheduler.pending_cpu_restore_count() == 1 &&
+               scheduler.kv_blocks().request_committed_blocks(RequestId{1}) ==
+                   2,
+           "same-session producer must own its full commitment before H2D");
+    auto restore_starts = scheduler.drain_auxiliary_events();
+    expect(restore_starts.size() == 1,
+           "same-session producer must emit one CPU restore start");
+    const auto restore_start =
+        std::get<frontier::CpuKVCacheRestoreStartPayload>(
+            restore_starts.front().payload);
+    scheduler.on_cpu_kv_cache_restore_start(
+        restore_start.transfer_id, restore_start.generation,
+        restore_starts.front().time);
+    auto restore_ends = scheduler.drain_auxiliary_events();
+    expect(restore_ends.size() == 1,
+           "same-session producer must emit one CPU restore completion");
+    const auto restore_end =
+        std::get<frontier::CpuKVCacheRestoreEndPayload>(
+            restore_ends.front().payload);
+    expect(scheduler.on_cpu_kv_cache_restore_end(
+               restore_end.transfer_id, restore_end.generation,
+               restore_ends.front().time),
+           "same-session producer H2D must stage successfully");
+
+    const auto first_chunk = scheduler.schedule(restore_ends.front().time);
+    expect(first_chunk.scheduled_requests.size() == 1 &&
+               first_chunk.scheduled_requests.front().request_id ==
+                   RequestId{1} &&
+               first_chunk.scheduled_requests.front().num_tokens == 16,
+           "producer must admit its first restored PREFILL chunk");
+    static_cast<void>(complete_prefill_schedule(
+        scheduler, requests, first_chunk,
+        restore_ends.front().time.seconds() + 0.01));
+    expect(requests[1].state() ==
+                   frontier::entities::RequestState::kTransferPending &&
+               scheduler.kv_blocks().allocated_blocks(RequestId{1}) == 2,
+           "completed producer PREFILL must retain source ownership");
+
+    expect(scheduler.prepare_cpu_kv_cache_offload(
+               RequestId{1}, SimTime::from_seconds(2.1)),
+           "producer must create a pending CPU D2H branch");
+    auto offload_starts = scheduler.drain_auxiliary_events();
+    expect(offload_starts.size() == 1,
+           "producer D2H must emit one CPU offload start");
+    const auto offload_start =
+        std::get<frontier::CpuKVCacheOffloadStartPayload>(
+            offload_starts.front().payload);
+    scheduler.on_cpu_kv_cache_offload_start(
+        offload_start.transfer_id, offload_start.cpu_generation,
+        offload_starts.front().time);
+    auto offload_ends = scheduler.drain_auxiliary_events();
+    expect(offload_ends.size() == 1,
+           "producer D2H must emit one CPU offload completion");
+    const auto offload_end =
+        std::get<frontier::CpuKVCacheOffloadEndPayload>(
+            offload_ends.front().payload);
+
+    // PDD DECODE has completed, but the PREFILL source remains owned by A
+    // until its D2H branch commits.  B is deliberately injected now and sees
+    // only the older one-block CPU snapshot.
+    requests[1].on_kv_cache_transfer_start(SimTime::from_seconds(
+        offload_ends.front().time.seconds() - 0.00002));
+    requests[1].on_kv_cache_transfer_complete(SimTime::from_seconds(
+        offload_ends.front().time.seconds() - 0.00001), 1);
+    scheduler.complete_kv_transfer(RequestId{1});
+    const SimTime successor_arrival = SimTime::from_seconds(
+        offload_ends.front().time.seconds() - 0.000005);
+    requests[2].set_pending_arrival(successor_arrival);
+    requests[2].on_arrival(successor_arrival);
+    scheduler.add_request(RequestId{2});
+    const auto older_cpu =
+        scheduler.cpu_kv_cache_manager()->lookup(kSession, 2);
+    expect(older_cpu.hit_blocks == 1 &&
+               scheduler.pending_kv_transfer_count() == 0 &&
+               scheduler.allocated_kv_blocks() == 2,
+           "successor must observe the older CPU prefix while A owns GPU KV");
+
+    const auto blocked = scheduler.schedule(SimTime::from_seconds(
+        offload_ends.front().time.seconds() - 0.000005));
+    expect(blocked.scheduled_requests.empty() &&
+               scheduler.waiting_queue().size() == 1 &&
+               scheduler.waiting_queue().front() == RequestId{2} &&
+               scheduler.kv_blocks().request_committed_blocks(RequestId{2}) ==
+                   0 &&
+               scheduler.pending_cpu_restore_count() == 0,
+           "same-session successor must wait without a second commitment or "
+           "restore while A's D2H is pending");
+
+    expect(scheduler.on_cpu_kv_cache_offload_end(
+               offload_end.transfer_id, offload_end.cpu_generation,
+               offload_ends.front().time),
+           "producer D2H completion must release its source ownership");
+    expect(scheduler.allocated_kv_blocks() == 0 &&
+               scheduler.cpu_kv_cache_manager()->committed_frontier_blocks(
+                   kSession) == 2,
+           "D2H completion must publish the producer's newer CPU frontier");
+
+    const auto admitted = scheduler.schedule(offload_ends.front().time);
+    expect(admitted.scheduled_requests.size() == 1 &&
+               admitted.scheduled_requests.front().request_id == RequestId{2} &&
+               admitted.scheduled_requests.front().num_tokens == 16 &&
+               scheduler.kv_blocks().request_committed_blocks(RequestId{2}) ==
+                   2,
+           "same-session successor must become admissible after D2H release");
+}
+
+void test_migration_discard_drains_inflight_cpu_offload() {
+    auto requests = make_cpu_restore_requests({{32, 55}});
+    SchedulerConfig config = scheduler_config();
+    config.block_size = 16;
+    config.num_blocks = 8;
+    frontier::config::PrefixCacheConfig prefix{};
+    prefix.enabled = true;
+    frontier::config::ParallelismConfig parallelism{};
+    frontier::entities::Replica replica{frontier::ReplicaId{0}, parallelism,
+                                        frontier::config::ModelConfig{}};
+    auto predictor = std::make_shared<
+        frontier::execution_time_predictor::FixedExecutionTimePredictor>(
+        frontier::config::FixedExecutionModelConfig{});
+    VllmV1Scheduler scheduler{config,
+                              requests,
+                              predictor,
+                              replica,
+                              frontier::DataParallelId{0},
+                              frontier::ClusterType::kPrefill,
+                              prefix,
+                              cpu_target_config()};
+    arrive_all(scheduler, requests);
+    const auto scheduled = scheduler.schedule(SimTime::from_seconds(1.0));
+    static_cast<void>(
+        complete_prefill_schedule(scheduler, requests, scheduled, 1.1));
+    expect(scheduler.prepare_cpu_kv_cache_offload(
+               RequestId{0}, SimTime::from_seconds(1.1)),
+           "migration fixture must create a D2H branch");
+    auto starts = scheduler.drain_auxiliary_events();
+    const auto start = std::get<frontier::CpuKVCacheOffloadStartPayload>(
+        starts.front().payload);
+    scheduler.on_cpu_kv_cache_offload_start(
+        start.transfer_id, start.cpu_generation, starts.front().time);
+    auto ends = scheduler.drain_auxiliary_events();
+    expect(ends.size() == 1,
+           "in-flight migration fixture must schedule a D2H completion");
+
+    scheduler.discard_tiered_prefix_cache_session(frontier::SessionId{55});
+    auto *cpu = scheduler.cpu_kv_cache_manager();
+    expect(cpu != nullptr &&
+               cpu->session_discard_pending(frontier::SessionId{55}) &&
+               cpu->lookup(frontier::SessionId{55}, 2).hit_blocks == 0,
+           "migration must hide an in-flight D2H reservation immediately");
+
+    requests[0].on_kv_cache_transfer_start(SimTime::from_seconds(1.11));
+    requests[0].on_kv_cache_transfer_complete(SimTime::from_seconds(1.12), 1);
+    scheduler.complete_kv_transfer(RequestId{0});
+    expect(scheduler.allocated_kv_blocks() == 2,
+           "retired D2H must keep its source allocation until completion");
+    const auto end = std::get<frontier::CpuKVCacheOffloadEndPayload>(
+        ends.front().payload);
+    expect(scheduler.on_cpu_kv_cache_offload_end(
+               end.transfer_id, end.cpu_generation, ends.front().time),
+           "retired D2H completion must close the export branch normally");
+    const auto state = cpu->diagnostics();
+    expect(state.sessions == 0 && state.materialized_blocks == 0 &&
+               cpu->stats().discarded_offload_completions == 1 &&
+               scheduler.allocated_kv_blocks() == 0,
+           "retired D2H completion must publish no CPU or GPU cache state");
+}
+
+void test_migration_discard_blocks_future_old_target_publish() {
+    auto requests = make_cpu_restore_requests({{32, 56}});
+    SchedulerConfig config = scheduler_config();
+    config.block_size = 16;
+    config.num_blocks = 8;
+    frontier::config::PrefixCacheConfig prefix{};
+    prefix.enabled = true;
+    frontier::config::ParallelismConfig parallelism{};
+    frontier::entities::Replica replica{frontier::ReplicaId{0}, parallelism,
+                                        frontier::config::ModelConfig{}};
+    auto predictor = std::make_shared<
+        frontier::execution_time_predictor::FixedExecutionTimePredictor>(
+        frontier::config::FixedExecutionModelConfig{});
+    VllmV1Scheduler scheduler{config,
+                              requests,
+                              predictor,
+                              replica,
+                              frontier::DataParallelId{0},
+                              frontier::ClusterType::kPrefill,
+                              prefix,
+                              cpu_target_config()};
+    arrive_all(scheduler, requests);
+    scheduler.discard_tiered_prefix_cache_session(frontier::SessionId{56});
+
+    const auto scheduled = scheduler.schedule(SimTime::from_seconds(1.0));
+    static_cast<void>(
+        complete_prefill_schedule(scheduler, requests, scheduled, 1.1));
+    expect(!scheduler.prepare_cpu_kv_cache_offload(
+               RequestId{0}, SimTime::from_seconds(1.1)),
+           "an old-target request retired before PREFILL must not create D2H");
+    requests[0].on_kv_cache_transfer_start(SimTime::from_seconds(1.11));
+    requests[0].on_kv_cache_transfer_complete(SimTime::from_seconds(1.12), 1);
+    scheduler.complete_kv_transfer(RequestId{0});
+    expect(scheduler.cpu_kv_cache_manager()->diagnostics().sessions == 0 &&
+               scheduler.gpu_cache_valid_prefix_blocks(
+                   frontier::SessionId{56}) == 0 &&
+               scheduler.allocated_kv_blocks() == 0,
+           "retired old-target request must publish neither CPU nor GPU KV");
 }
 
 void test_noop_cpu_offload_adds_no_export_branch() {
@@ -967,14 +1717,18 @@ void test_noop_cpu_offload_adds_no_export_branch() {
     frontier::config::PrefixCacheConfig prefix{};
     prefix.enabled = true;
     frontier::config::ParallelismConfig parallelism{};
-    frontier::entities::Replica replica{
-        frontier::ReplicaId{0}, parallelism, frontier::config::ModelConfig{}};
+    frontier::entities::Replica replica{frontier::ReplicaId{0}, parallelism,
+                                        frontier::config::ModelConfig{}};
     auto predictor = std::make_shared<
         frontier::execution_time_predictor::FixedExecutionTimePredictor>(
         frontier::config::FixedExecutionModelConfig{});
-    VllmV1Scheduler scheduler{config, requests, predictor, replica,
+    VllmV1Scheduler scheduler{config,
+                              requests,
+                              predictor,
+                              replica,
                               frontier::DataParallelId{0},
-                              frontier::ClusterType::kPrefill, prefix,
+                              frontier::ClusterType::kPrefill,
+                              prefix,
                               cpu_target_config()};
     arrive_all(scheduler, requests);
     const auto scheduled = scheduler.schedule(SimTime::from_seconds(1.0));
@@ -999,16 +1753,21 @@ void test_cpu_offload_scheduling_failure_rolls_back_cpu_only() {
     frontier::config::PrefixCacheConfig prefix{};
     prefix.enabled = true;
     frontier::config::ParallelismConfig parallelism{};
-    frontier::entities::Replica replica{
-        frontier::ReplicaId{0}, parallelism, frontier::config::ModelConfig{}};
+    frontier::entities::Replica replica{frontier::ReplicaId{0}, parallelism,
+                                        frontier::config::ModelConfig{}};
     auto predictor = std::make_shared<
         frontier::execution_time_predictor::FixedExecutionTimePredictor>(
         frontier::config::FixedExecutionModelConfig{});
     auto cpu = cpu_target_config();
     cpu.bytes_per_block = std::numeric_limits<std::uint64_t>::max();
-    VllmV1Scheduler scheduler{config, requests, predictor, replica,
+    VllmV1Scheduler scheduler{config,
+                              requests,
+                              predictor,
+                              replica,
                               frontier::DataParallelId{0},
-                              frontier::ClusterType::kPrefill, prefix, cpu};
+                              frontier::ClusterType::kPrefill,
+                              prefix,
+                              cpu};
     arrive_all(scheduler, requests);
     const auto scheduled = scheduler.schedule(SimTime::from_seconds(1.0));
     static_cast<void>(
@@ -1027,8 +1786,9 @@ void test_cpu_offload_scheduling_failure_rolls_back_cpu_only() {
     requests[0].on_kv_cache_transfer_start(SimTime::from_seconds(1.11));
     requests[0].on_kv_cache_transfer_complete(SimTime::from_seconds(1.12), 1);
     scheduler.complete_kv_transfer(RequestId{0});
-    expect(scheduler.allocated_kv_blocks() == 0,
-           "decode completion must still release PREFILL pages after CPU failure");
+    expect(
+        scheduler.allocated_kv_blocks() == 0,
+        "decode completion must still release PREFILL pages after CPU failure");
 }
 
 void test_cpu_offload_completion_failure_closes_cpu_branch() {
@@ -1039,21 +1799,25 @@ void test_cpu_offload_completion_failure_closes_cpu_branch() {
     frontier::config::PrefixCacheConfig prefix{};
     prefix.enabled = true;
     frontier::config::ParallelismConfig parallelism{};
-    frontier::entities::Replica replica{
-        frontier::ReplicaId{0}, parallelism, frontier::config::ModelConfig{}};
+    frontier::entities::Replica replica{frontier::ReplicaId{0}, parallelism,
+                                        frontier::config::ModelConfig{}};
     auto predictor = std::make_shared<
         frontier::execution_time_predictor::FixedExecutionTimePredictor>(
         frontier::config::FixedExecutionModelConfig{});
-    VllmV1Scheduler scheduler{config, requests, predictor, replica,
+    VllmV1Scheduler scheduler{config,
+                              requests,
+                              predictor,
+                              replica,
                               frontier::DataParallelId{0},
-                              frontier::ClusterType::kPrefill, prefix,
+                              frontier::ClusterType::kPrefill,
+                              prefix,
                               cpu_target_config()};
     arrive_all(scheduler, requests);
     const auto scheduled = scheduler.schedule(SimTime::from_seconds(1.0));
     static_cast<void>(
         complete_prefill_schedule(scheduler, requests, scheduled, 1.1));
-    expect(scheduler.prepare_cpu_kv_cache_offload(
-               RequestId{0}, SimTime::from_seconds(1.1)),
+    expect(scheduler.prepare_cpu_kv_cache_offload(RequestId{0},
+                                                  SimTime::from_seconds(1.1)),
            "completion-failure fixture must create a CPU branch");
     const auto operation = scheduler.cpu_kv_cache_offload_operations().front();
     auto starts = scheduler.drain_auxiliary_events();
@@ -1062,8 +1826,8 @@ void test_cpu_offload_completion_failure_closes_cpu_branch() {
     scheduler.on_cpu_kv_cache_offload_start(
         start.transfer_id, start.cpu_generation, starts.front().time);
     auto ends = scheduler.drain_auxiliary_events();
-    const auto end = std::get<frontier::CpuKVCacheOffloadEndPayload>(
-        ends.front().payload);
+    const auto end =
+        std::get<frontier::CpuKVCacheOffloadEndPayload>(ends.front().payload);
     expect(scheduler.cpu_kv_cache_manager()->abort_offload(
                operation.reservation_id()),
            "fixture must invalidate the in-flight reservation");
@@ -1073,20 +1837,21 @@ void test_cpu_offload_completion_failure_closes_cpu_branch() {
                 end.transfer_id, end.cpu_generation, ends.front().time));
         },
         "terminal reservation must fail D2H completion deterministically");
-    expect(scheduler.cpu_kv_cache_manager()
-                       ->diagnostics()
-                       .active_reservations == 0 &&
-               scheduler.cpu_kv_cache_offload_operations().front().state() ==
-                   frontier::entities::CpuKVCacheTransferState::kCancelled &&
-               scheduler.pending_kv_transfer_count() == 1 &&
-               scheduler.allocated_kv_blocks() == 2,
-           "D2H completion failure must close only the CPU export branch");
+    expect(
+        scheduler.cpu_kv_cache_manager()->diagnostics().active_reservations ==
+                0 &&
+            scheduler.cpu_kv_cache_offload_operations().front().state() ==
+                frontier::entities::CpuKVCacheTransferState::kCancelled &&
+            scheduler.pending_kv_transfer_count() == 1 &&
+            scheduler.allocated_kv_blocks() == 2,
+        "D2H completion failure must close only the CPU export branch");
 
     requests[0].on_kv_cache_transfer_start(SimTime::from_seconds(1.2));
     requests[0].on_kv_cache_transfer_complete(SimTime::from_seconds(1.21), 1);
     scheduler.complete_kv_transfer(RequestId{0});
-    expect(scheduler.allocated_kv_blocks() == 0,
-           "decode branch must release source pages after D2H completion failure");
+    expect(
+        scheduler.allocated_kv_blocks() == 0,
+        "decode branch must release source pages after D2H completion failure");
 }
 
 } // namespace
@@ -1102,6 +1867,12 @@ int main() {
     failures +=
         frontier::test::run("chunked prefill runs before waiting work",
                             test_chunked_prefill_runs_before_new_waiting_work);
+    failures += frontier::test::run(
+        "PDD chunked PREFILL commits full ISL without self-preemption",
+        test_pdd_chunked_prefill_commits_full_isl_without_self_preemption);
+    failures += frontier::test::run(
+        "PDD full prompt plus watermark overflow fails fast",
+        test_pdd_full_prompt_watermark_overflow_fails_fast);
     failures += frontier::test::run("decode frontier grows KV at boundary",
                                     test_decode_frontier_grows_kv_at_boundary);
     failures +=
@@ -1122,15 +1893,24 @@ int main() {
     failures += frontier::test::run(
         "cache-disabled reentry replays decode as prefill",
         test_cache_disabled_reentry_replays_decode_as_prefill);
-    failures += frontier::test::run(
-        "tiered prefix plan first gap and demotion",
-        test_tiered_prefix_plan_first_gap_and_demotion);
+    failures +=
+        frontier::test::run("tiered prefix plan first gap and demotion",
+                            test_tiered_prefix_plan_first_gap_and_demotion);
     failures += frontier::test::run(
         "deferred restore lifecycle and atomic admission",
         test_deferred_restore_lifecycle_and_atomic_admission);
     failures += frontier::test::run(
+        "migration discard drains in-flight CPU restore",
+        test_migration_discard_drains_inflight_cpu_restore);
+    failures += frontier::test::run(
+        "mixed GPU and CPU restore preserves pinned GPU frontier",
+        test_mixed_gpu_cpu_restore_preserves_pinned_gpu_frontier);
+    failures += frontier::test::run(
         "restore pending avoids GPU head-of-line blocking",
         test_restore_pending_does_not_head_of_line_block_gpu_admission);
+    failures += frontier::test::run(
+        "restored-ready request precedes blocked fresh head",
+        test_restored_ready_precedes_blocked_fresh_head);
     failures += frontier::test::run(
         "pending CPU restore cancellation cleanup",
         test_pending_restore_cancellation_removes_start_event);
@@ -1140,12 +1920,24 @@ int main() {
     failures += frontier::test::run(
         "CPU restore completion failure cleanup",
         test_restore_completion_failure_cancels_matching_operation);
+    failures +=
+        frontier::test::run("CPU offload export barrier both orders",
+                            test_cpu_offload_export_barrier_both_orders);
     failures += frontier::test::run(
-        "CPU offload export barrier both orders",
-        test_cpu_offload_export_barrier_both_orders);
+        "transfer-pending GPU blocks gate admission",
+        test_transfer_pending_gpu_blocks_gate_admission_until_all_exports_finish);
     failures += frontier::test::run(
-        "no-op CPU offload adds no export branch",
-        test_noop_cpu_offload_adds_no_export_branch);
+        "same-session successor waits for pending CPU offload",
+        test_same_session_successor_waits_for_pending_cpu_offload);
+    failures += frontier::test::run(
+        "migration discard drains in-flight CPU offload",
+        test_migration_discard_drains_inflight_cpu_offload);
+    failures += frontier::test::run(
+        "migration discard blocks future old-target publish",
+        test_migration_discard_blocks_future_old_target_publish);
+    failures +=
+        frontier::test::run("no-op CPU offload adds no export branch",
+                            test_noop_cpu_offload_adds_no_export_branch);
     failures += frontier::test::run(
         "CPU offload scheduling failure rollback",
         test_cpu_offload_scheduling_failure_rolls_back_cpu_only);

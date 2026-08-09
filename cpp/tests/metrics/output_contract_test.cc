@@ -197,13 +197,18 @@ SimulationOutput make_output() {
             0.05;
         batch_aggregate.execution_time.synchronization_attribution_overlap_ms =
             0.01;
+        batch_aggregate.prefill_attention_token_pairs = 42;
+        batch_aggregate.execution_time.prefill_attention_token_pairs = 42;
         batch_aggregate.batch_size_histogram[1] = 1;
         auto &time_bucket = value.aggregate.batch_time_buckets_by_cluster
                                 [frontier::ClusterType::kMonolithic][0];
         time_bucket.batch_count = 1;
         time_bucket.request_slots = 1;
         time_bucket.predicted_execution_ms = 1.0;
+        time_bucket.prefill_attention_token_pairs = 42;
         time_bucket.execution_time = batch_aggregate.execution_time;
+        value.aggregate.prefill_attention_token_pairs_by_arrival_time_bucket[0] =
+            87;
         value.prefix_cache_targets = {
             [&]() {
                 frontier::metrics::PrefixCacheTargetMetricsRecord value{};
@@ -318,6 +323,8 @@ void test_summary_contract() {
                json.at("batch_summary_by_cluster_time_bucket").is_object(),
            "summary must expose compact batch time buckets");
     const Json &cluster = json.at("batch_summary_by_cluster").at("MONOLITHIC");
+    expect(cluster.at("prefill_attention_token_pairs") == 42,
+           "summary must expose compact PREFILL attention token-pair totals");
     const Json &components = cluster.at("execution_time_components_ms");
     expect(components.at("dense_compute_ms") == 0.25 &&
                components.at("tp_communication_ms") == 0.125 &&
@@ -337,6 +344,14 @@ void test_summary_contract() {
             .at("execution_time_components_ms");
     expect(bucket_components == components,
            "time buckets must preserve execution-time component totals");
+    expect(json.at("batch_summary_by_cluster_time_bucket")
+                   .at("MONOLITHIC")
+                   .at(0)
+                   .at("prefill_attention_token_pairs") == 42,
+           "time buckets must expose PREFILL attention token-pair totals");
+    expect(json.at("prefill_attention_token_pairs_by_arrival_time_bucket")
+                   .at("0") == 87,
+           "summary must expose arrival-side PREFILL attention demand");
 }
 
 } // namespace

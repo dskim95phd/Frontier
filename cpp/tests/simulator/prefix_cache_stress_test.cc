@@ -66,6 +66,9 @@ struct StressCase {
     std::uint64_t rounds;
     bool pressure_prefill;
     std::uint64_t seed;
+    bool require_prefix_hits = true;
+    bool require_evictions = true;
+    bool require_pressure_preemption = true;
 };
 
 ParallelismConfig parallelism(const Topology &topology) {
@@ -248,17 +251,29 @@ void validate_output(const SimulationOutput &output,
     }
 
     const auto &cache = output.aggregate.prefix_cache;
+    const bool hits_match_contract =
+        !test_case.require_prefix_hits || cache.hit_blocks > 0;
+    const bool evictions_match_contract =
+        test_case.require_evictions ? cache.evicted_blocks > 0
+                                    : cache.evicted_blocks == 0;
     expect(cache.successful_admissions >= output.requests.size() &&
                cache.query_blocks >= request_query_blocks &&
-               cache.hit_blocks >= request_hit_blocks && cache.hit_blocks > 0 &&
-               cache.evicted_blocks > 0,
-           context + ": stress run missed reuse or eviction (admissions=" +
+               cache.hit_blocks >= request_hit_blocks &&
+               hits_match_contract && evictions_match_contract,
+           context + ": prefix-cache behavior violated the case contract "
+                     "(admissions=" +
                std::to_string(cache.successful_admissions) +
                ", hits=" + std::to_string(cache.hit_blocks) +
                ", evictions=" + std::to_string(cache.evicted_blocks) +
                ", sessions=" + std::to_string(cache.evicted_sessions) + ")");
-    expect(total_preemptions > 0 && maximum_preemptions >= 2,
-           context + ": no request experienced repeated preemption");
+    if (test_case.require_pressure_preemption) {
+        expect(total_preemptions > 0 && maximum_preemptions >= 2,
+               context + ": no request experienced repeated preemption");
+    } else {
+        expect(total_preemptions == 0 && maximum_preemptions == 0,
+               context +
+                   ": full-sequence PREFILL admission unexpectedly preempted");
+    }
 
     const ClusterType cache_owner =
         test_case.pdd ? ClusterType::kPrefill : ClusterType::kMonolithic;
@@ -291,8 +306,10 @@ void validate_output(const SimulationOutput &output,
         test_case.pdd && !test_case.pressure_prefill
             ? test_case.decode
             : test_case.prefill_or_monolithic;
-    expect_preemption_on_every_target(output, pressure_cluster,
-                                      pressure_topology, context);
+    if (test_case.require_pressure_preemption) {
+        expect_preemption_on_every_target(output, pressure_cluster,
+                                           pressure_topology, context);
+    }
     const std::uint64_t pressure_capacity =
         test_case.pdd && !test_case.pressure_prefill ? test_case.decode_blocks
                                                      : test_case.cache_blocks;
@@ -384,7 +401,10 @@ const std::vector<StressCase> kStressCases{
      64,
      8,
      true,
-     0xD801ULL},
+     0xD801ULL,
+     false,
+     true,
+     false},
     {"moe-pdd-prefill8-decode1",
      true,
      true,
@@ -396,6 +416,20 @@ const std::vector<StressCase> kStressCases{
      8,
      false,
      0xA801ULL},
+    {"dense-pdd-prefix-reuse-without-pressure",
+     false,
+     true,
+     {1, 1, 1, 1, 1, 1},
+     {1, 1, 1, 1, 1, 1},
+     64,
+     64,
+     4,
+     4,
+     true,
+     0xC401ULL,
+     true,
+     false,
+     false},
     {"dense-colocation-1000-request-soak",
      false,
      false,

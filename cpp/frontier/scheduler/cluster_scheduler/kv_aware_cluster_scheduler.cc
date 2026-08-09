@@ -72,8 +72,11 @@ std::vector<ClusterRequestAssignment> KvAwareClusterScheduler::schedule() {
                 saturated_add(queued_blocks, incoming_blocks);
             const std::uint64_t fits =
                 required_blocks <= target.available_kv_blocks() ? 0 : 1;
-            const std::uint64_t kv_load = saturated_add(
-                target.allocated_kv_blocks(), queued_blocks);
+            const std::uint64_t committed_load = saturated_add(
+                target.allocated_kv_blocks(),
+                target.virtual_committed_kv_blocks());
+            const std::uint64_t kv_load =
+                saturated_add(committed_load, queued_blocks);
             const std::uint64_t projected_load =
                 saturated_add(kv_load, incoming_blocks);
             const std::uint64_t outstanding = saturated_add(

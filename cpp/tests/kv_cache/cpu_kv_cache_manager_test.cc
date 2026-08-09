@@ -208,6 +208,52 @@ void test_noop_lru_empty_metadata_and_zero_fit() {
     skip.validate_invariants();
 }
 
+void test_migration_discard_drains_inflight_transfers() {
+    CpuKVCacheManager manager{8,
+                              CpuKVCacheCapacityPressurePolicy::kPrefixFit};
+    commit(manager, 41, 1, 3, 1.0);
+    const auto lease = manager.pin_restore(SessionId{41}, 0, 2, at(2.0));
+    const auto suffix = manager.reserve_offload(
+        SessionId{41}, CpuOffloadGeneration{2}, 5, at(2.1));
+    expect(suffix.requires_transfer() && suffix.reserved_blocks == 2,
+           "migration test must own an in-flight offload suffix");
+
+    expect(manager.discard_session(SessionId{41}) &&
+               manager.session_discard_pending(SessionId{41}) &&
+               manager.lookup(SessionId{41}, 5).hit_blocks == 0 &&
+               manager.committed_frontier_blocks(SessionId{41}) == 0,
+           "migration discard must hide CPU KV immediately");
+    const auto bounced = manager.reserve_offload(
+        SessionId{41}, CpuOffloadGeneration{3}, 6, at(2.2));
+    expect(bounced.skipped && !bounced.requires_transfer(),
+           "a bounced session must not reuse or extend retired CPU KV");
+
+    expect(manager.commit_offload(suffix.reservation_id, at(2.3)) &&
+               manager.stats().discarded_offload_completions == 1 &&
+               manager.diagnostics().materialized_blocks == 5,
+           "retired D2H completion must drain without publishing or freeing "
+           "restore-pinned storage");
+    expect(manager.release_restore(lease, true, at(2.4)),
+           "retired H2D lease must release normally");
+    const auto drained = manager.diagnostics();
+    expect(drained.sessions == 0 && drained.materialized_blocks == 0 &&
+               drained.active_reservations == 0 &&
+               drained.active_restore_leases == 0 &&
+               !manager.session_discard_pending(SessionId{41}),
+           "last retired transfer completion must physically reap the session");
+    expect(!manager.commit_offload(suffix.reservation_id, at(2.5)),
+           "late duplicate retired completion must remain idempotent");
+    manager.validate_invariants();
+
+    commit(manager, 41, 4, 2, 3.0);
+    expect(manager.lookup(SessionId{41}, 2).hit_blocks == 2,
+           "a fully drained lane may cache a later session incarnation");
+    expect(manager.discard_session(SessionId{41}) &&
+               manager.diagnostics().materialized_blocks == 0,
+           "inactive CPU migration discard must free immediately");
+    manager.validate_invariants();
+}
+
 void test_randomized_invariants() {
     CpuKVCacheManager manager{32,
                               CpuKVCacheCapacityPressurePolicy::kPrefixFit};
@@ -272,6 +318,9 @@ int main() {
     failures += frontier::test::run(
         "CPU no-op LRU and terminal empty paths",
         test_noop_lru_empty_metadata_and_zero_fit);
+    failures += frontier::test::run(
+        "CPU migration discard drains in-flight transfers",
+        test_migration_discard_drains_inflight_transfers);
     failures += frontier::test::run("CPU randomized invariants",
                                     test_randomized_invariants);
     return failures == 0 ? 0 : 1;

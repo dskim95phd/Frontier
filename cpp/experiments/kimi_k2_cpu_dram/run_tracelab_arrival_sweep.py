@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run the TraceLab cache-aware session-arrival sweep on the C++ simulator.
 
-The default matrix replays the same deterministic 3,000-source-session sample
+The default matrix replays the same deterministic 1,000-source-session sample
 twice at 0.10, 0.09, ..., 0.05 new source sessions/second.  Missing workload
 rates are generated with ``convert_tracelab_workload.py``; existing workload
 metadata is validated before reuse.  Each rate gets an immutable input config,
@@ -28,12 +28,13 @@ REPO_ROOT = HERE.parents[2]
 DEFAULT_CONFIG = HERE / "configs" / "tracelab_p8_d24_cache_aware.json"
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "outputs" / "tracelab_cache_aware_arrival_sweep"
 DEFAULT_WORKLOAD_ROOT = (
-    REPO_ROOT / "outputs" / "datasets" / "tracelab" / "v0.0.2" / "frontier" / "epoch3000"
+    REPO_ROOT / "outputs" / "datasets" / "tracelab" / "v0.0.2" / "frontier" / "epoch1000"
 )
 DEFAULT_TRACELAB_DB = (
     REPO_ROOT / "outputs" / "datasets" / "tracelab" / "v0.0.2" / "syfi_coding_trace.duckdb"
 )
 DEFAULT_RATES = "0.10,0.09,0.08,0.07,0.06,0.05"
+DEFAULT_SAMPLE_SESSIONS = 1000
 
 
 @dataclass(frozen=True)
@@ -99,11 +100,7 @@ def simulation_end_time_s(
     drain_fraction: float,
     minimum_drain_seconds: float,
 ) -> float:
-    """Return two injection epochs plus a rate-scaled settling window.
-
-    With the defaults this reproduces the previously used horizons at the
-    anchor rates: 144,000 s for 0.05, 90,000 s for 0.08, and 75,000 s for 0.10.
-    """
+    """Return two injection epochs plus a rate-scaled settling window."""
 
     if sample_sessions <= 0 or repetitions <= 0:
         raise ValueError("sample_sessions and repetitions must be positive")
@@ -371,7 +368,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--converter-python", type=Path, default=Path(sys.executable))
     parser.add_argument("--rates", type=parse_rates, default=parse_rates(DEFAULT_RATES))
     parser.add_argument("--seed", type=int, default=20260803)
-    parser.add_argument("--sample-sessions", type=int, default=3000)
+    parser.add_argument("--sample-sessions", type=int, default=DEFAULT_SAMPLE_SESSIONS)
     parser.add_argument("--session-repetitions", type=int, default=2)
     parser.add_argument("--cache-threshold", type=float, default=0.5)
     parser.add_argument("--balance-abs-threshold", type=int, default=8)

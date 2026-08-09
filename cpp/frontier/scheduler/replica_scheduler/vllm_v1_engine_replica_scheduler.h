@@ -11,11 +11,11 @@
 #include "frontier/config/config.h"
 #include "frontier/core/event.h"
 #include "frontier/core/ids.h"
-#include "frontier/entities/batch.h"
-#include "frontier/entities/request.h"
-#include "frontier/entities/cpu_kv_cache_transfer_info.h"
-#include "frontier/execution_time_predictor/base_execution_time_predictor.h"
 #include "frontier/cpu_kv_cache_transfer/analytical_transfer.h"
+#include "frontier/entities/batch.h"
+#include "frontier/entities/cpu_kv_cache_transfer_info.h"
+#include "frontier/entities/request.h"
+#include "frontier/execution_time_predictor/base_execution_time_predictor.h"
 #include "frontier/kv_cache/cpu_kv_cache_manager.h"
 #include "frontier/scheduler/kv_block_accounting.h"
 #include "frontier/scheduler/replica_scheduler/base_replica_scheduler.h"
@@ -83,15 +83,16 @@ class VllmV1Scheduler final : public BaseReplicaScheduler {
 
     [[nodiscard]] bool has_pending_work() const noexcept override {
         return !preempted_.empty() || !waiting_.empty() || !running_.empty() ||
-               !pending_cpu_restores_.empty() || !staged_cpu_restores_.empty() ||
-               !pending_exports_.empty();
+               !restored_ready_.empty() ||
+               !pending_cpu_restores_.empty() ||
+               !staged_cpu_restores_.empty() || !pending_exports_.empty();
     }
     [[nodiscard]] bool idle() const noexcept override {
         return !has_pending_work() && in_flight_batch_count_ == 0 &&
                pending_exports_.empty() && kv_blocks_.empty();
     }
     [[nodiscard]] std::size_t waiting_count() const noexcept override {
-        return preempted_.size() + waiting_.size() +
+        return preempted_.size() + restored_ready_.size() + waiting_.size() +
                pending_cpu_restores_.size();
     }
     [[nodiscard]] std::size_t running_count() const noexcept override {
@@ -101,7 +102,17 @@ class VllmV1Scheduler final : public BaseReplicaScheduler {
         return kv_blocks_.total_allocated_blocks();
     }
     [[nodiscard]] std::uint64_t available_kv_blocks() const noexcept override {
-        return kv_blocks_.available_blocks();
+        return kv_blocks_.full_sequence_commitments_enabled()
+                   ? kv_blocks_.available_commitment_blocks()
+                   : kv_blocks_.available_blocks();
+    }
+    [[nodiscard]] std::uint64_t
+    virtual_committed_kv_blocks() const noexcept override {
+        return kv_blocks_.virtual_committed_blocks();
+    }
+    [[nodiscard]] std::uint64_t
+    available_commitment_kv_blocks() const noexcept {
+        return kv_blocks_.available_commitment_blocks();
     }
     [[nodiscard]] std::uint64_t kv_block_size() const noexcept override {
         return kv_blocks_.block_size();
@@ -109,6 +120,14 @@ class VllmV1Scheduler final : public BaseReplicaScheduler {
     [[nodiscard]] std::uint64_t queued_kv_blocks() const noexcept override;
     [[nodiscard]] const std::deque<RequestId> &waiting_queue() const noexcept {
         return waiting_;
+    }
+    // PREFILL restores that have completed H2D and own a full-sequence
+    // commitment are runnable, but must be admitted before ordinary waiting
+    // or preempted requests.  Keep this queue observable for diagnostics and
+    // tests rather than folding resource-owning work into waiting_.
+    [[nodiscard]] const std::deque<RequestId> &
+    restored_ready_queue() const noexcept {
+        return restored_ready_;
     }
     [[nodiscard]] const std::deque<RequestId> &
     preempted_queue() const noexcept {
@@ -130,7 +149,7 @@ class VllmV1Scheduler final : public BaseReplicaScheduler {
         return kv_blocks_.diagnostics();
     }
     [[nodiscard]] kv_cache::CpuKVCacheManager *
-    cpu_kv_cache_manager() noexcept {
+    cpu_kv_cache_manager() noexcept override {
         return cpu_kv_cache_.get();
     }
     [[nodiscard]] const kv_cache::CpuKVCacheManager *
@@ -141,10 +160,13 @@ class VllmV1Scheduler final : public BaseReplicaScheduler {
     cpu_kv_cache_target_config() const noexcept override {
         return cpu_kv_cache_ == nullptr ? nullptr : &cpu_kv_cache_config_;
     }
-    [[nodiscard]] std::size_t pending_cpu_restore_count() const noexcept override {
+    void discard_tiered_prefix_cache_session(SessionId session_id) override;
+    [[nodiscard]] std::size_t
+    pending_cpu_restore_count() const noexcept override {
         return pending_cpu_restores_.size();
     }
-    [[nodiscard]] std::size_t staged_cpu_restore_count() const noexcept override {
+    [[nodiscard]] std::size_t
+    staged_cpu_restore_count() const noexcept override {
         return staged_cpu_restores_.size();
     }
     [[nodiscard]] std::vector<entities::CpuKVCacheOffloadInfo>
@@ -152,7 +174,7 @@ class VllmV1Scheduler final : public BaseReplicaScheduler {
     [[nodiscard]] std::vector<entities::CpuKVCacheRestoreInfo>
     cpu_kv_cache_restore_operations() const override;
     [[nodiscard]] bool cancel_cpu_kv_cache_restore(RequestId request_id,
-                                                    SimTime time);
+                                                   SimTime time);
 
   private:
     [[nodiscard]] bool contains_request(RequestId request_id) const override;
@@ -172,6 +194,7 @@ class VllmV1Scheduler final : public BaseReplicaScheduler {
     iteration_start_release_threshold() const noexcept;
     [[nodiscard]] bool has_visible_waiting_requests() const noexcept;
     void free_completed_request(RequestId request_id);
+    void release_request_kv(RequestId request_id);
     void materialize_terminal_releases_before_iteration();
     void advance_terminal_release_boundary();
     void preempt_request(RequestId victim, SimTime time,
@@ -197,12 +220,18 @@ class VllmV1Scheduler final : public BaseReplicaScheduler {
         const entities::Request &request,
         const entities::StagedCpuKVCacheRestore &staged) const;
     std::deque<RequestId> preempted_;
+    // A completed CPU restore owns its virtual/full-sequence commitment and
+    // therefore has priority over requests that have not acquired one.  The
+    // queue preserves restore-completion FIFO order.
+    std::deque<RequestId> restored_ready_;
     std::vector<RequestId> running_;
     std::uint64_t next_iteration_id_ = 0;
     std::unordered_map<RequestId, std::uint64_t, StrongIdHash<RequestId>>
         pending_terminal_release_iterations_;
     std::unordered_set<RequestId, StrongIdHash<RequestId>>
         waiting_sensitive_release_extensions_;
+    std::unordered_set<RequestId, StrongIdHash<RequestId>>
+        retired_session_requests_;
     struct PrefillExportState {
         bool decode_pending = true;
         bool cpu_offload_pending = false;
@@ -211,8 +240,7 @@ class VllmV1Scheduler final : public BaseReplicaScheduler {
         pending_exports_;
     config::ResolvedCpuKVCacheTargetConfig cpu_kv_cache_config_;
     std::unique_ptr<kv_cache::CpuKVCacheManager> cpu_kv_cache_;
-    std::unique_ptr<
-        cpu_kv_cache_transfer::AnalyticalCpuKVCacheTransferEngine>
+    std::unique_ptr<cpu_kv_cache_transfer::AnalyticalCpuKVCacheTransferEngine>
         cpu_transfer_engine_;
     CpuKvTransferId::ValueType next_cpu_transfer_id_ = 0;
     std::unordered_map<CpuKvTransferId, entities::CpuKVCacheRestoreInfo,
@@ -225,8 +253,7 @@ class VllmV1Scheduler final : public BaseReplicaScheduler {
         pending_cpu_restores_;
     std::unordered_map<RequestId, CpuKvTransferId, StrongIdHash<RequestId>>
         pending_cpu_offloads_;
-    std::unordered_map<SessionId, CpuOffloadGeneration,
-                       StrongIdHash<SessionId>>
+    std::unordered_map<SessionId, CpuOffloadGeneration, StrongIdHash<SessionId>>
         cpu_offload_generations_;
     std::unordered_map<RequestId, entities::StagedCpuKVCacheRestore,
                        StrongIdHash<RequestId>>

@@ -205,6 +205,7 @@ struct BatchMetricsAggregate {
     std::uint64_t preemption_recomputed_prefill_tokens = 0;
     double predicted_execution_ms = 0.0;
     double batch_size_execution_ms = 0.0;
+    std::uint64_t prefill_attention_token_pairs = 0;
     // Compact sum of completed stage component ledgers.  This is retained
     // even when detailed traces are disabled so long simulations can expose
     // analytical execution-time breakdowns without one record per stage.
@@ -216,6 +217,7 @@ struct BatchTimeBucketAggregate {
     std::uint64_t batch_count = 0;
     std::uint64_t request_slots = 0;
     double predicted_execution_ms = 0.0;
+    std::uint64_t prefill_attention_token_pairs = 0;
     entities::ExecutionTime execution_time;
 };
 
@@ -353,6 +355,11 @@ struct MetricsAggregate {
     // retaining one detailed record per decode iteration.
     std::map<ClusterType, std::map<std::uint64_t, BatchTimeBucketAggregate>>
         batch_time_buckets_by_cluster;
+    // Arrival-side PREFILL attention demand, bucketed by the same 60-second
+    // interval as completed-batch summaries.  This includes requests that
+    // have arrived but are not yet present in requests.csv at export time.
+    std::map<std::uint64_t, std::uint64_t>
+        prefill_attention_token_pairs_by_arrival_time_bucket;
 };
 
 struct SimulationOutput {

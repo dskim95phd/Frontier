@@ -44,6 +44,47 @@ void accumulate_execution_time(entities::ExecutionTime &total,
         value.synchronization_unattributed_wait_ms;
     total.synchronization_attribution_overlap_ms +=
         value.synchronization_attribution_overlap_ms;
+    if (total.prefill_attention_token_pairs >
+        std::numeric_limits<std::uint64_t>::max() -
+            value.prefill_attention_token_pairs) {
+        throw std::overflow_error(
+            "aggregate PREFILL attention token-pair count overflows uint64");
+    }
+    total.prefill_attention_token_pairs +=
+        value.prefill_attention_token_pairs;
+}
+
+std::uint64_t prefill_attention_token_pairs_for_request(
+    std::uint64_t query_tokens, std::uint64_t past_context) {
+    const auto checked_mul = [](std::uint64_t lhs, std::uint64_t rhs) {
+        if (lhs != 0 &&
+            rhs > std::numeric_limits<std::uint64_t>::max() / lhs) {
+            throw std::overflow_error(
+                "PREFILL attention token-pair count overflows uint64");
+        }
+        return lhs * rhs;
+    };
+    const auto checked_add = [](std::uint64_t lhs, std::uint64_t rhs) {
+        if (lhs > std::numeric_limits<std::uint64_t>::max() - rhs) {
+            throw std::overflow_error(
+                "PREFILL attention token-pair count overflows uint64");
+        }
+        return lhs + rhs;
+    };
+    const std::uint64_t triangular =
+        query_tokens % 2 == 0
+            ? checked_mul(query_tokens / 2, query_tokens + 1)
+            : checked_mul(query_tokens, query_tokens / 2 + 1);
+    return checked_add(checked_mul(query_tokens, past_context), triangular);
+}
+
+void accumulate_prefill_attention_token_pairs(std::uint64_t &total,
+                                              std::uint64_t value) {
+    if (total > std::numeric_limits<std::uint64_t>::max() - value) {
+        throw std::overflow_error(
+            "aggregate PREFILL attention token-pair count overflows uint64");
+    }
+    total += value;
 }
 
 } // namespace
@@ -170,6 +211,9 @@ void MetricsStore::record_batch_stage(
         output_.aggregate.batches_by_cluster[batch.cluster_type()];
     accumulate_execution_time(aggregate.execution_time,
                               batch_stage.execution_time());
+    accumulate_prefill_attention_token_pairs(
+        aggregate.prefill_attention_token_pairs,
+        batch_stage.execution_time().prefill_attention_token_pairs);
     constexpr double kBatchTimeBucketSeconds = 60.0;
     const auto bucket_index = static_cast<std::uint64_t>(
         std::floor(batch.scheduled_at().seconds() / kBatchTimeBucketSeconds));
@@ -178,6 +222,9 @@ void MetricsStore::record_batch_stage(
             .batch_time_buckets_by_cluster[batch.cluster_type()][bucket_index];
     accumulate_execution_time(time_bucket.execution_time,
                               batch_stage.execution_time());
+    accumulate_prefill_attention_token_pairs(
+        time_bucket.prefill_attention_token_pairs,
+        batch_stage.execution_time().prefill_attention_token_pairs);
     if (!detailed_traces_enabled_) {
         return;
     }
@@ -319,6 +366,38 @@ void MetricsStore::collect_completed_requests(
     const simulator::EntityArena &entities) {
     if (!output_.requests.empty()) {
         throw std::logic_error("request metrics were collected more than once");
+    }
+    // Keep arrival-side demand independent of completion filtering.  A bounded
+    // run can intentionally leave requests waiting or in flight, but those
+    // requests still contribute demand from the moment their arrival event was
+    // observed.
+    constexpr double kBatchTimeBucketSeconds = 60.0;
+    if (!arrival_demand_collected_) {
+        for (const entities::Request &request : entities.requests()) {
+            if (request.state() == entities::RequestState::kPending ||
+                !request.arrived_at().valid()) {
+                continue;
+            }
+            const std::uint64_t prompt_tokens =
+                request.initial_num_prefill_tokens();
+            const std::uint64_t cached_tokens =
+                request.cached_prefill_tokens();
+            if (cached_tokens > prompt_tokens) {
+                throw std::logic_error(
+                    "request cached PREFILL tokens exceed initial prompt");
+            }
+            const std::uint64_t query_tokens = prompt_tokens - cached_tokens;
+            const std::uint64_t token_pairs =
+                prefill_attention_token_pairs_for_request(query_tokens,
+                                                          cached_tokens);
+            const auto bucket_index = static_cast<std::uint64_t>(std::floor(
+                request.arrived_at().seconds() / kBatchTimeBucketSeconds));
+            std::uint64_t &bucket = output_.aggregate
+                                        .prefill_attention_token_pairs_by_arrival_time_bucket
+                                        [bucket_index];
+            accumulate_prefill_attention_token_pairs(bucket, token_pairs);
+        }
+        arrival_demand_collected_ = true;
     }
     const bool is_pdd = config.system_architecture ==
                         config::SystemArchitecture::kPdDisaggregation;

@@ -234,12 +234,13 @@ void test_cpu_disabled_and_detail_suppression_controls() {
     }
 }
 
-void test_slow_queues_are_full_duplex_and_source_hold_is_attributable() {
+SimulationOutput run_slow_queue_workload(std::uint64_t prefill_blocks,
+                                         const char *run_id) {
     auto config = parse_simulation_config_json(read_text_file(
         kExampleRoot / "configs" / "06_cpu_kv_cache_pdd_online.json"));
-    config.run_id = "cpu-kv-cache-slow-full-duplex";
+    config.run_id = run_id;
     config.pdd().clusters.prefill.scheduler.batch_size_cap = 1;
-    config.pdd().clusters.prefill.scheduler.num_blocks = 5;
+    config.pdd().clusters.prefill.scheduler.num_blocks = prefill_blocks;
     config.cpu_kv_cache.write_latency_ms = 20.0;
     config.cpu_kv_cache.read_latency_ms = 20.0;
 
@@ -267,31 +268,57 @@ void test_slow_queues_are_full_duplex_and_source_hold_is_attributable() {
     successor.session_turn_index = 1;
     workload.push_back(successor);
 
-    const auto output = run_workload(config, workload);
-    expect(output.requests.size() == workload.size() &&
-               output.aggregate.cpu_kv_cache.d2h_queue_time_ms > 0.0 &&
-               output.aggregate.cpu_kv_cache.restore_operations > 0 &&
-               output.aggregate.cpu_kv_cache.source_gpu_hold_time_ms > 0.0,
-           "slow system transfers must expose queueing, restore, and attributable source hold");
-    bool duplex_overlap = false;
+    return run_workload(config, workload);
+}
+
+bool has_duplex_overlap(const SimulationOutput &output) {
     for (const auto &left : output.cpu_kv_cache_transfers) {
         for (const auto &right : output.cpu_kv_cache_transfers) {
-            if (left.kind == frontier::metrics::CpuKVCacheTransferKind::kOffload &&
-                right.kind == frontier::metrics::CpuKVCacheTransferKind::kRestore &&
+            if (left.kind ==
+                    frontier::metrics::CpuKVCacheTransferKind::kOffload &&
+                right.kind ==
+                    frontier::metrics::CpuKVCacheTransferKind::kRestore &&
                 left.started_at < right.completed_at &&
                 right.started_at < left.completed_at) {
-                duplex_overlap = true;
+                return true;
             }
         }
     }
-    expect(duplex_overlap,
-           "an H2D restore must overlap an independently queued D2H offload");
+    return false;
+}
+
+void expect_slow_queue_cleanup(const SimulationOutput &output,
+                               const std::string &context) {
+    expect(output.requests.size() == 4 &&
+               output.aggregate.cpu_kv_cache.restore_operations > 0 &&
+               output.aggregate.cpu_kv_cache.source_gpu_hold_time_ms > 0.0,
+           context +
+               ": slow transfers must expose restore and attributable source "
+               "hold");
     const auto &target = output.cpu_kv_cache_targets.front();
     expect(target.active_offload_reservations == 0 &&
                target.active_restore_leases == 0 &&
                target.pending_restore_operations == 0 &&
                target.staged_restore_payloads == 0,
-           "slow full-duplex workload must release all transient ownership");
+           context + ": workload must release all transient ownership");
+}
+
+void test_slow_queues_are_full_duplex_when_memory_fits() {
+    const auto output = run_slow_queue_workload(
+        6, "cpu-kv-cache-slow-full-duplex-memory-fit");
+    expect_slow_queue_cleanup(output, "memory-feasible full-duplex");
+    expect(has_duplex_overlap(output),
+           "an H2D restore must overlap an independently queued D2H offload "
+           "when both GPU footprints fit");
+}
+
+void test_slow_queues_serialize_when_source_hold_blocks_restore() {
+    const auto output = run_slow_queue_workload(
+        5, "cpu-kv-cache-slow-memory-pressure-serialization");
+    expect_slow_queue_cleanup(output, "memory-constrained transfer");
+    expect(!has_duplex_overlap(output),
+           "source-held GPU blocks must serialize a restore whose full "
+           "commitment would exceed capacity");
 }
 
 } // namespace
@@ -308,7 +335,10 @@ int main() {
         "CPU KV-cache disabled and compact-output controls",
         test_cpu_disabled_and_detail_suppression_controls);
     failures += frontier::test::run(
-        "CPU KV-cache slow full-duplex queues",
-        test_slow_queues_are_full_duplex_and_source_hold_is_attributable);
+        "CPU KV-cache slow full-duplex queues when memory fits",
+        test_slow_queues_are_full_duplex_when_memory_fits);
+    failures += frontier::test::run(
+        "CPU KV-cache source hold serializes memory pressure",
+        test_slow_queues_serialize_when_source_hold_blocks_restore);
     return failures == 0 ? 0 : 1;
 }

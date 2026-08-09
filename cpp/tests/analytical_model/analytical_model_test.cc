@@ -280,6 +280,20 @@ void test_long_context_decode_cost_increases() {
            "long-context decode attention must cost more");
 }
 
+void test_prefill_attention_token_pairs_are_exact() {
+    const std::vector<analytical::AttentionRequestSlice> slices{
+        {3, 10}, // 3 * (10 + (3 + 1) / 2) = 36
+        {4, 7},  // 4 * (7 + (4 + 1) / 2) = 38
+        {2, 5},  // A chunk with cached context contributes 13.
+    };
+    expect(analytical::prefill_attention_token_pairs(slices) == 87,
+           "PREFILL attention token-pair work must retain exact arithmetic");
+    expect(analytical::prefill_attention_token_pairs({{1, 0}, {1, 1}}) == 3,
+           "PREFILL attention token-pair work must include cached context");
+    expect(analytical::prefill_attention_token_pairs({}) == 0,
+           "empty PREFILL attention slices must have zero token-pair work");
+}
+
 void test_operator_precisions_split_dense_and_kv_costs() {
     expect(
         analytical::precision_from_string("fp8") ==
@@ -704,6 +718,19 @@ void test_batch_model_matches_python_golden() {
         const predictor::ExecutionTimePrediction prediction =
             model.predict_stage_execution_time(batch, requests,
                                                frontier::StageId{0});
+        std::uint64_t expected_prefill_attention_token_pairs = 0;
+        for (const Json &slice : test_case.at("input").at("slices")) {
+            if (slice.at("phase").get<std::string>() == "decode") {
+                continue;
+            }
+            expected_prefill_attention_token_pairs +=
+                analytical::prefill_attention_token_pairs({
+                    {slice.at("scheduled_tokens").get<std::uint64_t>(),
+                     slice.at("past_context").get<std::uint64_t>()}});
+        }
+        expect(prediction.execution_time.prefill_attention_token_pairs ==
+                   expected_prefill_attention_token_pairs,
+               "analytical stage must expose exact PREFILL attention token-pair work");
         const predictor::ExecutionTimePrediction gb300_prediction =
             gb300_model.predict_stage_execution_time(batch, requests,
                                                      frontier::StageId{0});
@@ -1097,6 +1124,9 @@ int main() {
                                     test_dense_layer_matches_python_golden);
     failures += frontier::test::run("long-context decode cost increases",
                                     test_long_context_decode_cost_increases);
+    failures += frontier::test::run(
+        "PREFILL attention token pairs are exact",
+        test_prefill_attention_token_pairs_are_exact);
     failures +=
         frontier::test::run("operator precisions split dense and KV costs",
                             test_operator_precisions_split_dense_and_kv_costs);

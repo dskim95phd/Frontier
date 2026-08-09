@@ -212,6 +212,93 @@ void test_cache_disabled_count_accounting() {
            "cache-disabled release must return every slot to blank capacity");
 }
 
+void test_virtual_full_sequence_commitment_tracks_chunk_materialization() {
+    ReplicaKVCacheManager cache = manager(4);
+    cache.enable_full_sequence_commitments();
+    Request request = make_request(0, 12, 1, 41);
+
+    expect(cache.full_sequence_commitments_enabled() &&
+               cache.can_commit(request.id(), request.num_prefill_tokens()),
+           "a fitting full prompt must accept a virtual commitment");
+    cache.commit_virtual(request.id(), request.session_id(),
+                         request.num_prefill_tokens());
+    expect(cache.request_committed_blocks(request.id()) == 3 &&
+               cache.request_virtual_committed_blocks(request.id()) == 3 &&
+               cache.virtual_committed_blocks() == 3 &&
+               cache.available_commitment_blocks() == 1,
+           "full prompt commitment must reserve three future blocks");
+
+    cache.reserve(request.id(), 0, 4);
+    expect(cache.allocated_blocks(request.id()) == 1 &&
+               cache.request_committed_blocks(request.id()) == 3 &&
+               cache.request_virtual_committed_blocks(request.id()) == 2 &&
+               cache.virtual_committed_blocks() == 2 &&
+               cache.allocated_blocks(request.id()) +
+                       cache.virtual_committed_blocks() ==
+                   3,
+           "first chunk materialization must consume one virtual block");
+
+    cache.reserve(request.id(), 4, 4);
+    expect(cache.allocated_blocks(request.id()) == 2 &&
+               cache.request_committed_blocks(request.id()) == 3 &&
+               cache.request_virtual_committed_blocks(request.id()) == 1 &&
+               cache.virtual_committed_blocks() == 1 &&
+               cache.allocated_blocks(request.id()) +
+                       cache.virtual_committed_blocks() ==
+                   3,
+           "second chunk must preserve the physical-plus-future total");
+
+    cache.reserve(request.id(), 8, 4);
+    expect(cache.allocated_blocks(request.id()) == 3 &&
+               cache.request_committed_blocks(request.id()) == 3 &&
+               cache.request_virtual_committed_blocks(request.id()) == 0 &&
+               cache.virtual_committed_blocks() == 0 &&
+               cache.available_commitment_blocks() == 1,
+           "final chunk must materialize the last committed block");
+    static_cast<void>(cache.free(request.id()));
+    expect(cache.virtual_committed_blocks() == 0 &&
+               cache.available_commitment_blocks() == 4,
+           "free must release all physical and future commitment state");
+
+    ReplicaKVCacheManager cancelled = manager(4);
+    cancelled.enable_full_sequence_commitments();
+    Request partial = make_request(1, 12, 1, 42);
+    cancelled.commit_virtual(partial.id(), partial.session_id(),
+                             partial.num_prefill_tokens());
+    cancelled.reserve(partial.id(), 0, 4);
+    expect(cancelled.request_virtual_committed_blocks(partial.id()) == 2,
+           "partial materialization must leave two future blocks cancellable");
+    cancelled.release_commitment(partial.id());
+    expect(cancelled.allocated_blocks(partial.id()) == 0 &&
+               cancelled.virtual_committed_blocks() == 0 &&
+               cancelled.available_commitment_blocks() == 4,
+           "cancelling a partial commitment must release future blocks once");
+}
+
+void test_virtual_commitment_rejects_another_active_session_owner() {
+    ReplicaKVCacheManager cache = manager(8);
+    cache.enable_full_sequence_commitments();
+    Request owner = make_request(0, 12, 1, 43);
+    Request successor = make_request(1, 12, 1, 43);
+
+    cache.commit_virtual(owner.id(), owner.session_id(),
+                         owner.num_prefill_tokens());
+    expect(cache.session_has_active_request(owner.session_id()),
+           "virtual commitment must publish active session ownership");
+    expect(cache.can_commit(successor.id(), successor.num_prefill_tokens()) &&
+               !cache.can_commit(successor.id(), successor.session_id(),
+                                 successor.num_prefill_tokens()),
+           "session-aware commitment must reject a successor while the old "
+           "request still owns the session");
+
+    cache.release_commitment(owner.id());
+    expect(!cache.session_has_active_request(owner.session_id()) &&
+               cache.can_commit(successor.id(), successor.session_id(),
+                                successor.num_prefill_tokens()),
+           "releasing the old commitment must unblock the same-session "
+           "successor");
+}
+
 void test_seeded_session_range_churn() {
     constexpr std::uint64_t kIterations = 20'000;
     constexpr std::uint64_t kSessions = 31;
@@ -285,6 +372,12 @@ int main() {
         test_partial_prefill_preemption_reuses_resident_range);
     failures += frontier::test::run("cache-disabled count accounting",
                                     test_cache_disabled_count_accounting);
+    failures += frontier::test::run(
+        "virtual full-sequence commitment tracks chunk materialization",
+        test_virtual_full_sequence_commitment_tracks_chunk_materialization);
+    failures += frontier::test::run(
+        "virtual commitment rejects another active session owner",
+        test_virtual_commitment_rejects_another_active_session_owner);
     failures += frontier::test::run("seeded session range churn",
                                     test_seeded_session_range_churn);
     failures += frontier::test::run(

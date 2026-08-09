@@ -107,6 +107,13 @@ struct AttentionRequestSlice {
     std::uint64_t past_context;
 };
 
+// Exact token-pair demand used by analytical PREFILL attention.  For each
+// request slice this computes q * (past_context + (q + 1) / 2), where the
+// half term is evaluated as the exact triangular-number contribution rather
+// than through floating-point arithmetic.
+[[nodiscard]] std::uint64_t prefill_attention_token_pairs(
+    const std::vector<AttentionRequestSlice> &requests);
+
 struct DenseBatch {
     std::uint64_t total_tokens;
     std::vector<AttentionRequestSlice> prefill_requests;

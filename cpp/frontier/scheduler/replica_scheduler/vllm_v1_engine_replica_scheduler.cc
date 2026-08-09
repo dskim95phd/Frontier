@@ -35,14 +35,12 @@ entities::TieredPrefixPlan build_contiguous_tiered_prefix_plan(
     }
     entities::TieredPrefixPlan plan{};
     plan.query_blocks = query_blocks;
-    plan.gpu_hit_frontier_blocks =
-        std::min(gpu_frontier_blocks, query_blocks);
+    plan.gpu_hit_frontier_blocks = std::min(gpu_frontier_blocks, query_blocks);
     const std::uint64_t cpu_frontier =
         std::min(cpu_frontier_blocks, query_blocks);
-    plan.cpu_query_blocks =
-        query_blocks > plan.gpu_hit_frontier_blocks
-            ? query_blocks - plan.gpu_hit_frontier_blocks
-            : 0;
+    plan.cpu_query_blocks = query_blocks > plan.gpu_hit_frontier_blocks
+                                ? query_blocks - plan.gpu_hit_frontier_blocks
+                                : 0;
     plan.hit_frontier_blocks =
         std::max(plan.gpu_hit_frontier_blocks, cpu_frontier);
     if (prompt_tokens % block_size == 0 &&
@@ -51,8 +49,7 @@ entities::TieredPrefixPlan build_contiguous_tiered_prefix_plan(
     }
     plan.cpu_begin_block =
         std::min(plan.gpu_hit_frontier_blocks, plan.hit_frontier_blocks);
-    plan.cpu_end_block =
-        std::min(cpu_frontier, plan.hit_frontier_blocks);
+    plan.cpu_end_block = std::min(cpu_frontier, plan.hit_frontier_blocks);
     if (plan.cpu_end_block < plan.cpu_begin_block) {
         plan.cpu_end_block = plan.cpu_begin_block;
     }
@@ -72,9 +69,8 @@ std::uint64_t revalidate_contiguous_tiered_prefix_frontier(
     std::uint64_t reusable =
         std::min(current_gpu_frontier_blocks, staged.query_blocks);
     if (reusable >= staged.cpu_begin_block) {
-        reusable = std::max(reusable,
-                            std::min(staged.cpu_end_block,
-                                     staged.query_blocks));
+        reusable = std::max(
+            reusable, std::min(staged.cpu_end_block, staged.query_blocks));
     }
     if (staged.prompt_tokens % staged.block_size == 0 &&
         reusable == staged.query_blocks && reusable > 0) {
@@ -143,6 +139,11 @@ VllmV1Scheduler::VllmV1Scheduler(
         pipeline_parallel_size_ == 0) {
         throw SchedulerError("scheduler capacity values must be positive");
     }
+    // Sequential PDD PREFILL must reserve a request's complete prompt before
+    // admitting its first chunk.  MONOLITHIC/DECODE retain the legacy
+    // chunk-local accounting path.
+    kv_blocks_.enable_full_sequence_commitments(cluster_type ==
+                                                ClusterType::kPrefill);
     if (cpu_kv_cache_config_.enabled) {
         if (cluster_type != ClusterType::kPrefill ||
             !prefix_cache_config.enabled ||
@@ -167,13 +168,16 @@ VllmV1Scheduler::VllmV1Scheduler(
 bool VllmV1Scheduler::contains_request(RequestId request_id) const {
     return std::find(preempted_.begin(), preempted_.end(), request_id) !=
                preempted_.end() ||
+           std::find(restored_ready_.begin(), restored_ready_.end(),
+                     request_id) != restored_ready_.end() ||
            std::find(waiting_.begin(), waiting_.end(), request_id) !=
                waiting_.end() ||
            std::find(running_.begin(), running_.end(), request_id) !=
                running_.end() ||
            pending_cpu_restores_.find(request_id) !=
                pending_cpu_restores_.end() ||
-           staged_cpu_restores_.find(request_id) != staged_cpu_restores_.end();
+           staged_cpu_restores_.find(request_id) != staged_cpu_restores_.end() ||
+           pending_exports_.find(request_id) != pending_exports_.end();
 }
 
 std::uint64_t VllmV1Scheduler::queued_kv_blocks() const noexcept {
@@ -194,7 +198,20 @@ std::uint64_t VllmV1Scheduler::queued_kv_blocks() const noexcept {
         }
         try {
             const entities::Request &value = requests_->at(request_id.index());
-            const std::uint64_t tokens = kv_accounted_tokens(value);
+            // A pending/staged PDD restore already owns a full-sequence
+            // commitment. Its physical and future suffix blocks are exposed
+            // through the target load, so counting the request here would
+            // double-count it. Ordinary queued PREFILL requests have no
+            // commitment yet; account their materialized full ISL so routing
+            // can see the pressure they will impose on admission.
+            const bool has_commitment =
+                kv_blocks_.request_committed_blocks(request_id) > 0;
+            const bool queued_prefill =
+                cluster_type() == ClusterType::kPrefill &&
+                !value.is_prefill_complete() && !has_commitment;
+            const std::uint64_t tokens =
+                queued_prefill ? value.num_prefill_tokens()
+                               : kv_accounted_tokens(value);
             std::uint64_t blocks = tokens / block_size;
             if (tokens % block_size != 0) {
                 if (blocks == std::numeric_limits<std::uint64_t>::max()) {
@@ -217,6 +234,9 @@ std::uint64_t VllmV1Scheduler::queued_kv_blocks() const noexcept {
         }
     };
     for (const RequestId request_id : preempted_) {
+        add(request_id);
+    }
+    for (const RequestId request_id : restored_ready_) {
         add(request_id);
     }
     for (const RequestId request_id : waiting_) {
@@ -303,7 +323,8 @@ VllmV1Scheduler::iteration_start_release_threshold() const noexcept {
 }
 
 bool VllmV1Scheduler::has_visible_waiting_requests() const noexcept {
-    return !preempted_.empty() || !waiting_.empty();
+    return !preempted_.empty() || !restored_ready_.empty() ||
+           !waiting_.empty();
 }
 
 void VllmV1Scheduler::free_completed_request(RequestId request_id) {
@@ -312,7 +333,7 @@ void VllmV1Scheduler::free_completed_request(RequestId request_id) {
         throw SchedulerError(
             "terminal release references an incomplete request");
     }
-    static_cast<void>(kv_blocks_.free(request_id));
+    release_request_kv(request_id);
     const auto position =
         std::find(running_.begin(), running_.end(), request_id);
     if (position == running_.end()) {
@@ -320,6 +341,53 @@ void VllmV1Scheduler::free_completed_request(RequestId request_id) {
             "terminal release request is missing from running order");
     }
     running_.erase(position);
+}
+
+void VllmV1Scheduler::release_request_kv(RequestId request_id) {
+    if (retired_session_requests_.erase(request_id) != 0) {
+        static_cast<void>(
+            kv_blocks_.discard_session(request(request_id).session_id()));
+    }
+    static_cast<void>(kv_blocks_.free(request_id));
+}
+
+void VllmV1Scheduler::discard_tiered_prefix_cache_session(
+    SessionId session_id) {
+    BaseReplicaScheduler::discard_tiered_prefix_cache_session(session_id);
+    const auto retire = [&](RequestId request_id) {
+        if (request(request_id).session_id() == session_id) {
+            retired_session_requests_.insert(request_id);
+        }
+    };
+    for (const RequestId request_id : preempted_) {
+        retire(request_id);
+    }
+    for (const RequestId request_id : restored_ready_) {
+        retire(request_id);
+    }
+    for (const RequestId request_id : waiting_) {
+        retire(request_id);
+    }
+    for (const RequestId request_id : running_) {
+        retire(request_id);
+    }
+    for (const auto &[request_id, state] : pending_exports_) {
+        static_cast<void>(state);
+        retire(request_id);
+    }
+    for (const auto &[request_id, transfer_id] : pending_cpu_restores_) {
+        static_cast<void>(transfer_id);
+        retire(request_id);
+    }
+    for (const auto &[request_id, staged] : staged_cpu_restores_) {
+        static_cast<void>(staged);
+        retire(request_id);
+    }
+    for (const auto &[request_id, remaining] :
+         pending_terminal_release_iterations_) {
+        static_cast<void>(remaining);
+        retire(request_id);
+    }
 }
 
 void VllmV1Scheduler::materialize_terminal_releases_before_iteration() {
@@ -448,6 +516,14 @@ bool VllmV1Scheduler::try_reserve_with_preemption(
         const std::size_t preemption_count_before = newly_preempted.size();
         const std::optional<RequestId> victim =
             select_preemption_victim(requester);
+        if (!victim.has_value() && cluster_type() == ClusterType::kPrefill) {
+            // A PREFILL request owns a full-sequence commitment.  If no other
+            // runnable victim can release physical blocks, self-preempting it
+            // would discard the very commitment needed to resume the chunk
+            // and can livelock a sequential PDD replica.  Stall this running
+            // iteration instead; the caller will return false.
+            return false;
+        }
         preempt_request(victim.value_or(requester), time, newly_preempted,
                         result);
         rollback_preempted_schedules(
@@ -470,9 +546,15 @@ std::deque<RequestId> VllmV1Scheduler::take_admission_queue() {
         return std::exchange(waiting_, {});
     }
 
-    // MONOLITHIC and PREFILL retain Python's two-list priority:
+    // A completed CPU restore owns a full-sequence commitment.  Admit it
+    // before requests that have not acquired a commitment; otherwise a
+    // preempted/fresh head that cannot reserve can strand the restored
+    // request behind its own resource ownership.
+    std::deque<RequestId> queue = std::exchange(restored_ready_, {});
+    // MONOLITHIC and PREFILL otherwise retain Python's two-list priority:
     // preempted requests before newly arrived requests.
-    std::deque<RequestId> queue = std::exchange(preempted_, {});
+    std::deque<RequestId> preempted = std::exchange(preempted_, {});
+    queue.insert(queue.end(), preempted.begin(), preempted.end());
     queue.insert(queue.end(), waiting_.begin(), waiting_.end());
     waiting_.clear();
     return queue;
@@ -481,6 +563,10 @@ std::deque<RequestId> VllmV1Scheduler::take_admission_queue() {
 void VllmV1Scheduler::restore_admission_queue(std::deque<RequestId> queue) {
     for (const RequestId request_id : queue) {
         if (cluster_type() != ClusterType::kDecode &&
+            staged_cpu_restores_.find(request_id) !=
+                staged_cpu_restores_.end()) {
+            restored_ready_.push_back(request_id);
+        } else if (cluster_type() != ClusterType::kDecode &&
             request(request_id).preempted()) {
             preempted_.push_back(request_id);
         } else {
@@ -497,9 +583,9 @@ entities::TieredPrefixPlan VllmV1Scheduler::build_tiered_prefix_plan(
     const kv_cache::PrefixLookupResult gpu = kv_blocks_.lookup(value);
     const kv_cache::CpuPrefixLookupResult cpu =
         cpu_kv_cache_->lookup(value.session_id(), query_blocks);
-    return build_contiguous_tiered_prefix_plan(
-        query_blocks, gpu.hit_blocks, cpu.hit_blocks, block_size,
-        prompt_tokens);
+    return build_contiguous_tiered_prefix_plan(query_blocks, gpu.hit_blocks,
+                                               cpu.hit_blocks, block_size,
+                                               prompt_tokens);
 }
 
 void VllmV1Scheduler::suspend_for_cpu_restore(
@@ -527,23 +613,21 @@ void VllmV1Scheduler::suspend_for_cpu_restore(
         const CpuKvTransferId transfer_id{next_cpu_transfer_id_++};
         const Generation generation{value.runtime_epoch()};
         cpu_restore_operations_.emplace(
-            transfer_id,
-            entities::CpuKVCacheRestoreInfo{
-                transfer_id, request_id, replica_id(), dp_id(), lease, plan,
-                timing, generation});
+            transfer_id, entities::CpuKVCacheRestoreInfo{
+                             transfer_id, request_id, replica_id(), dp_id(),
+                             lease, plan, timing, generation});
         pending_cpu_restores_.emplace(request_id, transfer_id);
-        pending_auxiliary_events_.push_back(ScheduledAuxiliaryEvent{
-            timing.started_at,
-            [&]() {
-                CpuKVCacheRestoreStartPayload payload{};
-                payload.transfer_id = transfer_id;
-                payload.request_id = request_id;
-                payload.replica_id = replica_id();
-                payload.dp_id = dp_id();
-                payload.generation = generation;
-                payload.cluster_type = cluster_type();
-                return EventPayload{payload};
-            }()});
+        pending_auxiliary_events_.push_back(
+            ScheduledAuxiliaryEvent{timing.started_at, [&]() {
+                                        CpuKVCacheRestoreStartPayload payload{};
+                                        payload.transfer_id = transfer_id;
+                                        payload.request_id = request_id;
+                                        payload.replica_id = replica_id();
+                                        payload.dp_id = dp_id();
+                                        payload.generation = generation;
+                                        payload.cluster_type = cluster_type();
+                                        return EventPayload{payload};
+                                    }()});
     } catch (...) {
         static_cast<void>(cpu_kv_cache_->release_restore(lease, false, time));
         throw;
@@ -554,11 +638,10 @@ std::uint64_t VllmV1Scheduler::revalidate_staged_frontier(
     const entities::Request &value,
     const entities::StagedCpuKVCacheRestore &staged) const {
     return revalidate_contiguous_tiered_prefix_frontier(
-        kv_blocks_.lookup(value).hit_blocks, staged);
+        kv_blocks_.gpu_cache_valid_prefix_blocks(value.session_id()), staged);
 }
 
-std::vector<ScheduledAuxiliaryEvent>
-VllmV1Scheduler::drain_auxiliary_events() {
+std::vector<ScheduledAuxiliaryEvent> VllmV1Scheduler::drain_auxiliary_events() {
     return std::exchange(pending_auxiliary_events_, {});
 }
 
@@ -584,8 +667,9 @@ VllmV1Scheduler::cpu_kv_cache_restore_operations() const {
     return result;
 }
 
-void VllmV1Scheduler::on_cpu_kv_cache_restore_start(
-    CpuKvTransferId transfer_id, Generation generation, SimTime time) {
+void VllmV1Scheduler::on_cpu_kv_cache_restore_start(CpuKvTransferId transfer_id,
+                                                    Generation generation,
+                                                    SimTime time) {
     auto operation = cpu_restore_operations_.find(transfer_id);
     if (operation == cpu_restore_operations_.end() ||
         operation->second.request_generation() != generation ||
@@ -595,22 +679,22 @@ void VllmV1Scheduler::on_cpu_kv_cache_restore_start(
     }
     operation->second.mark_started(time);
     const entities::CpuKVCacheRestoreInfo &restore = operation->second;
-    pending_auxiliary_events_.push_back(ScheduledAuxiliaryEvent{
-        restore.timing().completed_at,
-        [&]() {
-            CpuKVCacheRestoreEndPayload payload{};
-            payload.transfer_id = transfer_id;
-            payload.request_id = restore.request_id();
-            payload.replica_id = replica_id();
-            payload.dp_id = dp_id();
-            payload.generation = generation;
-            payload.cluster_type = cluster_type();
-            return EventPayload{payload};
-        }()});
+    pending_auxiliary_events_.push_back(
+        ScheduledAuxiliaryEvent{restore.timing().completed_at, [&]() {
+                                    CpuKVCacheRestoreEndPayload payload{};
+                                    payload.transfer_id = transfer_id;
+                                    payload.request_id = restore.request_id();
+                                    payload.replica_id = replica_id();
+                                    payload.dp_id = dp_id();
+                                    payload.generation = generation;
+                                    payload.cluster_type = cluster_type();
+                                    return EventPayload{payload};
+                                }()});
 }
 
-bool VllmV1Scheduler::on_cpu_kv_cache_restore_end(
-    CpuKvTransferId transfer_id, Generation generation, SimTime time) {
+bool VllmV1Scheduler::on_cpu_kv_cache_restore_end(CpuKvTransferId transfer_id,
+                                                  Generation generation,
+                                                  SimTime time) {
     auto operation = cpu_restore_operations_.find(transfer_id);
     if (operation == cpu_restore_operations_.end() ||
         operation->second.request_generation() != generation ||
@@ -645,11 +729,15 @@ bool VllmV1Scheduler::on_cpu_kv_cache_restore_end(
         staged.block_size = plan.block_size;
         staged.prompt_tokens = plan.prompt_tokens;
         staged.timing = restore.timing();
-        if (!staged_cpu_restores_.emplace(value.id(), std::move(staged)).second) {
+        if (!staged_cpu_restores_.emplace(value.id(), std::move(staged))
+                 .second) {
             throw SchedulerError("CPU restore staged payload already exists");
         }
         staged_published = true;
-        waiting_.push_back(value.id());
+        // H2D is complete and the request owns its full-sequence
+        // commitment.  Keep it in a dedicated FIFO so it cannot be blocked
+        // behind a fresh/preempted request that fails admission.
+        restored_ready_.push_back(value.id());
         runnable_published = true;
         restore.mark_completed(time);
         value.record_cpu_restore_transfer(
@@ -659,24 +747,26 @@ bool VllmV1Scheduler::on_cpu_kv_cache_restore_end(
         pending_cpu_restores_.erase(pending);
     } catch (...) {
         if (runnable_published) {
-            const auto runnable =
-                std::find(waiting_.begin(), waiting_.end(), value.id());
-            if (runnable != waiting_.end()) {
-                waiting_.erase(runnable);
+            const auto runnable = std::find(restored_ready_.begin(),
+                                            restored_ready_.end(), value.id());
+            if (runnable != restored_ready_.end()) {
+                restored_ready_.erase(runnable);
             }
         }
         if (staged_published) {
             staged_cpu_restores_.erase(value.id());
         }
         if (cpu_kv_cache_->lease_active(restore.lease_id())) {
-            static_cast<void>(cpu_kv_cache_->release_restore(
-                restore.lease_id(), false, time));
+            static_cast<void>(cpu_kv_cache_->release_restore(restore.lease_id(),
+                                                             false, time));
         }
         pending_cpu_restores_.erase(value.id());
-        if (restore.state() !=
-            entities::CpuKVCacheTransferState::kCompleted) {
+        if (restore.state() != entities::CpuKVCacheTransferState::kCompleted) {
             restore.cancel();
         }
+        // A failed restore must not strand the PREFILL full-sequence
+        // commitment (or a GPU prefix pinned for that restore).
+        kv_blocks_.release_commitment(value.id());
         validate_policy_state();
         throw;
     }
@@ -702,28 +792,36 @@ bool VllmV1Scheduler::cancel_cpu_kv_cache_restore(RequestId request_id,
             cpu_kv_cache_->release_restore(restore.lease_id(), false, time));
         pending_cpu_restores_.erase(pending);
         pending_auxiliary_events_.erase(
-            std::remove_if(
-                pending_auxiliary_events_.begin(),
-                pending_auxiliary_events_.end(), [&](const auto &event) {
-                    const auto *start = std::get_if<
-                        CpuKVCacheRestoreStartPayload>(&event.payload);
-                    return start != nullptr &&
-                           start->transfer_id == transfer_id;
-                }),
+            std::remove_if(pending_auxiliary_events_.begin(),
+                           pending_auxiliary_events_.end(),
+                           [&](const auto &event) {
+                               const auto *start =
+                                   std::get_if<CpuKVCacheRestoreStartPayload>(
+                                       &event.payload);
+                               return start != nullptr &&
+                                      start->transfer_id == transfer_id;
+                           }),
             pending_auxiliary_events_.end());
+        // The pending H2D operation owns the PREFILL full-sequence
+        // commitment.  Once that operation is cancelled, the request returns
+        // to ordinary admission and must not retain either its virtual suffix
+        // or a GPU prefix pinned on behalf of the cancelled restore.
+        kv_blocks_.release_commitment(request_id);
         waiting_.push_back(request_id);
         validate_policy_state();
         return true;
     }
     const auto staged = staged_cpu_restores_.find(request_id);
     if (staged != staged_cpu_restores_.end()) {
-        staged_cpu_restores_.erase(staged);
-        const auto runnable =
-            std::find(waiting_.begin(), waiting_.end(), request_id);
-        if (runnable == waiting_.end()) {
-            throw SchedulerError("staged CPU restore runnable entry disappeared");
+        const auto runnable = std::find(restored_ready_.begin(),
+                                       restored_ready_.end(), request_id);
+        if (runnable == restored_ready_.end()) {
+            throw SchedulerError(
+                "staged CPU restore runnable entry disappeared");
         }
-        waiting_.erase(runnable);
+        staged_cpu_restores_.erase(staged);
+        restored_ready_.erase(runnable);
+        kv_blocks_.release_commitment(request_id);
         validate_policy_state();
         return true;
     }
@@ -742,18 +840,17 @@ void VllmV1Scheduler::on_cpu_kv_cache_offload_start(
     }
     operation->second.mark_started(time);
     const entities::CpuKVCacheOffloadInfo &offload = operation->second;
-    pending_auxiliary_events_.push_back(ScheduledAuxiliaryEvent{
-        offload.timing().completed_at,
-        [&]() {
-            CpuKVCacheOffloadEndPayload payload{};
-            payload.transfer_id = transfer_id;
-            payload.request_id = offload.request_id();
-            payload.replica_id = replica_id();
-            payload.dp_id = dp_id();
-            payload.cpu_generation = generation;
-            payload.cluster_type = cluster_type();
-            return EventPayload{payload};
-        }()});
+    pending_auxiliary_events_.push_back(
+        ScheduledAuxiliaryEvent{offload.timing().completed_at, [&]() {
+                                    CpuKVCacheOffloadEndPayload payload{};
+                                    payload.transfer_id = transfer_id;
+                                    payload.request_id = offload.request_id();
+                                    payload.replica_id = replica_id();
+                                    payload.dp_id = dp_id();
+                                    payload.cpu_generation = generation;
+                                    payload.cluster_type = cluster_type();
+                                    return EventPayload{payload};
+                                }()});
 }
 
 bool VllmV1Scheduler::on_cpu_kv_cache_offload_end(
@@ -782,8 +879,7 @@ bool VllmV1Scheduler::on_cpu_kv_cache_offload_end(
         }
         offload.mark_completed(time);
     } catch (...) {
-        if (offload.state() !=
-            entities::CpuKVCacheTransferState::kCompleted) {
+        if (offload.state() != entities::CpuKVCacheTransferState::kCompleted) {
             offload.cancel();
         }
         if (cpu_kv_cache_->reservation_pending(offload.reservation_id())) {
@@ -793,7 +889,7 @@ bool VllmV1Scheduler::on_cpu_kv_cache_offload_end(
         pending_cpu_offloads_.erase(pending);
         export_state->second.cpu_offload_pending = false;
         if (!export_state->second.decode_pending) {
-            static_cast<void>(kv_blocks_.free(offload.request_id()));
+            release_request_kv(offload.request_id());
             pending_exports_.erase(export_state);
         }
         validate_policy_state();
@@ -802,7 +898,7 @@ bool VllmV1Scheduler::on_cpu_kv_cache_offload_end(
     pending_cpu_offloads_.erase(pending);
     export_state->second.cpu_offload_pending = false;
     if (!export_state->second.decode_pending) {
-        static_cast<void>(kv_blocks_.free(offload.request_id()));
+        release_request_kv(offload.request_id());
         pending_exports_.erase(export_state);
     }
     request(offload.request_id())
@@ -919,14 +1015,25 @@ ScheduleResult VllmV1Scheduler::schedule_requests(SimTime time) {
             }
             const RequestId request_id = queue.front();
             entities::Request &value = request(request_id);
+            const bool prefill_request =
+                cluster_type() == ClusterType::kPrefill &&
+                !value.is_prefill_complete();
+            const std::uint64_t full_sequence_tokens =
+                prefill_request ? value.num_prefill_tokens() : 0;
+            if (prefill_request &&
+                !kv_blocks_.full_sequence_fits_empty(full_sequence_tokens)) {
+                queue.insert(queue.end(), skipped.begin(), skipped.end());
+                restore_admission_queue(std::move(queue));
+                throw SchedulerError("PREFILL prompt plus watermark exceeds "
+                                     "empty replica KV capacity");
+            }
             kv_cache::PrefixLookupResult prefix_lookup{};
-            const auto staged_position =
-                staged_cpu_restores_.find(request_id);
+            const auto staged_position = staged_cpu_restores_.find(request_id);
             const bool has_staged_restore =
                 staged_position != staged_cpu_restores_.end();
             if (has_staged_restore) {
-                const std::uint64_t reusable = revalidate_staged_frontier(
-                    value, staged_position->second);
+                const std::uint64_t reusable =
+                    revalidate_staged_frontier(value, staged_position->second);
                 prefix_lookup.query_blocks =
                     staged_position->second.query_blocks;
                 prefix_lookup.hit_blocks = reusable;
@@ -937,9 +1044,26 @@ ScheduleResult VllmV1Scheduler::schedule_requests(SimTime time) {
                 const entities::TieredPrefixPlan plan =
                     build_tiered_prefix_plan(value);
                 if (plan.cpu_end_block > plan.cpu_begin_block) {
+                    bool committed_for_restore = false;
                     try {
+                        if (prefill_request &&
+                            kv_blocks_.request_committed_blocks(request_id) ==
+                                0) {
+                            if (!kv_blocks_.can_commit(
+                                    request_id, value.session_id(),
+                                    full_sequence_tokens)) {
+                                break;
+                            }
+                            kv_blocks_.commit_virtual(request_id,
+                                                      value.session_id(),
+                                                      full_sequence_tokens);
+                            committed_for_restore = true;
+                        }
                         suspend_for_cpu_restore(request_id, plan, time);
                     } catch (...) {
+                        if (committed_for_restore) {
+                            kv_blocks_.release_commitment(request_id);
+                        }
                         queue.insert(queue.end(), skipped.begin(),
                                      skipped.end());
                         restore_admission_queue(std::move(queue));
@@ -987,82 +1111,100 @@ ScheduleResult VllmV1Scheduler::schedule_requests(SimTime time) {
                                                 ? prefix_lookup.cached_tokens
                                                 : kv_accounted_tokens(value);
             const bool can_reserve =
-                has_staged_restore
-                    ? kv_blocks_.can_admit_tiered(
-                          request_id, value.session_id(),
-                          prefix_lookup.hit_blocks, num_tokens)
-                    : kv_blocks_.prefix_cache_enabled() &&
+                has_staged_restore ? kv_blocks_.can_admit_tiered(
+                                         request_id, value.session_id(),
+                                         prefix_lookup.hit_blocks, num_tokens,
+                                         full_sequence_tokens)
+                : kv_blocks_.prefix_cache_enabled() &&
                         !value.is_prefill_complete()
                     ? kv_blocks_.can_admit(request_id, value.session_id(),
                                            prefix_lookup.cached_tokens,
-                                           num_tokens)
-                    : kv_blocks_.can_reserve(request_id, accounted, num_tokens);
+                                           num_tokens, full_sequence_tokens)
+                    : kv_blocks_.can_reserve(request_id, accounted, num_tokens,
+                                             full_sequence_tokens);
             if (!can_reserve) {
                 break;
             }
 
             queue.pop_front();
-            if (has_staged_restore) {
-                const std::uint64_t current_gpu =
-                    kv_blocks_.lookup(value).hit_blocks;
-                kv_blocks_.admit_tiered(request_id, value.session_id(),
-                                        prefix_lookup.hit_blocks, num_tokens);
-                value.restore_prefix_cache_lookup(
-                    prefix_lookup.query_blocks, prefix_lookup.hit_blocks,
-                    prefix_lookup.cached_tokens);
-                kv_blocks_.record_successful_admission(
-                    prefix_lookup.query_blocks, prefix_lookup.hit_blocks);
-                const entities::StagedCpuKVCacheRestore staged =
-                    staged_position->second;
-                const std::uint64_t cpu_query =
-                    staged.query_blocks > current_gpu
-                        ? staged.query_blocks - current_gpu
-                        : 0;
-                const std::uint64_t cpu_used =
-                    prefix_lookup.hit_blocks > current_gpu
-                        ? prefix_lookup.hit_blocks - current_gpu
-                        : 0;
-                const std::uint64_t gpu_used =
-                    std::min(current_gpu, prefix_lookup.hit_blocks);
-                value.record_cpu_prefix_admission(
-                    gpu_used, cpu_query, cpu_used,
-                    cpu_used * staged.block_size);
-                cpu_kv_cache_->record_successful_lookup(
-                    request_id,
-                    kv_cache::CpuPrefixLookupResult{cpu_query, cpu_used},
-                    value.session_id());
-                staged_cpu_restores_.erase(staged_position);
-            } else if (kv_blocks_.prefix_cache_enabled() &&
-                !value.is_prefill_complete()) {
-                const std::uint64_t current_gpu =
-                    kv_blocks_.lookup(value).hit_blocks;
-                kv_blocks_.admit(request_id, value.session_id(),
-                                 prefix_lookup.cached_tokens, num_tokens);
-                value.restore_prefix_cache_lookup(prefix_lookup.query_blocks,
-                                                  prefix_lookup.hit_blocks,
-                                                  prefix_lookup.cached_tokens);
-                kv_blocks_.record_successful_admission(
-                    prefix_lookup.query_blocks, prefix_lookup.hit_blocks);
-                if (cpu_kv_cache_ != nullptr) {
+            try {
+                if (has_staged_restore) {
+                    const std::uint64_t current_gpu =
+                        kv_blocks_.gpu_cache_valid_prefix_blocks(
+                            value.session_id());
+                    kv_blocks_.admit_tiered(request_id, value.session_id(),
+                                            prefix_lookup.hit_blocks,
+                                            num_tokens, full_sequence_tokens);
+                    value.restore_prefix_cache_lookup(
+                        prefix_lookup.query_blocks, prefix_lookup.hit_blocks,
+                        prefix_lookup.cached_tokens);
+                    kv_blocks_.record_successful_admission(
+                        prefix_lookup.query_blocks, prefix_lookup.hit_blocks);
+                    const entities::StagedCpuKVCacheRestore staged =
+                        staged_position->second;
                     const std::uint64_t cpu_query =
-                        prefix_lookup.query_blocks > current_gpu
-                            ? prefix_lookup.query_blocks - current_gpu
+                        staged.query_blocks > current_gpu
+                            ? staged.query_blocks - current_gpu
+                            : 0;
+                    const std::uint64_t cpu_used =
+                        prefix_lookup.hit_blocks > current_gpu
+                            ? prefix_lookup.hit_blocks - current_gpu
                             : 0;
                     const std::uint64_t gpu_used =
                         std::min(current_gpu, prefix_lookup.hit_blocks);
-                    value.record_cpu_prefix_admission(gpu_used, cpu_query, 0,
-                                                      0);
+                    value.record_cpu_prefix_admission(
+                        gpu_used, cpu_query, cpu_used,
+                        cpu_used * staged.block_size);
                     cpu_kv_cache_->record_successful_lookup(
                         request_id,
-                        kv_cache::CpuPrefixLookupResult{cpu_query, 0},
+                        kv_cache::CpuPrefixLookupResult{cpu_query, cpu_used},
                         value.session_id());
+                } else if (kv_blocks_.prefix_cache_enabled() &&
+                           !value.is_prefill_complete()) {
+                    const std::uint64_t current_gpu =
+                        kv_blocks_.lookup(value).hit_blocks;
+                    kv_blocks_.admit(request_id, value.session_id(),
+                                     prefix_lookup.cached_tokens, num_tokens,
+                                     full_sequence_tokens);
+                    value.restore_prefix_cache_lookup(
+                        prefix_lookup.query_blocks, prefix_lookup.hit_blocks,
+                        prefix_lookup.cached_tokens);
+                    kv_blocks_.record_successful_admission(
+                        prefix_lookup.query_blocks, prefix_lookup.hit_blocks);
+                    if (cpu_kv_cache_ != nullptr) {
+                        const std::uint64_t cpu_query =
+                            prefix_lookup.query_blocks > current_gpu
+                                ? prefix_lookup.query_blocks - current_gpu
+                                : 0;
+                        const std::uint64_t gpu_used =
+                            std::min(current_gpu, prefix_lookup.hit_blocks);
+                        value.record_cpu_prefix_admission(gpu_used, cpu_query,
+                                                          0, 0);
+                        cpu_kv_cache_->record_successful_lookup(
+                            request_id,
+                            kv_cache::CpuPrefixLookupResult{cpu_query, 0},
+                            value.session_id());
+                    }
+                } else {
+                    kv_blocks_.reserve(request_id, accounted, num_tokens,
+                                       full_sequence_tokens);
                 }
-            } else {
-                kv_blocks_.reserve(request_id, accounted, num_tokens);
+                value.on_admitted(time);
+                value.advance_scheduler_frontier(num_tokens);
+                running_.push_back(request_id);
+            } catch (...) {
+                // Admission is a single ownership transaction: if any
+                // manager/request validation throws after queue removal, give
+                // back physical and future blocks and restore queue ownership.
+                kv_blocks_.release_commitment(request_id);
+                queue.push_front(request_id);
+                queue.insert(queue.end(), skipped.begin(), skipped.end());
+                restore_admission_queue(std::move(queue));
+                throw;
             }
-            value.on_admitted(time);
-            value.advance_scheduler_frontier(num_tokens);
-            running_.push_back(request_id);
+            if (has_staged_restore) {
+                staged_cpu_restores_.erase(request_id);
+            }
             waiting_scheduled.push_back([&]() {
                 ScheduledRequest value{};
                 value.request_id = request_id;
@@ -1097,8 +1239,8 @@ ScheduleResult VllmV1Scheduler::schedule_requests(SimTime time) {
                                      running_scheduled.end());
     result.token_budget_after = token_budget;
     result.available_blocks_after = kv_blocks_.available_blocks();
-    result.waiting_count_after = checked_size(
-        waiting_count(), "waiting queue size overflows uint64");
+    result.waiting_count_after =
+        checked_size(waiting_count(), "waiting queue size overflows uint64");
     result.running_count_after =
         checked_size(running_.size(), "running queue size overflows uint64");
     const bool empty_iteration = result.scheduled_requests.empty();
@@ -1191,6 +1333,10 @@ void VllmV1Scheduler::complete_kv_transfer(RequestId request_id) {
     if (kv_blocks_.allocated_blocks(request_id) == 0) {
         throw SchedulerError("pending KV transfer source owns no blocks");
     }
+    if (kv_blocks_.request_virtual_committed_blocks(request_id) != 0) {
+        throw SchedulerError("pending KV transfer source still has an "
+                             "unmaterialized commitment");
+    }
     export_state->second.decode_pending = false;
     const auto offload = pending_cpu_offloads_.find(request_id);
     if (offload != pending_cpu_offloads_.end()) {
@@ -1199,14 +1345,14 @@ void VllmV1Scheduler::complete_kv_transfer(RequestId request_id) {
                 request(request_id).kv_cache_transfer_end_time());
     }
     if (!export_state->second.cpu_offload_pending) {
-        static_cast<void>(kv_blocks_.free(request_id));
+        release_request_kv(request_id);
         pending_exports_.erase(export_state);
     }
     validate_policy_state();
 }
 
 bool VllmV1Scheduler::prepare_cpu_kv_cache_offload(RequestId request_id,
-                                                    SimTime time) {
+                                                   SimTime time) {
     if (cpu_kv_cache_ == nullptr) {
         return false;
     }
@@ -1218,6 +1364,10 @@ bool VllmV1Scheduler::prepare_cpu_kv_cache_offload(RequestId request_id,
         value.state() != entities::RequestState::kTransferPending ||
         !value.session_id().valid()) {
         throw SchedulerError("invalid CPU offload preparation state");
+    }
+    if (retired_session_requests_.find(request_id) !=
+        retired_session_requests_.end()) {
+        return false;
     }
     CpuOffloadGeneration &last = cpu_offload_generations_[value.session_id()];
     if (last.valid() &&
@@ -1246,8 +1396,7 @@ bool VllmV1Scheduler::prepare_cpu_kv_cache_offload(RequestId request_id,
     try {
         const auto timing = cpu_transfer_engine_->schedule(
             cpu_kv_cache_transfer::CpuTransferDirection::kD2H,
-            reservation.reserved_blocks *
-                cpu_kv_cache_config_.bytes_per_block,
+            reservation.reserved_blocks * cpu_kv_cache_config_.bytes_per_block,
             time);
         const CpuKvTransferId transfer_id{next_cpu_transfer_id_++};
         cpu_offload_operations_.emplace(
@@ -1257,18 +1406,17 @@ bool VllmV1Scheduler::prepare_cpu_kv_cache_offload(RequestId request_id,
                 reservation.reservation_id, timing, desired, generation});
         pending_cpu_offloads_.emplace(request_id, transfer_id);
         export_state->second.cpu_offload_pending = true;
-        pending_auxiliary_events_.push_back(ScheduledAuxiliaryEvent{
-            timing.started_at,
-            [&]() {
-                CpuKVCacheOffloadStartPayload payload{};
-                payload.transfer_id = transfer_id;
-                payload.request_id = request_id;
-                payload.replica_id = replica_id();
-                payload.dp_id = dp_id();
-                payload.cpu_generation = generation;
-                payload.cluster_type = cluster_type();
-                return EventPayload{payload};
-            }()});
+        pending_auxiliary_events_.push_back(
+            ScheduledAuxiliaryEvent{timing.started_at, [&]() {
+                                        CpuKVCacheOffloadStartPayload payload{};
+                                        payload.transfer_id = transfer_id;
+                                        payload.request_id = request_id;
+                                        payload.replica_id = replica_id();
+                                        payload.dp_id = dp_id();
+                                        payload.cpu_generation = generation;
+                                        payload.cluster_type = cluster_type();
+                                        return EventPayload{payload};
+                                    }()});
     } catch (...) {
         static_cast<void>(
             cpu_kv_cache_->abort_offload(reservation.reservation_id));
@@ -1312,9 +1460,30 @@ void VllmV1Scheduler::validate_policy_state() const {
             throw SchedulerError(
                 "request appears in multiple scheduler queues");
         }
+        if (staged_cpu_restores_.find(request_id) !=
+            staged_cpu_restores_.end()) {
+            throw SchedulerError(
+                "staged CPU restore appears in ordinary waiting queue");
+        }
         if (request(request_id).state() != entities::RequestState::kWaiting) {
             throw SchedulerError(
                 "waiting queue contains a non-waiting request");
+        }
+    }
+    for (const RequestId request_id : restored_ready_) {
+        if (!ids.insert(request_id).second) {
+            throw SchedulerError(
+                "request appears in multiple scheduler queues");
+        }
+        const entities::Request &value = request(request_id);
+        if (value.state() != entities::RequestState::kWaiting ||
+            staged_cpu_restores_.find(request_id) ==
+                staged_cpu_restores_.end() ||
+            pending_cpu_restores_.find(request_id) !=
+                pending_cpu_restores_.end() ||
+            kv_blocks_.request_committed_blocks(request_id) == 0) {
+            throw SchedulerError(
+                "restored-ready queue contains a non-runnable request");
         }
     }
     for (const RequestId request_id : running_) {
@@ -1364,12 +1533,14 @@ void VllmV1Scheduler::validate_policy_state() const {
             (export_state.cpu_offload_pending !=
              (offload != pending_cpu_offloads_.end())) ||
             kv_blocks_.allocated_blocks(request_id) == 0 ||
+            kv_blocks_.request_virtual_committed_blocks(request_id) != 0 ||
             ids.find(request_id) != ids.end()) {
             throw SchedulerError(
                 "pending PREFILL export registry invariant failed");
         }
         if (offload != pending_cpu_offloads_.end()) {
-            const auto operation = cpu_offload_operations_.find(offload->second);
+            const auto operation =
+                cpu_offload_operations_.find(offload->second);
             if (operation == cpu_offload_operations_.end() ||
                 operation->second.request_id() != request_id ||
                 !cpu_kv_cache_->reservation_pending(
@@ -1382,7 +1553,7 @@ void VllmV1Scheduler::validate_policy_state() const {
         const auto operation = cpu_restore_operations_.find(transfer_id);
         if (request(request_id).state() != entities::RequestState::kWaiting ||
             ids.find(request_id) != ids.end() ||
-            kv_blocks_.allocated_blocks(request_id) != 0 ||
+            kv_blocks_.request_committed_blocks(request_id) == 0 ||
             operation == cpu_restore_operations_.end() ||
             operation->second.request_id() != request_id ||
             !cpu_kv_cache_->lease_active(operation->second.lease_id())) {
@@ -1393,10 +1564,18 @@ void VllmV1Scheduler::validate_policy_state() const {
         static_cast<void>(staged);
         if (request(request_id).state() != entities::RequestState::kWaiting ||
             ids.find(request_id) == ids.end() ||
-            kv_blocks_.allocated_blocks(request_id) != 0 ||
+            std::find(restored_ready_.begin(), restored_ready_.end(),
+                      request_id) == restored_ready_.end() ||
+            kv_blocks_.request_committed_blocks(request_id) == 0 ||
             pending_cpu_restores_.find(request_id) !=
                 pending_cpu_restores_.end()) {
             throw SchedulerError("staged CPU restore invariant failed");
+        }
+    }
+    for (const RequestId request_id : retired_session_requests_) {
+        if (!contains_request(request_id)) {
+            throw SchedulerError(
+                "retired session request escaped scheduler ownership");
         }
     }
     if (cpu_kv_cache_ != nullptr) {

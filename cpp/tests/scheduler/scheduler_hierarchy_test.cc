@@ -348,8 +348,63 @@ void test_stage_specific_factory_and_observable_routing_policies() {
                &global.get_cluster_scheduler(ClusterType::kPrefill)) != nullptr &&
                dynamic_cast<VllmQueueAwareClusterScheduler *>(
                    &global.get_cluster_scheduler(ClusterType::kDecode)) !=
-                   nullptr,
+               nullptr,
            "PDD stages must instantiate independent configured cluster policies");
+}
+
+void test_kv_aware_prefill_avoids_virtual_commitment() {
+    frontier::config::ClusterRuntimeConfig runtime;
+    runtime.parallelism.num_replicas = 2;
+    runtime.scheduler = scheduler_config();
+    // Leave most of the first prompt as a future-only commitment so the
+    // routing observable has to include virtual blocks, not only physical
+    // materialization of the first chunk.
+    runtime.scheduler.max_tokens_in_batch = 4;
+    runtime.scheduler.enable_chunked_prefill = true;
+    Cluster cluster{ClusterType::kPrefill, runtime};
+    const auto predictor = std::make_shared<FixedExecutionTimePredictor>([&]() {
+        frontier::config::FixedExecutionModelConfig value{};
+        value.batch_latency_ms = 0.0;
+        value.stage_latencies_ms = {};
+        return value;
+    }());
+    std::vector<Request> requests;
+    requests.emplace_back(make_request(RequestId{0}, 16, 1));
+    requests.emplace_back(make_request(RequestId{1}, 16, 1));
+    for (Request &request : requests) {
+        request.on_arrival(SimTime::from_seconds(0.0));
+    }
+
+    KvAwareClusterScheduler scheduler{cluster, requests, predictor, nullptr};
+    scheduler.add_request(RequestId{0}, SimTime::from_seconds(0.0));
+    const auto first = scheduler.schedule();
+    expect(first.size() == 1 && first.front().replica_id == ReplicaId{0},
+           "first PREFILL request must use stable empty-target ordering");
+    BaseReplicaScheduler &committed_target =
+        scheduler.get_replica_scheduler(ReplicaId{0}, DataParallelId{0});
+    const auto first_iteration =
+        committed_target.schedule(SimTime::from_seconds(0.0));
+    expect(first_iteration.scheduled_requests.size() == 1 &&
+               committed_target.allocated_kv_blocks() == 1 &&
+               committed_target.virtual_committed_kv_blocks() == 3,
+           "PREFILL admission must expose physical plus virtual KV blocks "
+           "(scheduled=" +
+               std::to_string(first_iteration.scheduled_requests.size()) +
+               ", physical=" +
+               std::to_string(committed_target.allocated_kv_blocks()) +
+               ", virtual=" +
+               std::to_string(
+                   committed_target.virtual_committed_kv_blocks()) +
+               ")");
+
+    scheduler.add_request(RequestId{1}, SimTime::from_seconds(0.0));
+    const auto second = scheduler.schedule();
+    expect(second.size() == 1 && second.front().replica_id == ReplicaId{1},
+           "KV-aware PREFILL routing must avoid a target with a virtual commitment");
+    BaseReplicaScheduler &queued_target =
+        scheduler.get_replica_scheduler(ReplicaId{1}, DataParallelId{0});
+    expect(queued_target.queued_kv_blocks() == 4,
+           "uncommitted queued PREFILL demand must use full materialized ISL");
 }
 
 void test_actual_cache_aware_routing_migrates_and_discards_old_gpu_kv() {
@@ -442,6 +497,207 @@ void test_actual_cache_aware_routing_migrates_and_discards_old_gpu_kv() {
            "low-hit migration must discard the partial old GPU prefix");
 }
 
+void test_actual_cache_aware_routing_waits_for_session_owner_release() {
+    frontier::config::ClusterRuntimeConfig runtime;
+    runtime.scheduler = scheduler_config();
+    Cluster cluster{ClusterType::kMonolithic, runtime};
+    const auto predictor = std::make_shared<FixedExecutionTimePredictor>([&]() {
+        frontier::config::FixedExecutionModelConfig value{};
+        value.batch_latency_ms = 0.0;
+        value.stage_latencies_ms = {};
+        return value;
+    }());
+    std::vector<Request> requests;
+    requests.emplace_back(make_request(RequestId{0}, 8, 1,
+                                       frontier::SessionId{31}));
+    requests.emplace_back(make_request(RequestId{1}, 12, 1,
+                                       frontier::SessionId{31}));
+    for (Request &request : requests) {
+        request.on_arrival(SimTime::from_seconds(0.0));
+    }
+    ClusterSchedulerConfig routing{};
+    routing.type = ClusterSchedulerType::kCacheAware;
+    CacheAwareClusterScheduler scheduler{
+        cluster, requests, predictor, nullptr,
+        frontier::config::PrefixCacheConfig{
+            true, frontier::config::PrefixCachingKeyMode::kSession},
+        {}, routing};
+
+    scheduler.add_request(RequestId{0}, SimTime::from_seconds(0.0));
+    const auto first_assignment = scheduler.schedule();
+    BaseReplicaScheduler &target = scheduler.get_replica_scheduler(
+        first_assignment.front().replica_id, first_assignment.front().dp_id);
+    const auto decision = target.schedule(SimTime::from_seconds(0.0));
+    expect(decision.scheduled_requests.size() == 1 &&
+               target.session_has_active_kv_request(frontier::SessionId{31}),
+           "first request must own the session before its batch completes");
+
+    scheduler.add_request(RequestId{1}, SimTime::from_seconds(0.001));
+    const auto blocked = scheduler.schedule();
+    expect(blocked.empty() && !scheduler.empty(),
+           "same-session successor must remain in the cluster queue while "
+           "the previous request owns KV state");
+
+    const auto &scheduled = decision.scheduled_requests.front();
+    Batch batch{BatchId{0},
+                decision.iteration_id,
+                {RequestBatchSnapshot{scheduled.request_id,
+                                      scheduled.num_tokens,
+                                      requests[0].runtime_epoch(),
+                                      requests[0].execution_epoch(),
+                                      requests[0].num_processed_tokens(),
+                                      requests[0]
+                                          .scheduler_num_computed_tokens()}},
+                decision.simulation_time,
+                Generation{1}};
+    batch.set_global_id(BatchGlobalId{0});
+    target.mark_batch_started(batch);
+    expect(target.on_batch_completed(batch, SimTime::from_seconds(0.002)) &&
+               !target.session_has_active_kv_request(
+                   frontier::SessionId{31}),
+           "finishing the old request must release session ownership");
+
+    const auto unblocked = scheduler.schedule();
+    expect(unblocked.size() == 1 &&
+               unblocked.front().request_id == RequestId{1} &&
+               scheduler.empty(),
+           "released same-session successor must route on the next cluster "
+           "schedule");
+}
+
+void test_actual_cache_aware_routing_keeps_cpu_hit_affinity() {
+    frontier::config::ClusterRuntimeConfig runtime;
+    runtime.parallelism.num_replicas = 2;
+    runtime.scheduler = scheduler_config();
+    Cluster cluster{ClusterType::kPrefill, runtime};
+    const auto predictor = std::make_shared<FixedExecutionTimePredictor>([&]() {
+        frontier::config::FixedExecutionModelConfig value{};
+        value.batch_latency_ms = 0.0;
+        value.stage_latencies_ms = {};
+        return value;
+    }());
+    std::vector<Request> requests;
+    requests.emplace_back(make_request(RequestId{0}, 8, 1,
+                                       frontier::SessionId{23}));
+    requests.emplace_back(make_request(RequestId{1}, 12, 1,
+                                       frontier::SessionId{23}));
+    for (Request &request : requests) {
+        request.on_arrival(SimTime::from_seconds(0.0));
+    }
+
+    frontier::config::ResolvedCpuKVCacheTargetConfig cpu{};
+    cpu.enabled = true;
+    cpu.capacity_bytes = 1'600;
+    cpu.capacity_blocks = 16;
+    cpu.bytes_per_block = 100;
+    cpu.d2h_bandwidth_gbps = 1.0;
+    cpu.d2h_latency_ms = 0.1;
+    cpu.h2d_bandwidth_gbps = 1.0;
+    cpu.h2d_latency_ms = 0.1;
+    ClusterSchedulerConfig routing{};
+    routing.type = ClusterSchedulerType::kCacheAware;
+    routing.cache_threshold = 0.5;
+    CacheAwareClusterScheduler scheduler{
+        cluster, requests, predictor, nullptr,
+        frontier::config::PrefixCacheConfig{
+            true, frontier::config::PrefixCachingKeyMode::kSession},
+        cpu, routing};
+
+    scheduler.add_request(RequestId{0}, SimTime::from_seconds(0.0));
+    const auto producer = scheduler.schedule();
+    expect(producer.size() == 1 &&
+               producer.front().replica_id == ReplicaId{0},
+           "first CPU-backed session turn must use stable placement");
+    BaseReplicaScheduler &affinity_target =
+        scheduler.get_replica_scheduler(ReplicaId{0}, DataParallelId{0});
+    auto *cpu_manager = affinity_target.cpu_kv_cache_manager();
+    expect(cpu_manager != nullptr,
+           "PREFILL cache-aware target must own a CPU KV cache");
+    const auto reservation = cpu_manager->reserve_offload(
+        frontier::SessionId{23}, frontier::CpuOffloadGeneration{1}, 2,
+        SimTime::from_seconds(0.0));
+    expect(reservation.requires_transfer() &&
+               cpu_manager->commit_offload(reservation.reservation_id,
+                                           SimTime::from_seconds(0.001)),
+           "test CPU prefix must commit");
+    expect(affinity_target.gpu_cache_valid_prefix_blocks(
+               frontier::SessionId{23}) == 0,
+           "CPU-affinity regression must not rely on a GPU cache hit");
+
+    scheduler.add_request(RequestId{1}, SimTime::from_seconds(1.0));
+    const auto reused = scheduler.schedule();
+    expect(reused.size() == 1 &&
+               reused.front().replica_id == ReplicaId{0},
+           "CPU prefix hit above threshold must preserve session affinity");
+}
+
+void test_actual_cache_aware_migration_discards_old_cpu_kv() {
+    frontier::config::ClusterRuntimeConfig runtime;
+    runtime.parallelism.num_replicas = 2;
+    runtime.scheduler = scheduler_config();
+    Cluster cluster{ClusterType::kPrefill, runtime};
+    const auto predictor = std::make_shared<FixedExecutionTimePredictor>([&]() {
+        frontier::config::FixedExecutionModelConfig value{};
+        value.batch_latency_ms = 0.0;
+        value.stage_latencies_ms = {};
+        return value;
+    }());
+    std::vector<Request> requests;
+    requests.emplace_back(make_request(RequestId{0}, 8, 1,
+                                       frontier::SessionId{29}));
+    requests.emplace_back(make_request(RequestId{1}, 12, 1,
+                                       frontier::SessionId{29}));
+    for (Request &request : requests) {
+        request.on_arrival(SimTime::from_seconds(0.0));
+    }
+
+    frontier::config::ResolvedCpuKVCacheTargetConfig cpu{};
+    cpu.enabled = true;
+    cpu.capacity_bytes = 1'600;
+    cpu.capacity_blocks = 16;
+    cpu.bytes_per_block = 100;
+    cpu.d2h_bandwidth_gbps = 1.0;
+    cpu.d2h_latency_ms = 0.1;
+    cpu.h2d_bandwidth_gbps = 1.0;
+    cpu.h2d_latency_ms = 0.1;
+    ClusterSchedulerConfig routing{};
+    routing.type = ClusterSchedulerType::kCacheAware;
+    routing.cache_threshold = 0.8;
+    CacheAwareClusterScheduler scheduler{
+        cluster, requests, predictor, nullptr,
+        frontier::config::PrefixCacheConfig{
+            true, frontier::config::PrefixCachingKeyMode::kSession},
+        cpu, routing};
+
+    scheduler.add_request(RequestId{0}, SimTime::from_seconds(0.0));
+    const auto producer = scheduler.schedule();
+    expect(producer.size() == 1 &&
+               producer.front().replica_id == ReplicaId{0},
+           "CPU migration producer must start on the stable first target");
+    BaseReplicaScheduler &old_target =
+        scheduler.get_replica_scheduler(ReplicaId{0}, DataParallelId{0});
+    auto *old_cpu = old_target.cpu_kv_cache_manager();
+    expect(old_cpu != nullptr, "old PREFILL target must own CPU KV");
+    complete_single_monolithic_iteration(old_target, requests[0], BatchId{0});
+    const auto reservation = old_cpu->reserve_offload(
+        frontier::SessionId{29}, frontier::CpuOffloadGeneration{1}, 2,
+        SimTime::from_seconds(0.0));
+    expect(reservation.requires_transfer() &&
+               old_cpu->commit_offload(reservation.reservation_id,
+                                       SimTime::from_seconds(0.001)),
+           "CPU migration fixture must seed the old target");
+    old_target.complete_kv_transfer(RequestId{0});
+
+    scheduler.add_request(RequestId{1}, SimTime::from_seconds(1.0));
+    const auto migrated = scheduler.schedule();
+    expect(migrated.size() == 1 &&
+               migrated.front().replica_id == ReplicaId{1},
+           "tiered hit below threshold must migrate to the next empty target");
+    expect(old_cpu->lookup(frontier::SessionId{29}, 3).hit_blocks == 0 &&
+               old_cpu->diagnostics().materialized_blocks == 0,
+           "migration must invalidate and physically reap inactive old CPU KV");
+}
+
 } // namespace
 
 int main() {
@@ -459,7 +715,19 @@ int main() {
         "stage-specific factory and observable routing policies",
         test_stage_specific_factory_and_observable_routing_policies);
     failures += frontier::test::run(
+        "KV-aware PREFILL routing avoids virtual commitments",
+        test_kv_aware_prefill_avoids_virtual_commitment);
+    failures += frontier::test::run(
         "actual cache-aware routing migrates and discards old GPU KV",
         test_actual_cache_aware_routing_migrates_and_discards_old_gpu_kv);
+    failures += frontier::test::run(
+        "actual cache-aware routing waits for session owner release",
+        test_actual_cache_aware_routing_waits_for_session_owner_release);
+    failures += frontier::test::run(
+        "actual cache-aware routing keeps CPU-hit affinity",
+        test_actual_cache_aware_routing_keeps_cpu_hit_affinity);
+    failures += frontier::test::run(
+        "actual cache-aware migration discards old CPU KV",
+        test_actual_cache_aware_migration_discards_old_cpu_kv);
     return failures == 0 ? 0 : 1;
 }

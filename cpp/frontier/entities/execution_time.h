@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <tuple>
 
 namespace frontier::entities {
@@ -27,6 +28,10 @@ struct ExecutionTime {
     double moe_ep_aggregation_extra_ms = 0.0;
     double synchronization_unattributed_wait_ms = 0.0;
     double synchronization_attribution_overlap_ms = 0.0;
+    // Exact demand-side work for the attention context of this execution
+    // stage's PREFILL slices.  This is instrumentation only and deliberately
+    // does not contribute to total_ms().
+    std::uint64_t prefill_attention_token_pairs = 0;
 
     [[nodiscard]] double total_ms() const noexcept {
         return dense_compute_ms + lm_head_ms + tp_communication_ms +
@@ -50,7 +55,8 @@ struct ExecutionTime {
                    lhs.dp_output_communication_ms, lhs.synchronization_wait_ms,
                    lhs.moe_pre_barrier_wait_ms, lhs.moe_ep_aggregation_extra_ms,
                    lhs.synchronization_unattributed_wait_ms,
-                   lhs.synchronization_attribution_overlap_ms) ==
+                   lhs.synchronization_attribution_overlap_ms,
+                   lhs.prefill_attention_token_pairs) ==
                std::tie(
                    rhs.dense_compute_ms, rhs.lm_head_ms,
                    rhs.tp_communication_ms, rhs.pp_communication_ms,
@@ -62,7 +68,8 @@ struct ExecutionTime {
                    rhs.dp_output_communication_ms, rhs.synchronization_wait_ms,
                    rhs.moe_pre_barrier_wait_ms, rhs.moe_ep_aggregation_extra_ms,
                    rhs.synchronization_unattributed_wait_ms,
-                   rhs.synchronization_attribution_overlap_ms);
+                   rhs.synchronization_attribution_overlap_ms,
+                   rhs.prefill_attention_token_pairs);
     }
 };
 

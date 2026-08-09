@@ -31,19 +31,19 @@ def test_default_rates_and_labels() -> None:
         runner.parse_rates("0.05,0.05")
 
 
-def test_default_horizons_reproduce_anchor_runs() -> None:
+def test_default_horizons_for_one_thousand_sessions() -> None:
     def end(rate: float) -> float:
         return runner.simulation_end_time_s(
-            sample_sessions=3000,
+            sample_sessions=runner.DEFAULT_SAMPLE_SESSIONS,
             rate=rate,
             repetitions=2,
             drain_fraction=0.4,
             minimum_drain_seconds=15000.0,
         )
 
-    assert end(0.05) == pytest.approx(144000.0)
-    assert end(0.08) == pytest.approx(90000.0)
-    assert end(0.10) == pytest.approx(75000.0)
+    assert end(0.05) == pytest.approx(55000.0)
+    assert end(0.08) == pytest.approx(40000.0)
+    assert end(0.10) == pytest.approx(35000.0)
 
 
 def test_build_config_only_overrides_experiment_routing() -> None:
@@ -65,6 +65,8 @@ def test_build_config_only_overrides_experiment_routing() -> None:
     }
     assert config["cpu_kv_cache"]["enabled"] is False
     assert config["clusters"]["prefill"]["parallelism"]["data_parallel_size"] == 8
+    assert config["clusters"]["prefill"]["scheduler"]["enable_chunked_prefill"] is True
+    assert config["clusters"]["prefill"]["scheduler"]["long_prefill_token_threshold"] == 1024
     assert config["clusters"]["decode"]["parallelism"]["data_parallel_size"] == 3
     assert config["clusters"]["decode"]["parallelism"]["decode_context_parallel_size"] == 8
 

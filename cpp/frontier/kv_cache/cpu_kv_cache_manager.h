@@ -52,6 +52,7 @@ struct CpuKVCacheStats {
     std::uint64_t peak_resident_blocks = 0;
     std::uint64_t peak_reserved_blocks = 0;
     std::uint64_t stale_generation_completions = 0;
+    std::uint64_t discarded_offload_completions = 0;
     std::uint64_t sessions_with_hits = 0;
 };
 
@@ -84,6 +85,9 @@ class CpuKVCacheManager {
     [[nodiscard]] bool commit_offload(CpuOffloadReservationId reservation_id,
                                       SimTime completed_at);
     [[nodiscard]] bool abort_offload(CpuOffloadReservationId reservation_id);
+    [[nodiscard]] bool discard_session(SessionId session_id);
+    [[nodiscard]] bool
+    session_discard_pending(SessionId session_id) const noexcept;
 
     [[nodiscard]] CpuRestoreLeaseId pin_restore(
         SessionId session_id, std::uint64_t begin_block,
@@ -128,6 +132,7 @@ class CpuKVCacheManager {
                            StrongIdHash<CpuOffloadReservationId>>
             active_reservations;
         std::uint64_t aggregate_restore_pins = 0;
+        bool discard_pending = false;
     };
 
     struct OffloadReservation {
@@ -142,6 +147,7 @@ class CpuKVCacheManager {
         std::vector<CpuBlockId> block_ids;
         SimTime submitted_at;
         bool truncated = false;
+        bool retired_completion_received = false;
         CpuOffloadReservationState state =
             CpuOffloadReservationState::kPending;
     };
@@ -162,6 +168,7 @@ class CpuKVCacheManager {
         std::uint64_t required, SessionId excluded_session);
     void advance_committed_frontier(SessionState &session);
     void erase_session_if_empty(SessionId session_id);
+    void maybe_reap_discarded_session(SessionId session_id);
     void record_occupancy_peaks() noexcept;
     // Hot-path accounting checks intentionally avoid traversing every block,
     // session, reservation, and lease.  Full structural validation remains

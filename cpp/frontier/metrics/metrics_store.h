@@ -113,6 +113,7 @@ class MetricsStore {
     SimulationOutput output_;
     bool detailed_traces_enabled_ = true;
     bool gpu_kv_occupancy_enabled_ = true;
+    bool arrival_demand_collected_ = false;
     std::map<OccupancyTarget, std::size_t> occupancy_positions_;
 };
 

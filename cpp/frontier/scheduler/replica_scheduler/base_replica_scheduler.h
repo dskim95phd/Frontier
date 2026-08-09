@@ -145,6 +145,13 @@ class BaseReplicaScheduler {
     [[nodiscard]] virtual std::size_t running_count() const noexcept = 0;
     [[nodiscard]] virtual std::uint64_t
     allocated_kv_blocks() const noexcept = 0;
+    // Future-only KV blocks held by a full-sequence PREFILL commitment. The
+    // default keeps non-vLLM/legacy schedulers source-compatible; cluster
+    // routing adds this to allocated_kv_blocks() when estimating target load.
+    [[nodiscard]] virtual std::uint64_t
+    virtual_committed_kv_blocks() const noexcept {
+        return 0;
+    }
     [[nodiscard]] virtual std::uint64_t
     available_kv_blocks() const noexcept {
         return 0;
@@ -164,13 +171,38 @@ class BaseReplicaScheduler {
     gpu_prefix_cache_lookup(const entities::Request &request) const {
         return kv_blocks_.lookup(request);
     }
+    [[nodiscard]] kv_cache::PrefixLookupResult
+    tiered_prefix_cache_lookup(const entities::Request &request) const {
+        kv_cache::PrefixLookupResult result =
+            gpu_prefix_cache_lookup(request);
+        const kv_cache::CpuKVCacheManager *cpu = cpu_kv_cache_manager();
+        if (cpu != nullptr) {
+            const kv_cache::CpuPrefixLookupResult cpu_result =
+                cpu->lookup(request.session_id(), result.query_blocks);
+            if (cpu_result.hit_blocks > result.hit_blocks) {
+                result.hit_blocks = cpu_result.hit_blocks;
+            }
+        }
+        return result;
+    }
     [[nodiscard]] std::uint64_t
     discard_gpu_prefix_cache_session(SessionId session_id) {
         return kv_blocks_.discard_session(session_id);
     }
+    virtual void discard_tiered_prefix_cache_session(SessionId session_id) {
+        static_cast<void>(discard_gpu_prefix_cache_session(session_id));
+        kv_cache::CpuKVCacheManager *cpu = cpu_kv_cache_manager();
+        if (cpu != nullptr) {
+            static_cast<void>(cpu->discard_session(session_id));
+        }
+    }
     [[nodiscard]] std::uint64_t
     gpu_cache_valid_prefix_blocks(SessionId session_id) const noexcept {
         return kv_blocks_.gpu_cache_valid_prefix_blocks(session_id);
+    }
+    [[nodiscard]] bool
+    session_has_active_kv_request(SessionId session_id) const noexcept {
+        return kv_blocks_.session_has_active_request(session_id);
     }
     [[nodiscard]] virtual const kv_cache::PrefixCacheStats &
     prefix_cache_stats() const noexcept = 0;
@@ -178,6 +210,10 @@ class BaseReplicaScheduler {
     prefix_cache_diagnostics() const = 0;
     [[nodiscard]] virtual const kv_cache::CpuKVCacheManager *
     cpu_kv_cache_manager() const noexcept {
+        return nullptr;
+    }
+    [[nodiscard]] virtual kv_cache::CpuKVCacheManager *
+    cpu_kv_cache_manager() noexcept {
         return nullptr;
     }
     [[nodiscard]] virtual const config::ResolvedCpuKVCacheTargetConfig *

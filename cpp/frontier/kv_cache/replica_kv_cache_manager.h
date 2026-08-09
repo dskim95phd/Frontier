@@ -43,6 +43,12 @@ struct PrefixCacheDiagnostics {
     std::uint64_t evictable_blocks = 0;
     std::uint64_t evictable_sessions = 0;
     std::uint64_t sessions_with_nonzero_frontier = 0;
+    // Logical KV capacity reserved by active physical blocks plus any
+    // PREFILL-only virtual commitments.  The latter is future-only: blocks
+    // already materialized for a request are counted in active_blocks.
+    std::uint64_t committed_blocks = 0;
+    std::uint64_t virtual_committed_blocks = 0;
+    std::uint64_t available_commitment_blocks = 0;
 };
 
 // Analytical, session-scoped append-only KV cache. Physical block identity is
@@ -59,24 +65,45 @@ class ReplicaKVCacheManager {
     lookup(const entities::Request &request) const;
     [[nodiscard]] bool can_admit(RequestId request_id, SessionId session_id,
                                  std::uint64_t cached_tokens,
-                                 std::uint64_t scheduled_tokens) const;
+                                 std::uint64_t scheduled_tokens,
+                                 std::uint64_t full_sequence_tokens = 0) const;
     void admit(RequestId request_id, SessionId session_id,
-               std::uint64_t cached_tokens, std::uint64_t scheduled_tokens);
-    [[nodiscard]] bool can_admit_tiered(
-        RequestId request_id, SessionId session_id,
-        std::uint64_t reusable_frontier_blocks,
-        std::uint64_t scheduled_tokens) const;
+               std::uint64_t cached_tokens, std::uint64_t scheduled_tokens,
+               std::uint64_t full_sequence_tokens = 0);
+    [[nodiscard]] bool
+    can_admit_tiered(RequestId request_id, SessionId session_id,
+                     std::uint64_t reusable_frontier_blocks,
+                     std::uint64_t scheduled_tokens,
+                     std::uint64_t full_sequence_tokens = 0) const;
     void admit_tiered(RequestId request_id, SessionId session_id,
                       std::uint64_t reusable_frontier_blocks,
-                      std::uint64_t scheduled_tokens);
+                      std::uint64_t scheduled_tokens,
+                      std::uint64_t full_sequence_tokens = 0);
     void record_successful_admission(std::uint64_t query_blocks,
                                      std::uint64_t hit_blocks);
 
-    [[nodiscard]] bool can_reserve(RequestId request_id,
-                                   std::uint64_t kv_accounted_tokens,
-                                   std::uint64_t scheduled_tokens) const;
+    [[nodiscard]] bool
+    can_reserve(RequestId request_id, std::uint64_t kv_accounted_tokens,
+                std::uint64_t scheduled_tokens,
+                std::uint64_t full_sequence_tokens = 0) const;
     void reserve(RequestId request_id, std::uint64_t kv_accounted_tokens,
-                 std::uint64_t scheduled_tokens);
+                 std::uint64_t scheduled_tokens,
+                 std::uint64_t full_sequence_tokens = 0);
+
+    // PREFILL admission can reserve the complete prompt before an asynchronous
+    // CPU/KV restore begins.  The commitment is future-only; materialization
+    // moves its own blocks into the physical allocation atomically.
+    void enable_full_sequence_commitments(bool enabled = true);
+    [[nodiscard]] bool full_sequence_commitments_enabled() const noexcept {
+        return full_sequence_commitments_enabled_;
+    }
+    [[nodiscard]] bool can_commit(RequestId request_id,
+                                  std::uint64_t full_sequence_tokens) const;
+    [[nodiscard]] bool can_commit(RequestId request_id, SessionId session_id,
+                                  std::uint64_t full_sequence_tokens) const;
+    void commit_virtual(RequestId request_id, SessionId session_id,
+                        std::uint64_t full_sequence_tokens);
+    void release_commitment(RequestId request_id);
     [[nodiscard]] std::uint64_t free(RequestId request_id);
     // Drop every GPU-resident block for a session. If the session still has
     // an active request, the drop is deferred until that request releases its
@@ -89,6 +116,22 @@ class ReplicaKVCacheManager {
     [[nodiscard]] std::uint64_t total_allocated_blocks() const noexcept {
         return active_blocks_;
     }
+    // Future-only blocks held by PREFILL full-sequence commitments.
+    [[nodiscard]] std::uint64_t virtual_committed_blocks() const noexcept {
+        return virtual_committed_blocks_;
+    }
+    [[nodiscard]] std::uint64_t committed_blocks() const noexcept {
+        return active_blocks_ + virtual_committed_blocks_;
+    }
+    [[nodiscard]] std::uint64_t available_commitment_blocks() const noexcept {
+        return capacity_blocks_ - committed_blocks();
+    }
+    [[nodiscard]] std::uint64_t
+    request_committed_blocks(RequestId request_id) const noexcept;
+    [[nodiscard]] std::uint64_t
+    request_virtual_committed_blocks(RequestId request_id) const noexcept;
+    [[nodiscard]] bool
+    full_sequence_fits_empty(std::uint64_t full_sequence_tokens) const;
     [[nodiscard]] std::uint64_t available_blocks() const noexcept {
         return capacity_blocks_ - active_blocks_;
     }
@@ -110,6 +153,8 @@ class ReplicaKVCacheManager {
     }
     [[nodiscard]] std::uint64_t
     gpu_cache_valid_prefix_blocks(SessionId session_id) const noexcept;
+    [[nodiscard]] bool
+    session_has_active_request(SessionId session_id) const noexcept;
     [[nodiscard]] const PrefixCacheStats &stats() const noexcept {
         return stats_;
     }
@@ -126,6 +171,9 @@ class ReplicaKVCacheManager {
         SessionId session_id;
         std::uint64_t allocated_blocks = 0;
         std::uint64_t published_blocks = 0;
+        // Total logical target for this request.  In PREFILL commitment mode
+        // this may exceed allocated_blocks while the suffix is virtual.
+        std::uint64_t committed_blocks = 0;
     };
 
     [[nodiscard]] static std::uint64_t ceil_div(std::uint64_t numerator,
@@ -133,6 +181,9 @@ class ReplicaKVCacheManager {
     [[nodiscard]] std::uint64_t additional_blocks_required(
         RequestId request_id, std::uint64_t kv_accounted_tokens,
         std::uint64_t scheduled_tokens, bool for_materialization) const;
+    [[nodiscard]] std::uint64_t
+    full_sequence_blocks(std::uint64_t full_sequence_tokens) const;
+    [[nodiscard]] bool can_commit_blocks(std::uint64_t blocks) const;
     void consume_available_blocks(std::uint64_t blocks);
     void remove_from_evictable_lru(SessionCacheEntry &entry);
     void append_to_evictable_lru(SessionId session_id,
@@ -144,6 +195,7 @@ class ReplicaKVCacheManager {
     bool prefix_cache_enabled_;
     std::uint64_t capacity_blocks_;
     std::uint64_t active_blocks_ = 0;
+    std::uint64_t virtual_committed_blocks_ = 0;
     std::uint64_t blank_blocks_;
     std::uint64_t evictable_blocks_ = 0;
     std::uint64_t resident_blocks_ = 0;
@@ -153,8 +205,8 @@ class ReplicaKVCacheManager {
         allocations_;
     std::unordered_map<SessionId, SessionCacheEntry, StrongIdHash<SessionId>>
         sessions_;
-    std::unordered_set<SessionId, StrongIdHash<SessionId>>
-        discard_on_release_;
+    std::unordered_set<SessionId, StrongIdHash<SessionId>> discard_on_release_;
+    bool full_sequence_commitments_enabled_ = false;
     PrefixCacheStats stats_;
 };
 

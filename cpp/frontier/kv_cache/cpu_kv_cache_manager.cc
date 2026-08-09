@@ -20,7 +20,8 @@ CpuKVCacheManager::lookup(SessionId session_id,
                           std::uint64_t query_blocks) const noexcept {
     CpuPrefixLookupResult result{query_blocks, 0};
     const auto position = sessions_.find(session_id);
-    if (!session_id.valid() || position == sessions_.end()) {
+    if (!session_id.valid() || position == sessions_.end() ||
+        position->second.discard_pending) {
         return result;
     }
     result.hit_blocks = std::min(
@@ -177,6 +178,57 @@ void CpuKVCacheManager::erase_session_if_empty(SessionId session_id) {
     }
 }
 
+void CpuKVCacheManager::maybe_reap_discarded_session(SessionId session_id) {
+    auto position = sessions_.find(session_id);
+    if (position == sessions_.end() || !position->second.discard_pending ||
+        position->second.aggregate_restore_pins != 0) {
+        return;
+    }
+    SessionState &session = position->second;
+    for (const CpuOffloadReservationId reservation_id :
+         session.active_reservations) {
+        const auto reservation = reservations_.find(reservation_id);
+        if (reservation == reservations_.end() ||
+            reservation->second.state !=
+                CpuOffloadReservationState::kPending) {
+            throw CpuKVCacheError(
+                "discarded CPU session has an invalid reservation");
+        }
+        if (!reservation->second.retired_completion_received) {
+            return;
+        }
+    }
+
+    std::uint64_t discarded_resident = 0;
+    std::vector<CpuBlockId> discarded_blocks;
+    discarded_blocks.reserve(session.blocks.size());
+    for (const auto &[index, block_id] : session.blocks) {
+        static_cast<void>(index);
+        const auto block = blocks_.find(block_id);
+        if (block == blocks_.end() || block->second.pin_count != 0) {
+            throw CpuKVCacheError(
+                "discarded CPU session retained an invalid block");
+        }
+        discarded_resident += static_cast<std::uint64_t>(
+            block->second.state == CpuBlockState::kCommitted);
+        discarded_blocks.push_back(block_id);
+    }
+    for (const CpuBlockId block_id : discarded_blocks) {
+        free_block(block_id);
+    }
+    for (const CpuOffloadReservationId reservation_id :
+         session.active_reservations) {
+        OffloadReservation &reservation = reservations_.at(reservation_id);
+        reservation.state = CpuOffloadReservationState::kAborted;
+        std::vector<CpuBlockId>{}.swap(reservation.block_ids);
+    }
+    const bool materialized = !session.blocks.empty();
+    stats_.evicted_blocks += discarded_resident;
+    stats_.evicted_sessions += static_cast<std::uint64_t>(materialized);
+    session.active_reservations.clear();
+    sessions_.erase(position);
+}
+
 void CpuKVCacheManager::record_occupancy_peaks() noexcept {
     stats_.peak_resident_blocks =
         std::max(stats_.peak_resident_blocks, resident_blocks_);
@@ -191,6 +243,13 @@ CpuOffloadReservationResult CpuKVCacheManager::reserve_offload(
         throw CpuKVCacheError("invalid CPU offload reservation identity/time");
     }
     auto existing = sessions_.find(session_id);
+    if (existing != sessions_.end() && existing->second.discard_pending) {
+        CpuOffloadReservationResult result{};
+        result.desired_frontier_blocks = desired_frontier_blocks;
+        result.skipped = true;
+        ++stats_.skipped_offloads;
+        return result;
+    }
     if (existing != sessions_.end() &&
         existing->second.latest_submitted_generation.valid() &&
         generation <= existing->second.latest_submitted_generation) {
@@ -312,6 +371,14 @@ bool CpuKVCacheManager::commit_offload(
         throw CpuKVCacheError("CPU offload session disappeared");
     }
     SessionState &session = session_position->second;
+    if (session.discard_pending) {
+        reservation.retired_completion_received = true;
+        const SessionId session_id = reservation.session_id;
+        ++stats_.discarded_offload_completions;
+        maybe_reap_discarded_session(session_id);
+        validate_local_invariants();
+        return true;
+    }
     if (session.latest_committed_generation.valid() &&
         reservation.generation < session.latest_committed_generation) {
         ++stats_.stale_generation_completions;
@@ -395,6 +462,26 @@ bool CpuKVCacheManager::abort_offload(
     return true;
 }
 
+bool CpuKVCacheManager::discard_session(SessionId session_id) {
+    if (!session_id.valid()) {
+        return false;
+    }
+    auto position = sessions_.find(session_id);
+    if (position == sessions_.end()) {
+        return false;
+    }
+    position->second.discard_pending = true;
+    maybe_reap_discarded_session(session_id);
+    validate_local_invariants();
+    return true;
+}
+
+bool CpuKVCacheManager::session_discard_pending(
+    SessionId session_id) const noexcept {
+    const auto position = sessions_.find(session_id);
+    return position != sessions_.end() && position->second.discard_pending;
+}
+
 CpuRestoreLeaseId CpuKVCacheManager::pin_restore(
     SessionId session_id, std::uint64_t begin_block,
     std::uint64_t end_block, SimTime started_at) {
@@ -404,6 +491,7 @@ CpuRestoreLeaseId CpuKVCacheManager::pin_restore(
     }
     auto position = sessions_.find(session_id);
     if (position == sessions_.end() ||
+        position->second.discard_pending ||
         end_block > position->second.committed_frontier_blocks) {
         throw CpuKVCacheError("CPU restore range is not committed");
     }
@@ -476,13 +564,14 @@ bool CpuKVCacheManager::release_restore(CpuRestoreLeaseId lease_id, bool used,
         --block.pin_count;
         --session.aggregate_restore_pins;
     }
-    if (used) {
+    if (used && !session.discard_pending) {
         session.last_access_time = released_at;
     }
     lease.released = true;
     // Keep only the terminal lease metadata needed for duplicate-release
     // idempotency; release the vector's backing allocation as well.
     std::vector<CpuBlockId>{}.swap(lease.block_ids);
+    maybe_reap_discarded_session(lease.session_id);
     validate_local_invariants();
     return true;
 }
@@ -490,7 +579,7 @@ bool CpuKVCacheManager::release_restore(CpuRestoreLeaseId lease_id, bool used,
 std::uint64_t CpuKVCacheManager::committed_frontier_blocks(
     SessionId session_id) const noexcept {
     const auto position = sessions_.find(session_id);
-    return position == sessions_.end()
+    return position == sessions_.end() || position->second.discard_pending
                ? 0
                : position->second.committed_frontier_blocks;
 }
