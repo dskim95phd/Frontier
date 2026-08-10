@@ -967,6 +967,13 @@ void test_kimi_k2_dcp_adds_decode_collectives() {
         batch, requests, frontier::StageId{0});
     const auto dcp_stage = dcp.predict_stage_execution_time(
         batch, requests, frontier::StageId{0});
+    const auto routing_tp_total = [](const auto &prediction) {
+        double total = 0.0;
+        for (const auto &diagnostic : prediction.moe_routing) {
+            total += diagnostic.pre_moe_tp_communication_ms;
+        }
+        return total;
+    };
     expect(diagnostic_value(replicated_stage,
                             "dcp_attention_communication_ms") == 0.0 &&
                diagnostic_value(dcp_stage,
@@ -974,6 +981,12 @@ void test_kimi_k2_dcp_adds_decode_collectives() {
                dcp_stage.execution_time.tp_communication_ms >
                    replicated_stage.execution_time.tp_communication_ms,
            "MLA DCP decode must add all-gather/reduce-scatter communication");
+    expect(routing_tp_total(dcp_stage) >
+               routing_tp_total(replicated_stage) &&
+               std::abs(routing_tp_total(dcp_stage) -
+                        dcp_stage.execution_time.tp_communication_ms) < 1e-12,
+           "MLA DCP communication must be attached to the per-MoE-layer "
+           "decode arrivals consumed by the scheduler");
     expect_approximately_equal(
         diagnostic_value(dcp_stage,
                          "kv_cache_rank_local_bytes_per_token_per_layer"),

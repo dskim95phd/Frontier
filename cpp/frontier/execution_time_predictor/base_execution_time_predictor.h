@@ -17,6 +17,9 @@ struct MoERoutingDiagnostic {
     LayerId layer_id;
     std::uint64_t model_layer_id = 0;
     double pre_moe_compute_ms = 0.0;
+    // Attention TP/DCP communication that must finish before routing and
+    // expert execution can begin for this MoE layer.
+    double pre_moe_tp_communication_ms = 0.0;
     std::uint64_t input_tokens = 0;
     std::uint64_t routed_tokens = 0;
     std::vector<std::uint64_t> global_expert_tokens;
@@ -33,7 +36,11 @@ struct ExecutionTimePrediction {
     std::vector<MoERoutingDiagnostic> moe_routing;
     std::uint64_t logical_moe_layer_count = 0;
     double repeated_moe_layer_pre_compute_ms = 0.0;
+    double repeated_moe_layer_pre_tp_communication_ms = 0.0;
     double moe_suffix_compute_ms = 0.0;
+    // TP/DCP communication belonging to dense layers after the final MoE
+    // layer in this pipeline stage.
+    double moe_suffix_tp_communication_ms = 0.0;
     bool lazy_moe_layer_prediction = false;
     bool scaled_moe_layer_prediction = false;
 };

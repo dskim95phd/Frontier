@@ -117,6 +117,9 @@ FixedExecutionTimePredictor::predict_stage_execution_time(
                 value.model_layer_id = model_layer;
                 value.pre_moe_compute_ms = execution_time.dense_compute_ms /
                                            static_cast<double>(moe_layer_count);
+                value.pre_moe_tp_communication_ms =
+                    execution_time.tp_communication_ms /
+                    static_cast<double>(moe_layer_count);
                 value.input_tokens = allocation.input_tokens;
                 value.routed_tokens = allocation.routed_tokens;
                 value.global_expert_tokens = allocation.global_expert_tokens;

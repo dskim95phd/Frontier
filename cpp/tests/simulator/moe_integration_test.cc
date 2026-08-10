@@ -935,6 +935,73 @@ void test_kimi_k2_first_layer_scaled_preserves_pdd_completion_time() {
            "scaled PDD MoE layers must materially reduce detailed records");
 }
 
+void test_generic_moe_decode_waits_for_attention_tp_communication() {
+    auto config = load_config("fixed_moe_local_colocation.json");
+    auto &runtime = config.cluster();
+    // Keep MoE-TP disabled. TP2/DP1 and MoE-TP1/EP2 describe the same
+    // two-GPU domain and exercise synchronized decode independently of Kimi.
+    runtime.parallelism.tensor_parallel_size = 2;
+    runtime.parallelism.pipeline_parallel_size = 2;
+    runtime.parallelism.data_parallel_size = 1;
+    runtime.parallelism.moe_tensor_parallel_size = 1;
+    runtime.parallelism.moe_expert_parallel_size = 2;
+
+    const auto output = run_simulation(
+        config,
+        parse_workload_csv(
+            "session_start_at,think_time,num_prefill_tokens,num_decode_tokens\n"
+            "0,0,4,2\n"));
+
+    bool checked_decode_arrival = false;
+    for (const frontier::Event &event : output.event_trace) {
+        if (event.type() != EventType::kDecodeSync) {
+            continue;
+        }
+        const auto &payload = event.as<frontier::DecodeSyncPayload>();
+        if (payload.is_idle ||
+            payload.sync_phase != frontier::MoESyncPhase::kPreMoe) {
+            continue;
+        }
+        const auto stage_layers = frontier::config::pipeline_stage_layer_range(
+            runtime.model.num_layers,
+            runtime.parallelism.pipeline_parallel_size,
+            payload.stage_id.index());
+        std::uint64_t moe_layer_count = 0;
+        for (std::uint64_t layer = stage_layers.begin;
+             layer < stage_layers.end; ++layer) {
+            moe_layer_count += runtime.model.is_moe_layer(layer) ? 1 : 0;
+        }
+        expect(moe_layer_count > 0,
+               "decode MoE synchronization requires a MoE layer");
+        const double latency_ms = runtime.execution_model.fixed
+                                      .stage_latencies_ms
+                                      .at(payload.stage_id.index());
+        const double component_ms =
+            latency_ms * static_cast<double>(stage_layers.size());
+        const double expected_compute_ms =
+            7.0 * component_ms / static_cast<double>(moe_layer_count);
+        const double expected_tp_ms =
+            component_ms / static_cast<double>(moe_layer_count);
+        const double preceding_ep_ms =
+            payload.layer_id == frontier::LayerId{0}
+                ? 0.0
+                : 2.0 * component_ms /
+                      static_cast<double>(moe_layer_count);
+        expect(std::abs(payload.elapsed_component_ms -
+                        (expected_compute_ms + expected_tp_ms +
+                         preceding_ep_ms)) < 1e-12,
+               "decode pre-MoE arrival must wait for attention compute and "
+               "TP communication: elapsed=" +
+                   std::to_string(payload.elapsed_component_ms) +
+                   " compute=" + std::to_string(expected_compute_ms) +
+                   " tp=" + std::to_string(expected_tp_ms));
+        checked_decode_arrival = true;
+    }
+    expect(checked_decode_arrival,
+           "regression must exercise a real synchronized decode pre-MoE "
+           "arrival with TP communication");
+}
+
 } // namespace
 
 int main() {
@@ -969,5 +1036,8 @@ int main() {
     failures += frontier::test::run(
         "Kimi K2 first-layer-scaled PDD completion",
         test_kimi_k2_first_layer_scaled_preserves_pdd_completion_time);
+    failures += frontier::test::run(
+        "generic MoE decode waits for attention TP communication",
+        test_generic_moe_decode_waits_for_attention_tp_communication);
     return failures == 0 ? 0 : 1;
 }

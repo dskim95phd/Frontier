@@ -307,6 +307,7 @@ class BaseClusterScheduler {
         std::uint64_t layers_per_stage = 0;
         std::uint64_t current_layer = 0;
         std::vector<double> pre_moe_compute_ms_by_layer;
+        std::vector<double> pre_moe_tp_communication_ms_by_layer;
         std::vector<double> prefill_post_attention_ms_by_layer;
         double decode_ep_communication_ms_per_layer = 0.0;
         double decode_dp_communication_ms_per_layer = 0.0;
@@ -314,11 +315,13 @@ class BaseClusterScheduler {
         std::vector<execution_time_predictor::MoERoutingDiagnostic>
             moe_routing_by_layer;
         double suffix_compute_ms = 0.0;
+        double suffix_tp_communication_ms = 0.0;
         double lm_head_ms = 0.0;
         double pp_ms = 0.0;
         double remaining_moe_layer_wait_ms = 0.0;
         std::uint64_t remaining_scaled_moe_layers = 0;
         double repeated_moe_layer_pre_compute_ms = 0.0;
+        double repeated_moe_layer_pre_tp_communication_ms = 0.0;
         bool lazy_layer_prediction = false;
     };
 
