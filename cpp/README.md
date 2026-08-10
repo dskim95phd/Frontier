@@ -158,14 +158,16 @@ target is available. `cache_aware` queries the actual GPU-resident prefix and
 may migrate to a least-loaded target; migration discards the old target's
 session KV.
 
-### Automatic GPU KV-block capacity
+### GPU HBM and KV-block capacity
 
-Analytical clusters may omit `scheduler.num_blocks` and provide physical HBM
-capacity instead:
+Every cluster must provide its physical per-GPU HBM capacity. Analytical
+clusters may either keep an explicit `scheduler.num_blocks` value or omit it
+and request automatic block sizing:
 
 ```json
 "gpu_memory": {
   "capacity_bytes_per_gpu": 288000000000,
+  "auto_calculate_num_blocks": true,
   "runtime_reserve_fraction": 0.10,
   "runtime_reserve_bytes": 0,
   "weight_overhead_fraction": 0.0
@@ -181,9 +183,11 @@ therefore all affect the resolved block count. `config.normalized.json` emits
 `model_weight_bytes_per_gpu`, `kv_cache_budget_bytes_per_gpu`,
 `kv_cache_bytes_per_block`, and the resolved `scheduler.num_blocks` for audit.
 
-Configs without `gpu_memory` retain the explicit legacy contract and must set
-`scheduler.num_blocks`. Automatic sizing is rejected for fixed-latency
-execution models because they do not carry a weight-precision contract.
+For manual sizing, retain `scheduler.num_blocks` and set
+`auto_calculate_num_blocks` to `false` (or omit that flag; the parser infers
+manual mode when `num_blocks` is present). The configured block count is still
+checked against the stage/rank-local physical capacity. Fixed-latency models
+must use manual sizing because they do not carry a weight-precision contract.
 
 ### CPU KV-cache tiering
 
@@ -231,6 +235,7 @@ Co-location has exactly one `monolithic` cluster:
         "watermark_blocks_fraction": 0.0,
         "num_preallocate_tokens": 0
       },
+      "gpu_memory": {"capacity_bytes_per_gpu": 288000000000},
       "execution_model": {
         "type": "fixed",
         "stage_latencies_ms": [1.0, 3.0]
@@ -286,6 +291,7 @@ model:
     "prefill": {
       "parallelism": {},
       "scheduler": {},
+      "gpu_memory": {"capacity_bytes_per_gpu": 288000000000},
       "execution_model": {},
       "model_name": "meta-llama/Llama-2-7b-hf",
       "moe_routing": {}
@@ -293,6 +299,7 @@ model:
     "decode": {
       "parallelism": {},
       "scheduler": {},
+      "gpu_memory": {"capacity_bytes_per_gpu": 288000000000},
       "execution_model": {},
       "model_name": "meta-llama/Llama-2-7b-hf",
       "moe_routing": {}
@@ -493,6 +500,15 @@ distinct KDA and MLA totals. Execution-time component totals remain unchanged.
 The mode deliberately omits inter-layer synchronization and congestion changes
 after the representative MoE event. A dense prefix is supported, but a dense
 layer after the first MoE layer in the same PP stage is rejected.
+
+`stage_group_scaled` is the PP-aware approximation mode. It derives a
+deterministic signature from each stage's ordered layer families and boundary
+work, groups only identical signatures, and retains separate standard/MLA/KDA
+attention totals. Representative MoE lane reuse is enabled only for
+layer-invariant routing (legacy uniform or balanced simulation routing).
+Layer-dependent routing and non-contiguous MoE layouts automatically use the
+detailed per-layer prediction path instead of reusing a mismatched first
+layer. PP stage arrival/end events remain unchanged.
 
 ## Workload contract
 

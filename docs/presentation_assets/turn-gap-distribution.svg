@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="520" viewBox="0 0 900 520" role="img" aria-labelledby="title desc">
+  <title id="title">Turn Gap Distribution</title>
+  <desc id="desc">Illustrative multimodal probability distribution of time gaps between turns on a logarithmic seconds axis.</desc>
+  <defs>
+    <linearGradient id="area" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#079a9a" stop-opacity="0.34"/>
+      <stop offset="1" stop-color="#079a9a" stop-opacity="0.03"/>
+    </linearGradient>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="7" stdDeviation="10" flood-color="#0b1f4d" flood-opacity="0.10"/>
+    </filter>
+  </defs>
+
+  <rect x="18" y="18" width="864" height="484" rx="24" fill="#ffffff" stroke="#bfd0da" stroke-width="2" filter="url(#shadow)"/>
+  <text x="450" y="74" text-anchor="middle" fill="#075f68" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="34" font-weight="700">Turn Gap Distribution</text>
+  <text x="82" y="111" fill="#13264d" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="18" font-weight="600">P(x)</text>
+
+  <g stroke="#dbe5ea" stroke-width="1.5">
+    <line x1="110" y1="132" x2="830" y2="132"/>
+    <line x1="110" y1="202" x2="830" y2="202"/>
+    <line x1="110" y1="272" x2="830" y2="272"/>
+    <line x1="110" y1="342" x2="830" y2="342"/>
+    <line x1="254" y1="132" x2="254" y2="412"/>
+    <line x1="398" y1="132" x2="398" y2="412"/>
+    <line x1="542" y1="132" x2="542" y2="412"/>
+    <line x1="686" y1="132" x2="686" y2="412"/>
+  </g>
+
+  <g stroke="#13264d" stroke-width="2.5" fill="none">
+    <line x1="110" y1="120" x2="110" y2="412"/>
+    <line x1="110" y1="412" x2="840" y2="412"/>
+  </g>
+
+  <path d="M110 410 C135 405 153 388 170 348 C189 302 207 276 228 290 C249 304 256 347 276 351 C300 356 313 307 334 251 C355 194 379 164 406 176 C431 187 442 231 459 274 C478 322 500 346 527 338 C558 329 572 273 597 253 C622 233 642 258 661 301 C684 353 711 385 746 397 C773 406 798 409 830 410 L830 412 L110 412 Z" fill="url(#area)"/>
+  <path d="M110 410 C135 405 153 388 170 348 C189 302 207 276 228 290 C249 304 256 347 276 351 C300 356 313 307 334 251 C355 194 379 164 406 176 C431 187 442 231 459 274 C478 322 500 346 527 338 C558 329 572 273 597 253 C622 233 642 258 661 301 C684 353 711 385 746 397 C773 406 798 409 830 410" fill="none" stroke="#078b8b" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <g fill="#075f68" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="16" font-weight="600">
+    <text x="197" y="268" text-anchor="middle">quick follow-up</text>
+    <text x="405" y="151" text-anchor="middle">typical response gap</text>
+    <text x="622" y="228" text-anchor="middle">long pause</text>
+  </g>
+  <g stroke="#078b8b" stroke-width="2">
+    <line x1="202" y1="274" x2="218" y2="289"/>
+    <line x1="405" y1="157" x2="405" y2="174"/>
+    <line x1="622" y1="234" x2="622" y2="251"/>
+  </g>
+
+  <g fill="#354766" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="17">
+    <text x="110" y="442" text-anchor="middle">0.1</text>
+    <text x="254" y="442" text-anchor="middle">1</text>
+    <text x="398" y="442" text-anchor="middle">10</text>
+    <text x="542" y="442" text-anchor="middle">100</text>
+    <text x="686" y="442" text-anchor="middle">1,000</text>
+  </g>
+  <text x="470" y="480" text-anchor="middle" fill="#13264d" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="21" font-weight="600">Turn Gap (seconds, log scale)</text>
+</svg>

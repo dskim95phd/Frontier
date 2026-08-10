@@ -36,6 +36,64 @@ std::uint64_t checked_state_size(long double elements,
     return static_cast<std::uint64_t>(std::ceil(bytes));
 }
 
+void validate_stage_range(const config::ModelConfig &model,
+                          const config::PipelineStageLayerRange &layers) {
+    if (layers.begin > layers.end || layers.end > model.num_layers) {
+        throw TransferModelError("pipeline stage layer range is out of bounds");
+    }
+}
+
+std::uint64_t count_stage_kv_layers(
+    const config::ModelConfig &model,
+    const config::PipelineStageLayerRange &layers) {
+    validate_stage_range(model, layers);
+    std::uint64_t count = 0;
+    for (std::uint64_t layer = layers.begin; layer < layers.end; ++layer) {
+        // KDA's recurrent state is not token-proportional KV.  For MLA
+        // checkpoints only explicitly marked MLA layers own latent KV; for a
+        // dense/KDA checkpoint every non-KDA layer retains the dense KV path.
+        const bool kv_bearing = model.use_mla
+                                    ? model.is_mla_layer(layer)
+                                    : !model.is_kda_layer(layer);
+        count += static_cast<std::uint64_t>(kv_bearing);
+    }
+    return count;
+}
+
+std::uint64_t count_stage_kda_layers(
+    const config::ModelConfig &model,
+    const config::PipelineStageLayerRange &layers) {
+    validate_stage_range(model, layers);
+    if (!model.has_kda()) {
+        return 0;
+    }
+    if (model.kda_layer_indices.empty()) {
+        // A KDA-only synthetic model may omit an explicit index list.  A
+        // partially hybrid model cannot be partitioned safely without exact
+        // indices, so fail rather than manufacture a positional distribution.
+        if (model.num_kda_layers == model.num_layers) {
+            return layers.size();
+        }
+        throw TransferModelError(
+            "KDA stage accounting requires explicit kda_layer_indices for a "
+            "partially hybrid model");
+    }
+    std::uint64_t count = 0;
+    for (std::uint64_t layer = layers.begin; layer < layers.end; ++layer) {
+        count += static_cast<std::uint64_t>(model.is_kda_layer(layer));
+    }
+    return count;
+}
+
+std::uint64_t checked_ceil_div(std::uint64_t numerator,
+                               std::uint64_t denominator) {
+    if (denominator == 0) {
+        throw TransferModelError("division by zero in stage memory layout");
+    }
+    return numerator / denominator +
+           static_cast<std::uint64_t>(numerator % denominator != 0);
+}
+
 } // namespace
 
 std::uint64_t dense_kv_cache_size_bytes(std::uint64_t num_tokens,
@@ -204,6 +262,93 @@ std::uint64_t model_kv_cache_size_bytes_rank_local(
     }
 }
 
+std::uint64_t model_kv_cache_size_bytes_stage_rank_local(
+    std::uint64_t num_tokens, const config::ModelConfig &model,
+    double kv_cache_dtype_size_bytes,
+    const config::PipelineStageLayerRange &layers,
+    std::uint64_t decode_context_parallel_size,
+    std::uint64_t decode_context_parallel_rank) {
+    if (!std::isfinite(kv_cache_dtype_size_bytes) ||
+        kv_cache_dtype_size_bytes <= 0.0) {
+        throw TransferModelError("KV dtype size must be finite and positive");
+    }
+    if (decode_context_parallel_size == 0 ||
+        decode_context_parallel_rank >= decode_context_parallel_size) {
+        throw TransferModelError("invalid decode context parallel rank");
+    }
+    if (decode_context_parallel_size > 1 && !model.use_mla) {
+        throw TransferModelError(
+            "decode context parallel KV layout is currently supported only "
+            "for MLA models");
+    }
+    const std::uint64_t layer_count = count_stage_kv_layers(model, layers);
+    if (layer_count == 0) {
+        return 0;
+    }
+    if (model.use_mla) {
+        try {
+            return attention::mla_dcp_rank_kv_cache_size_bytes(
+                num_tokens, layer_count,
+                attention::MlaKvCacheLayout{
+                    model.kv_lora_rank,
+                    model.qk_rope_head_dim,
+                    kv_cache_dtype_size_bytes,
+                    2.0,
+                },
+                decode_context_parallel_size, decode_context_parallel_rank);
+        } catch (const attention::MlaLayoutError &error) {
+            throw TransferModelError(error.what());
+        }
+    }
+    return dense_kv_cache_size_bytes(num_tokens, DenseKvLayout{
+                                                    layer_count,
+                                                    model.runtime_num_kv_heads(),
+                                                    model.runtime_head_size(),
+                                                    model.kv_factor(),
+                                                    kv_cache_dtype_size_bytes,
+                                                });
+}
+
+std::uint64_t model_kv_cache_size_bytes_stage_physical(
+    std::uint64_t num_tokens, const config::ModelConfig &model,
+    double kv_cache_dtype_size_bytes,
+    const config::PipelineStageLayerRange &layers,
+    std::uint64_t attention_tensor_parallel_size,
+    std::uint64_t decode_context_parallel_size) {
+    if (attention_tensor_parallel_size == 0 ||
+        decode_context_parallel_size == 0 ||
+        attention_tensor_parallel_size % decode_context_parallel_size != 0) {
+        throw TransferModelError(
+            "attention tensor parallel size must be positive and divisible "
+            "by decode context parallel size");
+    }
+    std::uint64_t total = 0;
+    for (std::uint64_t rank = 0; rank < decode_context_parallel_size; ++rank) {
+        const std::uint64_t bytes = model_kv_cache_size_bytes_stage_rank_local(
+            num_tokens, model, kv_cache_dtype_size_bytes, layers,
+            decode_context_parallel_size, rank);
+        if (bytes > std::numeric_limits<std::uint64_t>::max() - total) {
+            throw TransferModelError(
+                "stage physical KV cache size overflows uint64");
+        }
+        total += bytes;
+    }
+    // DCP ranks cover one TP/DCP-independent MLA copy.  Replication across
+    // the remaining attention TP groups is part of the full target-physical
+    // footprint (the same copies factor used by the legacy full-model helper).
+    if (model.use_mla) {
+        const std::uint64_t copies =
+            attention_tensor_parallel_size / decode_context_parallel_size;
+        if (copies != 0 &&
+            total > std::numeric_limits<std::uint64_t>::max() / copies) {
+            throw TransferModelError(
+                "stage physical KV cache size overflows uint64");
+        }
+        total *= copies;
+    }
+    return total;
+}
+
 std::uint64_t
 model_kda_state_snapshot_size_bytes(const config::ModelConfig &model,
                                     double state_dtype_size_bytes) {
@@ -236,6 +381,32 @@ std::uint64_t model_kda_state_snapshot_size_bytes_rank_local(
     return total / attention_tensor_parallel_size +
            static_cast<std::uint64_t>(total % attention_tensor_parallel_size !=
                                       0);
+}
+
+std::uint64_t model_kda_state_snapshot_size_bytes_stage_rank_local(
+    const config::ModelConfig &model, double state_dtype_size_bytes,
+    std::uint64_t attention_tensor_parallel_size,
+    const config::PipelineStageLayerRange &layers) {
+    if (attention_tensor_parallel_size == 0) {
+        throw TransferModelError(
+            "attention tensor parallel size must be positive");
+    }
+    const std::uint64_t layer_count = count_stage_kda_layers(model, layers);
+    if (layer_count == 0) {
+        return 0;
+    }
+    const std::uint64_t elements_per_layer =
+        model.kda_state_elements_per_layer();
+    if (elements_per_layer == 0) {
+        throw TransferModelError(
+            "KDA model must expose positive recurrent and convolution state "
+            "dimensions");
+    }
+    const std::uint64_t stage_bytes = checked_state_size(
+        static_cast<long double>(layer_count) *
+            static_cast<long double>(elements_per_layer),
+        state_dtype_size_bytes);
+    return checked_ceil_div(stage_bytes, attention_tensor_parallel_size);
 }
 
 TransferPrediction predict_transfer(std::uint64_t size_bytes,

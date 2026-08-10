@@ -40,8 +40,7 @@ DEFAULT_REPORTS = (
 PREFILL_GPUS = 8
 GPUS_PER_CPU_POOL = 2
 FINAL_WINDOW_SECONDS = 3_600.0
-DEFAULT_TTFT_P90_SLO_MS = 60_000.0
-STRICT_TTFT_P90_SLO_MS = 5_000.0
+DEFAULT_TTFT_P90_SLO_MS = 5_000.0
 DEFAULT_MIN_COMPLETION_RATIO = 0.99
 DEFAULT_MAX_WAITING_QUEUE = 1_000.0
 DEFAULT_MAX_BACKLOG_REQUESTS = 1_000.0
@@ -152,14 +151,6 @@ def extract_points(
                 and queue_pass
                 and backlog_pass
             )
-            strict_5s_verified = (
-                source_stable
-                and ttft_p90_max is not None
-                and ttft_p90_max <= STRICT_TTFT_P90_SLO_MS
-                and completion_pass
-                and queue_pass
-                and backlog_pass
-            )
             if verified:
                 status = "verified"
             elif ttft_pass and completion_pass:
@@ -220,7 +211,6 @@ def extract_points(
                 "waiting_queue_pass": queue_pass,
                 "backlog_pass": backlog_pass,
                 "verified_sustainable": verified,
-                "strict_5s_verified_sustainable": strict_5s_verified,
                 "report_status": status,
                 "source_report": str(path.resolve()),
             }
@@ -445,7 +435,6 @@ def _status_label(point: Mapping[str, Any]) -> str:
 def _html_report(document: Mapping[str, Any]) -> str:
     points = list(document["points"])
     envelope = list(document["load_envelope"])
-    strict_envelope = list(document["strict_5s_load_envelope"])
     capacity_summary = list(document["capacity_summary"])
     ttft_slo_s = float(document["criteria"]["ttft_p90_slo_ms"]) / 1_000.0
 
@@ -474,23 +463,6 @@ def _html_report(document: Mapping[str, Any]) -> str:
             f"<td>{_fmt(row['tpot_p90_max_ms'],2)} ms</td>"
             f"<td>{_fmt(row['combined_hit_pct'],1)}%</td>"
             f"<td>{html.escape(', '.join(_fmt(v,0) for v in anomalies) or 'none')}</td>"
-            "</tr>"
-        )
-
-    strict_rows = []
-    for row in strict_envelope:
-        if not row.get("verified"):
-            strict_rows.append(
-                f"<tr><td>{float(row['session_injection_rate_per_s']):.2f}</td><td colspan='4'>No verified point</td></tr>"
-            )
-            continue
-        strict_rows.append(
-            "<tr>"
-            f"<td>{float(row['session_injection_rate_per_s']):.2f}</td>"
-            f"<td>{_fmt(row['active_sessions_per_prefill_gpu'],1)}</td>"
-            f"<td>{_fmt(row['completion_requests_per_s_per_prefill_gpu'],3)}</td>"
-            f"<td>{_fmt(row['verified_dram_gb_per_gpu'],0)}</td>"
-            f"<td>{_fmt(row['physical_pool_gb_per_two_prefill_gpus'],0)}</td>"
             "</tr>"
         )
 
@@ -589,13 +561,9 @@ h1 {{ margin:0 0 6px; }} h2 {{ margin:30px 0 12px; }} h3 {{ margin:0 0 8px; }} .
 <div class='note'><strong>Interpretation.</strong> The report normalizes the measured system by PREFILL GPU. One physical CPU-DRAM pool serves two PREFILL GPUs, so a 4 TB experiment label means 2 TB/GPU and 16 TB aggregate CPU DRAM across P8. Proportional extrapolation assumes PREFILL GPUs, DECODE GPUs, CPU pools, memory bandwidth, and routing are all scaled together while preserving the TraceLab session mix.</div>
 
 <h2>Verified sizing envelope</h2>
-<p>“Verified” follows the existing operational gates: stable source classifications in both the final one-hour and two-hour windows, at least {100*float(document['criteria']['min_completion_ratio']):.0f}% completions/arrivals, final-hour waiting queue and backlog no greater than 1,000 requests, and every five-minute TTFT p90 at or below {ttft_slo_s:g} seconds. The memory value is the smallest passing point among the tested capacities, not an exact analytical minimum.</p>
+<p>“Verified” uses one unified service criterion: stable source classifications in both the final one-hour and two-hour windows, at least {100*float(document['criteria']['min_completion_ratio']):.0f}% completions/arrivals, final-hour waiting queue and backlog no greater than 1,000 requests, and every five-minute TTFT p90 in the final hour at or below {ttft_slo_s:g} seconds. The memory value is the smallest passing point among the tested capacities, not an exact analytical minimum.</p>
 <div class='charts'>{charts}</div>
 <div class='table-wrap'><table><thead><tr><th>Session injection</th><th>Active sessions/GPU</th><th>Completed req/s/GPU</th><th>Observed DRAM bracket (GB/GPU)</th><th>Passing pool GB/2 GPUs</th><th>TTFT p90 max</th><th>TPOT p90 max</th><th>Combined hit</th><th>Higher-capacity exceptions (GB/GPU)</th></tr></thead><tbody>{''.join(envelope_rows)}</tbody></table></div>
-
-<h2>Sensitivity to a strict 5-second TTFT guardrail</h2>
-<p>The 60-second threshold above is inherited from the existing analyzer and is not a universal service SLO. With a stricter 5-second final-hour TTFT p90 guardrail, only the 0.30/s row changes: its tested requirement rises from 250 to 375 GB/GPU.</p>
-<div class='table-wrap'><table><thead><tr><th>Session injection</th><th>Active sessions/GPU</th><th>Completed req/s/GPU</th><th>Strict DRAM GB/GPU</th><th>Pool GB/2 GPUs</th></tr></thead><tbody>{''.join(strict_rows)}</tbody></table></div>
 
 <h2>How to scale the claim</h2>
 <p>For a target tier, multiply the per-GPU active-session and request-rate values by the number of PREFILL GPUs. Provision <code>DRAM/GPU × PREFILL GPUs</code> aggregate CPU memory, implemented as one pool of <code>2 × DRAM/GPU</code> for each two-GPU pair. Keep the measured P8:D16 ratio, so doubling users from a verified point means P16/D32 and twice the aggregate CPU DRAM.</p>
@@ -660,9 +628,6 @@ def write_report(
             "binary_identity": "historical run.json files record a binary path but not an executable hash or Git revision",
         },
         "load_envelope": build_load_envelope(points),
-        "strict_5s_load_envelope": build_load_envelope(
-            points, verified_key="strict_5s_verified_sustainable"
-        ),
         "capacity_summary": build_capacity_summary(points),
         "points": points,
     }

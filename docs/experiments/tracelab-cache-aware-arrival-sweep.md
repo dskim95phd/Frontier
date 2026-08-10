@@ -1,7 +1,7 @@
 # TraceLab cache-aware arrival-rate sweep
 
 This experiment finds the sustainable TraceLab source-session arrival rate for
-the cache-aware PREFILL routing policy.  It runs the same seeded 3,000-source-
+the cache-aware PREFILL routing policy.  It runs the same seeded 1,000-source-
 session sample twice at six rates from 0.10 down to 0.05 sessions/s, then
 collects detailed system, latency, cache, migration, and per-lane balance
 metrics into CSV and Markdown tables.
@@ -16,7 +16,7 @@ The default config is
 | Model | `moonshotai/Kimi-K2-Instruct` |
 | Device and precision | GB300 analytical model, FP8 |
 | Architecture | sequential online PDD, one replica |
-| PREFILL | 8 GPUs, TP1 / DCP1 / DP8 / EP8, chunked PREFILL |
+| PREFILL | 8 GPUs, TP1 / DCP1 / DP8 / EP8, chunked PREFILL (1,024 tokens/request/iteration) |
 | DECODE | 24 GPUs, TP8 / DCP8 / DP3 / EP24 |
 | Scheduler cap | 64 requests |
 | PREFILL token cap | 131,072 tokens/batch |
@@ -29,7 +29,7 @@ The default config is
 | Absolute load-gap threshold | 8 outstanding requests |
 | Relative load threshold | 1.5× |
 | Migration | discard the old PREFILL target's session KV |
-| TraceLab sample | seed 20260803, 3,000 source sessions |
+| TraceLab sample | seed 20260803, 1,000 source sessions |
 | Repetitions | two independently reshuffled injection epochs |
 | Rates | 0.10, 0.09, 0.08, 0.07, 0.06, 0.05 sessions/s |
 
@@ -40,26 +40,25 @@ request prefix.
 
 ## Measurement horizon
 
-One injection epoch lasts `3,000 / arrival_rate` simulated seconds.  The
+One injection epoch lasts `1,000 / arrival_rate` simulated seconds.  The
 runner includes two complete injection epochs and a settling interval:
 
 ```text
-epoch_seconds = 3000 / rate
+epoch_seconds = 1000 / rate
 drain_seconds = max(15000, 0.4 * epoch_seconds)
 simulation_end = 2 * epoch_seconds + drain_seconds
 ```
 
 | Session arrival rate | Simulation end time |
 | ---: | ---: |
-| 0.10 | 75,000 s |
-| 0.09 | 81,666.667 s |
-| 0.08 | 90,000 s |
-| 0.07 | 102,857.143 s |
-| 0.06 | 120,000 s |
-| 0.05 | 144,000 s |
+| 0.10 | 35,000 s |
+| 0.09 | 37,222.222 s |
+| 0.08 | 40,000 s |
+| 0.07 | 43,571.429 s |
+| 0.06 | 48,333.333 s |
+| 0.05 | 55,000 s |
 
-This reproduces the previously used horizons at 0.05, 0.08, and 0.10.  Change
-`--drain-fraction` or `--minimum-drain-seconds` only when intentionally
+Change `--drain-fraction` or `--minimum-drain-seconds` only when intentionally
 changing the measurement contract.
 
 ## Build on the server
@@ -134,10 +133,9 @@ python cpp/experiments/kimi_k2_cpu_dram/run_tracelab_arrival_sweep.py \
   --resume
 ```
 
-Use `--jobs 2` or higher only when the server has enough memory.  The 0.05
-run observed locally used roughly 8 GB near completion and took about 14
-minutes; concurrent runs multiply that memory requirement.  Every rate writes
-its own `simulator.log`, so parallel output does not interleave.
+Use `--jobs 2` or higher only when the server has enough memory.  Concurrent
+runs multiply the per-process memory requirement.  Every rate writes its own
+`simulator.log`, so parallel output does not interleave.
 
 To run a subset or override the routing thresholds:
 

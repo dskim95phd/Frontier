@@ -36,6 +36,11 @@ class Simulator {
         return config_;
     }
     [[nodiscard]] EventQueue &event_queue() noexcept { return event_queue_; }
+    // Peak pending-event count is a lightweight performance diagnostic used
+    // by the optional PP benchmark; it does not affect scheduling semantics.
+    [[nodiscard]] std::size_t peak_event_queue_size() const noexcept {
+        return peak_event_queue_size_;
+    }
     [[nodiscard]] metrics::MetricsStore &metrics() noexcept { return metrics_; }
     void set_runtime_validation_enabled(bool enabled);
     [[nodiscard]] scheduler::GlobalScheduler &global_scheduler() noexcept {
@@ -123,6 +128,7 @@ class Simulator {
     std::shared_ptr<const kv_cache_transfer::BaseKVCacheTransferPredictor>
         kv_cache_transfer_predictor_;
     EventQueue event_queue_;
+    std::size_t peak_event_queue_size_ = 0;
     metrics::MetricsStore metrics_;
     std::unique_ptr<scheduler::GlobalScheduler> global_scheduler_;
     SimTime last_event_time_ = SimTime::from_seconds(0.0);

@@ -36,16 +36,46 @@ void replace_all(std::string &text, const std::string &from,
     expect(replacements > 0, "K3 integration fixture replacement is missing");
 }
 
-void test_k3_cpu_snapshot_offload_and_restore() {
+void run_k3_cpu_snapshot_offload_and_restore(std::uint64_t pp_size) {
     std::string config_text = read_text_file(kExampleRoot / "configs" /
                                              "06_cpu_kv_cache_pdd_online.json");
     replace_all(config_text, "meta-llama/Llama-2-7b-hf", "moonshotai/Kimi-K3");
     replace_all(config_text, "\"capacity_bytes\": 67108864",
                 "\"capacity_bytes\": 2147483648");
-    replace_all(config_text, "\"num_blocks\": 4", "\"num_blocks\": 5000");
-    replace_all(config_text, "\"num_blocks\": 32", "\"num_blocks\": 5000");
+    replace_all(config_text, "\"num_blocks\": 4", "\"num_blocks\": 16");
+    replace_all(config_text, "\"num_blocks\": 32", "\"num_blocks\": 16");
 
-    const auto config = parse_simulation_config_json(config_text);
+    auto config = parse_simulation_config_json(config_text);
+    auto &clusters = config.pdd().clusters;
+    for (auto *cluster : {&clusters.prefill, &clusters.decode}) {
+        cluster->parallelism.pipeline_parallel_size = pp_size;
+        const double stage_latency =
+            cluster->execution_model.fixed.stage_latencies_ms.front();
+        cluster->execution_model.fixed.stage_latencies_ms.assign(
+            static_cast<std::size_t>(pp_size), stage_latency);
+        // Keep enough physical HBM for one KDA snapshot plus ordinary KV, but
+        // not for two concurrent snapshots. With the fixture's default 10%
+        // reserve, capacity=2*S_max yields F=1.8*S_max and the normalized
+        // logical charge is ceil(16/1.8)=9 blocks. Two sessions therefore
+        // exceed the sixteen-block manager and force the CPU restore path,
+        // while one prompt still has room for its ordinary KV blocks.
+        const auto provisional_profiles =
+            frontier::config::build_pipeline_stage_memory_profiles(*cluster);
+        std::uint64_t maximum_snapshot_bytes = 0;
+        for (const auto &profile : provisional_profiles) {
+            for (const auto snapshot_bytes :
+                 profile.kda_snapshot_bytes_by_rank) {
+                maximum_snapshot_bytes =
+                    std::max(maximum_snapshot_bytes, snapshot_bytes);
+            }
+        }
+        expect(maximum_snapshot_bytes > 0,
+               "K3 PP fixture must expose a stage-local snapshot shard");
+        cluster->gpu_memory.capacity_bytes_per_gpu =
+            2 * maximum_snapshot_bytes;
+        frontier::config::resolve_gpu_memory_config(
+            *cluster, cluster->scheduler.num_blocks);
+    }
     // Serialize the two initial turns so the second atomic GPU snapshot
     // deterministically reclaims the first session.  The later successor can
     // then reuse that session only through CPU MLA KV + KDA restoration.
@@ -89,6 +119,74 @@ void test_k3_cpu_snapshot_offload_and_restore() {
         });
     expect(restored_snapshot,
            "detailed CPU transfer trace must identify the atomic KDA payload");
+
+    for (std::uint64_t stage = 0; stage < pp_size; ++stage) {
+        expect(std::any_of(output.batch_stages.begin(), output.batch_stages.end(),
+                           [stage](const auto &record) {
+                               return record.cluster_type ==
+                                          frontier::ClusterType::kPrefill &&
+                                      record.stage_id == frontier::StageId{stage};
+                           }),
+               "K3 CPU offload run must execute every PREFILL PP stage");
+    }
+
+    const auto batch_contains_request = [&](frontier::BatchId batch_id,
+                                            RequestId request_id) {
+        const auto batch = std::find_if(
+            output.batches.begin(), output.batches.end(),
+            [batch_id](const auto &record) {
+                return record.batch_id == batch_id;
+            });
+        return batch != output.batches.end() &&
+               std::find(batch->request_ids.begin(), batch->request_ids.end(),
+                         request_id) != batch->request_ids.end();
+    };
+    for (const auto &transfer : output.cpu_kv_cache_transfers) {
+        if (transfer.kind != CpuKVCacheTransferKind::kOffload) {
+            continue;
+        }
+        frontier::SimTime final_stage_completion{};
+        for (const auto &stage : output.batch_stages) {
+            if (stage.cluster_type == frontier::ClusterType::kPrefill &&
+                stage.stage_id == frontier::StageId{pp_size - 1} &&
+                batch_contains_request(stage.batch_id, transfer.request_id) &&
+                (!final_stage_completion.valid() ||
+                 final_stage_completion < stage.completed_at)) {
+                final_stage_completion = stage.completed_at;
+            }
+        }
+        expect(final_stage_completion.valid() &&
+                   final_stage_completion <= transfer.submitted_at,
+               "CPU offload must be submitted after the request's final PP "
+               "stage completes");
+    }
+
+    const auto restore = std::find_if(
+        output.cpu_kv_cache_transfers.begin(),
+        output.cpu_kv_cache_transfers.end(), [](const auto &transfer) {
+            return transfer.kind == CpuKVCacheTransferKind::kRestore &&
+                   transfer.request_id == RequestId{2};
+        });
+    frontier::SimTime successor_stage0_arrival{};
+    for (const auto &stage : output.batch_stages) {
+        if (stage.cluster_type == frontier::ClusterType::kPrefill &&
+            stage.stage_id == frontier::StageId{0} &&
+            batch_contains_request(stage.batch_id, RequestId{2}) &&
+            (!successor_stage0_arrival.valid() ||
+             stage.arrived_at < successor_stage0_arrival)) {
+            successor_stage0_arrival = stage.arrived_at;
+        }
+    }
+    expect(restore != output.cpu_kv_cache_transfers.end() &&
+               successor_stage0_arrival.valid() &&
+               restore->completed_at <= successor_stage0_arrival,
+           "PP0 admission must wait for the full atomic CPU restore");
+}
+
+void test_k3_cpu_snapshot_offload_and_restore() {
+    run_k3_cpu_snapshot_offload_and_restore(1);
+    run_k3_cpu_snapshot_offload_and_restore(2);
+    run_k3_cpu_snapshot_offload_and_restore(4);
 }
 
 void test_k3_pdd_tp8_dcp8_analytical_decode() {

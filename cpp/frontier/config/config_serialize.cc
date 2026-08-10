@@ -209,6 +209,7 @@ OrderedJson serialize_execution_model(const ExecutionModelConfig &execution) {
 
 OrderedJson serialize_gpu_memory(const GpuMemoryConfig &memory) {
     return OrderedJson::object({
+        {"auto_calculate_num_blocks", memory.auto_calculate_num_blocks},
         {"capacity_bytes_per_gpu", memory.capacity_bytes_per_gpu},
         {"runtime_reserve_fraction", memory.runtime_reserve_fraction},
         {"runtime_reserve_bytes", memory.runtime_reserve_bytes},
@@ -222,6 +223,11 @@ OrderedJson serialize_gpu_memory(const GpuMemoryConfig &memory) {
 }
 
 OrderedJson serialize_cluster_runtime(const ClusterRuntimeConfig &cluster) {
+    if (cluster.gpu_memory.capacity_bytes_per_gpu == 0) {
+        throw ConfigError(
+            "gpu_memory.capacity_bytes_per_gpu must be positive before "
+            "serialization");
+    }
     OrderedJson result = OrderedJson::object({
         {"parallelism", serialize_parallelism(cluster.parallelism)},
         {"scheduler", serialize_scheduler(cluster.scheduler)},
@@ -236,9 +242,10 @@ OrderedJson serialize_cluster_runtime(const ClusterRuntimeConfig &cluster) {
         {"num_shared_experts", cluster.model.num_shared_experts},
         {"moe_routing", serialize_moe_routing(cluster.moe_routing)},
     });
-    if (cluster.gpu_memory.auto_calculate_num_blocks) {
-        result["gpu_memory"] = serialize_gpu_memory(cluster.gpu_memory);
-    }
+    // HBM capacity is part of every runtime cluster contract, including
+    // fixed/manual scheduler configurations.  Keep the explicit auto flag so
+    // normalized JSON can round-trip manual num_blocks without ambiguity.
+    result["gpu_memory"] = serialize_gpu_memory(cluster.gpu_memory);
     return result;
 }
 

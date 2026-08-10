@@ -34,6 +34,7 @@
         "watermark_blocks_fraction": 0.0,
         "num_preallocate_tokens": 0
       },
+      "gpu_memory": {"capacity_bytes_per_gpu": 10000000000000000},
       "execution_model": {
         "type": "analytical",
         "device": "rubin",

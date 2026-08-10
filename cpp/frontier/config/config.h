@@ -12,6 +12,7 @@
 
 #include "frontier/attention/ops.h"
 #include "frontier/core/cluster_type.h"
+#include "frontier/core/ids.h"
 
 namespace frontier::config {
 
@@ -287,6 +288,15 @@ struct PipelineStageLayerRange {
     std::uint64_t end = 0;
 
     [[nodiscard]] std::uint64_t size() const noexcept { return end - begin; }
+
+    friend bool operator==(const PipelineStageLayerRange &lhs,
+                           const PipelineStageLayerRange &rhs) noexcept {
+        return lhs.begin == rhs.begin && lhs.end == rhs.end;
+    }
+    friend bool operator!=(const PipelineStageLayerRange &lhs,
+                           const PipelineStageLayerRange &rhs) noexcept {
+        return !(lhs == rhs);
+    }
 };
 
 [[nodiscard]] inline PipelineStageLayerRange
@@ -304,6 +314,138 @@ pipeline_stage_layer_range(std::uint64_t num_layers,
     const std::uint64_t size = base + (stage < remainder ? 1 : 0);
     return PipelineStageLayerRange{begin, begin + size};
 }
+
+// Static attention-family identity used by PP stage signatures.  This is
+// intentionally independent from the execution-time predictor's family enum:
+// it describes model structure, not a prediction policy.
+enum class AttentionFamily {
+    kStandard,
+    kMla,
+    kKda,
+};
+
+struct LayerStaticSignature {
+    AttentionFamily attention_family = AttentionFamily::kStandard;
+    bool is_moe = false;
+    bool has_dense_mlp = true;
+
+    friend bool operator==(const LayerStaticSignature &lhs,
+                           const LayerStaticSignature &rhs) noexcept {
+        return std::tie(lhs.attention_family, lhs.is_moe,
+                        lhs.has_dense_mlp) ==
+               std::tie(rhs.attention_family, rhs.is_moe,
+                        rhs.has_dense_mlp);
+    }
+    friend bool operator!=(const LayerStaticSignature &lhs,
+                           const LayerStaticSignature &rhs) noexcept {
+        return !(lhs == rhs);
+    }
+};
+
+struct StageTimingSignature {
+    std::vector<LayerStaticSignature> ordered_layers;
+    bool owns_input_embedding = false;
+    bool owns_final_norm = false;
+    bool owns_lm_head = false;
+    bool emits_pp_send = false;
+
+    friend bool operator==(const StageTimingSignature &lhs,
+                           const StageTimingSignature &rhs) noexcept {
+        return std::tie(lhs.ordered_layers, lhs.owns_input_embedding,
+                        lhs.owns_final_norm, lhs.owns_lm_head,
+                        lhs.emits_pp_send) ==
+               std::tie(rhs.ordered_layers, rhs.owns_input_embedding,
+                        rhs.owns_final_norm, rhs.owns_lm_head,
+                        rhs.emits_pp_send);
+    }
+    friend bool operator!=(const StageTimingSignature &lhs,
+                           const StageTimingSignature &rhs) noexcept {
+        return !(lhs == rhs);
+    }
+};
+
+struct StageMemorySignature {
+    std::uint64_t resident_weight_bytes = 0;
+    std::uint64_t reserved_bytes = 0;
+    std::vector<std::uint64_t> kv_bytes_per_block_by_rank;
+    std::vector<std::uint64_t> kda_snapshot_bytes_by_rank;
+
+    friend bool operator==(const StageMemorySignature &lhs,
+                           const StageMemorySignature &rhs) noexcept {
+        return std::tie(lhs.resident_weight_bytes, lhs.reserved_bytes,
+                        lhs.kv_bytes_per_block_by_rank,
+                        lhs.kda_snapshot_bytes_by_rank) ==
+               std::tie(rhs.resident_weight_bytes, rhs.reserved_bytes,
+                        rhs.kv_bytes_per_block_by_rank,
+                        rhs.kda_snapshot_bytes_by_rank);
+    }
+    friend bool operator!=(const StageMemorySignature &lhs,
+                           const StageMemorySignature &rhs) noexcept {
+        return !(lhs == rhs);
+    }
+};
+
+struct PipelineStageMemoryProfile {
+    StageId stage_id;
+    PipelineStageLayerRange layers;
+    std::uint64_t resident_weight_bytes = 0;
+    std::uint64_t reserved_bytes = 0;
+    std::uint64_t free_bytes = 0;
+    std::vector<std::uint64_t> kv_bytes_per_block_by_rank;
+    std::vector<std::uint64_t> kda_snapshot_bytes_by_rank;
+
+    [[nodiscard]] StageMemorySignature memory_signature() const {
+        return StageMemorySignature{resident_weight_bytes, reserved_bytes,
+                                    kv_bytes_per_block_by_rank,
+                                    kda_snapshot_bytes_by_rank};
+    }
+
+    friend bool operator==(const PipelineStageMemoryProfile &lhs,
+                           const PipelineStageMemoryProfile &rhs) noexcept {
+        return std::tie(lhs.stage_id, lhs.layers, lhs.resident_weight_bytes,
+                        lhs.reserved_bytes, lhs.free_bytes,
+                        lhs.kv_bytes_per_block_by_rank,
+                        lhs.kda_snapshot_bytes_by_rank) ==
+               std::tie(rhs.stage_id, rhs.layers, rhs.resident_weight_bytes,
+                        rhs.reserved_bytes, rhs.free_bytes,
+                        rhs.kv_bytes_per_block_by_rank,
+                        rhs.kda_snapshot_bytes_by_rank);
+    }
+    friend bool operator!=(const PipelineStageMemoryProfile &lhs,
+                           const PipelineStageMemoryProfile &rhs) noexcept {
+        return !(lhs == rhs);
+    }
+};
+
+// First-occurrence-order group IDs make diagnostics and tests stable without
+// relying on hash iteration order.  Group signatures are operation-specific:
+// timing equivalence and memory equivalence are intentionally independent.
+struct PipelineStageGroupCatalogue {
+    std::vector<StageTimingSignature> timing_groups;
+    std::vector<StageMemorySignature> memory_groups;
+    std::vector<std::uint32_t> stage_to_timing_group;
+    std::vector<std::uint32_t> stage_to_memory_group;
+    std::vector<std::uint64_t> timing_group_multiplicity;
+    std::vector<std::uint64_t> memory_group_multiplicity;
+
+    friend bool operator==(const PipelineStageGroupCatalogue &lhs,
+                           const PipelineStageGroupCatalogue &rhs) noexcept {
+        return std::tie(lhs.timing_groups, lhs.memory_groups,
+                        lhs.stage_to_timing_group,
+                        lhs.stage_to_memory_group,
+                        lhs.timing_group_multiplicity,
+                        lhs.memory_group_multiplicity) ==
+               std::tie(rhs.timing_groups, rhs.memory_groups,
+                        rhs.stage_to_timing_group,
+                        rhs.stage_to_memory_group,
+                        rhs.timing_group_multiplicity,
+                        rhs.memory_group_multiplicity);
+    }
+    friend bool operator!=(const PipelineStageGroupCatalogue &lhs,
+                           const PipelineStageGroupCatalogue &rhs) noexcept {
+        return !(lhs == rhs);
+    }
+};
 
 enum class MoeRoutingMode {
     kSimulation,
@@ -584,6 +726,9 @@ struct AnalyticalExecutionModelConfig {
     // time.
     // "first_layer_scaled" emits the first MoE layer normally, reuses its
     // expert path, and accumulates attention delays by implementation family.
+    // "stage_group_scaled" additionally exposes canonical PP stage groups,
+    // uses the same family-aware compression only for layer-invariant routing,
+    // and otherwise falls back to exact per-layer prediction.
     std::string moe_layer_event_mode = "detailed";
     std::uint64_t tensor_parallel_size = 8;
     double network_bandwidth_gbps = 400.0;
@@ -802,6 +947,8 @@ struct ExecutionModelConfig {
 
 struct GpuMemoryConfig {
     bool auto_calculate_num_blocks = false;
+    // Required for every runtime cluster.  Zero denotes an unbound in-memory
+    // object and is rejected by parsing and resolve_gpu_memory_config().
     std::uint64_t capacity_bytes_per_gpu = 0;
     double runtime_reserve_fraction = 0.0;
     std::uint64_t runtime_reserve_bytes = 0;
@@ -813,20 +960,30 @@ struct GpuMemoryConfig {
     std::uint64_t kv_cache_budget_bytes_per_gpu = 0;
     std::uint64_t kv_cache_bytes_per_block = 0;
 
+    // Exact PP stage/rank-local memory diagnostics.  These are derived fields
+    // populated by resolve_gpu_memory_config; they are deliberately omitted
+    // from the value-equality contract and legacy JSON surface so older
+    // normalized configs continue to round-trip.  Consumers that need physical
+    // occupancy should use these profiles instead of reconstructing a full
+    // model footprint from kv_cache_bytes_per_block.
+    std::vector<PipelineStageMemoryProfile> pipeline_stage_memory_profiles;
+    PipelineStageGroupCatalogue pipeline_stage_group_catalogue;
+    std::uint64_t ordinary_kv_capacity_blocks = 0;
+    std::uint64_t ordinary_kv_limiting_stage = 0;
+    std::uint64_t ordinary_kv_limiting_rank = 0;
+    std::uint64_t kda_snapshot_limiting_stage = 0;
+    std::uint64_t kda_snapshot_limiting_rank = 0;
+
     friend bool operator==(const GpuMemoryConfig &lhs,
                            const GpuMemoryConfig &rhs) {
         return std::tie(
                    lhs.auto_calculate_num_blocks, lhs.capacity_bytes_per_gpu,
                    lhs.runtime_reserve_fraction, lhs.runtime_reserve_bytes,
-                   lhs.weight_overhead_fraction, lhs.model_weight_bytes_per_gpu,
-                   lhs.kv_cache_budget_bytes_per_gpu,
-                   lhs.kv_cache_bytes_per_block) ==
+                   lhs.weight_overhead_fraction) ==
                std::tie(
                    rhs.auto_calculate_num_blocks, rhs.capacity_bytes_per_gpu,
                    rhs.runtime_reserve_fraction, rhs.runtime_reserve_bytes,
-                   rhs.weight_overhead_fraction, rhs.model_weight_bytes_per_gpu,
-                   rhs.kv_cache_budget_bytes_per_gpu,
-                   rhs.kv_cache_bytes_per_block);
+                   rhs.weight_overhead_fraction);
     }
 };
 
@@ -1013,9 +1170,42 @@ resolve_cpu_kv_cache_target(const SimulationConfig &config);
 [[nodiscard]] double resolve_pdd_kda_snapshot_dtype_size_bytes(
     const PddClustersConfig &clusters);
 
+// Build the exact static PP memory view for one logical (replica, DP) target.
+// The returned profiles contain one entry per physical pipeline stage and one
+// rank-local KV/KDA byte value per decode-context-parallel shard.  CPU/PDD
+// aggregate transfer helpers intentionally remain separate from this view.
+[[nodiscard]] std::vector<PipelineStageMemoryProfile>
+build_pipeline_stage_memory_profiles(const ClusterRuntimeConfig &cluster);
+
+// Build deterministic first-occurrence-order timing and memory groups for a
+// profile set.  `profiles` must be ordered by stage id and cover every PP
+// stage in `cluster.parallelism.pipeline_parallel_size`.
+[[nodiscard]] PipelineStageGroupCatalogue build_pipeline_stage_group_catalogue(
+    const ClusterRuntimeConfig &cluster,
+    const std::vector<PipelineStageMemoryProfile> &profiles);
+
+// Resolve the shared logical KV-block capacity from real stage/rank physical
+// profiles.  Ranks with zero KV bytes do not constrain ordinary KV capacity,
+// but remain part of the profile set for KDA snapshot admission.
+[[nodiscard]] std::uint64_t resolve_pipeline_logical_kv_capacity(
+    const std::vector<PipelineStageMemoryProfile> &profiles,
+    std::uint64_t *limiting_stage = nullptr,
+    std::uint64_t *limiting_rank = nullptr);
+
+// Derive the conservative scalar logical charge for one resident KDA
+// snapshot.  This includes KDA-only stages with B == 0 and checks that every
+// nonzero snapshot shard fits in its stage/rank's free HBM budget.
+[[nodiscard]] std::uint64_t resolve_pipeline_kda_snapshot_charge(
+    const std::vector<PipelineStageMemoryProfile> &profiles,
+    std::uint64_t logical_kv_capacity,
+    std::uint64_t *limiting_stage = nullptr,
+    std::uint64_t *limiting_rank = nullptr);
+
 // Resolve per-rank model weight storage and the remaining rank-local KV block
-// capacity. If an explicit_num_blocks value is supplied for an automatic
-// config, it is treated as a normalized-config consistency check.
+// capacity. Every caller must bind a positive gpu_memory capacity. Manual
+// configs retain their explicit scheduler.num_blocks but are checked against
+// exact PP stage/rank profiles; an explicit value on an automatic config is
+// treated as a normalized-config consistency check.
 void resolve_gpu_memory_config(
     ClusterRuntimeConfig &cluster,
     std::optional<std::uint64_t> explicit_num_blocks = std::nullopt);

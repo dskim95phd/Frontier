@@ -5,6 +5,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <variant>
 
 #include "frontier/entities/batch.h"
 #include "frontier/entities/batch_stage.h"
@@ -85,6 +86,91 @@ void accumulate_prefill_attention_token_pairs(std::uint64_t &total,
     total += value;
 }
 
+PipelineMemoryDiagnostics make_pipeline_memory_diagnostics(
+    ClusterType cluster_type, const config::ClusterRuntimeConfig &runtime) {
+    const config::GpuMemoryConfig &memory = runtime.gpu_memory;
+    PipelineMemoryDiagnostics diagnostics{};
+    diagnostics.cluster_type = cluster_type;
+    diagnostics.capacity_bytes_per_gpu = memory.capacity_bytes_per_gpu;
+    diagnostics.model_weight_bytes_per_gpu =
+        memory.model_weight_bytes_per_gpu;
+    diagnostics.kv_cache_budget_bytes_per_gpu =
+        memory.kv_cache_budget_bytes_per_gpu;
+    diagnostics.kv_cache_bytes_per_block = memory.kv_cache_bytes_per_block;
+    diagnostics.configured_num_blocks = runtime.scheduler.num_blocks;
+    diagnostics.ordinary_kv_capacity_blocks = memory.ordinary_kv_capacity_blocks;
+    diagnostics.ordinary_kv_limiting_stage = memory.ordinary_kv_limiting_stage;
+    diagnostics.ordinary_kv_limiting_rank = memory.ordinary_kv_limiting_rank;
+    diagnostics.kda_snapshot_blocks_per_session =
+        runtime.scheduler.kda_snapshot_blocks_per_session;
+    diagnostics.kda_snapshot_limiting_stage =
+        memory.kda_snapshot_limiting_stage;
+    diagnostics.kda_snapshot_limiting_rank = memory.kda_snapshot_limiting_rank;
+    diagnostics.timing_group_count =
+        memory.pipeline_stage_group_catalogue.timing_groups.size();
+    diagnostics.memory_group_count =
+        memory.pipeline_stage_group_catalogue.memory_groups.size();
+
+    const std::uint64_t pipeline_size =
+        runtime.parallelism.pipeline_parallel_size;
+    diagnostics.stages.reserve(static_cast<std::size_t>(pipeline_size));
+    for (std::uint64_t stage = 0; stage < pipeline_size; ++stage) {
+        PipelineStageMemoryDiagnostic stage_diagnostic{};
+        stage_diagnostic.cluster_type = cluster_type;
+        stage_diagnostic.stage_id = StageId{stage};
+        const config::PipelineStageLayerRange layers =
+            config::pipeline_stage_layer_range(
+            runtime.model.num_layers, pipeline_size, stage);
+        stage_diagnostic.layer_begin = layers.begin;
+        stage_diagnostic.layer_end = layers.end;
+        stage_diagnostic.layer_count = layers.size();
+        for (std::uint64_t layer = stage_diagnostic.layer_begin;
+             layer < stage_diagnostic.layer_end; ++layer) {
+            stage_diagnostic.kda_layer_count += static_cast<std::uint64_t>(
+                runtime.model.is_kda_layer(layer));
+            stage_diagnostic.mla_layer_count += static_cast<std::uint64_t>(
+                runtime.model.is_mla_layer(layer));
+            stage_diagnostic.moe_layer_count += static_cast<std::uint64_t>(
+                runtime.model.is_moe_layer(layer));
+        }
+
+        if (stage < memory.pipeline_stage_memory_profiles.size()) {
+            const auto &profile =
+                memory.pipeline_stage_memory_profiles.at(stage);
+            stage_diagnostic.resident_weight_bytes =
+                profile.resident_weight_bytes;
+            stage_diagnostic.reserved_bytes = profile.reserved_bytes;
+            stage_diagnostic.free_bytes = profile.free_bytes;
+            stage_diagnostic.kv_bytes_per_block_by_rank =
+                profile.kv_bytes_per_block_by_rank;
+            stage_diagnostic.kda_snapshot_bytes_by_rank =
+                profile.kda_snapshot_bytes_by_rank;
+        }
+
+        const auto &catalogue = memory.pipeline_stage_group_catalogue;
+        if (stage < catalogue.stage_to_timing_group.size()) {
+            const std::uint32_t group =
+                catalogue.stage_to_timing_group.at(stage);
+            stage_diagnostic.timing_group_id = group;
+            if (group < catalogue.timing_group_multiplicity.size()) {
+                stage_diagnostic.timing_group_multiplicity =
+                    catalogue.timing_group_multiplicity.at(group);
+            }
+        }
+        if (stage < catalogue.stage_to_memory_group.size()) {
+            const std::uint32_t group =
+                catalogue.stage_to_memory_group.at(stage);
+            stage_diagnostic.memory_group_id = group;
+            if (group < catalogue.memory_group_multiplicity.size()) {
+                stage_diagnostic.memory_group_multiplicity =
+                    catalogue.memory_group_multiplicity.at(group);
+            }
+        }
+        diagnostics.stages.push_back(std::move(stage_diagnostic));
+    }
+    return diagnostics;
+}
+
 } // namespace
 
 MetricsStore::MetricsStore(const config::SimulationConfig &config,
@@ -103,6 +189,20 @@ MetricsStore::MetricsStore(const config::SimulationConfig &config,
       }()) {
     output_.requests.reserve(expected_request_count);
     output_.event_trace.reserve(expected_request_count * 12);
+    if (config.system_architecture ==
+        config::SystemArchitecture::kPdDisaggregation) {
+        output_.pipeline_memory_diagnostics.push_back(
+            make_pipeline_memory_diagnostics(ClusterType::kPrefill,
+                                             config.pdd().clusters.prefill));
+        output_.pipeline_memory_diagnostics.push_back(
+            make_pipeline_memory_diagnostics(ClusterType::kDecode,
+                                             config.pdd().clusters.decode));
+    } else if (std::holds_alternative<config::ClusterRuntimeConfig>(
+                   config.runtime)) {
+        output_.pipeline_memory_diagnostics.push_back(
+            make_pipeline_memory_diagnostics(ClusterType::kMonolithic,
+                                             config.cluster()));
+    }
 }
 
 void MetricsStore::record_event(Event event) {
@@ -765,8 +865,9 @@ void MetricsStore::record_cpu_kv_cache_restore(
 
 void MetricsStore::record_gpu_kv_cache_occupancy(
     SimTime time, const scheduler::BaseReplicaScheduler &scheduler,
-    std::uint64_t bytes_per_block, std::optional<std::uint64_t> total_hbm_bytes,
-    bool force) {
+    std::uint64_t max_rank_bytes_per_block,
+    std::uint64_t pipeline_bytes_per_block,
+    std::optional<std::uint64_t> total_hbm_bytes, bool force) {
     if (!gpu_kv_occupancy_enabled_) {
         return;
     }
@@ -774,9 +875,10 @@ void MetricsStore::record_gpu_kv_cache_occupancy(
         throw std::invalid_argument(
             "GPU KV occupancy time must be finite and nonnegative");
     }
-    if (bytes_per_block == 0) {
+    if (max_rank_bytes_per_block == 0 || pipeline_bytes_per_block == 0 ||
+        pipeline_bytes_per_block < max_rank_bytes_per_block) {
         throw std::invalid_argument(
-            "GPU KV occupancy bytes_per_block must be positive");
+            "GPU KV occupancy block byte layout is invalid");
     }
     const kv_cache::PrefixCacheDiagnostics diagnostics =
         scheduler.prefix_cache_diagnostics();
@@ -784,7 +886,11 @@ void MetricsStore::record_gpu_kv_cache_occupancy(
         throw std::logic_error("GPU KV occupancy exceeds target capacity");
     }
     if (diagnostics.active_blocks >
-        std::numeric_limits<std::uint64_t>::max() / bytes_per_block) {
+            std::numeric_limits<std::uint64_t>::max() /
+                max_rank_bytes_per_block ||
+        diagnostics.active_blocks >
+            std::numeric_limits<std::uint64_t>::max() /
+                pipeline_bytes_per_block) {
         throw std::overflow_error(
             "GPU KV occupancy byte count overflows uint64");
     }
@@ -800,7 +906,10 @@ void MetricsStore::record_gpu_kv_cache_occupancy(
     record.dp_id = scheduler.dp_id();
     record.active_blocks = diagnostics.active_blocks;
     record.capacity_blocks = diagnostics.capacity_blocks;
-    record.active_bytes_per_gpu = diagnostics.active_blocks * bytes_per_block;
+    record.active_bytes_per_gpu =
+        diagnostics.active_blocks * max_rank_bytes_per_block;
+    record.active_bytes_across_pipeline =
+        diagnostics.active_blocks * pipeline_bytes_per_block;
     record.active_fraction_of_kv_budget =
         diagnostics.capacity_blocks == 0
             ? 0.0
@@ -824,6 +933,8 @@ void MetricsStore::record_gpu_kv_cache_occupancy(
             last.active_blocks == record.active_blocks &&
             last.capacity_blocks == record.capacity_blocks &&
             last.active_bytes_per_gpu == record.active_bytes_per_gpu &&
+            last.active_bytes_across_pipeline ==
+                record.active_bytes_across_pipeline &&
             last.active_fraction_of_kv_budget ==
                 record.active_fraction_of_kv_budget &&
             last.hbm_fraction == record.hbm_fraction &&

@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="750" viewBox="0 0 1000 750" role="img" aria-labelledby="title desc">
+  <title id="title">OSL Distribution</title>
+  <desc id="desc">Illustrative probability distribution of output sequence length on a logarithmic token axis.</desc>
+  <defs>
+    <linearGradient id="area" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#079a9a" stop-opacity="0.34"/>
+      <stop offset="1" stop-color="#079a9a" stop-opacity="0.03"/>
+    </linearGradient>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="7" stdDeviation="10" flood-color="#0b1f4d" flood-opacity="0.10"/>
+    </filter>
+  </defs>
+
+  <rect x="22" y="22" width="956" height="706" rx="26" fill="#ffffff" stroke="#bfd0da" stroke-width="2" filter="url(#shadow)"/>
+  <text x="500" y="86" text-anchor="middle" fill="#075f68" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="40" font-weight="700">OSL Distribution</text>
+  <text x="88" y="138" fill="#13264d" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="21" font-weight="600">P(x)</text>
+
+  <g stroke="#dbe5ea" stroke-width="1.5">
+    <line x1="110" y1="158" x2="920" y2="158"/>
+    <line x1="110" y1="258" x2="920" y2="258"/>
+    <line x1="110" y1="358" x2="920" y2="358"/>
+    <line x1="110" y1="458" x2="920" y2="458"/>
+    <line x1="272" y1="158" x2="272" y2="558"/>
+    <line x1="434" y1="158" x2="434" y2="558"/>
+    <line x1="596" y1="158" x2="596" y2="558"/>
+    <line x1="758" y1="158" x2="758" y2="558"/>
+  </g>
+
+  <g stroke="#13264d" stroke-width="3" fill="none">
+    <line x1="110" y1="145" x2="110" y2="558"/>
+    <line x1="110" y1="558" x2="930" y2="558"/>
+  </g>
+
+  <path d="M110 555 C146 553 173 539 199 496 C224 454 239 383 261 300 C283 221 313 190 347 219 C376 243 387 296 405 329 C426 368 453 371 477 360 C506 346 527 360 549 400 C576 449 608 489 653 511 C714 540 790 552 920 555 L920 558 L110 558 Z" fill="url(#area)"/>
+  <path d="M110 555 C146 553 173 539 199 496 C224 454 239 383 261 300 C283 221 313 190 347 219 C376 243 387 296 405 329 C426 368 453 371 477 360 C506 346 527 360 549 400 C576 449 608 489 653 511 C714 540 790 552 920 555" fill="none" stroke="#078b8b" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <g fill="#354766" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="20">
+    <text x="110" y="596" text-anchor="middle">10</text>
+    <text x="272" y="596" text-anchor="middle">10²</text>
+    <text x="434" y="596" text-anchor="middle">10³</text>
+    <text x="596" y="596" text-anchor="middle">10⁴</text>
+    <text x="758" y="596" text-anchor="middle">10⁵</text>
+  </g>
+  <text x="515" y="665" text-anchor="middle" fill="#13264d" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="25" font-weight="600">Output Sequence Length (tokens, log scale)</text>
+</svg>

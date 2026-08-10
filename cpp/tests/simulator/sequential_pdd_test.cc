@@ -256,8 +256,10 @@ void test_gpu_kv_occupancy_change_stream() {
                    sample.active_bytes_per_gpu > 0 ||
                    sample.active_blocks == 0 && sample.active_bytes_per_gpu == 0,
                "GPU KV occupancy bytes must track active blocks");
-        expect(!sample.hbm_fraction.has_value(),
-               "fixed-latency targets leave total-HBM fraction blank");
+        expect(sample.hbm_fraction.has_value() &&
+                   sample.active_fraction_of_total_hbm == sample.hbm_fraction,
+               "explicit HBM capacity must expose occupancy fractions for "
+               "fixed-latency targets");
         const TargetKey key{static_cast<int>(sample.cluster_type),
                             sample.replica_id.value(), sample.dp_id.value()};
         const auto previous = last_by_target.find(key);

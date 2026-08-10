@@ -521,19 +521,32 @@ SchedulerConfig parse_scheduler(const Json &root) {
 GpuMemoryConfig parse_gpu_memory(const Json &cluster,
                                  std::string_view context) {
     if (!cluster.contains("gpu_memory")) {
-        return GpuMemoryConfig{};
+        throw ConfigError(std::string{context} +
+                          ".gpu_memory is required; provide positive "
+                          "capacity_bytes_per_gpu");
     }
     const Json &memory = cluster.at("gpu_memory");
     const std::string memory_context = std::string{context} + ".gpu_memory";
     require_keys(memory, {"capacity_bytes_per_gpu"},
-                 {"runtime_reserve_fraction", "runtime_reserve_bytes",
+                 {"auto_calculate_num_blocks", "runtime_reserve_fraction",
+                  "runtime_reserve_bytes",
                   "weight_overhead_fraction", "model_weight_bytes_per_gpu",
                   "kv_cache_budget_bytes_per_gpu", "kv_cache_bytes_per_block"},
                  memory_context);
     GpuMemoryConfig parsed{};
-    parsed.auto_calculate_num_blocks = true;
+    // A scheduler.num_blocks field denotes an explicit/manual capacity unless
+    // the serialized gpu_memory object carries the explicit auto flag.  The
+    // latter is emitted by the normalizer so round-trips preserve the mode.
+    parsed.auto_calculate_num_blocks =
+        memory.contains("auto_calculate_num_blocks")
+            ? require_bool(memory, "auto_calculate_num_blocks", memory_context)
+            : !cluster.at("scheduler").contains("num_blocks");
     parsed.capacity_bytes_per_gpu =
         require_uint64(memory, "capacity_bytes_per_gpu", memory_context);
+    if (parsed.capacity_bytes_per_gpu == 0) {
+        throw ConfigError(memory_context +
+                          ".capacity_bytes_per_gpu must be positive");
+    }
     parsed.runtime_reserve_fraction =
         memory.contains("runtime_reserve_fraction")
             ? require_finite_number(memory, "runtime_reserve_fraction",
@@ -958,10 +971,11 @@ ExecutionModelConfig parse_execution_model(const Json &root,
                 "fp8, int8, fp4, int4, mxfp8, or mxfp4");
         }
         if (analytical.moe_layer_event_mode != "detailed" &&
-            analytical.moe_layer_event_mode != "first_layer_scaled") {
+            analytical.moe_layer_event_mode != "first_layer_scaled" &&
+            analytical.moe_layer_event_mode != "stage_group_scaled") {
             throw ConfigError(
                 "config.execution_model.moe_layer_event_mode must be "
-                "'detailed' or 'first_layer_scaled'");
+                "'detailed', 'first_layer_scaled', or 'stage_group_scaled'");
         }
         if (!model.attention.execution_enabled ||
             model.attention.memory_layout ==
@@ -1005,9 +1019,10 @@ ClusterRuntimeConfig parse_cluster_runtime(const Json &clusters,
                      "execution_model",
                      "model_name",
                      "moe_routing",
+                     "gpu_memory",
                  },
                  {"total_expert_num", "router_topk", "first_k_dense_replace",
-                  "num_shared_experts", "gpu_memory"},
+                  "num_shared_experts"},
                  context);
     const ModelConfig model = parse_model(cluster, context);
     const ParallelismConfig parallelism = parse_parallelism(cluster, model);

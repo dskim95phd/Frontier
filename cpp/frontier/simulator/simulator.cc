@@ -2,7 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cctype>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -125,21 +125,93 @@ double kv_cache_dtype_size_bytes(const config::ClusterRuntimeConfig &runtime,
         runtime.execution_model.analytical.kv_cache_precision());
 }
 
+struct GpuKvPhysicalBlockLayout {
+    std::uint64_t max_rank_bytes = 0;
+    std::uint64_t pipeline_bytes = 0;
+};
+
+GpuKvPhysicalBlockLayout gpu_kv_physical_block_layout(
+    const config::ClusterRuntimeConfig &runtime,
+    const config::SimulationConfig &config) {
+    const double dtype_bytes = kv_cache_dtype_size_bytes(runtime, config);
+    GpuKvPhysicalBlockLayout result{};
+    const std::uint64_t dcp =
+        runtime.parallelism.decode_context_parallel_size;
+    const std::uint64_t tp = runtime.parallelism.tensor_parallel_size;
+    if (dcp == 0 || tp == 0 || tp % dcp != 0) {
+        throw SimulationError("invalid GPU KV physical parallelism layout");
+    }
+    const std::uint64_t mla_copies = tp / dcp;
+    const auto add_pipeline_bytes = [&](std::uint64_t stage_bytes) {
+        if (stage_bytes > std::numeric_limits<std::uint64_t>::max() -
+                              result.pipeline_bytes) {
+            throw SimulationError("GPU KV pipeline byte layout overflows");
+        }
+        result.pipeline_bytes += stage_bytes;
+    };
+
+    if (!runtime.gpu_memory.pipeline_stage_memory_profiles.empty()) {
+        for (const config::PipelineStageMemoryProfile &profile :
+             runtime.gpu_memory.pipeline_stage_memory_profiles) {
+            std::uint64_t stage_bytes = 0;
+            for (const std::uint64_t rank_bytes :
+                 profile.kv_bytes_per_block_by_rank) {
+                result.max_rank_bytes =
+                    std::max(result.max_rank_bytes, rank_bytes);
+                if (rank_bytes > std::numeric_limits<std::uint64_t>::max() -
+                                     stage_bytes) {
+                    throw SimulationError(
+                        "GPU KV stage byte layout overflows");
+                }
+                stage_bytes += rank_bytes;
+            }
+            if (runtime.model.use_mla) {
+                if (stage_bytes >
+                    std::numeric_limits<std::uint64_t>::max() / mla_copies) {
+                    throw SimulationError(
+                        "GPU KV stage replication bytes overflow");
+                }
+                stage_bytes *= mla_copies;
+            }
+            add_pipeline_bytes(stage_bytes);
+        }
+    } else {
+        for (std::uint64_t stage = 0;
+             stage < runtime.parallelism.pipeline_parallel_size; ++stage) {
+            const config::PipelineStageLayerRange layers =
+                config::pipeline_stage_layer_range(
+                    runtime.model.num_layers,
+                    runtime.parallelism.pipeline_parallel_size, stage);
+            for (std::uint64_t rank = 0; rank < dcp; ++rank) {
+                result.max_rank_bytes = std::max(
+                    result.max_rank_bytes,
+                    kv_cache_transfer::
+                        model_kv_cache_size_bytes_stage_rank_local(
+                            runtime.scheduler.block_size, runtime.model,
+                            dtype_bytes, layers, dcp, rank));
+            }
+            add_pipeline_bytes(
+                kv_cache_transfer::model_kv_cache_size_bytes_stage_physical(
+                    runtime.scheduler.block_size, runtime.model, dtype_bytes,
+                    layers, tp, dcp));
+        }
+    }
+    if (result.max_rank_bytes == 0 || result.pipeline_bytes == 0 ||
+        result.pipeline_bytes < result.max_rank_bytes) {
+        throw SimulationError("GPU KV physical block layout is empty");
+    }
+    return result;
+}
+
 std::optional<std::uint64_t>
 total_hbm_bytes_per_gpu(const config::ClusterRuntimeConfig &runtime) {
-    if (runtime.execution_model.type != config::ExecutionModelType::kAnalytical) {
-        return std::nullopt;
-    }
-    std::string device = runtime.execution_model.analytical.device;
-    std::transform(device.begin(), device.end(), device.begin(),
-                   [](unsigned char value) {
-                       return static_cast<char>(std::tolower(value));
-                   });
-    if (device.find("gb300") != std::string::npos ||
-        device.find("rubin") != std::string::npos) {
-        // NVIDIA GB300 and Rubin both expose 288 GB of nominal HBM per GPU
-        // in the experiment hardware contracts.
-        return 288'000'000'000ULL;
+    // HBM is an explicit part of the runtime contract.  Use the configured
+    // capacity for every execution model/device instead of inferring a
+    // nominal device size from the analytical device name.  Keep a nullopt
+    // fallback for callers that construct legacy in-memory configs without a
+    // capacity; parsed configs reject that shape before simulation starts.
+    if (runtime.gpu_memory.capacity_bytes_per_gpu != 0) {
+        return runtime.gpu_memory.capacity_bytes_per_gpu;
     }
     return std::nullopt;
 }
@@ -249,6 +321,7 @@ Simulator::Simulator(
             return value;
         }());
     }
+    peak_event_queue_size_ = event_queue_.size();
 }
 
 void Simulator::enqueue_request_arrival(RequestId request_id,
@@ -286,13 +359,11 @@ void Simulator::record_gpu_kv_occupancy_for_event(const Event &event) {
             cluster_scheduler.get_replica_scheduler(replica_id, dp_id);
         const config::ClusterRuntimeConfig &runtime =
             runtime_config(cluster_type);
-        const std::uint64_t bytes_per_block =
-            kv_cache_transfer::model_kv_cache_size_bytes_rank_local(
-                runtime.scheduler.block_size, runtime.model,
-                kv_cache_dtype_size_bytes(runtime, config_),
-                runtime.parallelism.decode_context_parallel_size);
+        const GpuKvPhysicalBlockLayout bytes =
+            gpu_kv_physical_block_layout(runtime, config_);
         metrics_.record_gpu_kv_cache_occupancy(
-            event.time, replica_scheduler, bytes_per_block,
+            event.time, replica_scheduler, bytes.max_rank_bytes,
+            bytes.pipeline_bytes,
             total_hbm_bytes_per_gpu(runtime));
     };
 
@@ -588,13 +659,11 @@ void Simulator::finalize() {
             }
             const config::ClusterRuntimeConfig &runtime =
                 cluster_entity.runtime_config();
-            const std::uint64_t bytes_per_block =
-                kv_cache_transfer::model_kv_cache_size_bytes_rank_local(
-                    runtime.scheduler.block_size, runtime.model,
-                    kv_cache_dtype_size_bytes(runtime, config_),
-                    runtime.parallelism.decode_context_parallel_size);
+            const GpuKvPhysicalBlockLayout bytes =
+                gpu_kv_physical_block_layout(runtime, config_);
             metrics_.record_gpu_kv_cache_occupancy(
-                last_event_time_, replica_scheduler, bytes_per_block,
+                last_event_time_, replica_scheduler, bytes.max_rank_bytes,
+                bytes.pipeline_bytes,
                 total_hbm_bytes_per_gpu(runtime), true);
             if (config_.prefix_cache.enabled &&
                 cluster_type != ClusterType::kDecode) {
@@ -700,6 +769,8 @@ metrics::SimulationOutput Simulator::run() {
         // keeps the occupancy stream event-driven and coalesces same-time
         // transitions in MetricsStore.
         record_gpu_kv_occupancy_for_event(event);
+        peak_event_queue_size_ =
+            std::max(peak_event_queue_size_, event_queue_.size());
     }
     finalize();
     return take_output();
@@ -716,6 +787,8 @@ metrics::SimulationOutput Simulator::run_until(SimTime end_time) {
         metrics_.record_event(event);
         dispatcher.dispatch(event, *this);
         record_gpu_kv_occupancy_for_event(event);
+        peak_event_queue_size_ =
+            std::max(peak_event_queue_size_, event_queue_.size());
     }
     // A bounded experiment intentionally leaves future session turns and
     // possibly in-flight requests outside the observation horizon.  Export

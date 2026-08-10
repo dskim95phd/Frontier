@@ -4,6 +4,7 @@
 #include <cmath>
 #include <limits>
 #include <string>
+#include <utility>
 
 #include "frontier/kv_cache_transfer/analytical_transfer.h"
 
@@ -151,11 +152,10 @@ void add_mlp_weight_bytes(long double &total, std::uint64_t hidden_size,
                      bytes_per_element, copies);
 }
 
-std::uint64_t
-model_weight_bytes_per_gpu(const ModelConfig &model,
-                           const ParallelismConfig &parallelism,
-                           const AnalyticalExecutionModelConfig &execution,
-                           double weight_overhead_fraction) {
+std::uint64_t stage_model_weight_bytes_per_gpu(
+    const ModelConfig &model, const ParallelismConfig &parallelism,
+    const AnalyticalExecutionModelConfig &execution,
+    double weight_overhead_fraction, std::uint64_t stage) {
     if (!model.kda_topology_is_symmetric()) {
         throw ConfigError(
             "automatic GPU weight memory currently supports only symmetric "
@@ -180,129 +180,130 @@ model_weight_bytes_per_gpu(const ModelConfig &model,
         execution.router_weight_storage_precision());
     const double lm_head_bytes =
         storage_bytes_per_element(execution.lm_head_weight_precision());
-    std::uint64_t maximum = 0;
-    for (std::uint64_t stage = 0; stage < parallelism.pipeline_parallel_size;
-         ++stage) {
-        long double total = 0.0L;
-        const PipelineStageLayerRange layers = pipeline_stage_layer_range(
-            model.num_layers, parallelism.pipeline_parallel_size, stage);
-        if (stage == 0) {
-            add_weight_bytes(
-                total,
-                ceil_div(model.vocab_size, parallelism.tensor_parallel_size),
-                model.hidden_size, lm_head_bytes);
-        }
-        if (stage + 1 == parallelism.pipeline_parallel_size) {
-            // Conservatively model untied input embeddings and LM head. The
-            // model contract currently has no tie_word_embeddings field.
-            add_weight_bytes(
-                total,
-                ceil_div(model.vocab_size, parallelism.tensor_parallel_size),
-                model.hidden_size, lm_head_bytes);
-        }
-        for (std::uint64_t layer = layers.begin; layer < layers.end; ++layer) {
-            add_attention_weight_bytes(total, model, parallelism,
-                                       attention_bytes, layer);
-            // Attention and post-attention norms are replicated.
-            add_weight_bytes(total, 2, model.hidden_size, dense_bytes);
-            if (!model.is_moe_layer(layer)) {
-                add_mlp_weight_bytes(total, model.hidden_size,
-                                     ceil_div(model.dense_intermediate_size,
-                                              parallelism.tensor_parallel_size),
-                                     model.gated_mlp, dense_mlp_bytes);
-                continue;
-            }
-            add_weight_bytes(total, model.hidden_size, model.total_expert_num,
-                             router_bytes);
-            const std::uint64_t local_intermediate =
-                ceil_div(model.moe_intermediate_size,
-                         parallelism.moe_tensor_parallel_size);
-            const std::uint64_t local_routed_experts = ceil_div(
-                model.total_expert_num, parallelism.moe_expert_parallel_size);
-            const std::uint64_t routed_hidden =
-                model.has_latent_moe() ? model.routed_expert_hidden_size
-                                       : model.hidden_size;
-            add_mlp_weight_bytes(total, routed_hidden, local_intermediate,
-                                 model.gated_mlp, routed_expert_bytes,
-                                 local_routed_experts);
-            if (model.has_latent_moe()) {
-                add_weight_bytes(total, model.hidden_size, routed_hidden,
-                                 latent_moe_projection_bytes);
-                add_weight_bytes(total, routed_hidden, model.hidden_size,
-                                 latent_moe_projection_bytes);
-                if (model.latent_moe_use_norm) {
-                    add_weight_bytes(total, 1, routed_hidden, dense_bytes);
-                }
-            }
-            // Shared experts are replicated across EP lanes and sharded only
-            // by the MoE tensor-parallel dimension.
-            add_mlp_weight_bytes(total, model.hidden_size, local_intermediate,
-                                 model.gated_mlp, shared_expert_bytes,
-                                 model.num_shared_experts);
-        }
-        // Final RMSNorm lives on the last pipeline stage.
-        if (stage + 1 == parallelism.pipeline_parallel_size) {
-            add_weight_bytes(total, 1, model.hidden_size, dense_bytes);
-        }
-        total *= 1.0L + static_cast<long double>(weight_overhead_fraction);
-        if (!std::isfinite(total) ||
-            total > static_cast<long double>(
-                        std::numeric_limits<std::uint64_t>::max())) {
-            throw ConfigError("per-GPU model weight storage overflows uint64");
-        }
-        maximum =
-            std::max(maximum, static_cast<std::uint64_t>(std::ceil(total)));
+    if (stage >= parallelism.pipeline_parallel_size) {
+        throw ConfigError("pipeline stage id is out of range");
     }
-    return maximum;
+    long double total = 0.0L;
+    const PipelineStageLayerRange layers = pipeline_stage_layer_range(
+        model.num_layers, parallelism.pipeline_parallel_size, stage);
+    if (stage == 0) {
+        add_weight_bytes(
+            total,
+            ceil_div(model.vocab_size, parallelism.tensor_parallel_size),
+            model.hidden_size, lm_head_bytes);
+    }
+    if (stage + 1 == parallelism.pipeline_parallel_size) {
+        // Conservatively model untied input embeddings and LM head. The model
+        // contract currently has no tie_word_embeddings field.
+        add_weight_bytes(
+            total,
+            ceil_div(model.vocab_size, parallelism.tensor_parallel_size),
+            model.hidden_size, lm_head_bytes);
+    }
+    for (std::uint64_t layer = layers.begin; layer < layers.end; ++layer) {
+        add_attention_weight_bytes(total, model, parallelism, attention_bytes,
+                                   layer);
+        // Attention and post-attention norms are replicated.
+        add_weight_bytes(total, 2, model.hidden_size, dense_bytes);
+        if (!model.is_moe_layer(layer)) {
+            add_mlp_weight_bytes(total, model.hidden_size,
+                                 ceil_div(model.dense_intermediate_size,
+                                          parallelism.tensor_parallel_size),
+                                 model.gated_mlp, dense_mlp_bytes);
+            continue;
+        }
+        add_weight_bytes(total, model.hidden_size, model.total_expert_num,
+                         router_bytes);
+        const std::uint64_t local_intermediate =
+            ceil_div(model.moe_intermediate_size,
+                     parallelism.moe_tensor_parallel_size);
+        const std::uint64_t local_routed_experts =
+            ceil_div(model.total_expert_num,
+                     parallelism.moe_expert_parallel_size);
+        const std::uint64_t routed_hidden =
+            model.has_latent_moe() ? model.routed_expert_hidden_size
+                                   : model.hidden_size;
+        add_mlp_weight_bytes(total, routed_hidden, local_intermediate,
+                             model.gated_mlp, routed_expert_bytes,
+                             local_routed_experts);
+        if (model.has_latent_moe()) {
+            add_weight_bytes(total, model.hidden_size, routed_hidden,
+                             latent_moe_projection_bytes);
+            add_weight_bytes(total, routed_hidden, model.hidden_size,
+                             latent_moe_projection_bytes);
+            if (model.latent_moe_use_norm) {
+                add_weight_bytes(total, 1, routed_hidden, dense_bytes);
+            }
+        }
+        // Shared experts are replicated across EP lanes and sharded only by
+        // the MoE tensor-parallel dimension.
+        add_mlp_weight_bytes(total, model.hidden_size, local_intermediate,
+                             model.gated_mlp, shared_expert_bytes,
+                             model.num_shared_experts);
+    }
+    // Final RMSNorm lives on the last pipeline stage.
+    if (stage + 1 == parallelism.pipeline_parallel_size) {
+        add_weight_bytes(total, 1, model.hidden_size, dense_bytes);
+    }
+    total *= 1.0L + static_cast<long double>(weight_overhead_fraction);
+    if (!std::isfinite(total) ||
+        total > static_cast<long double>(std::numeric_limits<std::uint64_t>::max())) {
+        throw ConfigError("per-GPU model weight storage overflows uint64");
+    }
+    return static_cast<std::uint64_t>(std::ceil(total));
 }
 
-void resolve_kda_snapshot_charge(ClusterRuntimeConfig &cluster,
-                                 std::uint64_t kv_cache_bytes_per_block) {
-    cluster.scheduler.kda_snapshot_blocks_per_session = 0;
-    if (!cluster.model.has_kda()) {
-        return;
-    }
-    if (kv_cache_bytes_per_block == 0) {
+std::uint64_t resolve_total_gpu_reserve_bytes(const GpuMemoryConfig &memory,
+                                              std::uint64_t capacity_bytes) {
+    if (!std::isfinite(memory.runtime_reserve_fraction) ||
+        memory.runtime_reserve_fraction < 0.0 ||
+        memory.runtime_reserve_fraction >= 1.0) {
         throw ConfigError(
-            "KDA snapshot charge requires a positive KV block byte size");
+            "gpu_memory.runtime_reserve_fraction must be in [0, 1)");
     }
-    try {
-        const std::uint64_t snapshot_bytes =
-            kv_cache_transfer::model_kda_state_snapshot_size_bytes_rank_local(
-                cluster.model,
-                cluster.execution_model.type == ExecutionModelType::kAnalytical
-                    ? storage_bytes_per_element(
-                          cluster.execution_model.analytical
-                              .kda_snapshot_precision())
-                    : 4.0,
-                cluster.parallelism.tensor_parallel_size);
-        cluster.scheduler.kda_snapshot_blocks_per_session =
-            ceil_div(snapshot_bytes, kv_cache_bytes_per_block);
-    } catch (const kv_cache_transfer::TransferModelError &error) {
-        throw ConfigError(std::string{"invalid KDA snapshot layout: "} +
-                          error.what());
+    const long double fractional_reserve =
+        static_cast<long double>(capacity_bytes) *
+        static_cast<long double>(memory.runtime_reserve_fraction);
+    if (!std::isfinite(fractional_reserve) ||
+        fractional_reserve > static_cast<long double>(
+                                  std::numeric_limits<std::uint64_t>::max())) {
+        throw ConfigError("GPU runtime reserve overflows uint64");
     }
+    const std::uint64_t reserve_from_fraction =
+        static_cast<std::uint64_t>(std::ceil(fractional_reserve));
+    if (memory.runtime_reserve_bytes > capacity_bytes ||
+        reserve_from_fraction >
+            capacity_bytes - memory.runtime_reserve_bytes) {
+        throw ConfigError("GPU runtime reserve exceeds device capacity");
+    }
+    return memory.runtime_reserve_bytes + reserve_from_fraction;
 }
 
-std::uint64_t
-derive_rank_local_kv_block_bytes(const ClusterRuntimeConfig &cluster,
-                                 double kv_cache_dtype_size_bytes) {
-    try {
-        std::uint64_t maximum_block_bytes = 0;
-        for (std::uint64_t rank = 0;
-             rank < cluster.parallelism.decode_context_parallel_size; ++rank) {
-            maximum_block_bytes = std::max(
-                maximum_block_bytes,
-                kv_cache_transfer::model_kv_cache_size_bytes_rank_local(
-                    cluster.scheduler.block_size, cluster.model,
-                    kv_cache_dtype_size_bytes,
-                    cluster.parallelism.decode_context_parallel_size, rank));
+StageTimingSignature stage_timing_signature(const ClusterRuntimeConfig &cluster,
+                                            std::uint64_t stage) {
+    const auto &model = cluster.model;
+    const auto pp = cluster.parallelism.pipeline_parallel_size;
+    const auto layers = pipeline_stage_layer_range(model.num_layers, pp, stage);
+    StageTimingSignature signature{};
+    signature.owns_input_embedding = stage == 0;
+    signature.owns_final_norm = stage + 1 == pp;
+    signature.owns_lm_head = stage + 1 == pp;
+    signature.emits_pp_send = stage + 1 < pp;
+    signature.ordered_layers.reserve(static_cast<std::size_t>(layers.size()));
+    for (std::uint64_t layer = layers.begin; layer < layers.end; ++layer) {
+        LayerStaticSignature layer_signature{};
+        if (model.is_kda_layer(layer)) {
+            layer_signature.attention_family = AttentionFamily::kKda;
+        } else if (model.is_mla_layer(layer)) {
+            layer_signature.attention_family = AttentionFamily::kMla;
+        } else {
+            layer_signature.attention_family = AttentionFamily::kStandard;
         }
-        return maximum_block_bytes;
-    } catch (const kv_cache_transfer::TransferModelError &error) {
-        throw ConfigError(std::string{"invalid automatic GPU KV layout: "} +
-                          error.what());
+        layer_signature.is_moe = model.is_moe_layer(layer);
+        layer_signature.has_dense_mlp = !layer_signature.is_moe;
+        signature.ordered_layers.push_back(layer_signature);
     }
+    return signature;
 }
 
 } // namespace
@@ -442,6 +443,245 @@ void apply_model_native_precision_defaults(
     if (operators.kda_snapshot.empty()) {
         operators.kda_snapshot = "bf16";
     }
+}
+
+std::vector<PipelineStageMemoryProfile>
+build_pipeline_stage_memory_profiles(const ClusterRuntimeConfig &cluster) {
+    const auto pp = cluster.parallelism.pipeline_parallel_size;
+    if (pp == 0 || pp > cluster.model.num_layers) {
+        throw ConfigError("invalid pipeline layer partition");
+    }
+    if (cluster.parallelism.tensor_parallel_size == 0 ||
+        cluster.parallelism.decode_context_parallel_size == 0) {
+        throw ConfigError("GPU memory parallelism dimensions must be positive");
+    }
+    if (cluster.gpu_memory.capacity_bytes_per_gpu == 0) {
+        throw ConfigError("gpu_memory.capacity_bytes_per_gpu must be positive");
+    }
+    if (!std::isfinite(cluster.gpu_memory.weight_overhead_fraction) ||
+        cluster.gpu_memory.weight_overhead_fraction < 0.0) {
+        throw ConfigError(
+            "gpu_memory.weight_overhead_fraction must be nonnegative");
+    }
+    const double kv_dtype_size =
+        cluster.execution_model.type == ExecutionModelType::kAnalytical
+            ? storage_bytes_per_element(
+                  cluster.execution_model.analytical.kv_cache_precision())
+            : 2.0;
+    const double kda_dtype_size =
+        cluster.execution_model.type == ExecutionModelType::kAnalytical
+            ? storage_bytes_per_element(
+                  cluster.execution_model.analytical.kda_snapshot_precision())
+            : 2.0;
+    const std::uint64_t reserve_bytes = resolve_total_gpu_reserve_bytes(
+        cluster.gpu_memory, cluster.gpu_memory.capacity_bytes_per_gpu);
+
+    std::vector<PipelineStageMemoryProfile> profiles;
+    profiles.reserve(static_cast<std::size_t>(pp));
+    for (std::uint64_t stage = 0; stage < pp; ++stage) {
+        PipelineStageMemoryProfile profile{};
+        profile.stage_id = StageId{stage};
+        profile.layers =
+            pipeline_stage_layer_range(cluster.model.num_layers, pp, stage);
+        profile.resident_weight_bytes =
+            cluster.execution_model.type == ExecutionModelType::kAnalytical
+                ? stage_model_weight_bytes_per_gpu(
+                      cluster.model, cluster.parallelism,
+                      cluster.execution_model.analytical,
+                      cluster.gpu_memory.weight_overhead_fraction, stage)
+                : 0;
+        profile.reserved_bytes = reserve_bytes;
+        if (cluster.gpu_memory.capacity_bytes_per_gpu < reserve_bytes ||
+            profile.resident_weight_bytes >
+                cluster.gpu_memory.capacity_bytes_per_gpu - reserve_bytes) {
+            throw ConfigError(
+                "stage resident weights and runtime reserve exceed GPU "
+                "capacity");
+        }
+        profile.free_bytes = cluster.gpu_memory.capacity_bytes_per_gpu -
+                             reserve_bytes - profile.resident_weight_bytes;
+        profile.kv_bytes_per_block_by_rank.reserve(
+            static_cast<std::size_t>(
+                cluster.parallelism.decode_context_parallel_size));
+        profile.kda_snapshot_bytes_by_rank.reserve(
+            static_cast<std::size_t>(
+                cluster.parallelism.decode_context_parallel_size));
+        try {
+            for (std::uint64_t rank = 0;
+                 rank < cluster.parallelism.decode_context_parallel_size;
+                 ++rank) {
+                profile.kv_bytes_per_block_by_rank.push_back(
+                    kv_cache_transfer::model_kv_cache_size_bytes_stage_rank_local(
+                        cluster.scheduler.block_size, cluster.model,
+                        kv_dtype_size, profile.layers,
+                        cluster.parallelism.decode_context_parallel_size,
+                        rank));
+                profile.kda_snapshot_bytes_by_rank.push_back(
+                    kv_cache_transfer::
+                        model_kda_state_snapshot_size_bytes_stage_rank_local(
+                            cluster.model, kda_dtype_size,
+                            cluster.parallelism.tensor_parallel_size,
+                            profile.layers));
+            }
+        } catch (const kv_cache_transfer::TransferModelError &error) {
+            throw ConfigError(std::string{"invalid stage-local GPU memory "} +
+                              error.what());
+        }
+        profiles.push_back(std::move(profile));
+    }
+    return profiles;
+}
+
+PipelineStageGroupCatalogue build_pipeline_stage_group_catalogue(
+    const ClusterRuntimeConfig &cluster,
+    const std::vector<PipelineStageMemoryProfile> &profiles) {
+    const auto pp = cluster.parallelism.pipeline_parallel_size;
+    if (profiles.size() != pp) {
+        throw ConfigError(
+            "stage group catalogue requires one profile per pipeline stage");
+    }
+    PipelineStageGroupCatalogue catalogue{};
+    catalogue.stage_to_timing_group.reserve(profiles.size());
+    catalogue.stage_to_memory_group.reserve(profiles.size());
+    for (std::size_t index = 0; index < profiles.size(); ++index) {
+        const auto stage = static_cast<std::uint64_t>(index);
+        const StageTimingSignature timing = stage_timing_signature(cluster, stage);
+        const StageMemorySignature memory = profiles[index].memory_signature();
+
+        auto timing_it = std::find(catalogue.timing_groups.begin(),
+                                   catalogue.timing_groups.end(), timing);
+        std::uint32_t timing_group = 0;
+        if (timing_it == catalogue.timing_groups.end()) {
+            timing_group = static_cast<std::uint32_t>(
+                catalogue.timing_groups.size());
+            catalogue.timing_groups.push_back(timing);
+            catalogue.timing_group_multiplicity.push_back(0);
+        } else {
+            timing_group = static_cast<std::uint32_t>(
+                std::distance(catalogue.timing_groups.begin(), timing_it));
+        }
+        ++catalogue.timing_group_multiplicity[timing_group];
+        catalogue.stage_to_timing_group.push_back(timing_group);
+
+        auto memory_it = std::find(catalogue.memory_groups.begin(),
+                                   catalogue.memory_groups.end(), memory);
+        std::uint32_t memory_group = 0;
+        if (memory_it == catalogue.memory_groups.end()) {
+            memory_group = static_cast<std::uint32_t>(
+                catalogue.memory_groups.size());
+            catalogue.memory_groups.push_back(memory);
+            catalogue.memory_group_multiplicity.push_back(0);
+        } else {
+            memory_group = static_cast<std::uint32_t>(
+                std::distance(catalogue.memory_groups.begin(), memory_it));
+        }
+        ++catalogue.memory_group_multiplicity[memory_group];
+        catalogue.stage_to_memory_group.push_back(memory_group);
+    }
+    return catalogue;
+}
+
+std::uint64_t resolve_pipeline_logical_kv_capacity(
+    const std::vector<PipelineStageMemoryProfile> &profiles,
+    std::uint64_t *limiting_stage, std::uint64_t *limiting_rank) {
+    if (profiles.empty()) {
+        throw ConfigError("GPU memory requires at least one stage profile");
+    }
+    std::uint64_t capacity = std::numeric_limits<std::uint64_t>::max();
+    bool found_kv = false;
+    std::uint64_t selected_stage = 0;
+    std::uint64_t selected_rank = 0;
+    for (const auto &profile : profiles) {
+        if (!profile.stage_id.valid()) {
+            throw ConfigError("GPU memory profile has an invalid stage id");
+        }
+        for (std::size_t rank = 0;
+             rank < profile.kv_bytes_per_block_by_rank.size(); ++rank) {
+            const std::uint64_t block_bytes =
+                profile.kv_bytes_per_block_by_rank[rank];
+            if (block_bytes == 0) {
+                continue;
+            }
+            const std::uint64_t candidate = profile.free_bytes / block_bytes;
+            if (!found_kv || candidate < capacity) {
+                found_kv = true;
+                capacity = candidate;
+                selected_stage = static_cast<std::uint64_t>(
+                    profile.stage_id.value());
+                selected_rank = static_cast<std::uint64_t>(rank);
+            }
+        }
+    }
+    if (!found_kv) {
+        throw ConfigError(
+            "GPU memory profile has no ordinary KV-bearing stage/rank");
+    }
+    if (limiting_stage != nullptr) {
+        *limiting_stage = selected_stage;
+    }
+    if (limiting_rank != nullptr) {
+        *limiting_rank = selected_rank;
+    }
+    return capacity;
+}
+
+std::uint64_t resolve_pipeline_kda_snapshot_charge(
+    const std::vector<PipelineStageMemoryProfile> &profiles,
+    std::uint64_t logical_kv_capacity, std::uint64_t *limiting_stage,
+    std::uint64_t *limiting_rank) {
+    std::uint64_t charge = 0;
+    std::uint64_t selected_stage = 0;
+    std::uint64_t selected_rank = 0;
+    bool saw_snapshot = false;
+    for (const auto &profile : profiles) {
+        if (!profile.stage_id.valid()) {
+            throw ConfigError("GPU memory profile has an invalid stage id");
+        }
+        if (profile.kda_snapshot_bytes_by_rank.size() !=
+            profile.kv_bytes_per_block_by_rank.size()) {
+            throw ConfigError(
+                "stage KV/KDA rank profile lengths do not match");
+        }
+        for (std::size_t rank = 0;
+             rank < profile.kda_snapshot_bytes_by_rank.size(); ++rank) {
+            const std::uint64_t snapshot_bytes =
+                profile.kda_snapshot_bytes_by_rank[rank];
+            if (snapshot_bytes == 0) {
+                continue;
+            }
+            saw_snapshot = true;
+            if (snapshot_bytes > profile.free_bytes) {
+                throw ConfigError(
+                    "one KDA snapshot does not fit in stage/rank free HBM");
+            }
+            if (logical_kv_capacity != 0 &&
+                snapshot_bytes >
+                    std::numeric_limits<std::uint64_t>::max() /
+                        logical_kv_capacity) {
+                throw ConfigError(
+                    "normalized KDA snapshot charge overflows uint64");
+            }
+            const std::uint64_t product =
+                logical_kv_capacity * snapshot_bytes;
+            const std::uint64_t candidate =
+                ceil_div(product, profile.free_bytes);
+            if (candidate > charge) {
+                charge = candidate;
+                selected_stage = static_cast<std::uint64_t>(
+                    profile.stage_id.value());
+                selected_rank = static_cast<std::uint64_t>(rank);
+            }
+        }
+    }
+    if (saw_snapshot) {
+        if (limiting_stage != nullptr) {
+            *limiting_stage = selected_stage;
+        }
+        if (limiting_rank != nullptr) {
+            *limiting_rank = selected_rank;
+        }
+    }
+    return charge;
 }
 
 std::string_view to_string(SimulationMode mode) noexcept {
@@ -584,6 +824,16 @@ void resolve_gpu_memory_config(
             cluster.execution_model.analytical, cluster.model);
     }
     GpuMemoryConfig &memory = cluster.gpu_memory;
+    memory.pipeline_stage_memory_profiles.clear();
+    memory.pipeline_stage_group_catalogue = {};
+    memory.ordinary_kv_capacity_blocks = 0;
+    memory.ordinary_kv_limiting_stage = 0;
+    memory.ordinary_kv_limiting_rank = 0;
+    memory.kda_snapshot_limiting_stage = 0;
+    memory.kda_snapshot_limiting_rank = 0;
+    if (memory.capacity_bytes_per_gpu == 0) {
+        throw ConfigError("gpu_memory.capacity_bytes_per_gpu must be positive");
+    }
     if (!memory.auto_calculate_num_blocks) {
         if (!explicit_num_blocks.has_value() ||
             explicit_num_blocks.value() == 0) {
@@ -591,72 +841,79 @@ void resolve_gpu_memory_config(
                 "manual GPU memory config requires scheduler.num_blocks");
         }
         cluster.scheduler.num_blocks = explicit_num_blocks.value();
-        const double kv_bytes =
-            cluster.execution_model.type == ExecutionModelType::kAnalytical
-                ? storage_bytes_per_element(
-                      cluster.execution_model.analytical.kv_cache_precision())
-                : 2.0;
-        resolve_kda_snapshot_charge(
-            cluster, derive_rank_local_kv_block_bytes(cluster, kv_bytes));
+        const auto profiles = build_pipeline_stage_memory_profiles(cluster);
+        const std::uint64_t physical_capacity =
+            resolve_pipeline_logical_kv_capacity(
+                profiles, &memory.ordinary_kv_limiting_stage,
+                &memory.ordinary_kv_limiting_rank);
+        if (cluster.scheduler.num_blocks > physical_capacity) {
+            throw ConfigError(
+                "manual scheduler.num_blocks exceeds stage-local GPU KV "
+                "capacity");
+        }
+        memory.pipeline_stage_memory_profiles = profiles;
+        memory.pipeline_stage_group_catalogue =
+            build_pipeline_stage_group_catalogue(cluster, profiles);
+        memory.ordinary_kv_capacity_blocks = physical_capacity;
+        memory.model_weight_bytes_per_gpu = 0;
+        memory.kv_cache_budget_bytes_per_gpu = std::numeric_limits<
+            std::uint64_t>::max();
+        memory.kv_cache_bytes_per_block = 0;
+        for (const auto &profile : profiles) {
+            memory.model_weight_bytes_per_gpu = std::max(
+                memory.model_weight_bytes_per_gpu, profile.resident_weight_bytes);
+            memory.kv_cache_budget_bytes_per_gpu = std::min(
+                memory.kv_cache_budget_bytes_per_gpu, profile.free_bytes);
+            for (const auto bytes : profile.kv_bytes_per_block_by_rank) {
+                memory.kv_cache_bytes_per_block = std::max(
+                    memory.kv_cache_bytes_per_block, bytes);
+            }
+        }
+        memory.kda_snapshot_limiting_stage = 0;
+        memory.kda_snapshot_limiting_rank = 0;
+        cluster.scheduler.kda_snapshot_blocks_per_session =
+            resolve_pipeline_kda_snapshot_charge(
+                profiles, cluster.scheduler.num_blocks,
+                &memory.kda_snapshot_limiting_stage,
+                &memory.kda_snapshot_limiting_rank);
         return;
     }
     if (cluster.execution_model.type != ExecutionModelType::kAnalytical) {
         throw ConfigError(
             "automatic GPU block calculation requires analytical execution");
     }
-    if (memory.capacity_bytes_per_gpu == 0) {
-        throw ConfigError("gpu_memory.capacity_bytes_per_gpu must be positive");
-    }
-    if (!std::isfinite(memory.runtime_reserve_fraction) ||
-        memory.runtime_reserve_fraction < 0.0 ||
-        memory.runtime_reserve_fraction >= 1.0) {
-        throw ConfigError(
-            "gpu_memory.runtime_reserve_fraction must be in [0, 1)");
-    }
     if (!std::isfinite(memory.weight_overhead_fraction) ||
         memory.weight_overhead_fraction < 0.0) {
         throw ConfigError(
             "gpu_memory.weight_overhead_fraction must be nonnegative");
     }
-    memory.model_weight_bytes_per_gpu = model_weight_bytes_per_gpu(
-        cluster.model, cluster.parallelism, cluster.execution_model.analytical,
-        memory.weight_overhead_fraction);
-    const long double fractional_reserve =
-        static_cast<long double>(memory.capacity_bytes_per_gpu) *
-        static_cast<long double>(memory.runtime_reserve_fraction);
-    if (!std::isfinite(fractional_reserve) ||
-        fractional_reserve > static_cast<long double>(
-                                 std::numeric_limits<std::uint64_t>::max())) {
-        throw ConfigError("GPU runtime reserve overflows uint64");
-    }
-    const std::uint64_t reserve_from_fraction =
-        static_cast<std::uint64_t>(std::ceil(fractional_reserve));
-    if (memory.runtime_reserve_bytes > memory.capacity_bytes_per_gpu ||
-        reserve_from_fraction >
-            memory.capacity_bytes_per_gpu - memory.runtime_reserve_bytes) {
-        throw ConfigError("GPU runtime reserve exceeds device capacity");
-    }
-    const std::uint64_t total_reserve =
-        memory.runtime_reserve_bytes + reserve_from_fraction;
-    if (memory.model_weight_bytes_per_gpu >
-        memory.capacity_bytes_per_gpu - total_reserve) {
-        throw ConfigError(
-            "model weights and runtime reserve exceed GPU capacity");
-    }
-    memory.kv_cache_budget_bytes_per_gpu = memory.capacity_bytes_per_gpu -
-                                           total_reserve -
-                                           memory.model_weight_bytes_per_gpu;
-    memory.kv_cache_bytes_per_block = derive_rank_local_kv_block_bytes(
-        cluster, storage_bytes_per_element(
-                     cluster.execution_model.analytical.kv_cache_precision()));
-    if (memory.kv_cache_bytes_per_block == 0) {
-        throw ConfigError("automatic GPU KV block size must be positive");
+    const auto profiles = build_pipeline_stage_memory_profiles(cluster);
+    memory.pipeline_stage_memory_profiles = profiles;
+    memory.pipeline_stage_group_catalogue =
+        build_pipeline_stage_group_catalogue(cluster, profiles);
+    memory.model_weight_bytes_per_gpu = 0;
+    memory.kv_cache_budget_bytes_per_gpu =
+        std::numeric_limits<std::uint64_t>::max();
+    memory.kv_cache_bytes_per_block = 0;
+    for (const auto &profile : profiles) {
+        memory.model_weight_bytes_per_gpu = std::max(
+            memory.model_weight_bytes_per_gpu, profile.resident_weight_bytes);
+        // Compatibility scalar: expose the least-free physical stage while
+        // retaining exact F/B vectors in pipeline_stage_memory_profiles.
+        memory.kv_cache_budget_bytes_per_gpu = std::min(
+            memory.kv_cache_budget_bytes_per_gpu, profile.free_bytes);
+        for (const auto bytes : profile.kv_bytes_per_block_by_rank) {
+            memory.kv_cache_bytes_per_block =
+                std::max(memory.kv_cache_bytes_per_block, bytes);
+        }
     }
     const std::uint64_t calculated_blocks =
-        memory.kv_cache_budget_bytes_per_gpu / memory.kv_cache_bytes_per_block;
+        resolve_pipeline_logical_kv_capacity(
+            profiles, &memory.ordinary_kv_limiting_stage,
+            &memory.ordinary_kv_limiting_rank);
     if (calculated_blocks == 0) {
         throw ConfigError(
-            "remaining GPU KV budget cannot hold one cache block");
+            "remaining stage-local GPU KV budget cannot hold one cache block");
     }
     if (explicit_num_blocks.has_value() &&
         explicit_num_blocks.value() != calculated_blocks) {
@@ -665,7 +922,11 @@ void resolve_gpu_memory_config(
             "calculation");
     }
     cluster.scheduler.num_blocks = calculated_blocks;
-    resolve_kda_snapshot_charge(cluster, memory.kv_cache_bytes_per_block);
+    memory.ordinary_kv_capacity_blocks = calculated_blocks;
+    cluster.scheduler.kda_snapshot_blocks_per_session =
+        resolve_pipeline_kda_snapshot_charge(
+            profiles, calculated_blocks, &memory.kda_snapshot_limiting_stage,
+            &memory.kda_snapshot_limiting_rank);
 }
 
 ResolvedCpuKVCacheTargetConfig

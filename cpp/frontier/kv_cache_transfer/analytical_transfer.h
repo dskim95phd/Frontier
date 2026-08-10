@@ -69,6 +69,29 @@ model_kv_cache_size_bytes_one_copy(std::uint64_t num_tokens,
     double kv_cache_dtype_size_bytes,
     std::uint64_t decode_context_parallel_size,
     std::uint64_t decode_context_parallel_rank = 0);
+
+// Stage-local GPU views.  Unlike model_kv_cache_size_bytes_target_physical,
+// these helpers count only layers in `layers` and return the bytes resident on
+// one physical rank.  A stage with no token KV-bearing attention layers
+// returns zero (it may still have a nonzero KDA snapshot shard).
+[[nodiscard]] std::uint64_t model_kv_cache_size_bytes_stage_rank_local(
+    std::uint64_t num_tokens, const config::ModelConfig &model,
+    double kv_cache_dtype_size_bytes,
+    const config::PipelineStageLayerRange &layers,
+    std::uint64_t decode_context_parallel_size,
+    std::uint64_t decode_context_parallel_rank = 0);
+[[nodiscard]] std::uint64_t model_kv_cache_size_bytes_stage_physical(
+    std::uint64_t num_tokens, const config::ModelConfig &model,
+    double kv_cache_dtype_size_bytes,
+    const config::PipelineStageLayerRange &layers,
+    std::uint64_t attention_tensor_parallel_size,
+    std::uint64_t decode_context_parallel_size = 1);
+
+[[nodiscard]] std::uint64_t
+model_kda_state_snapshot_size_bytes_stage_rank_local(
+    const config::ModelConfig &model, double state_dtype_size_bytes,
+    std::uint64_t attention_tensor_parallel_size,
+    const config::PipelineStageLayerRange &layers);
 // KDA keeps a fixed-size recurrent/short-convolution state rather than a
 // token-proportional KV sequence.  The snapshot is independent of the MLA KV
 // block layout and is transferred atomically.

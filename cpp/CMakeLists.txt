@@ -678,4 +678,25 @@ if(BUILD_TESTING)
       RUN_SERIAL TRUE
       TIMEOUT 180
   )
+
+  # Optional, non-gating performance probe for PP stage grouping.  It is
+  # intentionally a standalone target rather than a CTest test: wall-clock
+  # samples are machine-dependent, while the output exposes event and
+  # predictor counts for regression analysis.
+  add_executable(
+    frontier_pp_stage_group_benchmark
+    tests/benchmarks/pp_stage_group_benchmark.cc
+  )
+  target_compile_definitions(
+    frontier_pp_stage_group_benchmark
+    PRIVATE
+      FRONTIER_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures"
+  )
+  target_link_libraries(
+    frontier_pp_stage_group_benchmark
+    PRIVATE
+      frontier_core
+      nlohmann_json::nlohmann_json
+  )
+  frontier_enable_warnings(frontier_pp_stage_group_benchmark)
 endif()

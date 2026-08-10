@@ -154,9 +154,9 @@ struct KVCacheTransferMetricsRecord {
 
 // Compact event-driven occupancy samples for the scheduler's active KV
 // allocations.  `active_blocks` intentionally excludes resident/evictable
-// prefix-cache blocks.  Bytes are one-copy bytes per GPU (for MLA this is the
-// 624,640-byte Kimi K2 block at block_size=16, rather than TP-replicated
-// transfer bytes).
+// prefix-cache blocks. `active_bytes_per_gpu` is the maximum physical
+// stage/rank footprint, while `active_bytes_across_pipeline` sums the physical
+// footprint of every PP stage for one logical (replica, DP) target.
 struct GpuKVCacheOccupancyRecord {
     SimTime time = SimTime::from_seconds(0.0);
     ClusterType cluster_type = ClusterType::kMonolithic;
@@ -165,11 +165,60 @@ struct GpuKVCacheOccupancyRecord {
     std::uint64_t active_blocks = 0;
     std::uint64_t capacity_blocks = 0;
     std::uint64_t active_bytes_per_gpu = 0;
+    std::uint64_t active_bytes_across_pipeline = 0;
     // Fraction of total physical HBM on the GPU.  This is absent when the
     // configured device does not expose a total-HBM capacity.
     std::optional<double> hbm_fraction;
     double active_fraction_of_kv_budget = 0.0;
     std::optional<double> active_fraction_of_total_hbm;
+};
+
+// Per-stage memory and signature diagnostics.  These records are emitted at
+// run construction time (rather than once per event) so PP runs can be
+// audited without retaining a stage trace.  Byte vectors are rank-local and
+// use DCP rank order; `free_bytes` is the physical HBM available to that
+// stage after resident weights and the runtime reserve.
+struct PipelineStageMemoryDiagnostic {
+    ClusterType cluster_type = ClusterType::kMonolithic;
+    StageId stage_id{0};
+    std::uint64_t layer_begin = 0;
+    std::uint64_t layer_end = 0;
+    std::uint64_t layer_count = 0;
+    std::uint64_t kda_layer_count = 0;
+    std::uint64_t mla_layer_count = 0;
+    std::uint64_t moe_layer_count = 0;
+    std::uint64_t resident_weight_bytes = 0;
+    std::uint64_t reserved_bytes = 0;
+    std::uint64_t free_bytes = 0;
+    std::vector<std::uint64_t> kv_bytes_per_block_by_rank;
+    std::vector<std::uint64_t> kda_snapshot_bytes_by_rank;
+    std::optional<std::uint32_t> timing_group_id;
+    std::optional<std::uint32_t> memory_group_id;
+    std::uint64_t timing_group_multiplicity = 0;
+    std::uint64_t memory_group_multiplicity = 0;
+};
+
+// One record is emitted for each runtime cluster.  It includes the logical
+// PP-wide capacity and the physical stage/rank that determined it, together
+// with the stage/group records above.  This is intentionally additive to the
+// existing output schema so consumers that ignore unknown top-level fields
+// remain compatible.
+struct PipelineMemoryDiagnostics {
+    ClusterType cluster_type = ClusterType::kMonolithic;
+    std::uint64_t capacity_bytes_per_gpu = 0;
+    std::uint64_t model_weight_bytes_per_gpu = 0;
+    std::uint64_t kv_cache_budget_bytes_per_gpu = 0;
+    std::uint64_t kv_cache_bytes_per_block = 0;
+    std::uint64_t configured_num_blocks = 0;
+    std::uint64_t ordinary_kv_capacity_blocks = 0;
+    std::uint64_t ordinary_kv_limiting_stage = 0;
+    std::uint64_t ordinary_kv_limiting_rank = 0;
+    std::uint64_t kda_snapshot_blocks_per_session = 0;
+    std::uint64_t kda_snapshot_limiting_stage = 0;
+    std::uint64_t kda_snapshot_limiting_rank = 0;
+    std::uint64_t timing_group_count = 0;
+    std::uint64_t memory_group_count = 0;
+    std::vector<PipelineStageMemoryDiagnostic> stages;
 };
 
 struct AnalyticalDiagnostic {
@@ -408,6 +457,7 @@ struct SimulationOutput {
     std::vector<MoERoutingMetricsRecord> moe_routing;
     std::vector<KVCacheTransferMetricsRecord> kv_cache_transfers;
     std::vector<GpuKVCacheOccupancyRecord> gpu_kv_occupancy;
+    std::vector<PipelineMemoryDiagnostics> pipeline_memory_diagnostics;
     std::vector<PrefixCacheTargetMetricsRecord> prefix_cache_targets;
     std::vector<CpuKVCacheTargetMetricsRecord> cpu_kv_cache_targets;
     std::vector<CpuKVCacheTransferMetricsRecord> cpu_kv_cache_transfers;

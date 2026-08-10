@@ -383,13 +383,17 @@ void test_gpu_memory_auto_block_calculation() {
     cluster.gpu_memory.runtime_reserve_fraction = 0.10;
     frontier::config::resolve_gpu_memory_config(cluster);
 
+    const auto expected_stage_capacity =
+        frontier::config::resolve_pipeline_logical_kv_capacity(
+            cluster.gpu_memory.pipeline_stage_memory_profiles);
     expect(cluster.gpu_memory.model_weight_bytes_per_gpu > 0 &&
                cluster.gpu_memory.kv_cache_budget_bytes_per_gpu > 0 &&
                cluster.gpu_memory.kv_cache_bytes_per_block > 0 &&
-               cluster.scheduler.num_blocks ==
-                   cluster.gpu_memory.kv_cache_budget_bytes_per_gpu /
-                       cluster.gpu_memory.kv_cache_bytes_per_block,
-           "GPU capacity must resolve weight storage, KV budget, and blocks");
+               cluster.scheduler.num_blocks == expected_stage_capacity &&
+               cluster.gpu_memory.ordinary_kv_capacity_blocks ==
+                   expected_stage_capacity,
+            "GPU capacity must resolve stage-local profiles and logical "
+            "blocks");
 
     std::string without_manual_blocks =
         serialize_simulation_config_json(config);
@@ -463,6 +467,78 @@ void test_gpu_memory_auto_block_calculation() {
                    kimi_decode.scheduler.num_blocks,
            "Kimi K2 TP/EP and MLA DCP must change rank-local weights and KV "
            "capacity");
+}
+
+void test_gpu_memory_capacity_is_required_and_mode_round_trips() {
+    const auto fixed = load("fixed_parallel_colocation.json");
+    const auto fixed_json = serialize_simulation_config_json(fixed);
+    expect(!fixed.cluster().gpu_memory.auto_calculate_num_blocks,
+           "explicit scheduler.num_blocks must select manual GPU memory mode");
+    expect(fixed_json.find("\"auto_calculate_num_blocks\": false") !=
+               std::string::npos,
+           "serialized manual GPU memory must carry an explicit auto flag");
+    expect(parse_simulation_config_json(fixed_json) == fixed,
+           "manual GPU memory mode must round-trip with required HBM input");
+
+    auto missing = fixed_json;
+    const std::string capacity_line = "\"capacity_bytes_per_gpu\":";
+    const auto capacity_position = missing.find(capacity_line);
+    expect(capacity_position != std::string::npos,
+           "serialized GPU memory must expose HBM capacity");
+    const auto line_begin = missing.rfind('\n', capacity_position);
+    const auto line_end = missing.find('\n', capacity_position);
+    expect(line_begin != std::string::npos && line_end != std::string::npos,
+           "serialized HBM capacity must occupy one JSON line");
+    missing.erase(line_begin + 1, line_end - line_begin);
+    expect_throws<ConfigError>(
+        [&missing] {
+            static_cast<void>(parse_simulation_config_json(missing));
+        },
+        "every cluster must provide gpu_memory.capacity_bytes_per_gpu");
+
+    auto zero = fixed_json;
+    const auto zero_position = zero.find(capacity_line);
+    const auto zero_value_begin = zero_position + capacity_line.size();
+    const auto zero_value_end = zero.find(',', zero_value_begin);
+    expect(zero_value_end != std::string::npos,
+           "serialized HBM capacity must be comma-terminated");
+    zero.replace(zero_value_begin, zero_value_end - zero_value_begin, " 0");
+    expect_throws<ConfigError>(
+        [&zero] {
+            static_cast<void>(parse_simulation_config_json(zero));
+        },
+        "GPU HBM capacity must be strictly positive");
+
+    auto unset = fixed.cluster();
+    unset.gpu_memory.capacity_bytes_per_gpu = 0;
+    expect_throws<ConfigError>(
+        [&unset] {
+            frontier::config::resolve_gpu_memory_config(
+                unset, unset.scheduler.num_blocks);
+        },
+        "in-memory GPU memory resolution must reject an unset HBM capacity");
+
+    auto too_small = fixed.cluster();
+    too_small.gpu_memory.capacity_bytes_per_gpu = 1;
+    too_small.gpu_memory.runtime_reserve_fraction = 0.0;
+    expect_throws<ConfigError>(
+        [&too_small] {
+            frontier::config::resolve_gpu_memory_config(
+                too_small, too_small.scheduler.num_blocks);
+        },
+        "manual blocks must fit the exact stage-local HBM capacity");
+
+    auto analytical = load("analytical_parallel_colocation.json");
+    analytical.cluster().gpu_memory.auto_calculate_num_blocks = true;
+    frontier::config::resolve_gpu_memory_config(analytical.cluster());
+    const auto analytical_json = serialize_simulation_config_json(analytical);
+    expect(analytical.cluster().gpu_memory.auto_calculate_num_blocks,
+           "analytical configs without explicit blocks must select auto mode");
+    expect(analytical_json.find("\"auto_calculate_num_blocks\": true") !=
+               std::string::npos,
+           "serialized automatic GPU memory must carry an explicit auto flag");
+    expect(parse_simulation_config_json(analytical_json) == analytical,
+           "automatic GPU memory mode must round-trip with required HBM input");
 }
 
 void test_kimi_k3_gated_mla_weight_memory() {
@@ -992,10 +1068,16 @@ void test_kimi_k3_nested_model_asset_and_aliases() {
            "MoE fixture must expose a replaceable model name");
     runtime.replace(name_position, old_name.size(), "\"moonshotai/Kimi-K3\"");
     const auto parsed = parse_simulation_config_json(runtime);
+    const auto expected_runtime_snapshot_charge =
+        frontier::config::resolve_pipeline_kda_snapshot_charge(
+            parsed.cluster().gpu_memory.pipeline_stage_memory_profiles,
+            parsed.cluster().scheduler.num_blocks);
     expect(parsed.cluster().model.has_kda() &&
                parsed.cluster().scheduler.kda_snapshot_blocks_per_session ==
-                   526,
-           "K3 runtime must derive one atomic per-session snapshot charge");
+                   expected_runtime_snapshot_charge &&
+               expected_runtime_snapshot_charge > 0,
+           "K3 runtime must derive one bounded physical per-session snapshot "
+           "charge");
 
     std::string analytical_runtime =
         read_text_file(fixture("analytical_moe_ep4_colocation.json"));
@@ -1051,10 +1133,15 @@ void test_kimi_k3_nested_model_asset_and_aliases() {
            "families retain native defaults");
     frontier::config::resolve_gpu_memory_config(
         overridden.cluster(), overridden.cluster().scheduler.num_blocks);
+    const auto expected_overridden_snapshot_charge =
+        frontier::config::resolve_pipeline_kda_snapshot_charge(
+            overridden.cluster().gpu_memory.pipeline_stage_memory_profiles,
+            overridden.cluster().scheduler.num_blocks);
     expect(overridden.cluster().scheduler.kda_snapshot_blocks_per_session ==
-               526,
+               expected_overridden_snapshot_charge &&
+               expected_overridden_snapshot_charge > 0,
            "explicit BF16 KV and FP32 KDA snapshot overrides must preserve "
-           "the full-width snapshot charge in BF16-sized KV blocks");
+           "the physical snapshot charge");
 
     const std::string disabled_prefix = "\"enabled\": false";
     const std::size_t prefix_position = runtime.find(disabled_prefix);
@@ -1062,11 +1149,14 @@ void test_kimi_k3_nested_model_asset_and_aliases() {
            "MoE fixture must expose disabled prefix caching");
     runtime.replace(prefix_position, disabled_prefix.size(),
                     "\"enabled\": true");
-    expect_throws<ConfigError>(
-        [&runtime] {
-            static_cast<void>(parse_simulation_config_json(runtime));
-        },
-        "K3 prefix caching must reject a cache smaller than one snapshot");
+    const auto prefix_enabled = parse_simulation_config_json(runtime);
+    expect(prefix_enabled.cluster().scheduler
+                   .kda_snapshot_blocks_per_session > 0 &&
+               prefix_enabled.cluster().scheduler
+                       .kda_snapshot_blocks_per_session <=
+                   prefix_enabled.cluster().scheduler.num_blocks,
+           "K3 prefix caching must use the normalized physical snapshot "
+           "charge when the HBM snapshot fits");
 }
 
 void test_explicit_hybrid_attention_metadata_is_strict() {
@@ -1336,6 +1426,137 @@ void test_cpu_kv_cache_invalid_combinations() {
         "co-location CPU tiering must fail fast");
 }
 
+void test_pipeline_stage_profiles_k3_partitions_and_groups() {
+    const auto base = load("analytical_parallel_colocation.json").cluster();
+    const auto k3 = frontier::config::load_model_config("moonshotai/Kimi-K3");
+    for (const std::uint64_t pp : {2ULL, 4ULL, 24ULL}) {
+        auto cluster = base;
+        cluster.model = k3;
+        cluster.parallelism.pipeline_parallel_size = pp;
+        cluster.gpu_memory.capacity_bytes_per_gpu =
+            10'000'000'000'000'000ULL;
+        cluster.gpu_memory.auto_calculate_num_blocks = true;
+
+        const auto first =
+            frontier::config::build_pipeline_stage_memory_profiles(cluster);
+        const auto second =
+            frontier::config::build_pipeline_stage_memory_profiles(cluster);
+        expect(first == second && first.size() == pp,
+               "K3 PP stage profiles must be deterministic");
+
+        std::uint64_t kda_layers = 0;
+        std::uint64_t mla_layers = 0;
+        for (const auto &profile : first) {
+            expect(profile.layers.begin < profile.layers.end &&
+                       profile.layers.end <= k3.num_layers,
+                   "K3 stage profile ranges must be nonempty and bounded");
+            for (std::uint64_t layer = profile.layers.begin;
+                 layer < profile.layers.end; ++layer) {
+                kda_layers += static_cast<std::uint64_t>(
+                    k3.is_kda_layer(layer));
+                mla_layers += static_cast<std::uint64_t>(
+                    k3.is_mla_layer(layer));
+            }
+        }
+        expect(kda_layers == 69 && mla_layers == 24,
+               "K3 PP stage profiles must preserve 69 KDA and 24 MLA layers");
+
+        const auto groups = frontier::config::build_pipeline_stage_group_catalogue(
+            cluster, first);
+        const auto groups_again =
+            frontier::config::build_pipeline_stage_group_catalogue(cluster, second);
+        expect(groups == groups_again &&
+                   groups.stage_to_timing_group.size() == pp &&
+                   groups.stage_to_memory_group.size() == pp,
+               "stage timing/memory groups must be deterministic");
+
+        frontier::config::resolve_gpu_memory_config(cluster);
+        const auto expected_capacity =
+            frontier::config::resolve_pipeline_logical_kv_capacity(
+                cluster.gpu_memory.pipeline_stage_memory_profiles);
+        expect(cluster.scheduler.num_blocks == expected_capacity &&
+                   cluster.scheduler.kda_snapshot_blocks_per_session > 0 &&
+                   cluster.gpu_memory.pipeline_stage_memory_profiles.size() ==
+                       pp,
+               "K3 PP automatic memory must install exact N and KDA charge");
+    }
+}
+
+void test_pipeline_stage_profile_capacity_and_snapshot_charge() {
+    using frontier::config::PipelineStageMemoryProfile;
+
+    PipelineStageMemoryProfile kda_only{};
+    kda_only.stage_id = frontier::StageId{0};
+    kda_only.layers = {0, 1};
+    kda_only.free_bytes = 100;
+    kda_only.kv_bytes_per_block_by_rank = {0};
+    kda_only.kda_snapshot_bytes_by_rank = {50};
+
+    PipelineStageMemoryProfile kv_stage{};
+    kv_stage.stage_id = frontier::StageId{1};
+    kv_stage.layers = {1, 2};
+    kv_stage.free_bytes = 1'000;
+    kv_stage.kv_bytes_per_block_by_rank = {10};
+    kv_stage.kda_snapshot_bytes_by_rank = {0};
+
+    const std::vector<PipelineStageMemoryProfile> profiles = {kda_only,
+                                                               kv_stage};
+    std::uint64_t limiting_stage = 0;
+    std::uint64_t limiting_rank = 0;
+    const auto capacity =
+        frontier::config::resolve_pipeline_logical_kv_capacity(
+            profiles, &limiting_stage, &limiting_rank);
+    expect(capacity == 100 && limiting_stage == 1 && limiting_rank == 0,
+           "ordinary KV capacity must ignore B==0 KDA-only ranks");
+    const auto charge = frontier::config::resolve_pipeline_kda_snapshot_charge(
+        profiles, capacity, &limiting_stage, &limiting_rank);
+    expect(charge == 50 && limiting_stage == 0 && limiting_rank == 0,
+           "KDA-only stage must contribute normalized snapshot charge");
+    expect_throws<ConfigError>(
+        [&profiles] {
+            auto invalid = profiles;
+            invalid[0].free_bytes = 49;
+            static_cast<void>(
+                frontier::config::resolve_pipeline_kda_snapshot_charge(
+                    invalid, 100));
+        },
+        "KDA snapshot larger than stage free HBM must fail");
+}
+
+void test_pipeline_stage_profile_pp1_compatibility_and_uneven_ranges() {
+    auto cluster = load("analytical_parallel_colocation.json").cluster();
+    cluster.parallelism.pipeline_parallel_size = 1;
+    cluster.gpu_memory.capacity_bytes_per_gpu =
+        10'000'000'000'000'000ULL;
+    cluster.gpu_memory.auto_calculate_num_blocks = true;
+    const auto profiles =
+        frontier::config::build_pipeline_stage_memory_profiles(cluster);
+    expect(profiles.size() == 1 && profiles.front().layers.begin == 0 &&
+               profiles.front().layers.end == cluster.model.num_layers,
+           "PP1 must retain the full model range in one stage");
+    const auto legacy_block =
+        frontier::kv_cache_transfer::model_kv_cache_size_bytes_rank_local(
+            cluster.scheduler.block_size, cluster.model,
+            2.0, cluster.parallelism.decode_context_parallel_size, 0);
+    expect(profiles.front().kv_bytes_per_block_by_rank.front() == legacy_block,
+           "PP1 stage-local KV bytes must match the legacy full-model helper");
+
+    const auto kimi =
+        frontier::config::load_model_config("moonshotai/Kimi-K2-Instruct");
+    for (std::uint64_t stage = 0; stage < 4; ++stage) {
+        const auto range = frontier::config::pipeline_stage_layer_range(
+            kimi.num_layers, 4, stage);
+        expect(range.end > range.begin,
+               "uneven PP partitions must assign every Kimi K2 stage layers");
+    }
+    const auto first = frontier::config::pipeline_stage_layer_range(
+        kimi.num_layers, 4, 0);
+    const auto second = frontier::config::pipeline_stage_layer_range(
+        kimi.num_layers, 4, 1);
+    expect(first.size() == 16 && second.size() == 15,
+           "uneven Kimi K2 PP4 partition must preserve 16/15 stage sizes");
+}
+
 } // namespace
 
 int main() {
@@ -1354,6 +1575,9 @@ int main() {
                             test_operator_precision_contract_round_trip);
     failures += frontier::test::run("GPU memory auto block calculation",
                                     test_gpu_memory_auto_block_calculation);
+    failures += frontier::test::run(
+        "GPU memory capacity is required and mode round trips",
+        test_gpu_memory_capacity_is_required_and_mode_round_trips);
     failures += frontier::test::run("Kimi K3 gated MLA weight memory",
                                     test_kimi_k3_gated_mla_weight_memory);
     failures += frontier::test::run(
@@ -1398,5 +1622,14 @@ int main() {
                                     test_cpu_kv_cache_contract_and_resolution);
     failures += frontier::test::run("CPU KV cache invalid combinations",
                                     test_cpu_kv_cache_invalid_combinations);
+    failures += frontier::test::run(
+        "PP stage profiles K3 partitions and groups",
+        test_pipeline_stage_profiles_k3_partitions_and_groups);
+    failures += frontier::test::run(
+        "PP stage profile capacity and snapshot charge",
+        test_pipeline_stage_profile_capacity_and_snapshot_charge);
+    failures += frontier::test::run(
+        "PP stage profile PP1 compatibility and uneven ranges",
+        test_pipeline_stage_profile_pp1_compatibility_and_uneven_ranges);
     return failures == 0 ? 0 : 1;
 }

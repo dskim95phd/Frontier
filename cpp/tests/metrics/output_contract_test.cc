@@ -2,6 +2,7 @@
 #include "tests/test_support.h"
 
 #include <string>
+#include <utility>
 
 #include <nlohmann/json.hpp>
 
@@ -20,6 +21,8 @@ using frontier::config::SimulationMode;
 using frontier::config::SystemArchitecture;
 using frontier::metrics::BatchMetricsRecord;
 using frontier::metrics::GpuKVCacheOccupancyRecord;
+using frontier::metrics::PipelineMemoryDiagnostics;
+using frontier::metrics::PipelineStageMemoryDiagnostic;
 using frontier::metrics::RequestMetricsRecord;
 using frontier::metrics::RunMetadata;
 using frontier::metrics::SchedulerDecisionRecord;
@@ -156,6 +159,7 @@ SimulationOutput make_output() {
                 value.active_blocks = 2;
                 value.capacity_blocks = 8;
                 value.active_bytes_per_gpu = 1'249'280;
+                value.active_bytes_across_pipeline = 2'498'560;
                 value.active_fraction_of_kv_budget = 0.25;
                 const double total_hbm_fraction =
                     static_cast<double>(value.active_bytes_per_gpu) /
@@ -171,6 +175,43 @@ SimulationOutput make_output() {
                 value.replica_id = ReplicaId{0};
                 value.dp_id = DataParallelId{0};
                 value.capacity_blocks = 8;
+                return value;
+            }(),
+        };
+        value.pipeline_memory_diagnostics = {
+            [&]() {
+                PipelineMemoryDiagnostics value{};
+                value.cluster_type = frontier::ClusterType::kMonolithic;
+                value.capacity_bytes_per_gpu = 80'000;
+                value.model_weight_bytes_per_gpu = 20'000;
+                value.kv_cache_budget_bytes_per_gpu = 60'000;
+                value.kv_cache_bytes_per_block = 1'000;
+                value.configured_num_blocks = 60;
+                value.ordinary_kv_capacity_blocks = 60;
+                value.ordinary_kv_limiting_stage = 1;
+                value.ordinary_kv_limiting_rank = 0;
+                value.kda_snapshot_blocks_per_session = 3;
+                value.kda_snapshot_limiting_stage = 0;
+                value.kda_snapshot_limiting_rank = 0;
+                value.timing_group_count = 2;
+                value.memory_group_count = 2;
+                PipelineStageMemoryDiagnostic stage0{};
+                stage0.stage_id = frontier::StageId{0};
+                stage0.layer_begin = 0;
+                stage0.layer_end = 16;
+                stage0.layer_count = 16;
+                stage0.kda_layer_count = 4;
+                stage0.mla_layer_count = 12;
+                stage0.resident_weight_bytes = 10'000;
+                stage0.reserved_bytes = 1'000;
+                stage0.free_bytes = 69'000;
+                stage0.kv_bytes_per_block_by_rank = {1'000};
+                stage0.kda_snapshot_bytes_by_rank = {2'000};
+                stage0.timing_group_id = 0;
+                stage0.memory_group_id = 0;
+                stage0.timing_group_multiplicity = 1;
+                stage0.memory_group_multiplicity = 1;
+                value.stages.push_back(std::move(stage0));
                 return value;
             }(),
         };
@@ -270,6 +311,9 @@ void test_json_contract() {
            "CPU offload trace must serialize its CPU generation");
     expect(json.at("gpu_kv_occupancy").size() == 2 &&
                json.at("gpu_kv_occupancy").at(0).at("active_blocks") == 2 &&
+               json.at("gpu_kv_occupancy")
+                       .at(0)
+                       .at("active_bytes_across_pipeline") == 2'498'560 &&
                json.at("gpu_kv_occupancy").at(0).at("hbm_fraction") ==
                    static_cast<double>(1'249'280) / 288'000'000'000.0 &&
                json.at("gpu_kv_occupancy")
@@ -278,6 +322,17 @@ void test_json_contract() {
                    .is_null(),
            "GPU KV occupancy event samples must serialize with optional HBM "
            "basis");
+    const Json &pipeline = json.at("pipeline_memory_diagnostics").at(0);
+    expect(pipeline.at("capacity_bytes_per_gpu") == 80'000 &&
+               pipeline.at("ordinary_kv_limiting_stage") == 1 &&
+               pipeline.at("timing_group_count") == 2 &&
+               pipeline.at("stages").at(0).at("layer_begin") == 0 &&
+               pipeline.at("stages").at(0).at("layer_end") == 16 &&
+               pipeline.at("stages").at(0).at("kda_layer_count") == 4 &&
+               pipeline.at("stages").at(0).at("timing_group_id") == 0 &&
+               pipeline.at("stages").at(0).at("kv_bytes_per_block_by_rank") ==
+                   Json::array({1'000}),
+           "PP stage memory and signature diagnostics must serialize");
 }
 
 void test_csv_contract() {
@@ -297,13 +352,15 @@ void test_csv_contract() {
         serialize_gpu_kv_occupancy_csv(make_output().gpu_kv_occupancy);
     expect(occupancy_csv.rfind(
                "time_s,cluster_type,replica_id,dp_id,active_blocks,"
-               "capacity_blocks,active_bytes_per_gpu,hbm_fraction,"
+               "capacity_blocks,active_bytes_per_gpu,"
+               "active_bytes_across_pipeline,hbm_fraction,"
                "active_fraction_of_kv_budget,active_fraction_of_total_hbm\n",
                0) == 0,
            "GPU KV occupancy CSV must expose per-GPU and fraction fields");
-    expect(occupancy_csv.find("0,PREFILL,0,0,2,8,1249280,") !=
+    expect(occupancy_csv.find(
+               "0,PREFILL,0,0,2,8,1249280,2498560,") !=
                    std::string::npos &&
-               occupancy_csv.find("1,PREFILL,0,0,0,8,0,,0,\n") !=
+               occupancy_csv.find("1,PREFILL,0,0,0,8,0,0,,0,\n") !=
                    std::string::npos,
            "GPU KV occupancy CSV must retain terminal zero snapshots");
 }

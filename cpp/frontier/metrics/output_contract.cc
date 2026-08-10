@@ -727,6 +727,8 @@ std::string serialize_simulation_output_json(const SimulationOutput &output) {
             {"active_blocks", record.active_blocks},
             {"capacity_blocks", record.capacity_blocks},
             {"active_bytes_per_gpu", record.active_bytes_per_gpu},
+            {"active_bytes_across_pipeline",
+             record.active_bytes_across_pipeline},
             {"active_fraction_of_kv_budget",
              record.active_fraction_of_kv_budget},
         });
@@ -742,6 +744,68 @@ std::string serialize_simulation_output_json(const SimulationOutput &output) {
             value["active_fraction_of_total_hbm"] = nullptr;
         }
         root["gpu_kv_occupancy"].push_back(std::move(value));
+    }
+    root["pipeline_memory_diagnostics"] = OrderedJson::array();
+    for (const PipelineMemoryDiagnostics &diagnostic :
+         output.pipeline_memory_diagnostics) {
+        OrderedJson value = OrderedJson::object({
+            {"cluster_type", to_string(diagnostic.cluster_type)},
+            {"capacity_bytes_per_gpu", diagnostic.capacity_bytes_per_gpu},
+            {"model_weight_bytes_per_gpu",
+             diagnostic.model_weight_bytes_per_gpu},
+            {"kv_cache_budget_bytes_per_gpu",
+             diagnostic.kv_cache_budget_bytes_per_gpu},
+            {"kv_cache_bytes_per_block", diagnostic.kv_cache_bytes_per_block},
+            {"configured_num_blocks", diagnostic.configured_num_blocks},
+            {"ordinary_kv_capacity_blocks",
+             diagnostic.ordinary_kv_capacity_blocks},
+            {"ordinary_kv_limiting_stage",
+             diagnostic.ordinary_kv_limiting_stage},
+            {"ordinary_kv_limiting_rank", diagnostic.ordinary_kv_limiting_rank},
+            {"kda_snapshot_blocks_per_session",
+             diagnostic.kda_snapshot_blocks_per_session},
+            {"kda_snapshot_limiting_stage",
+             diagnostic.kda_snapshot_limiting_stage},
+            {"kda_snapshot_limiting_rank",
+             diagnostic.kda_snapshot_limiting_rank},
+            {"timing_group_count", diagnostic.timing_group_count},
+            {"memory_group_count", diagnostic.memory_group_count},
+            {"stages", OrderedJson::array()},
+        });
+        for (const PipelineStageMemoryDiagnostic &stage : diagnostic.stages) {
+            OrderedJson stage_value = OrderedJson::object({
+                {"stage_id", stage.stage_id.value()},
+                {"layer_begin", stage.layer_begin},
+                {"layer_end", stage.layer_end},
+                {"layer_count", stage.layer_count},
+                {"kda_layer_count", stage.kda_layer_count},
+                {"mla_layer_count", stage.mla_layer_count},
+                {"moe_layer_count", stage.moe_layer_count},
+                {"resident_weight_bytes", stage.resident_weight_bytes},
+                {"reserved_bytes", stage.reserved_bytes},
+                {"free_bytes", stage.free_bytes},
+                {"kv_bytes_per_block_by_rank",
+                 stage.kv_bytes_per_block_by_rank},
+                {"kda_snapshot_bytes_by_rank",
+                 stage.kda_snapshot_bytes_by_rank},
+                {"timing_group_multiplicity",
+                 stage.timing_group_multiplicity},
+                {"memory_group_multiplicity",
+                 stage.memory_group_multiplicity},
+            });
+            if (stage.timing_group_id.has_value()) {
+                stage_value["timing_group_id"] = stage.timing_group_id.value();
+            } else {
+                stage_value["timing_group_id"] = nullptr;
+            }
+            if (stage.memory_group_id.has_value()) {
+                stage_value["memory_group_id"] = stage.memory_group_id.value();
+            } else {
+                stage_value["memory_group_id"] = nullptr;
+            }
+            value["stages"].push_back(std::move(stage_value));
+        }
+        root["pipeline_memory_diagnostics"].push_back(std::move(value));
     }
     root["scheduler_trace"] = OrderedJson::array();
     for (const SchedulerTraceRecord &trace : output.scheduler_trace) {
@@ -1421,7 +1485,8 @@ std::string serialize_gpu_kv_occupancy_csv(
     output.imbue(std::locale::classic());
     output << std::setprecision(std::numeric_limits<double>::max_digits10);
     output << "time_s,cluster_type,replica_id,dp_id,active_blocks,"
-              "capacity_blocks,active_bytes_per_gpu,hbm_fraction,"
+              "capacity_blocks,active_bytes_per_gpu,"
+              "active_bytes_across_pipeline,hbm_fraction,"
               "active_fraction_of_kv_budget,active_fraction_of_total_hbm\n";
 
     std::map<std::tuple<ClusterType, ReplicaId, DataParallelId>, SimTime>
@@ -1472,7 +1537,7 @@ std::string serialize_gpu_kv_occupancy_csv(
                << ',' << record.replica_id.value() << ','
                << record.dp_id.value() << ',' << record.active_blocks << ','
                << record.capacity_blocks << ',' << record.active_bytes_per_gpu
-               << ',';
+               << ',' << record.active_bytes_across_pipeline << ',';
         if (record.hbm_fraction.has_value()) {
             output << record.hbm_fraction.value();
         }

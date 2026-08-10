@@ -99,7 +99,8 @@ class MetricsStore {
         ClusterType cluster_type, std::uint64_t bytes_per_block);
     void record_gpu_kv_cache_occupancy(
         SimTime time, const scheduler::BaseReplicaScheduler &scheduler,
-        std::uint64_t bytes_per_block,
+        std::uint64_t max_rank_bytes_per_block,
+        std::uint64_t pipeline_bytes_per_block,
         std::optional<std::uint64_t> total_hbm_bytes = std::nullopt,
         bool force = false);
 
