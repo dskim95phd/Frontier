@@ -27,19 +27,23 @@ struct TieredPrefixPlan {
     std::uint64_t cpu_begin_block = 0;
     std::uint64_t cpu_end_block = 0;
     std::uint64_t hit_frontier_blocks = 0;
+    // KDA state is an independent fixed-size object.  It can require an H2D
+    // restore even when the prompt contains no complete reusable KV block.
+    bool restore_kda_snapshot = false;
     std::uint64_t block_size = 0;
     std::uint64_t prompt_tokens = 0;
 };
 
 class CpuKVCacheOffloadInfo {
   public:
-    CpuKVCacheOffloadInfo(
-        CpuKvTransferId transfer_id, RequestId request_id,
-        ReplicaId replica_id, DataParallelId dp_id,
-        CpuOffloadReservationId reservation_id,
-        cpu_kv_cache_transfer::CpuTransferTiming timing,
-        std::uint64_t desired_frontier_blocks,
-        CpuOffloadGeneration generation);
+    CpuKVCacheOffloadInfo(CpuKvTransferId transfer_id, RequestId request_id,
+                          ReplicaId replica_id, DataParallelId dp_id,
+                          CpuOffloadReservationId reservation_id,
+                          cpu_kv_cache_transfer::CpuTransferTiming timing,
+                          std::uint64_t desired_frontier_blocks,
+                          CpuOffloadGeneration generation,
+                          std::uint64_t transferred_kv_blocks = 0,
+                          std::uint64_t kda_snapshot_bytes = 0);
 
     void mark_started(SimTime time);
     void mark_completed(SimTime time);
@@ -65,6 +69,15 @@ class CpuKVCacheOffloadInfo {
     [[nodiscard]] CpuOffloadGeneration generation() const noexcept {
         return generation_;
     }
+    [[nodiscard]] std::uint64_t transferred_kv_blocks() const noexcept {
+        return transferred_kv_blocks_;
+    }
+    [[nodiscard]] bool includes_kda_snapshot() const noexcept {
+        return kda_snapshot_bytes_ != 0;
+    }
+    [[nodiscard]] std::uint64_t kda_snapshot_bytes() const noexcept {
+        return kda_snapshot_bytes_;
+    }
     [[nodiscard]] CpuKVCacheTransferState state() const noexcept {
         return state_;
     }
@@ -82,18 +95,21 @@ class CpuKVCacheOffloadInfo {
     cpu_kv_cache_transfer::CpuTransferTiming timing_;
     std::uint64_t desired_frontier_blocks_;
     CpuOffloadGeneration generation_;
+    std::uint64_t transferred_kv_blocks_ = 0;
+    std::uint64_t kda_snapshot_bytes_ = 0;
     CpuKVCacheTransferState state_ = CpuKVCacheTransferState::kPending;
     SimTime decode_transfer_completed_at_;
 };
 
 class CpuKVCacheRestoreInfo {
   public:
-    CpuKVCacheRestoreInfo(
-        CpuKvTransferId transfer_id, RequestId request_id,
-        ReplicaId replica_id, DataParallelId dp_id,
-        CpuRestoreLeaseId lease_id, TieredPrefixPlan plan,
-        cpu_kv_cache_transfer::CpuTransferTiming timing,
-        Generation request_generation);
+    CpuKVCacheRestoreInfo(CpuKvTransferId transfer_id, RequestId request_id,
+                          ReplicaId replica_id, DataParallelId dp_id,
+                          CpuRestoreLeaseId lease_id, TieredPrefixPlan plan,
+                          cpu_kv_cache_transfer::CpuTransferTiming timing,
+                          Generation request_generation,
+                          std::uint64_t kda_snapshot_bytes = 0,
+                          std::uint64_t kda_snapshot_frontier_blocks = 0);
 
     void mark_started(SimTime time);
     void mark_completed(SimTime time);
@@ -108,13 +124,24 @@ class CpuKVCacheRestoreInfo {
     [[nodiscard]] CpuRestoreLeaseId lease_id() const noexcept {
         return lease_id_;
     }
-    [[nodiscard]] const TieredPrefixPlan &plan() const noexcept { return plan_; }
+    [[nodiscard]] const TieredPrefixPlan &plan() const noexcept {
+        return plan_;
+    }
     [[nodiscard]] const cpu_kv_cache_transfer::CpuTransferTiming &
     timing() const noexcept {
         return timing_;
     }
     [[nodiscard]] Generation request_generation() const noexcept {
         return request_generation_;
+    }
+    [[nodiscard]] bool includes_kda_snapshot() const noexcept {
+        return kda_snapshot_bytes_ != 0;
+    }
+    [[nodiscard]] std::uint64_t kda_snapshot_bytes() const noexcept {
+        return kda_snapshot_bytes_;
+    }
+    [[nodiscard]] std::uint64_t kda_snapshot_frontier_blocks() const noexcept {
+        return kda_snapshot_frontier_blocks_;
     }
     [[nodiscard]] CpuKVCacheTransferState state() const noexcept {
         return state_;
@@ -129,6 +156,8 @@ class CpuKVCacheRestoreInfo {
     TieredPrefixPlan plan_;
     cpu_kv_cache_transfer::CpuTransferTiming timing_;
     Generation request_generation_;
+    std::uint64_t kda_snapshot_bytes_ = 0;
+    std::uint64_t kda_snapshot_frontier_blocks_ = 0;
     CpuKVCacheTransferState state_ = CpuKVCacheTransferState::kPending;
 };
 

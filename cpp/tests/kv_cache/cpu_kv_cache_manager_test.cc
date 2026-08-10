@@ -28,13 +28,11 @@ void commit(CpuKVCacheManager &manager, std::int64_t session,
 }
 
 void test_incremental_contiguous_and_metrics() {
-    CpuKVCacheManager manager{16,
-                              CpuKVCacheCapacityPressurePolicy::kPrefixFit};
+    CpuKVCacheManager manager{16, CpuKVCacheCapacityPressurePolicy::kPrefixFit};
     commit(manager, 1, 1, 2, 1.0);
     const auto delta = manager.reserve_offload(
         SessionId{1}, CpuOffloadGeneration{2}, 5, at(2.0));
-    expect(delta.reserved_blocks == 3 &&
-               delta.admitted_frontier_blocks == 5,
+    expect(delta.reserved_blocks == 3 && delta.admitted_frontier_blocks == 5,
            "incremental offload must reserve only the missing suffix");
     expect(manager.lookup(SessionId{1}, 8).hit_blocks == 2,
            "reserved suffix must remain invisible to lookup");
@@ -53,8 +51,8 @@ void test_incremental_contiguous_and_metrics() {
 }
 
 void test_prefix_fit_skip_and_lazy_capacity() {
-    CpuKVCacheManager prefix_fit{
-        4, CpuKVCacheCapacityPressurePolicy::kPrefixFit};
+    CpuKVCacheManager prefix_fit{4,
+                                 CpuKVCacheCapacityPressurePolicy::kPrefixFit};
     const auto truncated = prefix_fit.reserve_offload(
         SessionId{1}, CpuOffloadGeneration{1}, 9, at(1.0));
     expect(truncated.requires_transfer() && truncated.reserved_blocks == 4 &&
@@ -63,25 +61,23 @@ void test_prefix_fit_skip_and_lazy_capacity() {
     expect(prefix_fit.commit_offload(truncated.reservation_id, at(1.1)),
            "truncated prefix must remain committable");
 
-    CpuKVCacheManager skip{3,
-                           CpuKVCacheCapacityPressurePolicy::kSkipOffload};
+    CpuKVCacheManager skip{3, CpuKVCacheCapacityPressurePolicy::kSkipOffload};
     commit(skip, 1, 1, 3, 1.0);
-    const auto skipped = skip.reserve_offload(
-        SessionId{2}, CpuOffloadGeneration{1}, 4, at(2.0));
+    const auto skipped =
+        skip.reserve_offload(SessionId{2}, CpuOffloadGeneration{1}, 4, at(2.0));
     expect(skipped.skipped && !skipped.requires_transfer() &&
                skip.committed_frontier_blocks(SessionId{1}) == 3,
            "skip_offload must not evict when the complete delta cannot fit");
 
-    CpuKVCacheManager huge{
-        1'000'000'000ULL, CpuKVCacheCapacityPressurePolicy::kPrefixFit};
+    CpuKVCacheManager huge{1'000'000'000ULL,
+                           CpuKVCacheCapacityPressurePolicy::kPrefixFit};
     const auto idle = huge.diagnostics();
     expect(idle.materialized_blocks == 0 && idle.sessions == 0,
            "huge CPU capacity must use constant-size initial state");
 }
 
 void test_lru_suffix_and_restore_pins() {
-    CpuKVCacheManager manager{6,
-                              CpuKVCacheCapacityPressurePolicy::kPrefixFit};
+    CpuKVCacheManager manager{6, CpuKVCacheCapacityPressurePolicy::kPrefixFit};
     commit(manager, 1, 1, 3, 1.0);
     commit(manager, 2, 1, 3, 2.0);
     const auto lease = manager.pin_restore(SessionId{1}, 0, 3, at(3.0));
@@ -100,13 +96,11 @@ void test_lru_suffix_and_restore_pins() {
 }
 
 void test_incremental_occupancy_accounting() {
-    CpuKVCacheManager manager{5,
-                              CpuKVCacheCapacityPressurePolicy::kPrefixFit};
+    CpuKVCacheManager manager{5, CpuKVCacheCapacityPressurePolicy::kPrefixFit};
     const auto reservation = manager.reserve_offload(
         SessionId{11}, CpuOffloadGeneration{1}, 3, at(1.0));
     const auto reserved = manager.diagnostics();
-    expect(reserved.materialized_blocks == 3 &&
-               reserved.resident_blocks == 0 &&
+    expect(reserved.materialized_blocks == 3 && reserved.resident_blocks == 0 &&
                reserved.reserved_blocks == 3 && reserved.pinned_blocks == 0 &&
                manager.stats().peak_reserved_blocks == 3,
            "reservation accounting must update occupancy incrementally");
@@ -130,8 +124,7 @@ void test_incremental_occupancy_accounting() {
 }
 
 void test_out_of_order_commit_and_dependent_abort() {
-    CpuKVCacheManager manager{8,
-                              CpuKVCacheCapacityPressurePolicy::kPrefixFit};
+    CpuKVCacheManager manager{8, CpuKVCacheCapacityPressurePolicy::kPrefixFit};
     const auto first = manager.reserve_offload(
         SessionId{7}, CpuOffloadGeneration{1}, 2, at(1.0));
     const auto second = manager.reserve_offload(
@@ -147,8 +140,7 @@ void test_out_of_order_commit_and_dependent_abort() {
                manager.stats().stale_generation_completions == 2,
            "duplicate terminal commit must remain idempotent");
 
-    CpuKVCacheManager aborting{
-        8, CpuKVCacheCapacityPressurePolicy::kPrefixFit};
+    CpuKVCacheManager aborting{8, CpuKVCacheCapacityPressurePolicy::kPrefixFit};
     const auto base = aborting.reserve_offload(
         SessionId{8}, CpuOffloadGeneration{1}, 2, at(1.0));
     const auto suffix = aborting.reserve_offload(
@@ -164,15 +156,17 @@ void test_out_of_order_commit_and_dependent_abort() {
 }
 
 void test_noop_lru_empty_metadata_and_zero_fit() {
-    CpuKVCacheManager manager{4,
-                              CpuKVCacheCapacityPressurePolicy::kPrefixFit};
+    CpuKVCacheManager manager{4, CpuKVCacheCapacityPressurePolicy::kPrefixFit};
     commit(manager, 1, 1, 2, 1.0);
     commit(manager, 2, 1, 2, 2.0);
+    const std::uint64_t truncated_before =
+        manager.stats().truncated_offloads;
     const auto no_op = manager.reserve_offload(
         SessionId{1}, CpuOffloadGeneration{2}, 2, at(3.0));
-    expect(!no_op.requires_transfer() && !no_op.skipped &&
-               no_op.admitted_frontier_blocks == 2,
-           "already resident snapshot must be a terminal no-op");
+    expect(!no_op.requires_transfer() && !no_op.skipped && !no_op.truncated &&
+               no_op.admitted_frontier_blocks == 2 &&
+               manager.stats().truncated_offloads == truncated_before,
+           "an identical resident frontier must be a metric-neutral no-op");
     const auto shorter_no_op = manager.reserve_offload(
         SessionId{1}, CpuOffloadGeneration{3}, 1, at(3.1));
     expect(!shorter_no_op.requires_transfer() &&
@@ -187,8 +181,7 @@ void test_noop_lru_empty_metadata_and_zero_fit() {
     expect(manager.abort_offload(replacement.reservation_id),
            "replacement cleanup must succeed");
 
-    CpuKVCacheManager full{2,
-                           CpuKVCacheCapacityPressurePolicy::kPrefixFit};
+    CpuKVCacheManager full{2, CpuKVCacheCapacityPressurePolicy::kPrefixFit};
     commit(full, 20, 1, 2, 1.0);
     const auto zero_fit = full.reserve_offload(
         SessionId{20}, CpuOffloadGeneration{2}, 4, at(5.0));
@@ -197,8 +190,7 @@ void test_noop_lru_empty_metadata_and_zero_fit() {
                full.diagnostics().active_restore_leases == 0,
            "zero-block prefix fit must be a truncation and pin nothing");
 
-    CpuKVCacheManager skip{1,
-                           CpuKVCacheCapacityPressurePolicy::kSkipOffload};
+    CpuKVCacheManager skip{1, CpuKVCacheCapacityPressurePolicy::kSkipOffload};
     commit(skip, 9, 1, 1, 1.0);
     const auto skipped = skip.reserve_offload(
         SessionId{10}, CpuOffloadGeneration{1}, 2, at(2.0));
@@ -209,8 +201,7 @@ void test_noop_lru_empty_metadata_and_zero_fit() {
 }
 
 void test_migration_discard_drains_inflight_transfers() {
-    CpuKVCacheManager manager{8,
-                              CpuKVCacheCapacityPressurePolicy::kPrefixFit};
+    CpuKVCacheManager manager{8, CpuKVCacheCapacityPressurePolicy::kPrefixFit};
     commit(manager, 41, 1, 3, 1.0);
     const auto lease = manager.pin_restore(SessionId{41}, 0, 2, at(2.0));
     const auto suffix = manager.reserve_offload(
@@ -255,8 +246,7 @@ void test_migration_discard_drains_inflight_transfers() {
 }
 
 void test_randomized_invariants() {
-    CpuKVCacheManager manager{32,
-                              CpuKVCacheCapacityPressurePolicy::kPrefixFit};
+    CpuKVCacheManager manager{32, CpuKVCacheCapacityPressurePolicy::kPrefixFit};
     std::mt19937_64 random{42};
     std::uint64_t generation[6]{};
     double now = 1.0;
@@ -268,24 +258,23 @@ void test_randomized_invariants() {
             manager.committed_frontier_blocks(session);
         const std::uint64_t desired = current + 1 + random() % 8;
         const auto reservation = manager.reserve_offload(
-            session, CpuOffloadGeneration{++generation[session_value]},
-            desired, at(now));
+            session, CpuOffloadGeneration{++generation[session_value]}, desired,
+            at(now));
         now += 0.001;
         if (reservation.requires_transfer()) {
             if (random() % 4 == 0) {
                 expect(manager.abort_offload(reservation.reservation_id),
                        "random pending reservation must abort");
             } else {
-                expect(manager.commit_offload(reservation.reservation_id,
-                                              at(now)),
-                       "random pending reservation must commit");
+                expect(
+                    manager.commit_offload(reservation.reservation_id, at(now)),
+                    "random pending reservation must commit");
                 now += 0.001;
             }
         }
         if (manager.committed_frontier_blocks(session) > 0 &&
             random() % 5 == 0) {
-            const auto lease = manager.pin_restore(
-                session, 0, 1, at(now));
+            const auto lease = manager.pin_restore(session, 0, 1, at(now));
             now += 0.001;
             expect(manager.release_restore(lease, random() % 2 == 0, at(now)),
                    "random restore lease must release");
@@ -299,6 +288,218 @@ void test_randomized_invariants() {
     }
 }
 
+void test_kda_snapshot_offload_replacement_and_restore_pin() {
+    CpuKVCacheManager manager{16, CpuKVCacheCapacityPressurePolicy::kPrefixFit};
+    manager.configure_kda_snapshot(2, 8'192);
+
+    const auto first = manager.reserve_offload(
+        SessionId{71}, CpuOffloadGeneration{1}, 3, at(1.0));
+    expect(first.requires_transfer() && first.reserved_blocks == 3 &&
+               first.kda_snapshot_blocks == 2 &&
+               first.kda_snapshot_bytes == 8'192,
+           "KDA first offload must carry one fixed snapshot payload");
+    expect(manager.commit_offload(first.reservation_id, at(1.1)) &&
+               manager.has_kda_snapshot(SessionId{71}) &&
+               manager.kda_snapshot_frontier_blocks(SessionId{71}) == 3 &&
+               manager.lookup(SessionId{71}, 8).hit_blocks == 3,
+           "KDA commit must publish the immutable snapshot frontier");
+
+    const auto lease = manager.pin_restore(SessionId{71}, 0, 2, at(2.0));
+    expect(manager.restore_includes_kda_snapshot(lease) &&
+               manager.restore_kda_snapshot_blocks(lease) == 2 &&
+               manager.restore_kda_snapshot_bytes(lease) == 8'192 &&
+               manager.diagnostics().pinned_kda_snapshots == 1,
+           "KDA restore lease must pin and expose the snapshot payload");
+
+    const auto replacement = manager.reserve_offload(
+        SessionId{71}, CpuOffloadGeneration{2}, 4, at(2.1));
+    expect(replacement.requires_transfer() &&
+               replacement.reserved_blocks == 1 &&
+               replacement.kda_snapshot_blocks == 2 &&
+               replacement.kda_snapshot_bytes == 8'192,
+           "snapshot replacement must retransmit its full fixed payload");
+    expect(manager.commit_offload(replacement.reservation_id, at(2.2)) &&
+               manager.kda_snapshot_frontier_blocks(SessionId{71}) == 4 &&
+               manager.lookup(SessionId{71}, 8).hit_blocks == 4,
+           "newer KDA generation must atomically replace the frontier");
+    expect(manager.release_restore(lease, true, at(2.3)),
+           "KDA restore lease must release exactly once");
+
+    const std::uint64_t truncated_before =
+        manager.stats().truncated_offloads;
+    const auto no_op = manager.reserve_offload(
+        SessionId{71}, CpuOffloadGeneration{3}, 4, at(3.0));
+    expect(!no_op.requires_transfer() && !no_op.truncated &&
+               no_op.kda_snapshot_blocks == 0 &&
+               manager.stats().truncated_offloads == truncated_before,
+           "equal KDA frontier must avoid transfer and truncation metrics");
+    manager.validate_invariants();
+}
+
+void test_kda_snapshot_only_offload_and_restore_pin() {
+    CpuKVCacheManager manager{4, CpuKVCacheCapacityPressurePolicy::kPrefixFit};
+    manager.configure_kda_snapshot(2, 8'192);
+
+    const auto reservation = manager.reserve_offload(
+        SessionId{72}, CpuOffloadGeneration{1}, 0, at(1.0));
+    expect(reservation.requires_transfer() &&
+               reservation.reserved_blocks == 0 &&
+               reservation.kda_snapshot_blocks == 2 &&
+               reservation.kda_snapshot_bytes == 8'192,
+           "a sub-block KDA prefix must reserve one snapshot-only payload");
+    expect(manager.commit_offload(reservation.reservation_id, at(1.1)) &&
+               manager.committed_frontier_blocks(SessionId{72}) == 0 &&
+               manager.has_kda_snapshot(SessionId{72}) &&
+               manager.kda_snapshot_frontier_blocks(SessionId{72}) == 0,
+           "snapshot-only commit must preserve explicit zero-frontier state");
+
+    const auto lease = manager.pin_restore(SessionId{72}, 0, 0, at(2.0));
+    expect(manager.restore_includes_kda_snapshot(lease) &&
+               manager.restore_kda_snapshot_bytes(lease) == 8'192 &&
+               manager.diagnostics().pinned_blocks == 0 &&
+               manager.diagnostics().pinned_kda_snapshots == 1,
+           "an empty KV range must be valid only as a snapshot restore lease");
+    expect(manager.release_restore(lease, true, at(2.1)),
+           "snapshot-only restore lease must release normally");
+    manager.validate_invariants();
+}
+
+void test_kda_snapshot_eviction_is_atomic_after_normal_kv() {
+    CpuKVCacheManager manager{6, CpuKVCacheCapacityPressurePolicy::kPrefixFit};
+    manager.configure_kda_snapshot(2, 2'048);
+    commit(manager, 81, 1, 2, 1.0);
+    commit(manager, 82, 1, 2, 2.0);
+    expect(manager.diagnostics().resident_blocks == 2 &&
+               manager.kda_snapshot_occupied_blocks() == 4,
+           "fixed KDA snapshots must share CPU capacity with ordinary KV");
+
+    // The fourth snapshot forces one whole inactive snapshot group out.  The
+    // manager completes the oldest session's eviction chain (ordinary KV,
+    // then its snapshot) before considering the newer session's KV, and
+    // never tears a snapshot into partial blocks.
+    commit(manager, 83, 1, 0, 3.0);
+    commit(manager, 84, 1, 0, 4.0);
+    expect(manager.stats().evicted_blocks >= 4 &&
+               manager.stats().evicted_kda_snapshots == 1 &&
+               manager.stats().evicted_kda_snapshot_blocks == 2 &&
+               !manager.has_kda_snapshot(SessionId{81}) &&
+               manager.has_kda_snapshot(SessionId{82}) &&
+               manager.committed_frontier_blocks(SessionId{82}) == 0 &&
+               manager.has_kda_snapshot(SessionId{83}) &&
+               manager.has_kda_snapshot(SessionId{84}) &&
+               manager.kda_snapshot_occupied_blocks() == 6,
+           "snapshot pressure must finish one session chain before the next");
+    manager.validate_invariants();
+}
+
+void test_kda_session_lru_prefers_older_snapshot_before_newer_kv() {
+    CpuKVCacheManager manager{8, CpuKVCacheCapacityPressurePolicy::kPrefixFit};
+    manager.configure_kda_snapshot(2);
+    commit(manager, 111, 1, 2, 1.0);
+    commit(manager, 112, 1, 2, 2.0);
+
+    // This allocation needs exactly the two blocks in session 111's ordinary
+    // suffix.  Its snapshot must remain as an LRU-only session after the
+    // pressure event stops at that exact fit.
+    commit(manager, 113, 1, 0, 3.0);
+    expect(manager.committed_frontier_blocks(SessionId{111}) == 0 &&
+               manager.has_kda_snapshot(SessionId{111}) &&
+               manager.committed_frontier_blocks(SessionId{112}) == 2,
+           "exact ordinary fit must leave the oldest snapshot-only session");
+
+    // The next pressure event must choose that older snapshot-only session,
+    // rather than trimming newer session 112's ordinary KV first.
+    commit(manager, 114, 1, 0, 4.0);
+    expect(!manager.has_kda_snapshot(SessionId{111}) &&
+               manager.has_kda_snapshot(SessionId{112}) &&
+               manager.committed_frontier_blocks(SessionId{112}) == 2 &&
+               manager.has_kda_snapshot(SessionId{113}) &&
+               manager.has_kda_snapshot(SessionId{114}) &&
+               manager.stats().evicted_kda_snapshots == 1,
+           "session-level LRU must evict the older snapshot before newer KV");
+    manager.validate_invariants();
+}
+
+void test_kda_snapshot_eviction_reclaims_whole_fixed_charge() {
+    CpuKVCacheManager manager{6, CpuKVCacheCapacityPressurePolicy::kPrefixFit};
+    manager.configure_kda_snapshot(2);
+    commit(manager, 121, 1, 1, 1.0);
+    commit(manager, 122, 1, 1, 2.0);
+
+    // Only one free block is needed after trimming session 121's ordinary KV,
+    // but its two-block snapshot is the next chain step and must be removed
+    // atomically as a whole.
+    commit(manager, 123, 1, 0, 3.0);
+    expect(!manager.has_kda_snapshot(SessionId{121}) &&
+               manager.has_kda_snapshot(SessionId{122}) &&
+               manager.has_kda_snapshot(SessionId{123}) &&
+               manager.stats().evicted_kda_snapshots == 1 &&
+               manager.stats().evicted_kda_snapshot_blocks == 2 &&
+               manager.diagnostics().kda_snapshot_occupied_blocks == 4,
+           "KDA eviction must reclaim a fixed snapshot charge atomically");
+    manager.validate_invariants();
+}
+
+void test_kda_skip_offload_uses_session_chain_reclaimability() {
+    CpuKVCacheManager manager{8,
+                              CpuKVCacheCapacityPressurePolicy::kSkipOffload};
+    manager.configure_kda_snapshot(2);
+    commit(manager, 131, 1, 2, 1.0);
+    commit(manager, 132, 1, 2, 2.0);
+    commit(manager, 133, 1, 0, 3.0);
+
+    // The skip estimate must include both ordinary and fixed-charge reclaim
+    // steps, while the actual pressure path keeps them in one session chain.
+    commit(manager, 134, 1, 0, 4.0);
+    expect(!manager.has_kda_snapshot(SessionId{131}) &&
+               manager.has_kda_snapshot(SessionId{132}) &&
+               manager.committed_frontier_blocks(SessionId{132}) == 2 &&
+               manager.has_kda_snapshot(SessionId{133}) &&
+               manager.has_kda_snapshot(SessionId{134}) &&
+               manager.stats().skipped_offloads == 0,
+           "skip_offload must estimate and execute the same session chain");
+    manager.validate_invariants();
+}
+
+void test_kda_snapshot_discard_waits_for_restore_pin() {
+    CpuKVCacheManager manager{8, CpuKVCacheCapacityPressurePolicy::kPrefixFit};
+    manager.configure_kda_snapshot(2, 4'096);
+    commit(manager, 91, 1, 3, 1.0);
+    const auto lease = manager.pin_restore(SessionId{91}, 0, 2, at(2.0));
+    expect(manager.discard_session(SessionId{91}) &&
+               manager.session_discard_pending(SessionId{91}) &&
+               manager.lookup(SessionId{91}, 3).hit_blocks == 0 &&
+               manager.has_kda_snapshot(SessionId{91}),
+           "discard must hide but retain pinned KDA state until release");
+    expect(manager.release_restore(lease, true, at(2.1)) &&
+               !manager.has_kda_snapshot(SessionId{91}) &&
+               manager.diagnostics().materialized_blocks == 0 &&
+               manager.diagnostics().kda_snapshot_occupied_blocks == 0,
+           "discarded pinned KDA session must reap atomically on release");
+    manager.validate_invariants();
+}
+
+void test_kda_first_snapshot_out_of_order_generation_commit() {
+    CpuKVCacheManager manager{20, CpuKVCacheCapacityPressurePolicy::kPrefixFit};
+    manager.configure_kda_snapshot(2, 4'096);
+    const auto older = manager.reserve_offload(
+        SessionId{101}, CpuOffloadGeneration{1}, 2, at(1.0));
+    const auto newer = manager.reserve_offload(
+        SessionId{101}, CpuOffloadGeneration{2}, 4, at(1.1));
+    expect(older.requires_transfer() && newer.requires_transfer() &&
+               manager.commit_offload(newer.reservation_id, at(1.2)) &&
+               manager.kda_snapshot_frontier_blocks(SessionId{101}) == 4,
+           "newer first-snapshot generation must consume the shared atomic "
+           "slot");
+    expect(manager.commit_offload(older.reservation_id, at(1.3)) &&
+               manager.lookup(SessionId{101}, 4).hit_blocks == 4 &&
+               manager.diagnostics().reserved_blocks == 0 &&
+               manager.diagnostics().kda_snapshot_reserved_blocks == 0 &&
+               manager.kda_snapshot_occupied_blocks() == 2,
+           "late stale generation must not regress or leak the snapshot slot");
+    manager.validate_invariants();
+}
+
 } // namespace
 
 int main() {
@@ -309,19 +510,41 @@ int main() {
                                     test_prefix_fit_skip_and_lazy_capacity);
     failures += frontier::test::run("CPU LRU suffix and restore pins",
                                     test_lru_suffix_and_restore_pins);
-    failures += frontier::test::run(
-        "CPU incremental occupancy accounting",
-        test_incremental_occupancy_accounting);
-    failures += frontier::test::run(
-        "CPU out-of-order commit and dependent abort",
-        test_out_of_order_commit_and_dependent_abort);
-    failures += frontier::test::run(
-        "CPU no-op LRU and terminal empty paths",
-        test_noop_lru_empty_metadata_and_zero_fit);
-    failures += frontier::test::run(
-        "CPU migration discard drains in-flight transfers",
-        test_migration_discard_drains_inflight_transfers);
+    failures += frontier::test::run("CPU incremental occupancy accounting",
+                                    test_incremental_occupancy_accounting);
+    failures +=
+        frontier::test::run("CPU out-of-order commit and dependent abort",
+                            test_out_of_order_commit_and_dependent_abort);
+    failures += frontier::test::run("CPU no-op LRU and terminal empty paths",
+                                    test_noop_lru_empty_metadata_and_zero_fit);
+    failures +=
+        frontier::test::run("CPU migration discard drains in-flight transfers",
+                            test_migration_discard_drains_inflight_transfers);
     failures += frontier::test::run("CPU randomized invariants",
                                     test_randomized_invariants);
+    failures += frontier::test::run(
+        "CPU KDA snapshot replacement and restore pin",
+        test_kda_snapshot_offload_replacement_and_restore_pin);
+    failures += frontier::test::run(
+        "CPU KDA snapshot-only offload and restore pin",
+        test_kda_snapshot_only_offload_and_restore_pin);
+    failures += frontier::test::run(
+        "CPU KDA snapshot atomic eviction after ordinary KV",
+        test_kda_snapshot_eviction_is_atomic_after_normal_kv);
+    failures += frontier::test::run(
+        "CPU KDA session LRU prefers old snapshot before newer KV",
+        test_kda_session_lru_prefers_older_snapshot_before_newer_kv);
+    failures += frontier::test::run(
+        "CPU KDA snapshot eviction uses whole fixed charge",
+        test_kda_snapshot_eviction_reclaims_whole_fixed_charge);
+    failures += frontier::test::run(
+        "CPU KDA skip offload follows session chain",
+        test_kda_skip_offload_uses_session_chain_reclaimability);
+    failures +=
+        frontier::test::run("CPU KDA snapshot discard waits for restore pin",
+                            test_kda_snapshot_discard_waits_for_restore_pin);
+    failures += frontier::test::run(
+        "CPU KDA first snapshot out-of-order generation commit",
+        test_kda_first_snapshot_out_of_order_generation_commit);
     return failures == 0 ? 0 : 1;
 }

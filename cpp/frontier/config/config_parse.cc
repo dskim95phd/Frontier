@@ -250,7 +250,7 @@ ClusterSchedulerType parse_cluster_scheduler_type(std::string_view value) {
         "config.cluster_scheduler.type must be 'round_robin', "
         "'sticky_round_robin', 'vllm_queue_aware', 'kv_aware', or "
         "'cache_aware', got '" +
-                      std::string{value} + "'");
+        std::string{value} + "'");
 }
 
 MoeRoutingMode parse_moe_routing_mode(std::string_view value) {
@@ -365,44 +365,43 @@ CpuKVCacheConfig parse_cpu_kv_cache(const Json &root) {
         return CpuKVCacheConfig{};
     }
     const Json &cpu = root.at("cpu_kv_cache");
-    require_exact_keys(
-        cpu,
-        {
-            "enabled",
-            "capacity_bytes",
-            "static_slice_per_gpu",
-            "capacity_bytes_per_gpu",
-            "dram_bandwidth_gbps_per_gpu",
-            "c2c_bandwidth_gbps_per_gpu",
-            "write_bandwidth_gbps",
-            "write_latency_ms",
-            "read_bandwidth_gbps",
-            "read_latency_ms",
-            "eviction_policy",
-            "capacity_pressure_policy",
-            "transfer_concurrency",
-        },
-        "config.cpu_kv_cache");
+    require_exact_keys(cpu,
+                       {
+                           "enabled",
+                           "capacity_bytes",
+                           "static_slice_per_gpu",
+                           "capacity_bytes_per_gpu",
+                           "dram_bandwidth_gbps_per_gpu",
+                           "c2c_bandwidth_gbps_per_gpu",
+                           "write_bandwidth_gbps",
+                           "write_latency_ms",
+                           "read_bandwidth_gbps",
+                           "read_latency_ms",
+                           "eviction_policy",
+                           "capacity_pressure_policy",
+                           "transfer_concurrency",
+                       },
+                       "config.cpu_kv_cache");
     CpuKVCacheConfig result{};
     result.enabled = require_bool(cpu, "enabled", "config.cpu_kv_cache");
     result.capacity_bytes =
         require_uint64(cpu, "capacity_bytes", "config.cpu_kv_cache");
-    result.static_slice_per_gpu = require_bool(
-        cpu, "static_slice_per_gpu", "config.cpu_kv_cache");
-    result.capacity_bytes_per_gpu = require_uint64(
-        cpu, "capacity_bytes_per_gpu", "config.cpu_kv_cache");
+    result.static_slice_per_gpu =
+        require_bool(cpu, "static_slice_per_gpu", "config.cpu_kv_cache");
+    result.capacity_bytes_per_gpu =
+        require_uint64(cpu, "capacity_bytes_per_gpu", "config.cpu_kv_cache");
     result.dram_bandwidth_gbps_per_gpu = require_finite_number(
         cpu, "dram_bandwidth_gbps_per_gpu", "config.cpu_kv_cache");
     result.c2c_bandwidth_gbps_per_gpu = require_finite_number(
         cpu, "c2c_bandwidth_gbps_per_gpu", "config.cpu_kv_cache");
     result.write_bandwidth_gbps = require_finite_number(
         cpu, "write_bandwidth_gbps", "config.cpu_kv_cache");
-    result.write_latency_ms = require_finite_number(
-        cpu, "write_latency_ms", "config.cpu_kv_cache");
+    result.write_latency_ms =
+        require_finite_number(cpu, "write_latency_ms", "config.cpu_kv_cache");
     result.read_bandwidth_gbps = require_finite_number(
         cpu, "read_bandwidth_gbps", "config.cpu_kv_cache");
-    result.read_latency_ms = require_finite_number(
-        cpu, "read_latency_ms", "config.cpu_kv_cache");
+    result.read_latency_ms =
+        require_finite_number(cpu, "read_latency_ms", "config.cpu_kv_cache");
 
     const std::string eviction =
         require_string(cpu, "eviction_policy", "config.cpu_kv_cache");
@@ -410,8 +409,8 @@ CpuKVCacheConfig parse_cpu_kv_cache(const Json &root) {
         throw ConfigError("config.cpu_kv_cache.eviction_policy must be "
                           "'session_lru_suffix'");
     }
-    const std::string pressure = require_string(
-        cpu, "capacity_pressure_policy", "config.cpu_kv_cache");
+    const std::string pressure =
+        require_string(cpu, "capacity_pressure_policy", "config.cpu_kv_cache");
     if (pressure == "prefix_fit") {
         result.capacity_pressure_policy =
             CpuKVCacheCapacityPressurePolicy::kPrefixFit;
@@ -422,8 +421,8 @@ CpuKVCacheConfig parse_cpu_kv_cache(const Json &root) {
         throw ConfigError("config.cpu_kv_cache.capacity_pressure_policy must "
                           "be 'prefix_fit' or 'skip_offload'");
     }
-    const std::string concurrency = require_string(
-        cpu, "transfer_concurrency", "config.cpu_kv_cache");
+    const std::string concurrency =
+        require_string(cpu, "transfer_concurrency", "config.cpu_kv_cache");
     if (concurrency != "full_duplex_serialized") {
         throw ConfigError("config.cpu_kv_cache.transfer_concurrency must be "
                           "'full_duplex_serialized'");
@@ -525,27 +524,24 @@ GpuMemoryConfig parse_gpu_memory(const Json &cluster,
         return GpuMemoryConfig{};
     }
     const Json &memory = cluster.at("gpu_memory");
-    const std::string memory_context =
-        std::string{context} + ".gpu_memory";
+    const std::string memory_context = std::string{context} + ".gpu_memory";
     require_keys(memory, {"capacity_bytes_per_gpu"},
                  {"runtime_reserve_fraction", "runtime_reserve_bytes",
-                  "weight_overhead_fraction",
-                  "model_weight_bytes_per_gpu",
-                  "kv_cache_budget_bytes_per_gpu",
-                  "kv_cache_bytes_per_block"},
+                  "weight_overhead_fraction", "model_weight_bytes_per_gpu",
+                  "kv_cache_budget_bytes_per_gpu", "kv_cache_bytes_per_block"},
                  memory_context);
     GpuMemoryConfig parsed{};
     parsed.auto_calculate_num_blocks = true;
-    parsed.capacity_bytes_per_gpu = require_uint64(
-        memory, "capacity_bytes_per_gpu", memory_context);
+    parsed.capacity_bytes_per_gpu =
+        require_uint64(memory, "capacity_bytes_per_gpu", memory_context);
     parsed.runtime_reserve_fraction =
         memory.contains("runtime_reserve_fraction")
             ? require_finite_number(memory, "runtime_reserve_fraction",
                                     memory_context)
             : 0.1;
     if (memory.contains("runtime_reserve_bytes")) {
-        parsed.runtime_reserve_bytes = require_uint64(
-            memory, "runtime_reserve_bytes", memory_context);
+        parsed.runtime_reserve_bytes =
+            require_uint64(memory, "runtime_reserve_bytes", memory_context);
     }
     if (memory.contains("weight_overhead_fraction")) {
         parsed.weight_overhead_fraction = require_finite_number(
@@ -574,9 +570,9 @@ ParallelismConfig parse_parallelism(const Json &root,
         value.tensor_parallel_size = require_uint64(
             parallelism, "tensor_parallel_size", "config.parallelism");
         if (parallelism.contains("decode_context_parallel_size")) {
-            value.decode_context_parallel_size = require_uint64(
-                parallelism, "decode_context_parallel_size",
-                "config.parallelism");
+            value.decode_context_parallel_size =
+                require_uint64(parallelism, "decode_context_parallel_size",
+                               "config.parallelism");
         }
         value.pipeline_parallel_size = require_uint64(
             parallelism, "pipeline_parallel_size", "config.parallelism");
@@ -600,8 +596,7 @@ ParallelismConfig parse_parallelism(const Json &root,
         throw ConfigError("config.parallelism.tensor_parallel_size must be one "
                           "of 1, 2, 4, 8");
     }
-    if (parsed.tensor_parallel_size %
-            parsed.decode_context_parallel_size !=
+    if (parsed.tensor_parallel_size % parsed.decode_context_parallel_size !=
         0) {
         throw ConfigError(
             "config.parallelism.tensor_parallel_size must be divisible by "
@@ -685,13 +680,11 @@ ClusterSchedulerConfig parse_cluster_scheduler(const Json &root) {
         }
         if (scheduler.contains("balance_abs_threshold")) {
             value.balance_abs_threshold = require_uint64(
-                scheduler, "balance_abs_threshold",
-                "config.cluster_scheduler");
+                scheduler, "balance_abs_threshold", "config.cluster_scheduler");
         }
         if (scheduler.contains("balance_rel_threshold")) {
             value.balance_rel_threshold = require_finite_number(
-                scheduler, "balance_rel_threshold",
-                "config.cluster_scheduler");
+                scheduler, "balance_rel_threshold", "config.cluster_scheduler");
         }
         if (!std::isfinite(value.cache_threshold) ||
             value.cache_threshold < 0.0 || value.cache_threshold > 1.0) {
@@ -747,7 +740,8 @@ std::vector<double> require_finite_number_array(const Json &object,
 bool is_supported_analytical_precision(std::string_view precision) noexcept {
     return precision == "fp32" || precision == "fp16" || precision == "bf16" ||
            precision == "fp8" || precision == "int8" || precision == "fp4" ||
-           precision == "int4";
+           precision == "int4" || precision == "mxfp8" ||
+           precision == "mxfp4";
 }
 
 double analytical_precision_size_bytes(std::string_view precision) {
@@ -760,8 +754,14 @@ double analytical_precision_size_bytes(std::string_view precision) {
     if (precision == "fp8" || precision == "int8") {
         return 1.0;
     }
+    if (precision == "mxfp8") {
+        return 1.0 + 1.0 / 32.0;
+    }
     if (precision == "fp4" || precision == "int4") {
         return 0.5;
+    }
+    if (precision == "mxfp4") {
+        return 0.5 + 1.0 / 32.0;
     }
     throw ConfigError("unsupported analytical precision: " +
                       std::string{precision});
@@ -813,8 +813,13 @@ OperatorPrecisionConfig parse_operator_precisions(const Json &execution) {
                   "communication", "attention_weight", "attention_activation",
                   "dense_weight", "dense_activation", "moe_expert_weight",
                   "moe_expert_activation", "moe_router_weight",
-                  "moe_router_activation", "lm_head", "lm_head_weight",
-                  "lm_head_activation"},
+                  "moe_router_activation", "router_weight_storage", "lm_head",
+                  "lm_head_weight",
+                  "lm_head_activation", "routed_expert_weight",
+                  "routed_expert_activation", "latent_moe_projection_weight",
+                  "latent_moe_projection_activation", "shared_expert_weight",
+                  "shared_expert_activation", "dense_mlp_weight",
+                  "dense_mlp_activation", "router_compute", "kda_snapshot"},
                  context);
     const auto parse_optional = [&](std::string_view field,
                                     std::string &destination) {
@@ -825,7 +830,7 @@ OperatorPrecisionConfig parse_operator_precisions(const Json &execution) {
         if (!is_supported_analytical_precision(destination)) {
             throw ConfigError(std::string{context} + "." + std::string{field} +
                               " must be one of fp32, fp16, bf16, fp8, int8, "
-                              "fp4, or int4");
+                              "fp4, int4, mxfp8, or mxfp4");
         }
     };
     parse_optional("attention", result.attention);
@@ -842,9 +847,23 @@ OperatorPrecisionConfig parse_operator_precisions(const Json &execution) {
     parse_optional("moe_expert_activation", result.moe_expert_activation);
     parse_optional("moe_router_weight", result.moe_router_weight);
     parse_optional("moe_router_activation", result.moe_router_activation);
+    parse_optional("router_weight_storage", result.router_weight_storage);
     parse_optional("lm_head", result.lm_head);
     parse_optional("lm_head_weight", result.lm_head_weight);
     parse_optional("lm_head_activation", result.lm_head_activation);
+    parse_optional("routed_expert_weight", result.routed_expert_weight);
+    parse_optional("routed_expert_activation", result.routed_expert_activation);
+    parse_optional("latent_moe_projection_weight",
+                   result.latent_moe_projection_weight);
+    parse_optional("latent_moe_projection_activation",
+                   result.latent_moe_projection_activation);
+    parse_optional("shared_expert_weight", result.shared_expert_weight);
+    parse_optional("shared_expert_activation",
+                   result.shared_expert_activation);
+    parse_optional("dense_mlp_weight", result.dense_mlp_weight);
+    parse_optional("dense_mlp_activation", result.dense_mlp_activation);
+    parse_optional("router_compute", result.router_compute);
+    parse_optional("kda_snapshot", result.kda_snapshot);
     return result;
 }
 
@@ -936,7 +955,7 @@ ExecutionModelConfig parse_execution_model(const Json &root,
         if (!is_supported_analytical_precision(analytical.precision)) {
             throw ConfigError(
                 "analytical execution precision must be fp32, fp16, bf16, "
-                "fp8, int8, fp4, or int4");
+                "fp8, int8, fp4, int4, mxfp8, or mxfp4");
         }
         if (analytical.moe_layer_event_mode != "detailed" &&
             analytical.moe_layer_event_mode != "first_layer_scaled") {
@@ -1022,10 +1041,9 @@ PddClustersConfig parse_pdd_clusters(const Json &root) {
         return value;
     }();
     if (parsed.prefill.parallelism.decode_context_parallel_size != 1) {
-        throw ConfigError(
-            "config.clusters.prefill.parallelism."
-            "decode_context_parallel_size must be 1 for "
-            "pd-disaggregation");
+        throw ConfigError("config.clusters.prefill.parallelism."
+                          "decode_context_parallel_size must be 1 for "
+                          "pd-disaggregation");
     }
     if (parsed.prefill.model != parsed.decode.model) {
         throw ConfigError(
@@ -1128,6 +1146,20 @@ CommonConfigFields parse_common_fields(const Json &root) {
     }();
 }
 
+void validate_kda_prefix_capacity(const ClusterRuntimeConfig &cluster,
+                                  bool prefix_cache_enabled,
+                                  std::string_view context) {
+    if (!prefix_cache_enabled || !cluster.model.has_kda()) {
+        return;
+    }
+    const std::uint64_t charge =
+        cluster.scheduler.kda_snapshot_blocks_per_session;
+    if (charge == 0 || charge > cluster.scheduler.num_blocks) {
+        throw ConfigError(std::string{context} +
+                          " GPU cache cannot hold one atomic KDA snapshot");
+    }
+}
+
 SimulationConfig make_pdd_config(const Json &root, CommonConfigFields common) {
     require_keys(root,
                  {
@@ -1170,6 +1202,13 @@ SimulationConfig make_pdd_config(const Json &root, CommonConfigFields common) {
                 "match the analytical KV-cache precision");
         }
     }
+    // KDA recurrent-state snapshots are part of the PDD payload too. Unlike
+    // KV cache bytes, the snapshot dtype is an operator precision and must
+    // match exactly (e.g. BF16 and FP16 are not interchangeable despite both
+    // occupying two bytes). Fixed execution follows the native BF16 snapshot;
+    // mixed analytical/fixed PDD is accepted only for analytical BF16.
+    static_cast<void>(
+        resolve_pdd_kda_snapshot_dtype_size_bytes(runtime.clusters));
     return [&]() {
         SimulationConfig value{};
         value.schema_version = common.schema_version;
@@ -1181,16 +1220,17 @@ SimulationConfig make_pdd_config(const Json &root, CommonConfigFields common) {
         value.cpu_kv_cache = common.cpu_kv_cache;
         value.cluster_scheduler = parse_cluster_scheduler(root);
         value.runtime = std::move(runtime);
+        validate_kda_prefix_capacity(value.pdd().clusters.prefill,
+                                     value.prefix_cache.enabled,
+                                     "config.clusters.prefill");
         if (value.cpu_kv_cache.enabled) {
             if (!value.prefix_cache.enabled) {
                 throw ConfigError(
                     "CPU KV cache requires prefix_cache.enabled=true");
             }
             const ClusterSchedulerType prefill_scheduler =
-                value.cluster_scheduler.type_for_cluster(
-                    ClusterType::kPrefill);
-            if (prefill_scheduler !=
-                    ClusterSchedulerType::kStickyRoundRobin &&
+                value.cluster_scheduler.type_for_cluster(ClusterType::kPrefill);
+            if (prefill_scheduler != ClusterSchedulerType::kStickyRoundRobin &&
                 prefill_scheduler != ClusterSchedulerType::kCacheAware) {
                 throw ConfigError("CPU KV cache requires "
                                   "PREFILL cluster scheduler to be "
@@ -1234,6 +1274,9 @@ SimulationConfig make_single_cluster_config(const Json &root,
         value.cpu_kv_cache = common.cpu_kv_cache;
         value.cluster_scheduler = parse_cluster_scheduler(root);
         value.runtime = parse_cluster_runtime(clusters, "monolithic");
+        validate_kda_prefix_capacity(value.cluster(),
+                                     value.prefix_cache.enabled,
+                                     "config.clusters.monolithic");
         if (value.cpu_kv_cache.enabled) {
             throw ConfigError(
                 "CPU KV cache is supported only for sequential PDD");

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <list>
 #include <optional>
 #include <stdexcept>
 #include <unordered_map>
@@ -31,11 +32,18 @@ struct CpuOffloadReservationResult {
     std::uint64_t desired_frontier_blocks = 0;
     std::uint64_t admitted_frontier_blocks = 0;
     std::uint64_t reserved_blocks = 0;
+    // A KDA state snapshot is transferred as one fixed-size immutable object.
+    // The payload is charged in full for every update, including replacement
+    // of an existing snapshot; it is intentionally separate from the normal
+    // KV block reservation count above.
+    std::uint64_t kda_snapshot_blocks = 0;
+    std::uint64_t kda_snapshot_bytes = 0;
     bool skipped = false;
     bool truncated = false;
 
     [[nodiscard]] bool requires_transfer() const noexcept {
-        return reservation_id.valid() && reserved_blocks > 0;
+        return reservation_id.valid() &&
+               (reserved_blocks > 0 || kda_snapshot_blocks > 0);
     }
 };
 
@@ -49,6 +57,8 @@ struct CpuKVCacheStats {
     std::uint64_t truncated_offloads = 0;
     std::uint64_t evicted_blocks = 0;
     std::uint64_t evicted_sessions = 0;
+    std::uint64_t evicted_kda_snapshots = 0;
+    std::uint64_t evicted_kda_snapshot_blocks = 0;
     std::uint64_t peak_resident_blocks = 0;
     std::uint64_t peak_reserved_blocks = 0;
     std::uint64_t stale_generation_completions = 0;
@@ -60,7 +70,12 @@ struct CpuKVCacheDiagnostics {
     std::uint64_t capacity_blocks = 0;
     std::uint64_t resident_blocks = 0;
     std::uint64_t reserved_blocks = 0;
+    std::uint64_t kda_snapshot_occupied_blocks = 0;
+    std::uint64_t kda_snapshot_reserved_blocks = 0;
+    std::uint64_t kda_snapshot_sessions = 0;
+    std::uint64_t kda_snapshot_evictable_sessions = 0;
     std::uint64_t pinned_blocks = 0;
+    std::uint64_t pinned_kda_snapshots = 0;
     std::uint64_t sessions = 0;
     std::uint64_t active_reservations = 0;
     std::uint64_t active_restore_leases = 0;
@@ -69,9 +84,24 @@ struct CpuKVCacheDiagnostics {
 
 class CpuKVCacheManager {
   public:
-    CpuKVCacheManager(
-        std::uint64_t capacity_blocks,
-        config::CpuKVCacheCapacityPressurePolicy pressure_policy);
+    CpuKVCacheManager(std::uint64_t capacity_blocks,
+                      config::CpuKVCacheCapacityPressurePolicy pressure_policy);
+
+    // Configure the fixed CPU charge for one KDA recurrent-state snapshot.
+    // A zero charge disables snapshot handling and preserves the legacy CPU
+    // KV policy.  Bytes are optional for direct users; schedulers should pass
+    // the resolved state footprint so transfer accounting can report it.
+    void configure_kda_snapshot(std::uint64_t charged_blocks,
+                                std::uint64_t charged_bytes = 0);
+    [[nodiscard]] bool kda_snapshot_enabled() const noexcept {
+        return kda_snapshot_charge_blocks_ != 0;
+    }
+    [[nodiscard]] std::uint64_t kda_snapshot_charge_blocks() const noexcept {
+        return kda_snapshot_charge_blocks_;
+    }
+    [[nodiscard]] std::uint64_t kda_snapshot_charge_bytes() const noexcept {
+        return kda_snapshot_charge_bytes_;
+    }
 
     [[nodiscard]] CpuPrefixLookupResult
     lookup(SessionId session_id, std::uint64_t query_blocks) const noexcept;
@@ -79,9 +109,10 @@ class CpuKVCacheManager {
                                   CpuPrefixLookupResult result,
                                   SessionId session_id = SessionId{});
 
-    [[nodiscard]] CpuOffloadReservationResult reserve_offload(
-        SessionId session_id, CpuOffloadGeneration generation,
-        std::uint64_t desired_frontier_blocks, SimTime submitted_at);
+    [[nodiscard]] CpuOffloadReservationResult
+    reserve_offload(SessionId session_id, CpuOffloadGeneration generation,
+                    std::uint64_t desired_frontier_blocks,
+                    SimTime submitted_at);
     [[nodiscard]] bool commit_offload(CpuOffloadReservationId reservation_id,
                                       SimTime completed_at);
     [[nodiscard]] bool abort_offload(CpuOffloadReservationId reservation_id);
@@ -89,16 +120,33 @@ class CpuKVCacheManager {
     [[nodiscard]] bool
     session_discard_pending(SessionId session_id) const noexcept;
 
-    [[nodiscard]] CpuRestoreLeaseId pin_restore(
-        SessionId session_id, std::uint64_t begin_block,
-        std::uint64_t end_block, SimTime started_at);
+    [[nodiscard]] bool has_kda_snapshot(SessionId session_id) const noexcept;
+    [[nodiscard]] std::uint64_t
+    kda_snapshot_frontier_blocks(SessionId session_id) const noexcept;
+    [[nodiscard]] std::uint64_t kda_snapshot_occupied_blocks() const noexcept {
+        return kda_snapshot_occupied_blocks_;
+    }
+    // Return the number of fixed-charge blocks removed.  Explicit discard is
+    // not counted as an eviction in stats.
+    [[nodiscard]] std::uint64_t discard_kda_snapshot(SessionId session_id);
+
+    [[nodiscard]] CpuRestoreLeaseId pin_restore(SessionId session_id,
+                                                std::uint64_t begin_block,
+                                                std::uint64_t end_block,
+                                                SimTime started_at);
     [[nodiscard]] bool release_restore(CpuRestoreLeaseId lease_id, bool used,
                                        SimTime released_at);
+    [[nodiscard]] bool
+    restore_includes_kda_snapshot(CpuRestoreLeaseId lease_id) const noexcept;
+    [[nodiscard]] std::uint64_t
+    restore_kda_snapshot_blocks(CpuRestoreLeaseId lease_id) const noexcept;
+    [[nodiscard]] std::uint64_t
+    restore_kda_snapshot_bytes(CpuRestoreLeaseId lease_id) const noexcept;
 
     [[nodiscard]] std::uint64_t
     committed_frontier_blocks(SessionId session_id) const noexcept;
-    [[nodiscard]] bool reservation_pending(
-        CpuOffloadReservationId reservation_id) const noexcept;
+    [[nodiscard]] bool
+    reservation_pending(CpuOffloadReservationId reservation_id) const noexcept;
     [[nodiscard]] bool lease_active(CpuRestoreLeaseId lease_id) const noexcept;
     [[nodiscard]] const CpuKVCacheStats &stats() const noexcept {
         return stats_;
@@ -132,7 +180,15 @@ class CpuKVCacheManager {
                            StrongIdHash<CpuOffloadReservationId>>
             active_reservations;
         std::uint64_t aggregate_restore_pins = 0;
+        std::uint64_t aggregate_snapshot_pins = 0;
         bool discard_pending = false;
+    };
+
+    struct KdaSnapshot {
+        std::uint64_t frontier_blocks = 0;
+        CpuOffloadGeneration generation;
+        bool in_lru = false;
+        std::list<SessionId>::iterator lru_position;
     };
 
     struct OffloadReservation {
@@ -146,10 +202,12 @@ class CpuKVCacheManager {
         // metadata for duplicate-completion idempotency.
         std::vector<CpuBlockId> block_ids;
         SimTime submitted_at;
+        bool includes_kda_snapshot = false;
+        bool snapshot_slot_reserved = false;
+        std::uint64_t kda_snapshot_frontier_blocks = 0;
         bool truncated = false;
         bool retired_completion_received = false;
-        CpuOffloadReservationState state =
-            CpuOffloadReservationState::kPending;
+        CpuOffloadReservationState state = CpuOffloadReservationState::kPending;
     };
 
     struct RestoreLease {
@@ -158,14 +216,26 @@ class CpuKVCacheManager {
         // Populated only while active; release drops the backing allocation.
         std::vector<CpuBlockId> block_ids;
         SimTime started_at;
+        bool includes_kda_snapshot = false;
+        std::uint64_t kda_snapshot_blocks = 0;
+        std::uint64_t kda_snapshot_bytes = 0;
         bool released = false;
     };
 
     [[nodiscard]] CpuBlockId allocate_block_id();
     void free_block(CpuBlockId block_id);
     [[nodiscard]] std::uint64_t available_blocks() const noexcept;
-    [[nodiscard]] std::uint64_t evict_for(
-        std::uint64_t required, SessionId excluded_session);
+    [[nodiscard]] std::uint64_t evict_for(std::uint64_t required,
+                                          SessionId excluded_session);
+    void remove_kda_snapshot_from_lru(KdaSnapshot &snapshot);
+    void append_kda_snapshot_to_lru(SessionId session_id,
+                                    KdaSnapshot &snapshot);
+    void remove_kda_snapshot(SessionId session_id, bool count_eviction);
+    [[nodiscard]] bool can_evict_kda_snapshot(SessionId session_id) const;
+    [[nodiscard]] bool reserve_kda_snapshot_slot(SessionId session_id);
+    void release_kda_snapshot_slot(SessionId session_id);
+    [[nodiscard]] bool
+    session_has_pending_snapshot(SessionId session_id) const noexcept;
     void advance_committed_frontier(SessionState &session);
     void erase_session_if_empty(SessionId session_id);
     void maybe_reap_discarded_session(SessionId session_id);
@@ -179,7 +249,12 @@ class CpuKVCacheManager {
     config::CpuKVCacheCapacityPressurePolicy pressure_policy_;
     std::uint64_t resident_blocks_ = 0;
     std::uint64_t reserved_blocks_ = 0;
+    std::uint64_t kda_snapshot_charge_blocks_ = 0;
+    std::uint64_t kda_snapshot_charge_bytes_ = 0;
+    std::uint64_t kda_snapshot_occupied_blocks_ = 0;
+    std::uint64_t kda_snapshot_reserved_blocks_ = 0;
     std::uint64_t pinned_blocks_ = 0;
+    std::uint64_t pinned_kda_snapshots_ = 0;
     std::uint64_t next_block_id_ = 0;
     std::uint64_t next_reservation_id_ = 0;
     std::uint64_t next_lease_id_ = 0;
@@ -187,6 +262,9 @@ class CpuKVCacheManager {
     std::unordered_map<CpuBlockId, CpuBlock, StrongIdHash<CpuBlockId>> blocks_;
     std::unordered_map<SessionId, SessionState, StrongIdHash<SessionId>>
         sessions_;
+    std::list<SessionId> kda_snapshot_lru_;
+    std::unordered_map<SessionId, KdaSnapshot, StrongIdHash<SessionId>>
+        kda_snapshots_;
     std::unordered_map<CpuOffloadReservationId, OffloadReservation,
                        StrongIdHash<CpuOffloadReservationId>>
         reservations_;

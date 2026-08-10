@@ -16,6 +16,10 @@ Replica::Replica(ReplicaId replica_id, config::ParallelismConfig parallelism,
         parallelism_.moe_expert_parallel_size == 0 || model_.num_layers == 0) {
         throw ReplicaError("replica topology dimensions must be positive");
     }
+    if (!model_.kda_topology_is_symmetric()) {
+        throw ReplicaError(
+            "replica currently supports only symmetric KDA Q/K/V topology");
+    }
     if (parallelism_.tensor_parallel_size %
                 parallelism_.decode_context_parallel_size !=
             0 ||
@@ -23,6 +27,10 @@ Replica::Replica(ReplicaId replica_id, config::ParallelismConfig parallelism,
         parallelism_.pipeline_parallel_size > model_.num_layers ||
         model_.hidden_size % parallelism_.tensor_parallel_size != 0 ||
         model_.num_query_heads % parallelism_.tensor_parallel_size != 0 ||
+        (model_.has_kda() &&
+         (model_.kda_num_heads % parallelism_.tensor_parallel_size != 0 ||
+          model_.kda_num_k_heads % parallelism_.tensor_parallel_size != 0 ||
+          model_.kda_num_v_heads % parallelism_.tensor_parallel_size != 0)) ||
         (!model_.use_mla &&
          model_.num_kv_heads % parallelism_.tensor_parallel_size != 0)) {
         throw ReplicaError("replica topology does not divide model dimensions");

@@ -260,6 +260,81 @@ void test_shared_expert_is_replicated_across_ep_and_sharded_by_tp() {
             "MoE TP must shard the replicated shared expert");
 }
 
+void test_latent_moe_projection_precision_is_independent() {
+    using frontier::execution_time_predictor::detail::AnalyticalConfig;
+    using frontier::execution_time_predictor::detail::DeviceCeilings;
+    using frontier::execution_time_predictor::detail::MoEModel;
+    using frontier::execution_time_predictor::detail::MoEOperatorPrecisions;
+    using frontier::execution_time_predictor::detail::Precision;
+
+    MoEModel latent{};
+    latent.hidden_size = 7'168;
+    latent.intermediate_size = 2'048;
+    latent.model_num_experts = 4;
+    latent.moe_tensor_parallel_size = 1;
+    latent.routed_expert_hidden_size = 3'584;
+    latent.gated_mlp = true;
+    const std::vector<std::uint64_t> local_expert_tokens = {64, 64, 64, 64};
+
+    MoEOperatorPrecisions bf16_projection{};
+    bf16_projection.expert = Precision::kFp16;
+    bf16_projection.router = Precision::kFp16;
+    bf16_projection.dense = Precision::kFp16;
+    bf16_projection.shared_expert = Precision::kFp16;
+    bf16_projection.expert_weight = Precision::kFp4;
+    bf16_projection.expert_activation = Precision::kFp8;
+    bf16_projection.latent_moe_projection_weight = Precision::kBf16;
+    bf16_projection.latent_moe_projection_activation = Precision::kBf16;
+
+    auto quantized_projection = bf16_projection;
+    quantized_projection.latent_moe_projection_weight = Precision::kFp4;
+    quantized_projection.latent_moe_projection_activation = Precision::kFp8;
+    const auto bf16 =
+        frontier::execution_time_predictor::detail::predict_moe_layer(
+            DeviceCeilings::rubin(), AnalyticalConfig{}, latent, 128, 2,
+            local_expert_tokens, bf16_projection);
+    const auto quantized =
+        frontier::execution_time_predictor::detail::predict_moe_layer(
+            DeviceCeilings::rubin(), AnalyticalConfig{}, latent, 128, 2,
+            local_expert_tokens, quantized_projection);
+    require(bf16.latent_projection_ms > quantized.latent_projection_ms,
+            "BF16 Stable LatentMoE projections must use their own HBM and "
+            "compute roofline");
+    require(bf16.grouped_up_projection_ms ==
+                    quantized.grouped_up_projection_ms &&
+                bf16.grouped_down_projection_ms ==
+                    quantized.grouped_down_projection_ms,
+            "Stable LatentMoE projection precision must not change routed "
+            "expert kernels");
+
+    MoEOperatorPrecisions legacy = bf16_projection;
+    legacy.latent_moe_projection_weight.reset();
+    legacy.latent_moe_projection_activation.reset();
+    const auto legacy_prediction =
+        frontier::execution_time_predictor::detail::predict_moe_layer(
+            DeviceCeilings::rubin(), AnalyticalConfig{}, latent, 128, 2,
+            local_expert_tokens, legacy);
+    require(legacy_prediction.latent_projection_ms ==
+                quantized.latent_projection_ms,
+            "legacy latent-MoE callers must inherit routed-expert precision "
+            "when projection fields are absent");
+
+    auto non_latent = latent;
+    non_latent.routed_expert_hidden_size = 0;
+    const auto non_latent_bf16 =
+        frontier::execution_time_predictor::detail::predict_moe_layer(
+            DeviceCeilings::rubin(), AnalyticalConfig{}, non_latent, 128, 2,
+            local_expert_tokens, bf16_projection);
+    const auto non_latent_quantized =
+        frontier::execution_time_predictor::detail::predict_moe_layer(
+            DeviceCeilings::rubin(), AnalyticalConfig{}, non_latent, 128, 2,
+            local_expert_tokens, quantized_projection);
+    require(non_latent_bf16.total_ms() == non_latent_quantized.total_ms() &&
+                non_latent_bf16.latent_projection_ms == 0.0,
+            "non-latent MoE execution must ignore latent projection "
+            "precision overrides");
+}
+
 void test_moe_overflow_and_nonfinite_inputs_fail_fast() {
     using frontier::config::MoeRoutingConfig;
     bool routing_overflow_rejected = false;
@@ -321,6 +396,7 @@ int main() {
         test_numpy_random_golden_vectors();
         test_moe_lane_analytical_model();
         test_shared_expert_is_replicated_across_ep_and_sharded_by_tp();
+        test_latent_moe_projection_precision_is_independent();
         test_moe_overflow_and_nonfinite_inputs_fail_fast();
     } catch (const std::exception &error) {
         std::cerr << error.what() << '\n';

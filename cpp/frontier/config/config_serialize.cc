@@ -186,9 +186,22 @@ OrderedJson serialize_execution_model(const ExecutionModelConfig &execution) {
         add("moe_expert_activation", operators.moe_expert_activation);
         add("moe_router_weight", operators.moe_router_weight);
         add("moe_router_activation", operators.moe_router_activation);
+        add("router_weight_storage", operators.router_weight_storage);
         add("lm_head", operators.lm_head);
         add("lm_head_weight", operators.lm_head_weight);
         add("lm_head_activation", operators.lm_head_activation);
+        add("routed_expert_weight", operators.routed_expert_weight);
+        add("routed_expert_activation", operators.routed_expert_activation);
+        add("latent_moe_projection_weight",
+            operators.latent_moe_projection_weight);
+        add("latent_moe_projection_activation",
+            operators.latent_moe_projection_activation);
+        add("shared_expert_weight", operators.shared_expert_weight);
+        add("shared_expert_activation", operators.shared_expert_activation);
+        add("dense_mlp_weight", operators.dense_mlp_weight);
+        add("dense_mlp_activation", operators.dense_mlp_activation);
+        add("router_compute", operators.router_compute);
+        add("kda_snapshot", operators.kda_snapshot);
         result["operator_precisions"] = std::move(values);
     }
     return result;

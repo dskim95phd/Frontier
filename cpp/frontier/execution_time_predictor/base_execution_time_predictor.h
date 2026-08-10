@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -17,8 +18,11 @@ struct MoERoutingDiagnostic {
     LayerId layer_id;
     std::uint64_t model_layer_id = 0;
     double pre_moe_compute_ms = 0.0;
-    // Attention TP/DCP communication that must finish before routing and
-    // expert execution can begin for this MoE layer.
+    // Attention TP/DCP communication that must complete before this layer's
+    // routing/expert phase can begin.  MoE decode scheduling is decomposed
+    // into separate DES events, so keeping this distinct from compute avoids
+    // dropping the communication from wall-clock time while preserving the
+    // ExecutionTime component breakdown.
     double pre_moe_tp_communication_ms = 0.0;
     std::uint64_t input_tokens = 0;
     std::uint64_t routed_tokens = 0;
@@ -29,17 +33,37 @@ struct MoERoutingDiagnostic {
     double critical_lane_time_ms = 0.0;
 };
 
+enum class ScaledMoEAttentionFamily {
+    kStandard,
+    kMla,
+    kKda,
+};
+
+// A first-layer-scaled prediction retains one detailed MoE routing/expert
+// event, but attention can have multiple implementations within the same
+// pipeline stage (for example Kimi K3's KDA/MLA schedule).  Each entry
+// represents the remaining logical layers of one attention family.
+struct ScaledMoEAttentionGroup {
+    ScaledMoEAttentionFamily family = ScaledMoEAttentionFamily::kStandard;
+    std::uint64_t layer_count = 0;
+    double pre_moe_compute_ms_per_layer = 0.0;
+    double pre_moe_tp_communication_ms_per_layer = 0.0;
+};
+
 struct ExecutionTimePrediction {
     double duration_ms = 0.0;
     entities::ExecutionTime execution_time;
     std::vector<std::pair<std::string, double>> diagnostics;
     std::vector<MoERoutingDiagnostic> moe_routing;
     std::uint64_t logical_moe_layer_count = 0;
+    std::vector<ScaledMoEAttentionGroup> scaled_moe_attention_groups;
+    // Retained as the first detailed MoE layer's attention time for output
+    // compatibility.  Schedulers use scaled_moe_attention_groups for the
+    // remaining layers.
     double repeated_moe_layer_pre_compute_ms = 0.0;
-    double repeated_moe_layer_pre_tp_communication_ms = 0.0;
     double moe_suffix_compute_ms = 0.0;
-    // TP/DCP communication belonging to dense layers after the final MoE
-    // layer in this pipeline stage.
+    // TP communication belonging to dense layers after the final MoE layer.
+    // Decode's decomposed scheduler must wait for it at stage completion.
     double moe_suffix_tp_communication_ms = 0.0;
     bool lazy_moe_layer_prediction = false;
     bool scaled_moe_layer_prediction = false;

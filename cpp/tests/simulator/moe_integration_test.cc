@@ -345,25 +345,29 @@ void test_colocation_dp2_ep2_repredicts_aggregated_expert_tokens() {
     moe_model.gated_mlp = runtime.model.gated_mlp;
     moe_model.fused_add_norm = runtime.model.fused_add_norm;
     const auto &analytical_config = runtime.execution_model.analytical;
-    const analytical::MoEOperatorPrecisions precisions{
-        analytical::precision_from_string(
-            analytical_config.moe_expert_precision()),
-        analytical::precision_from_string(
-            analytical_config.moe_router_precision()),
-        analytical::precision_from_string(analytical_config.dense_precision()),
-        analytical::precision_from_string(
-            analytical_config.moe_expert_weight_precision()),
-        analytical::precision_from_string(
-            analytical_config.moe_expert_activation_precision()),
-        analytical::precision_from_string(
-            analytical_config.moe_router_weight_precision()),
-        analytical::precision_from_string(
-            analytical_config.moe_router_activation_precision()),
-        analytical::precision_from_string(
-            analytical_config.dense_weight_precision()),
-        analytical::precision_from_string(
-            analytical_config.dense_activation_precision()),
-    };
+    analytical::MoEOperatorPrecisions precisions{};
+    precisions.expert = analytical::precision_from_string(
+        analytical_config.moe_expert_precision());
+    precisions.router = analytical::precision_from_string(
+        analytical_config.moe_router_precision());
+    precisions.dense = analytical::precision_from_string(
+        analytical_config.dense_precision());
+    precisions.shared_expert = analytical::precision_from_string(
+        analytical_config.shared_expert_weight_precision());
+    precisions.expert_weight = analytical::precision_from_string(
+        analytical_config.moe_expert_weight_precision());
+    precisions.expert_activation = analytical::precision_from_string(
+        analytical_config.moe_expert_activation_precision());
+    precisions.router_weight = analytical::precision_from_string(
+        analytical_config.router_weight_storage_precision());
+    precisions.router_activation = analytical::precision_from_string(
+        analytical_config.moe_router_activation_precision());
+    precisions.dense_weight = analytical::precision_from_string(
+        analytical_config.dense_weight_precision());
+    precisions.dense_activation = analytical::precision_from_string(
+        analytical_config.dense_activation_precision());
+    precisions.router_compute = analytical::precision_from_string(
+        analytical_config.router_compute_precision());
     const analytical::MoELanePrediction aggregate_prediction =
         analytical::predict_moe_lanes(
             analytical::DeviceCeilings::from_config(analytical_config),
@@ -938,8 +942,9 @@ void test_kimi_k2_first_layer_scaled_preserves_pdd_completion_time() {
 void test_generic_moe_decode_waits_for_attention_tp_communication() {
     auto config = load_config("fixed_moe_local_colocation.json");
     auto &runtime = config.cluster();
-    // Keep MoE-TP disabled. TP2/DP1 and MoE-TP1/EP2 describe the same
-    // two-GPU domain and exercise synchronized decode independently of Kimi.
+    // Keep MoE-TP disabled.  TP2/DP1 and MoE-TP1/EP2 still describe the same
+    // two-GPU domain, so the synchronized decode path is exercised without
+    // relying on Kimi K3 or MoE tensor-parallel communication.
     runtime.parallelism.tensor_parallel_size = 2;
     runtime.parallelism.pipeline_parallel_size = 2;
     runtime.parallelism.data_parallel_size = 1;

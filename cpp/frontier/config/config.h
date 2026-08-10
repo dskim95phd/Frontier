@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <optional>
 #include <stdexcept>
@@ -79,6 +80,12 @@ struct ModelConfig {
     std::uint64_t intermediate_size = 11'008;
     std::uint64_t dense_intermediate_size = 11'008;
     std::uint64_t moe_intermediate_size = 11'008;
+    // K3's Stable LatentMoE exports both the routed expert width and the
+    // conventional moe_intermediate_size.  Keep the former when present so
+    // execution/memory consumers can choose the faithful latent path.
+    std::uint64_t routed_expert_hidden_size = 0;
+    bool latent_moe_use_norm = false;
+    std::uint64_t attn_res_block_size = 0;
     std::uint64_t num_query_heads = 32;
     std::uint64_t num_kv_heads = 32;
     std::uint64_t head_dim = 128;
@@ -93,6 +100,10 @@ struct ModelConfig {
     std::uint64_t moe_layer_freq = 1;
     std::uint64_t vocab_size = 32'000;
     bool use_mla = false;
+    // MLA variants are explicit model metadata. Kimi K3's full-attention
+    // layers use both options; legacy MLA checkpoints leave them disabled.
+    bool mla_use_output_gate = false;
+    bool mla_use_nope = false;
     bool use_mfa = false;
     std::uint64_t q_lora_rank = 0;
     std::uint64_t kv_lora_rank = 0;
@@ -101,6 +112,25 @@ struct ModelConfig {
     std::uint64_t qk_head_dim = 0;
     std::uint64_t v_head_dim = 0;
     std::uint64_t share_q_dim = 0;
+    // Kimi-Linear/Kimi-K3 hybrid attention metadata.  The official K3
+    // checkpoint stores these values below text_config.linear_attn_config;
+    // keeping them on ModelConfig lets consumers account for the recurrent
+    // state without having to reopen the source JSON.
+    std::uint64_t num_kda_layers = 0;
+    std::uint64_t num_mla_layers = 0;
+    std::uint64_t kda_num_heads = 0;
+    std::uint64_t kda_num_k_heads = 0;
+    std::uint64_t kda_num_v_heads = 0;
+    std::uint64_t kda_key_head_dim = 0;
+    std::uint64_t kda_value_head_dim = 0;
+    std::uint64_t kda_head_dim = 0;
+    std::uint64_t kda_short_conv_kernel_size = 0;
+    std::uint64_t kda_conv_state_dim = 0;
+    // Layer ids are zero based, unlike the one-based ids in the Hugging Face
+    // linear_attn_config arrays.  They are sorted and contain an exact
+    // partition of the decoder layers whenever hybrid metadata is present.
+    std::vector<std::uint64_t> kda_layer_indices;
+    std::vector<std::uint64_t> mla_layer_indices;
     bool has_dsa_marker = false;
     std::vector<std::string> exotic_attention_fields;
     attention::AttentionFamilyBinding attention;
@@ -136,33 +166,116 @@ struct ModelConfig {
                    : 2;
     }
 
+    [[nodiscard]] bool has_kda() const noexcept {
+        return num_kda_layers != 0 || !kda_layer_indices.empty();
+    }
+
+    // The current KDA weight-memory and execution models implement the
+    // symmetric topology published for Kimi K3. Keep this predicate explicit
+    // so every entry point can reject unsupported generalized Kimi-Linear
+    // shapes instead of silently applying the K3 formulas to them.
+    [[nodiscard]] bool kda_topology_is_symmetric() const noexcept {
+        return !has_kda() ||
+               (kda_num_heads == kda_num_k_heads &&
+                kda_num_heads == kda_num_v_heads &&
+                kda_head_dim == kda_key_head_dim &&
+                kda_head_dim == kda_value_head_dim);
+    }
+
+    [[nodiscard]] bool is_kda_layer(std::uint64_t layer) const noexcept {
+        return std::binary_search(kda_layer_indices.begin(),
+                                  kda_layer_indices.end(), layer);
+    }
+
+    [[nodiscard]] bool is_mla_layer(std::uint64_t layer) const noexcept {
+        if (!mla_layer_indices.empty()) {
+            return std::binary_search(mla_layer_indices.begin(),
+                                      mla_layer_indices.end(), layer);
+        }
+        // Legacy flat MLA assets (including Kimi K2) do not carry a per-layer
+        // list, so use_mla retains its historical all-layers semantics.
+        return use_mla && !has_kda();
+    }
+
+    [[nodiscard]] bool has_hybrid_attention() const noexcept {
+        return has_kda() && num_mla_layers != 0;
+    }
+
+    [[nodiscard]] bool has_latent_moe() const noexcept {
+        return routed_expert_hidden_size != 0 || latent_moe_use_norm;
+    }
+
+    [[nodiscard]] std::uint64_t
+    kda_recurrent_state_elements_per_layer() const noexcept {
+        return kda_num_v_heads == 0 || kda_key_head_dim == 0 ||
+                       kda_value_head_dim == 0
+                   ? 0
+                   : kda_num_v_heads * kda_key_head_dim * kda_value_head_dim;
+    }
+
+    [[nodiscard]] std::uint64_t
+    kda_conv_state_elements_per_layer() const noexcept {
+        return kda_conv_state_dim == 0 || kda_short_conv_kernel_size <= 1
+                   ? 0
+                   : kda_conv_state_dim * (kda_short_conv_kernel_size - 1);
+    }
+
+    [[nodiscard]] std::uint64_t kda_state_elements_per_layer() const noexcept {
+        return kda_recurrent_state_elements_per_layer() +
+               kda_conv_state_elements_per_layer();
+    }
+
+    [[nodiscard]] std::uint64_t kda_state_snapshot_bytes(
+        std::uint64_t element_size_bytes = 2) const noexcept {
+        return num_kda_layers * kda_state_elements_per_layer() *
+               element_size_bytes;
+    }
+
     friend bool operator==(const ModelConfig &lhs, const ModelConfig &rhs) {
         return std::tie(lhs.name, lhs.model_type, lhs.kind, lhs.num_layers,
                         lhs.hidden_size, lhs.intermediate_size,
                         lhs.dense_intermediate_size, lhs.moe_intermediate_size,
-                        lhs.num_query_heads, lhs.num_kv_heads, lhs.head_dim,
-                        lhs.gated_mlp, lhs.fused_add_norm, lhs.num_experts,
+                        lhs.routed_expert_hidden_size, lhs.latent_moe_use_norm,
+                        lhs.attn_res_block_size, lhs.num_query_heads,
+                        lhs.num_kv_heads, lhs.head_dim, lhs.gated_mlp,
+                        lhs.fused_add_norm, lhs.num_experts,
                         lhs.num_experts_per_token, lhs.total_expert_num,
                         lhs.router_topk, lhs.num_shared_experts,
                         lhs.first_k_dense_replace, lhs.moe_layer_freq,
-                        lhs.vocab_size, lhs.use_mla, lhs.use_mfa,
+                        lhs.vocab_size, lhs.use_mla, lhs.mla_use_output_gate,
+                        lhs.mla_use_nope, lhs.use_mfa,
                         lhs.q_lora_rank, lhs.kv_lora_rank, lhs.qk_nope_head_dim,
                         lhs.qk_rope_head_dim, lhs.qk_head_dim, lhs.v_head_dim,
-                        lhs.share_q_dim, lhs.has_dsa_marker,
-                        lhs.exotic_attention_fields, lhs.attention) ==
+                        lhs.share_q_dim, lhs.num_kda_layers, lhs.num_mla_layers,
+                        lhs.kda_num_heads, lhs.kda_num_k_heads,
+                        lhs.kda_num_v_heads, lhs.kda_key_head_dim,
+                        lhs.kda_value_head_dim, lhs.kda_head_dim,
+                        lhs.kda_short_conv_kernel_size, lhs.kda_conv_state_dim,
+                        lhs.kda_layer_indices, lhs.mla_layer_indices,
+                        lhs.has_dsa_marker, lhs.exotic_attention_fields,
+                        lhs.attention) ==
                std::tie(rhs.name, rhs.model_type, rhs.kind, rhs.num_layers,
                         rhs.hidden_size, rhs.intermediate_size,
                         rhs.dense_intermediate_size, rhs.moe_intermediate_size,
-                        rhs.num_query_heads, rhs.num_kv_heads, rhs.head_dim,
-                        rhs.gated_mlp, rhs.fused_add_norm, rhs.num_experts,
+                        rhs.routed_expert_hidden_size, rhs.latent_moe_use_norm,
+                        rhs.attn_res_block_size, rhs.num_query_heads,
+                        rhs.num_kv_heads, rhs.head_dim, rhs.gated_mlp,
+                        rhs.fused_add_norm, rhs.num_experts,
                         rhs.num_experts_per_token, rhs.total_expert_num,
                         rhs.router_topk, rhs.num_shared_experts,
                         rhs.first_k_dense_replace, rhs.moe_layer_freq,
-                        rhs.vocab_size, rhs.use_mla, rhs.use_mfa,
+                        rhs.vocab_size, rhs.use_mla, rhs.mla_use_output_gate,
+                        rhs.mla_use_nope, rhs.use_mfa,
                         rhs.q_lora_rank, rhs.kv_lora_rank, rhs.qk_nope_head_dim,
                         rhs.qk_rope_head_dim, rhs.qk_head_dim, rhs.v_head_dim,
-                        rhs.share_q_dim, rhs.has_dsa_marker,
-                        rhs.exotic_attention_fields, rhs.attention);
+                        rhs.share_q_dim, rhs.num_kda_layers, rhs.num_mla_layers,
+                        rhs.kda_num_heads, rhs.kda_num_k_heads,
+                        rhs.kda_num_v_heads, rhs.kda_key_head_dim,
+                        rhs.kda_value_head_dim, rhs.kda_head_dim,
+                        rhs.kda_short_conv_kernel_size, rhs.kda_conv_state_dim,
+                        rhs.kda_layer_indices, rhs.mla_layer_indices,
+                        rhs.has_dsa_marker, rhs.exotic_attention_fields,
+                        rhs.attention);
     }
     friend bool operator!=(const ModelConfig &lhs, const ModelConfig &rhs) {
         return !(lhs == rhs);
@@ -298,6 +411,10 @@ struct SchedulerConfig {
     std::uint64_t num_blocks = 1;
     double watermark_blocks_fraction = 0.0;
     std::uint64_t num_preallocate_tokens = 0;
+    // Derived per-session KDA recurrent-state footprint, expressed in GPU
+    // scheduler blocks.  It is populated by memory resolution and omitted
+    // from user-authored JSON unless a caller explicitly normalizes it.
+    std::uint64_t kda_snapshot_blocks_per_session = 0;
 
     friend bool operator==(const SchedulerConfig &lhs,
                            const SchedulerConfig &rhs) {
@@ -306,13 +423,15 @@ struct SchedulerConfig {
                         lhs.enable_chunked_prefill,
                         lhs.long_prefill_token_threshold, lhs.block_size,
                         lhs.num_blocks, lhs.watermark_blocks_fraction,
-                        lhs.num_preallocate_tokens) ==
+                        lhs.num_preallocate_tokens,
+                        lhs.kda_snapshot_blocks_per_session) ==
                std::tie(rhs.type, rhs.scheduling_policy, rhs.batch_size_cap,
                         rhs.max_tokens_in_batch, rhs.enable_preemption,
                         rhs.enable_chunked_prefill,
                         rhs.long_prefill_token_threshold, rhs.block_size,
                         rhs.num_blocks, rhs.watermark_blocks_fraction,
-                        rhs.num_preallocate_tokens);
+                        rhs.num_preallocate_tokens,
+                        rhs.kda_snapshot_blocks_per_session);
     }
 };
 
@@ -348,9 +467,28 @@ struct OperatorPrecisionConfig {
     std::string moe_expert_activation;
     std::string moe_router_weight;
     std::string moe_router_activation;
+    // Canonical router weight storage precision.  `moe_router_weight` is
+    // retained as a legacy fallback for configs written before router
+    // compute/storage precisions were split.
+    std::string router_weight_storage;
     std::string lm_head;
     std::string lm_head_weight;
     std::string lm_head_activation;
+    // K3-native mixed-precision overrides.  Empty values are optional and
+    // inherit the legacy family/suffix fields through the accessors below.
+    std::string routed_expert_weight;
+    std::string routed_expert_activation;
+    // Stable LatentMoE's dense down/up projections sit outside the routed
+    // expert bank and may use a different dtype.  Empty values retain the
+    // historical routed-expert precision for backward compatibility.
+    std::string latent_moe_projection_weight;
+    std::string latent_moe_projection_activation;
+    std::string shared_expert_weight;
+    std::string shared_expert_activation;
+    std::string dense_mlp_weight;
+    std::string dense_mlp_activation;
+    std::string router_compute;
+    std::string kda_snapshot;
 
     [[nodiscard]] bool empty() const noexcept {
         return attention.empty() && dense.empty() && moe_expert.empty() &&
@@ -360,7 +498,16 @@ struct OperatorPrecisionConfig {
                dense_activation.empty() && moe_expert_weight.empty() &&
                moe_expert_activation.empty() && moe_router_weight.empty() &&
                moe_router_activation.empty() && lm_head.empty() &&
-               lm_head_weight.empty() && lm_head_activation.empty();
+               lm_head_weight.empty() && lm_head_activation.empty() &&
+               router_weight_storage.empty() &&
+               routed_expert_weight.empty() &&
+               routed_expert_activation.empty() &&
+               latent_moe_projection_weight.empty() &&
+               latent_moe_projection_activation.empty() &&
+               shared_expert_weight.empty() &&
+               shared_expert_activation.empty() && dense_mlp_weight.empty() &&
+               dense_mlp_activation.empty() && router_compute.empty() &&
+               kda_snapshot.empty();
     }
 
     friend bool operator==(const OperatorPrecisionConfig &lhs,
@@ -371,16 +518,32 @@ struct OperatorPrecisionConfig {
                         lhs.dense_weight, lhs.dense_activation,
                         lhs.moe_expert_weight, lhs.moe_expert_activation,
                         lhs.moe_router_weight, lhs.moe_router_activation,
-                        lhs.lm_head, lhs.lm_head_weight,
-                        lhs.lm_head_activation) ==
+                        lhs.router_weight_storage, lhs.lm_head,
+                        lhs.lm_head_weight,
+                        lhs.lm_head_activation, lhs.routed_expert_weight,
+                        lhs.routed_expert_activation,
+                        lhs.latent_moe_projection_weight,
+                        lhs.latent_moe_projection_activation,
+                        lhs.shared_expert_weight,
+                        lhs.shared_expert_activation, lhs.dense_mlp_weight,
+                        lhs.dense_mlp_activation, lhs.router_compute,
+                        lhs.kda_snapshot) ==
                std::tie(rhs.attention, rhs.dense, rhs.moe_expert,
                         rhs.moe_router, rhs.kv_cache, rhs.communication,
                         rhs.attention_weight, rhs.attention_activation,
                         rhs.dense_weight, rhs.dense_activation,
                         rhs.moe_expert_weight, rhs.moe_expert_activation,
                         rhs.moe_router_weight, rhs.moe_router_activation,
-                        rhs.lm_head, rhs.lm_head_weight,
-                        rhs.lm_head_activation);
+                        rhs.router_weight_storage, rhs.lm_head,
+                        rhs.lm_head_weight,
+                        rhs.lm_head_activation, rhs.routed_expert_weight,
+                        rhs.routed_expert_activation,
+                        rhs.latent_moe_projection_weight,
+                        rhs.latent_moe_projection_activation,
+                        rhs.shared_expert_weight,
+                        rhs.shared_expert_activation, rhs.dense_mlp_weight,
+                        rhs.dense_mlp_activation, rhs.router_compute,
+                        rhs.kda_snapshot);
     }
 };
 
@@ -419,8 +582,8 @@ struct AnalyticalExecutionModelConfig {
     OperatorPrecisionConfig operator_precisions;
     // "detailed" predicts and emits synchronization events one MoE layer at a
     // time.
-    // "first_layer_scaled" emits the first layer normally and models the
-    // remaining identical layers as one accumulated delay.
+    // "first_layer_scaled" emits the first MoE layer normally, reuses its
+    // expert path, and accumulates attention delays by implementation family.
     std::string moe_layer_event_mode = "detailed";
     std::uint64_t tensor_parallel_size = 8;
     double network_bandwidth_gbps = 400.0;
@@ -506,6 +669,19 @@ struct AnalyticalExecutionModelConfig {
     }
     [[nodiscard]] const std::string &
     moe_router_weight_precision() const noexcept {
+        // Keep the historical getter as an alias.  New configs should use
+        // router_weight_storage_precision() so the storage dtype cannot be
+        // confused with the FP32 router compute dtype.
+        return router_weight_storage_precision();
+    }
+    [[nodiscard]] const std::string &
+    router_weight_storage_precision() const noexcept {
+        if (!operator_precisions.router_weight_storage.empty()) {
+            return operator_precisions.router_weight_storage;
+        }
+        // Legacy configs used moe_router_weight for the router's resident
+        // weight dtype.  Preserve that fallback when no canonical field is
+        // present.
         return operator_precisions.moe_router_weight.empty()
                    ? moe_router_precision()
                    : operator_precisions.moe_router_weight;
@@ -532,7 +708,85 @@ struct AnalyticalExecutionModelConfig {
                    ? lm_head_precision()
                    : operator_precisions.lm_head_activation;
     }
+
+    // K3-native precision families retain the legacy operator-specific
+    // fields as fallbacks.  The older *_weight/*_activation overrides are
+    // checked before their unsuffixed family so existing configs preserve
+    // their most specific setting.
+    [[nodiscard]] const std::string &
+    routed_expert_weight_precision() const noexcept {
+        return operator_precisions.routed_expert_weight.empty()
+                   ? moe_expert_weight_precision()
+                   : operator_precisions.routed_expert_weight;
+    }
+    [[nodiscard]] const std::string &
+    routed_expert_activation_precision() const noexcept {
+        return operator_precisions.routed_expert_activation.empty()
+                   ? moe_expert_activation_precision()
+                   : operator_precisions.routed_expert_activation;
+    }
+    [[nodiscard]] const std::string &
+    latent_moe_projection_weight_precision() const noexcept {
+        return operator_precisions.latent_moe_projection_weight.empty()
+                   ? routed_expert_weight_precision()
+                   : operator_precisions.latent_moe_projection_weight;
+    }
+    [[nodiscard]] const std::string &
+    latent_moe_projection_activation_precision() const noexcept {
+        return operator_precisions.latent_moe_projection_activation.empty()
+                   ? routed_expert_activation_precision()
+                   : operator_precisions.latent_moe_projection_activation;
+    }
+    [[nodiscard]] const std::string &
+    shared_expert_weight_precision() const noexcept {
+        return operator_precisions.shared_expert_weight.empty()
+                   ? moe_expert_weight_precision()
+                   : operator_precisions.shared_expert_weight;
+    }
+    [[nodiscard]] const std::string &
+    shared_expert_activation_precision() const noexcept {
+        return operator_precisions.shared_expert_activation.empty()
+                   ? moe_expert_activation_precision()
+                   : operator_precisions.shared_expert_activation;
+    }
+    [[nodiscard]] const std::string &dense_mlp_weight_precision() const
+        noexcept {
+        return operator_precisions.dense_mlp_weight.empty()
+                   ? dense_weight_precision()
+                   : operator_precisions.dense_mlp_weight;
+    }
+    [[nodiscard]] const std::string &dense_mlp_activation_precision() const
+        noexcept {
+        return operator_precisions.dense_mlp_activation.empty()
+                   ? dense_activation_precision()
+                   : operator_precisions.dense_mlp_activation;
+    }
+    [[nodiscard]] const std::string &router_compute_precision() const noexcept {
+        if (!operator_precisions.router_compute.empty()) {
+            return operator_precisions.router_compute;
+        }
+        // A legacy router weight override was historically also used as the
+        // router compute dtype.  Keep that fallback for old configs while
+        // allowing the canonical router_weight_storage field to be
+        // independent.  K3 native defaults install an explicit FP32 value.
+        return operator_precisions.moe_router_weight.empty()
+                   ? moe_router_precision()
+                   : operator_precisions.moe_router_weight;
+    }
+    [[nodiscard]] const std::string &kda_snapshot_precision() const noexcept {
+        // This is an execution-config override only. A model-aware resolver
+        // installs K3's native BF16 snapshot default before memory sizing.
+        return operator_precisions.kda_snapshot.empty()
+                   ? precision
+                   : operator_precisions.kda_snapshot;
+    }
 };
+
+// Fill model-native operator defaults without overwriting explicit modern or
+// legacy precision overrides. Kimi K3 uses its published mixed-precision
+// execution policy; other models are unchanged.
+void apply_model_native_precision_defaults(
+    AnalyticalExecutionModelConfig &execution, const ModelConfig &model);
 
 struct ExecutionModelConfig {
     ExecutionModelType type = ExecutionModelType::kFixed;
@@ -561,22 +815,18 @@ struct GpuMemoryConfig {
 
     friend bool operator==(const GpuMemoryConfig &lhs,
                            const GpuMemoryConfig &rhs) {
-        return std::tie(lhs.auto_calculate_num_blocks,
-                        lhs.capacity_bytes_per_gpu,
-                        lhs.runtime_reserve_fraction,
-                        lhs.runtime_reserve_bytes,
-                        lhs.weight_overhead_fraction,
-                        lhs.model_weight_bytes_per_gpu,
-                        lhs.kv_cache_budget_bytes_per_gpu,
-                        lhs.kv_cache_bytes_per_block) ==
-               std::tie(rhs.auto_calculate_num_blocks,
-                        rhs.capacity_bytes_per_gpu,
-                        rhs.runtime_reserve_fraction,
-                        rhs.runtime_reserve_bytes,
-                        rhs.weight_overhead_fraction,
-                        rhs.model_weight_bytes_per_gpu,
-                        rhs.kv_cache_budget_bytes_per_gpu,
-                        rhs.kv_cache_bytes_per_block);
+        return std::tie(
+                   lhs.auto_calculate_num_blocks, lhs.capacity_bytes_per_gpu,
+                   lhs.runtime_reserve_fraction, lhs.runtime_reserve_bytes,
+                   lhs.weight_overhead_fraction, lhs.model_weight_bytes_per_gpu,
+                   lhs.kv_cache_budget_bytes_per_gpu,
+                   lhs.kv_cache_bytes_per_block) ==
+               std::tie(
+                   rhs.auto_calculate_num_blocks, rhs.capacity_bytes_per_gpu,
+                   rhs.runtime_reserve_fraction, rhs.runtime_reserve_bytes,
+                   rhs.weight_overhead_fraction, rhs.model_weight_bytes_per_gpu,
+                   rhs.kv_cache_budget_bytes_per_gpu,
+                   rhs.kv_cache_bytes_per_block);
     }
 };
 
@@ -651,23 +901,19 @@ struct CpuKVCacheConfig {
     friend bool operator==(const CpuKVCacheConfig &lhs,
                            const CpuKVCacheConfig &rhs) {
         return std::tie(
-                   lhs.enabled, lhs.capacity_bytes,
-                   lhs.static_slice_per_gpu, lhs.capacity_bytes_per_gpu,
-                   lhs.dram_bandwidth_gbps_per_gpu,
-                   lhs.c2c_bandwidth_gbps_per_gpu,
-                   lhs.write_bandwidth_gbps, lhs.write_latency_ms,
-                   lhs.read_bandwidth_gbps, lhs.read_latency_ms,
-                   lhs.eviction_policy, lhs.capacity_pressure_policy,
-                   lhs.transfer_concurrency) ==
+                   lhs.enabled, lhs.capacity_bytes, lhs.static_slice_per_gpu,
+                   lhs.capacity_bytes_per_gpu, lhs.dram_bandwidth_gbps_per_gpu,
+                   lhs.c2c_bandwidth_gbps_per_gpu, lhs.write_bandwidth_gbps,
+                   lhs.write_latency_ms, lhs.read_bandwidth_gbps,
+                   lhs.read_latency_ms, lhs.eviction_policy,
+                   lhs.capacity_pressure_policy, lhs.transfer_concurrency) ==
                std::tie(
-                   rhs.enabled, rhs.capacity_bytes,
-                   rhs.static_slice_per_gpu, rhs.capacity_bytes_per_gpu,
-                   rhs.dram_bandwidth_gbps_per_gpu,
-                   rhs.c2c_bandwidth_gbps_per_gpu,
-                   rhs.write_bandwidth_gbps, rhs.write_latency_ms,
-                   rhs.read_bandwidth_gbps, rhs.read_latency_ms,
-                   rhs.eviction_policy, rhs.capacity_pressure_policy,
-                   rhs.transfer_concurrency);
+                   rhs.enabled, rhs.capacity_bytes, rhs.static_slice_per_gpu,
+                   rhs.capacity_bytes_per_gpu, rhs.dram_bandwidth_gbps_per_gpu,
+                   rhs.c2c_bandwidth_gbps_per_gpu, rhs.write_bandwidth_gbps,
+                   rhs.write_latency_ms, rhs.read_bandwidth_gbps,
+                   rhs.read_latency_ms, rhs.eviction_policy,
+                   rhs.capacity_pressure_policy, rhs.transfer_concurrency);
     }
 };
 
@@ -676,6 +922,11 @@ struct ResolvedCpuKVCacheTargetConfig {
     std::uint64_t capacity_bytes = 0;
     std::uint64_t capacity_blocks = 0;
     std::uint64_t bytes_per_block = 0;
+    // Hybrid KDA models keep one latest recurrent-state snapshot per cached
+    // session. The CPU manager charges it as one indivisible group while
+    // transfer accounting uses the exact byte size.
+    std::uint64_t kda_snapshot_bytes = 0;
+    std::uint64_t kda_snapshot_blocks = 0;
     double d2h_bandwidth_gbps = 0.0;
     double d2h_latency_ms = 0.0;
     double h2d_bandwidth_gbps = 0.0;
@@ -754,12 +1005,20 @@ to_string(CpuKVCacheTransferConcurrency concurrency) noexcept;
 [[nodiscard]] ResolvedCpuKVCacheTargetConfig
 resolve_cpu_kv_cache_target(const SimulationConfig &config);
 
+// Resolve the common KDA recurrent-state snapshot element size used by a
+// sequential PDD transfer. Fixed execution follows the native BF16 snapshot;
+// analytical PREFILL/DECODE clusters must agree on the exact precision when
+// the model exposes KDA layers. A mixed analytical/fixed pair is therefore
+// valid only when the analytical side also uses BF16.
+[[nodiscard]] double resolve_pdd_kda_snapshot_dtype_size_bytes(
+    const PddClustersConfig &clusters);
+
 // Resolve per-rank model weight storage and the remaining rank-local KV block
 // capacity. If an explicit_num_blocks value is supplied for an automatic
 // config, it is treated as a normalized-config consistency check.
-void resolve_gpu_memory_config(ClusterRuntimeConfig &cluster,
-                               std::optional<std::uint64_t>
-                                   explicit_num_blocks = std::nullopt);
+void resolve_gpu_memory_config(
+    ClusterRuntimeConfig &cluster,
+    std::optional<std::uint64_t> explicit_num_blocks = std::nullopt);
 
 [[nodiscard]] SimulationConfig
 parse_simulation_config_json(std::string_view json_text);

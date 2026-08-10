@@ -50,15 +50,14 @@ void accumulate_execution_time(entities::ExecutionTime &total,
         throw std::overflow_error(
             "aggregate PREFILL attention token-pair count overflows uint64");
     }
-    total.prefill_attention_token_pairs +=
-        value.prefill_attention_token_pairs;
+    total.prefill_attention_token_pairs += value.prefill_attention_token_pairs;
 }
 
-std::uint64_t prefill_attention_token_pairs_for_request(
-    std::uint64_t query_tokens, std::uint64_t past_context) {
+std::uint64_t
+prefill_attention_token_pairs_for_request(std::uint64_t query_tokens,
+                                          std::uint64_t past_context) {
     const auto checked_mul = [](std::uint64_t lhs, std::uint64_t rhs) {
-        if (lhs != 0 &&
-            rhs > std::numeric_limits<std::uint64_t>::max() / lhs) {
+        if (lhs != 0 && rhs > std::numeric_limits<std::uint64_t>::max() / lhs) {
             throw std::overflow_error(
                 "PREFILL attention token-pair count overflows uint64");
         }
@@ -72,9 +71,8 @@ std::uint64_t prefill_attention_token_pairs_for_request(
         return lhs + rhs;
     };
     const std::uint64_t triangular =
-        query_tokens % 2 == 0
-            ? checked_mul(query_tokens / 2, query_tokens + 1)
-            : checked_mul(query_tokens, query_tokens / 2 + 1);
+        query_tokens % 2 == 0 ? checked_mul(query_tokens / 2, query_tokens + 1)
+                              : checked_mul(query_tokens, query_tokens / 2 + 1);
     return checked_add(checked_mul(query_tokens, past_context), triangular);
 }
 
@@ -380,8 +378,7 @@ void MetricsStore::collect_completed_requests(
             }
             const std::uint64_t prompt_tokens =
                 request.initial_num_prefill_tokens();
-            const std::uint64_t cached_tokens =
-                request.cached_prefill_tokens();
+            const std::uint64_t cached_tokens = request.cached_prefill_tokens();
             if (cached_tokens > prompt_tokens) {
                 throw std::logic_error(
                     "request cached PREFILL tokens exceed initial prompt");
@@ -392,9 +389,10 @@ void MetricsStore::collect_completed_requests(
                                                           cached_tokens);
             const auto bucket_index = static_cast<std::uint64_t>(std::floor(
                 request.arrived_at().seconds() / kBatchTimeBucketSeconds));
-            std::uint64_t &bucket = output_.aggregate
-                                        .prefill_attention_token_pairs_by_arrival_time_bucket
-                                        [bucket_index];
+            std::uint64_t &bucket =
+                output_.aggregate
+                    .prefill_attention_token_pairs_by_arrival_time_bucket
+                        [bucket_index];
             accumulate_prefill_attention_token_pairs(bucket, token_pairs);
         }
         arrival_demand_collected_ = true;
@@ -521,12 +519,20 @@ void MetricsStore::record_prefix_cache_target(
     aggregate.hit_blocks += stats.hit_blocks;
     aggregate.evicted_blocks += stats.evicted_blocks;
     aggregate.evicted_sessions += stats.evicted_sessions;
+    aggregate.evicted_kda_snapshots += stats.evicted_kda_snapshots;
+    aggregate.evicted_kda_snapshot_blocks += stats.evicted_kda_snapshot_blocks;
+    aggregate.kda_snapshot_occupied_blocks +=
+        diagnostics.kda_snapshot_occupied_blocks;
+    aggregate.kda_snapshot_sessions += diagnostics.kda_snapshot_sessions;
     output_.prefix_cache_targets.push_back(PrefixCacheTargetMetricsRecord{
         cluster_type, target.replica_id, target.dp_id,
         diagnostics.capacity_blocks, diagnostics.available_blocks,
         diagnostics.active_blocks, diagnostics.resident_blocks,
         diagnostics.evictable_blocks, diagnostics.evictable_sessions,
-        diagnostics.sessions_with_nonzero_frontier});
+        diagnostics.sessions_with_nonzero_frontier,
+        diagnostics.kda_snapshot_occupied_blocks,
+        diagnostics.kda_snapshot_sessions,
+        diagnostics.kda_snapshot_evictable_sessions});
 }
 
 void MetricsStore::record_cpu_kv_cache_target(
@@ -542,8 +548,10 @@ void MetricsStore::record_cpu_kv_cache_target(
         }
         return blocks * config.bytes_per_block;
     };
-    const std::uint64_t used =
-        diagnostics.resident_blocks + diagnostics.reserved_blocks;
+    const std::uint64_t used = diagnostics.resident_blocks +
+                               diagnostics.reserved_blocks +
+                               diagnostics.kda_snapshot_occupied_blocks +
+                               diagnostics.kda_snapshot_reserved_blocks;
     if (used > diagnostics.capacity_blocks) {
         throw std::logic_error("CPU KV-cache target exceeds capacity");
     }
@@ -554,6 +562,36 @@ void MetricsStore::record_cpu_kv_cache_target(
     record.capacity_bytes = config.capacity_bytes;
     record.capacity_blocks = diagnostics.capacity_blocks;
     record.bytes_per_block = config.bytes_per_block;
+    record.kda_snapshot_bytes_per_session = config.kda_snapshot_bytes;
+    record.kda_snapshot_blocks_per_session = config.kda_snapshot_blocks;
+    record.kda_snapshot_occupied_blocks =
+        diagnostics.kda_snapshot_occupied_blocks;
+    record.kda_snapshot_reserved_blocks =
+        diagnostics.kda_snapshot_reserved_blocks;
+    record.kda_snapshot_sessions = diagnostics.kda_snapshot_sessions;
+    record.kda_snapshot_evictable_sessions =
+        diagnostics.kda_snapshot_evictable_sessions;
+    const auto snapshot_bytes = [&](std::uint64_t charged_blocks) {
+        if (charged_blocks == 0) {
+            return std::uint64_t{0};
+        }
+        if (config.kda_snapshot_blocks == 0 ||
+            charged_blocks % config.kda_snapshot_blocks != 0) {
+            throw std::logic_error(
+                "CPU KDA snapshot metric charge is not atomic");
+        }
+        const std::uint64_t groups =
+            charged_blocks / config.kda_snapshot_blocks;
+        if (groups > std::numeric_limits<std::uint64_t>::max() /
+                         config.kda_snapshot_bytes) {
+            throw std::overflow_error("CPU KDA snapshot metric bytes overflow");
+        }
+        return groups * config.kda_snapshot_bytes;
+    };
+    record.kda_snapshot_occupied_bytes =
+        snapshot_bytes(record.kda_snapshot_occupied_blocks);
+    record.kda_snapshot_reserved_bytes =
+        snapshot_bytes(record.kda_snapshot_reserved_blocks);
     record.resident_blocks = diagnostics.resident_blocks;
     record.resident_bytes = bytes(record.resident_blocks);
     record.reserved_blocks = diagnostics.reserved_blocks;
@@ -568,6 +606,10 @@ void MetricsStore::record_cpu_kv_cache_target(
     record.evicted_sessions = stats.evicted_sessions;
     record.evicted_blocks = stats.evicted_blocks;
     record.evicted_bytes = bytes(stats.evicted_blocks);
+    record.evicted_kda_snapshots = stats.evicted_kda_snapshots;
+    record.evicted_kda_snapshot_blocks = stats.evicted_kda_snapshot_blocks;
+    record.evicted_kda_snapshot_bytes =
+        snapshot_bytes(record.evicted_kda_snapshot_blocks);
     record.skipped_offloads = stats.skipped_offloads;
     record.truncated_offloads = stats.truncated_offloads;
     record.stale_generation_completions = stats.stale_generation_completions;
@@ -590,6 +632,31 @@ void MetricsStore::record_cpu_kv_cache_target(
         throw std::logic_error(
             "CPU KV-cache targets reported inconsistent block sizes");
     }
+    if (aggregate.kda_snapshot_bytes_per_session == 0) {
+        aggregate.kda_snapshot_bytes_per_session =
+            record.kda_snapshot_bytes_per_session;
+        aggregate.kda_snapshot_blocks_per_session =
+            record.kda_snapshot_blocks_per_session;
+    } else if (record.kda_snapshot_bytes_per_session != 0 &&
+               (aggregate.kda_snapshot_bytes_per_session !=
+                    record.kda_snapshot_bytes_per_session ||
+                aggregate.kda_snapshot_blocks_per_session !=
+                    record.kda_snapshot_blocks_per_session)) {
+        throw std::logic_error(
+            "CPU KV-cache targets reported inconsistent KDA snapshot sizes");
+    }
+    aggregate.kda_snapshot_occupied_bytes += record.kda_snapshot_occupied_bytes;
+    aggregate.kda_snapshot_occupied_blocks +=
+        record.kda_snapshot_occupied_blocks;
+    aggregate.kda_snapshot_reserved_bytes += record.kda_snapshot_reserved_bytes;
+    aggregate.kda_snapshot_reserved_blocks +=
+        record.kda_snapshot_reserved_blocks;
+    aggregate.kda_snapshot_sessions += record.kda_snapshot_sessions;
+    aggregate.kda_snapshot_evictable_sessions +=
+        record.kda_snapshot_evictable_sessions;
+    aggregate.evicted_kda_snapshots += record.evicted_kda_snapshots;
+    aggregate.evicted_kda_snapshot_blocks += record.evicted_kda_snapshot_blocks;
+    aggregate.evicted_kda_snapshot_bytes += record.evicted_kda_snapshot_bytes;
     aggregate.query_blocks += record.cpu_query_blocks;
     aggregate.hit_blocks += record.cpu_hit_blocks;
     aggregate.resident_bytes += record.resident_bytes;
@@ -620,6 +687,7 @@ void MetricsStore::record_cpu_kv_cache_target(
 void MetricsStore::record_cpu_kv_cache_offload(
     const entities::CpuKVCacheOffloadInfo &operation, ClusterType cluster_type,
     std::uint64_t bytes_per_block) {
+    static_cast<void>(bytes_per_block);
     if (operation.state() != entities::CpuKVCacheTransferState::kCompleted) {
         return;
     }
@@ -631,8 +699,9 @@ void MetricsStore::record_cpu_kv_cache_offload(
     record.cluster_type = cluster_type;
     record.replica_id = operation.replica_id();
     record.dp_id = operation.dp_id();
-    record.blocks = timing.size_bytes / bytes_per_block;
+    record.blocks = operation.transferred_kv_blocks();
     record.size_bytes = timing.size_bytes;
+    record.kda_snapshot_bytes = operation.kda_snapshot_bytes();
     record.submitted_at = timing.submitted_at;
     record.started_at = timing.started_at;
     record.completed_at = timing.completed_at;
@@ -643,6 +712,10 @@ void MetricsStore::record_cpu_kv_cache_offload(
     ++aggregate.offload_operations;
     aggregate.offload_blocks += record.blocks;
     aggregate.offload_bytes += record.size_bytes;
+    if (record.kda_snapshot_bytes != 0) {
+        ++aggregate.kda_snapshot_offload_operations;
+        aggregate.kda_snapshot_offload_bytes += record.kda_snapshot_bytes;
+    }
     aggregate.d2h_queue_time_ms += record.queue_time_ms;
     aggregate.d2h_service_time_ms += record.service_time_ms;
     aggregate.source_gpu_hold_time_ms += record.source_gpu_hold_ms;
@@ -654,6 +727,7 @@ void MetricsStore::record_cpu_kv_cache_offload(
 void MetricsStore::record_cpu_kv_cache_restore(
     const entities::CpuKVCacheRestoreInfo &operation, ClusterType cluster_type,
     std::uint64_t bytes_per_block) {
+    static_cast<void>(bytes_per_block);
     if (operation.state() != entities::CpuKVCacheTransferState::kCompleted) {
         return;
     }
@@ -665,8 +739,10 @@ void MetricsStore::record_cpu_kv_cache_restore(
     record.cluster_type = cluster_type;
     record.replica_id = operation.replica_id();
     record.dp_id = operation.dp_id();
-    record.blocks = timing.size_bytes / bytes_per_block;
+    record.blocks =
+        operation.plan().cpu_end_block - operation.plan().cpu_begin_block;
     record.size_bytes = timing.size_bytes;
+    record.kda_snapshot_bytes = operation.kda_snapshot_bytes();
     record.submitted_at = timing.submitted_at;
     record.started_at = timing.started_at;
     record.completed_at = timing.completed_at;
@@ -676,6 +752,10 @@ void MetricsStore::record_cpu_kv_cache_restore(
     ++aggregate.restore_operations;
     aggregate.restore_blocks += record.blocks;
     aggregate.restore_bytes += record.size_bytes;
+    if (record.kda_snapshot_bytes != 0) {
+        ++aggregate.kda_snapshot_restore_operations;
+        aggregate.kda_snapshot_restore_bytes += record.kda_snapshot_bytes;
+    }
     aggregate.h2d_queue_time_ms += record.queue_time_ms;
     aggregate.h2d_service_time_ms += record.service_time_ms;
     if (detailed_traces_enabled_) {

@@ -155,6 +155,14 @@ VllmV1Scheduler::VllmV1Scheduler(
         cpu_kv_cache_ = std::make_unique<kv_cache::CpuKVCacheManager>(
             cpu_kv_cache_config_.capacity_blocks,
             cpu_kv_cache_config_.capacity_pressure_policy);
+        cpu_kv_cache_->configure_kda_snapshot(
+            cpu_kv_cache_config_.kda_snapshot_blocks,
+            cpu_kv_cache_config_.kda_snapshot_bytes);
+        if (cpu_kv_cache_config_.kda_snapshot_blocks != 0 &&
+            !kv_blocks_.kda_snapshot_enabled()) {
+            throw SchedulerError(
+                "CPU KDA snapshots require a configured GPU snapshot cache");
+        }
         cpu_transfer_engine_ = std::make_unique<
             cpu_kv_cache_transfer::AnalyticalCpuKVCacheTransferEngine>(
             cpu_kv_cache_transfer::CpuTransferEngineConfig{
@@ -176,7 +184,8 @@ bool VllmV1Scheduler::contains_request(RequestId request_id) const {
                running_.end() ||
            pending_cpu_restores_.find(request_id) !=
                pending_cpu_restores_.end() ||
-           staged_cpu_restores_.find(request_id) != staged_cpu_restores_.end() ||
+           staged_cpu_restores_.find(request_id) !=
+               staged_cpu_restores_.end() ||
            pending_exports_.find(request_id) != pending_exports_.end();
 }
 
@@ -209,9 +218,9 @@ std::uint64_t VllmV1Scheduler::queued_kv_blocks() const noexcept {
             const bool queued_prefill =
                 cluster_type() == ClusterType::kPrefill &&
                 !value.is_prefill_complete() && !has_commitment;
-            const std::uint64_t tokens =
-                queued_prefill ? value.num_prefill_tokens()
-                               : kv_accounted_tokens(value);
+            const std::uint64_t tokens = queued_prefill
+                                             ? value.num_prefill_tokens()
+                                             : kv_accounted_tokens(value);
             std::uint64_t blocks = tokens / block_size;
             if (tokens % block_size != 0) {
                 if (blocks == std::numeric_limits<std::uint64_t>::max()) {
@@ -323,8 +332,7 @@ VllmV1Scheduler::iteration_start_release_threshold() const noexcept {
 }
 
 bool VllmV1Scheduler::has_visible_waiting_requests() const noexcept {
-    return !preempted_.empty() || !restored_ready_.empty() ||
-           !waiting_.empty();
+    return !preempted_.empty() || !restored_ready_.empty() || !waiting_.empty();
 }
 
 void VllmV1Scheduler::free_completed_request(RequestId request_id) {
@@ -567,7 +575,7 @@ void VllmV1Scheduler::restore_admission_queue(std::deque<RequestId> queue) {
                 staged_cpu_restores_.end()) {
             restored_ready_.push_back(request_id);
         } else if (cluster_type() != ClusterType::kDecode &&
-            request(request_id).preempted()) {
+                   request(request_id).preempted()) {
             preempted_.push_back(request_id);
         } else {
             waiting_.push_back(request_id);
@@ -583,16 +591,27 @@ entities::TieredPrefixPlan VllmV1Scheduler::build_tiered_prefix_plan(
     const kv_cache::PrefixLookupResult gpu = kv_blocks_.lookup(value);
     const kv_cache::CpuPrefixLookupResult cpu =
         cpu_kv_cache_->lookup(value.session_id(), query_blocks);
-    return build_contiguous_tiered_prefix_plan(query_blocks, gpu.hit_blocks,
-                                               cpu.hit_blocks, block_size,
-                                               prompt_tokens);
+    entities::TieredPrefixPlan plan = build_contiguous_tiered_prefix_plan(
+        query_blocks, gpu.hit_blocks, cpu.hit_blocks, block_size,
+        prompt_tokens);
+    const bool cpu_has_snapshot =
+        cpu_kv_cache_->has_kda_snapshot(value.session_id());
+    const bool gpu_has_snapshot =
+        kv_blocks_.has_kda_snapshot(value.session_id());
+    plan.restore_kda_snapshot =
+        cpu_has_snapshot &&
+        (!gpu_has_snapshot ||
+         kv_blocks_.kda_snapshot_frontier_blocks(value.session_id()) <
+             plan.cpu_end_block);
+    return plan;
 }
 
 void VllmV1Scheduler::suspend_for_cpu_restore(
     RequestId request_id, const entities::TieredPrefixPlan &plan,
     SimTime time) {
     if (cpu_kv_cache_ == nullptr || cpu_transfer_engine_ == nullptr ||
-        plan.cpu_begin_block >= plan.cpu_end_block ||
+        (plan.cpu_begin_block >= plan.cpu_end_block &&
+         !plan.restore_kda_snapshot) ||
         pending_cpu_restores_.find(request_id) != pending_cpu_restores_.end() ||
         staged_cpu_restores_.find(request_id) != staged_cpu_restores_.end()) {
         throw SchedulerError("invalid CPU restore suspension");
@@ -606,16 +625,35 @@ void VllmV1Scheduler::suspend_for_cpu_restore(
         static_cast<void>(cpu_kv_cache_->release_restore(lease, false, time));
         throw SchedulerError("CPU restore transfer size overflows uint64");
     }
+    std::uint64_t transfer_bytes =
+        blocks * cpu_kv_cache_config_.bytes_per_block;
+    std::uint64_t snapshot_bytes = 0;
+    std::uint64_t snapshot_frontier = 0;
+    if (cpu_kv_cache_->restore_includes_kda_snapshot(lease) &&
+        plan.restore_kda_snapshot) {
+        snapshot_bytes = cpu_kv_cache_->restore_kda_snapshot_bytes(lease);
+        snapshot_frontier =
+            cpu_kv_cache_->kda_snapshot_frontier_blocks(value.session_id());
+        if (snapshot_bytes == 0 || snapshot_frontier < plan.cpu_end_block ||
+            transfer_bytes >
+                std::numeric_limits<std::uint64_t>::max() - snapshot_bytes) {
+            static_cast<void>(
+                cpu_kv_cache_->release_restore(lease, false, time));
+            throw SchedulerError("CPU KDA snapshot restore payload is invalid");
+        }
+        transfer_bytes += snapshot_bytes;
+    }
     try {
         const auto timing = cpu_transfer_engine_->schedule(
-            cpu_kv_cache_transfer::CpuTransferDirection::kH2D,
-            blocks * cpu_kv_cache_config_.bytes_per_block, time);
+            cpu_kv_cache_transfer::CpuTransferDirection::kH2D, transfer_bytes,
+            time);
         const CpuKvTransferId transfer_id{next_cpu_transfer_id_++};
         const Generation generation{value.runtime_epoch()};
         cpu_restore_operations_.emplace(
-            transfer_id, entities::CpuKVCacheRestoreInfo{
-                             transfer_id, request_id, replica_id(), dp_id(),
-                             lease, plan, timing, generation});
+            transfer_id,
+            entities::CpuKVCacheRestoreInfo{
+                transfer_id, request_id, replica_id(), dp_id(), lease, plan,
+                timing, generation, snapshot_bytes, snapshot_frontier});
         pending_cpu_restores_.emplace(request_id, transfer_id);
         pending_auxiliary_events_.push_back(
             ScheduledAuxiliaryEvent{timing.started_at, [&]() {
@@ -712,7 +750,20 @@ bool VllmV1Scheduler::on_cpu_kv_cache_restore_end(CpuKvTransferId transfer_id,
     const entities::TieredPrefixPlan &plan = restore.plan();
     bool staged_published = false;
     bool runnable_published = false;
+    std::optional<kv_cache::KdaSnapshotCheckpoint> kda_checkpoint;
     try {
+        if (restore.includes_kda_snapshot()) {
+            kda_checkpoint =
+                kv_blocks_.checkpoint_kda_snapshot(value.session_id());
+            const std::uint64_t frontier = std::max(
+                kv_blocks_.kda_snapshot_frontier_blocks(value.session_id()),
+                restore.kda_snapshot_frontier_blocks());
+            if (!kv_blocks_.publish_kda_snapshot(value.session_id(),
+                                                 frontier)) {
+                throw SchedulerError(
+                    "GPU cache cannot admit restored atomic KDA snapshot");
+            }
+        }
         if (!cpu_kv_cache_->release_restore(restore.lease_id(), true, time)) {
             throw SchedulerError("CPU restore lease was already terminal");
         }
@@ -755,6 +806,14 @@ bool VllmV1Scheduler::on_cpu_kv_cache_restore_end(CpuKvTransferId transfer_id,
         }
         if (staged_published) {
             staged_cpu_restores_.erase(value.id());
+        }
+        // GPU publication precedes CPU lease termination. If any later step
+        // fails, restore the exact prior snapshot state (including whether a
+        // zero frontier was merely reserved or validly published) before the
+        // commitment cleanup decides whether to retain it.
+        if (kda_checkpoint.has_value()) {
+            kv_blocks_.restore_kda_snapshot(value.session_id(),
+                                            *kda_checkpoint);
         }
         if (cpu_kv_cache_->lease_active(restore.lease_id())) {
             static_cast<void>(cpu_kv_cache_->release_restore(restore.lease_id(),
@@ -814,7 +873,7 @@ bool VllmV1Scheduler::cancel_cpu_kv_cache_restore(RequestId request_id,
     const auto staged = staged_cpu_restores_.find(request_id);
     if (staged != staged_cpu_restores_.end()) {
         const auto runnable = std::find(restored_ready_.begin(),
-                                       restored_ready_.end(), request_id);
+                                        restored_ready_.end(), request_id);
         if (runnable == restored_ready_.end()) {
             throw SchedulerError(
                 "staged CPU restore runnable entry disappeared");
@@ -1043,15 +1102,16 @@ ScheduleResult VllmV1Scheduler::schedule_requests(SimTime time) {
                        !value.is_prefill_complete()) {
                 const entities::TieredPrefixPlan plan =
                     build_tiered_prefix_plan(value);
-                if (plan.cpu_end_block > plan.cpu_begin_block) {
+                if (plan.cpu_end_block > plan.cpu_begin_block ||
+                    plan.restore_kda_snapshot) {
                     bool committed_for_restore = false;
                     try {
                         if (prefill_request &&
                             kv_blocks_.request_committed_blocks(request_id) ==
                                 0) {
-                            if (!kv_blocks_.can_commit(
-                                    request_id, value.session_id(),
-                                    full_sequence_tokens)) {
+                            if (!kv_blocks_.can_commit(request_id,
+                                                       value.session_id(),
+                                                       full_sequence_tokens)) {
                                 break;
                             }
                             kv_blocks_.commit_virtual(request_id,
@@ -1285,6 +1345,16 @@ bool VllmV1Scheduler::apply_batch_completion(entities::Batch &batch,
         value.on_batch_completion(time, snapshot.scheduled_tokens,
                                   cluster_type());
         kv_blocks_.mark_blocks_computed(value);
+        if (kv_blocks_.kda_snapshot_enabled()) {
+            const std::uint64_t published_blocks =
+                std::min(value.num_processed_tokens() / kv_blocks_.block_size(),
+                         kv_blocks_.allocated_blocks(value.id()));
+            if (!kv_blocks_.publish_kda_snapshot(value.session_id(),
+                                                 published_blocks)) {
+                throw SchedulerError(
+                    "reserved KDA snapshot publication failed");
+            }
+        }
         has_valid_request = true;
         if (cluster_type() == ClusterType::kPrefill &&
             value.is_prefill_complete()) {
@@ -1393,17 +1463,27 @@ bool VllmV1Scheduler::prepare_cpu_kv_cache_offload(RequestId request_id,
             cpu_kv_cache_->abort_offload(reservation.reservation_id));
         throw SchedulerError("CPU offload transfer size overflows uint64");
     }
+    std::uint64_t transfer_bytes =
+        reservation.reserved_blocks * cpu_kv_cache_config_.bytes_per_block;
+    if (transfer_bytes > std::numeric_limits<std::uint64_t>::max() -
+                             reservation.kda_snapshot_bytes) {
+        static_cast<void>(
+            cpu_kv_cache_->abort_offload(reservation.reservation_id));
+        throw SchedulerError(
+            "CPU KDA snapshot offload payload overflows uint64");
+    }
+    transfer_bytes += reservation.kda_snapshot_bytes;
     try {
         const auto timing = cpu_transfer_engine_->schedule(
-            cpu_kv_cache_transfer::CpuTransferDirection::kD2H,
-            reservation.reserved_blocks * cpu_kv_cache_config_.bytes_per_block,
+            cpu_kv_cache_transfer::CpuTransferDirection::kD2H, transfer_bytes,
             time);
         const CpuKvTransferId transfer_id{next_cpu_transfer_id_++};
         cpu_offload_operations_.emplace(
             transfer_id,
             entities::CpuKVCacheOffloadInfo{
                 transfer_id, request_id, replica_id(), dp_id(),
-                reservation.reservation_id, timing, desired, generation});
+                reservation.reservation_id, timing, desired, generation,
+                reservation.reserved_blocks, reservation.kda_snapshot_bytes});
         pending_cpu_offloads_.emplace(request_id, transfer_id);
         export_state->second.cpu_offload_pending = true;
         pending_auxiliary_events_.push_back(

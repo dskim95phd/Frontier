@@ -37,6 +37,14 @@ BaseReplicaScheduler::BaseReplicaScheduler(
         throw SchedulerError(
             "replica scheduler requires an execution model and positive PP");
     }
+    if (replica.model().has_kda() && kv_blocks_.prefix_cache_enabled()) {
+        if (config_.kda_snapshot_blocks_per_session == 0) {
+            throw SchedulerError(
+                "KDA prefix caching requires a resolved snapshot charge");
+        }
+        kv_blocks_.configure_kda_snapshot(
+            config_.kda_snapshot_blocks_per_session);
+    }
     stage_schedulers_.reserve(static_cast<std::size_t>(pipeline_parallel_size));
     for (std::uint64_t stage = 0; stage < pipeline_parallel_size; ++stage) {
         stage_schedulers_.emplace_back(replica.id(), dp_id, StageId{stage},

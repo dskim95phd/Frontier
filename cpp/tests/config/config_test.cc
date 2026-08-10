@@ -1,6 +1,7 @@
 #include "frontier/config/config.h"
 #include "tests/test_support.h"
 
+#include <cstdlib>
 #include <cstdint>
 #include <filesystem>
 #include <stdexcept>
@@ -16,15 +17,16 @@
 
 namespace {
 
+using frontier::ClusterType;
+using frontier::config::ClusterSchedulerType;
 using frontier::config::ConfigError;
 using frontier::config::ExecutionModelType;
-using frontier::config::ClusterSchedulerType;
 using frontier::config::kSchemaVersion;
 using frontier::config::parse_simulation_config_json;
 using frontier::config::PddRuntimeConfig;
+using frontier::config::resolve_pdd_kda_snapshot_dtype_size_bytes;
 using frontier::config::serialize_simulation_config_json;
 using frontier::config::SystemArchitecture;
-using frontier::ClusterType;
 using frontier::test::expect;
 using frontier::test::expect_throws;
 using frontier::test::read_text_file;
@@ -36,6 +38,62 @@ std::filesystem::path fixture(std::string_view name) {
 frontier::config::SimulationConfig load(std::string_view name) {
     return parse_simulation_config_json(read_text_file(fixture(name)));
 }
+
+class ScopedModelConfigDirectory {
+  public:
+    explicit ScopedModelConfigDirectory(const std::filesystem::path &path) {
+#ifdef _WIN32
+        char *previous = nullptr;
+        std::size_t previous_size = 0;
+        if (_dupenv_s(&previous, &previous_size,
+                      "FRONTIER_MODEL_CONFIG_DIR") == 0 &&
+            previous != nullptr) {
+            had_previous_ = true;
+            previous_ = previous;
+        }
+        std::free(previous);
+#else
+        if (const char *value = std::getenv("FRONTIER_MODEL_CONFIG_DIR");
+            value != nullptr) {
+            had_previous_ = true;
+            previous_ = value;
+        }
+#endif
+#ifdef _WIN32
+        if (_putenv_s("FRONTIER_MODEL_CONFIG_DIR", path.string().c_str()) !=
+            0) {
+            throw std::runtime_error("failed to set model fixture directory");
+        }
+#else
+        if (setenv("FRONTIER_MODEL_CONFIG_DIR", path.string().c_str(), 1) !=
+            0) {
+            throw std::runtime_error("failed to set model fixture directory");
+        }
+#endif
+    }
+
+    ScopedModelConfigDirectory(const ScopedModelConfigDirectory &) = delete;
+    ScopedModelConfigDirectory &
+    operator=(const ScopedModelConfigDirectory &) = delete;
+
+    ~ScopedModelConfigDirectory() {
+#ifdef _WIN32
+        static_cast<void>(_putenv_s("FRONTIER_MODEL_CONFIG_DIR",
+                                    had_previous_ ? previous_.c_str() : ""));
+#else
+        if (had_previous_) {
+            static_cast<void>(
+                setenv("FRONTIER_MODEL_CONFIG_DIR", previous_.c_str(), 1));
+        } else {
+            static_cast<void>(unsetenv("FRONTIER_MODEL_CONFIG_DIR"));
+        }
+#endif
+    }
+
+  private:
+    bool had_previous_ = false;
+    std::string previous_;
+};
 
 void test_colocation_contract_round_trip() {
     const auto config = load("fixed_parallel_colocation.json");
@@ -69,8 +127,8 @@ void test_stage_specific_cluster_scheduler_overrides() {
     auto config = load("fixed_sequential_pdd.json");
     expect(config.cluster_scheduler.type_for_cluster(ClusterType::kPrefill) ==
                    ClusterSchedulerType::kRoundRobin &&
-               config.cluster_scheduler.type_for_cluster(ClusterType::kDecode) ==
-                   ClusterSchedulerType::kRoundRobin,
+               config.cluster_scheduler.type_for_cluster(
+                   ClusterType::kDecode) == ClusterSchedulerType::kRoundRobin,
            "legacy cluster scheduler type must fall back for both PDD stages");
 
     config.cluster_scheduler.type = ClusterSchedulerType::kStickyRoundRobin;
@@ -81,23 +139,23 @@ void test_stage_specific_cluster_scheduler_overrides() {
     config.cluster_scheduler.cache_threshold = 0.625;
     config.cluster_scheduler.balance_abs_threshold = 17;
     config.cluster_scheduler.balance_rel_threshold = 1.25;
-    const auto parsed = parse_simulation_config_json(
-        serialize_simulation_config_json(config));
-    expect(parsed.cluster_scheduler.prefill_type.has_value() &&
-               parsed.cluster_scheduler.decode_type.has_value() &&
-               parsed.cluster_scheduler.type_for_cluster(ClusterType::kPrefill) ==
-                   ClusterSchedulerType::kStickyRoundRobin &&
-               parsed.cluster_scheduler.type_for_cluster(ClusterType::kDecode) ==
-                   ClusterSchedulerType::kVllmQueueAware &&
-               parsed.cluster_scheduler.cache_threshold == 0.625 &&
-               parsed.cluster_scheduler.balance_abs_threshold == 17 &&
-               parsed.cluster_scheduler.balance_rel_threshold == 1.25,
-           "PDD stage scheduler overrides must parse and round-trip");
+    const auto parsed =
+        parse_simulation_config_json(serialize_simulation_config_json(config));
+    expect(
+        parsed.cluster_scheduler.prefill_type.has_value() &&
+            parsed.cluster_scheduler.decode_type.has_value() &&
+            parsed.cluster_scheduler.type_for_cluster(ClusterType::kPrefill) ==
+                ClusterSchedulerType::kStickyRoundRobin &&
+            parsed.cluster_scheduler.type_for_cluster(ClusterType::kDecode) ==
+                ClusterSchedulerType::kVllmQueueAware &&
+            parsed.cluster_scheduler.cache_threshold == 0.625 &&
+            parsed.cluster_scheduler.balance_abs_threshold == 17 &&
+            parsed.cluster_scheduler.balance_rel_threshold == 1.25,
+        "PDD stage scheduler overrides must parse and round-trip");
 
     auto colocation = load("fixed_parallel_colocation.json");
     colocation.cluster_scheduler.type = ClusterSchedulerType::kRoundRobin;
-    colocation.cluster_scheduler.prefill_type =
-        ClusterSchedulerType::kKvAware;
+    colocation.cluster_scheduler.prefill_type = ClusterSchedulerType::kKvAware;
     colocation.cluster_scheduler.decode_type =
         ClusterSchedulerType::kVllmQueueAware;
     const auto parsed_colocation = parse_simulation_config_json(
@@ -184,6 +242,17 @@ void test_operator_precision_contract_round_trip() {
     analytical.operator_precisions.moe_expert_activation = "fp8";
     analytical.operator_precisions.lm_head_weight = "fp8";
     analytical.operator_precisions.lm_head_activation = "bf16";
+    analytical.operator_precisions.routed_expert_weight = "mxfp4";
+    analytical.operator_precisions.routed_expert_activation = "mxfp8";
+    analytical.operator_precisions.latent_moe_projection_weight = "bf16";
+    analytical.operator_precisions.latent_moe_projection_activation = "fp8";
+    analytical.operator_precisions.shared_expert_weight = "mxfp4";
+    analytical.operator_precisions.shared_expert_activation = "mxfp8";
+    analytical.operator_precisions.dense_mlp_weight = "mxfp8";
+    analytical.operator_precisions.dense_mlp_activation = "bf16";
+    analytical.operator_precisions.router_weight_storage = "bf16";
+    analytical.operator_precisions.router_compute = "mxfp8";
+    analytical.operator_precisions.kda_snapshot = "mxfp8";
 
     const std::string serialized = serialize_simulation_config_json(config);
     const auto parsed = parse_simulation_config_json(serialized);
@@ -198,8 +267,55 @@ void test_operator_precision_contract_round_trip() {
                resolved.moe_expert_weight_precision() == "fp4" &&
                resolved.moe_expert_activation_precision() == "fp8" &&
                resolved.lm_head_weight_precision() == "fp8" &&
-               resolved.lm_head_activation_precision() == "bf16",
+               resolved.lm_head_activation_precision() == "bf16" &&
+               resolved.routed_expert_weight_precision() == "mxfp4" &&
+               resolved.routed_expert_activation_precision() == "mxfp8" &&
+               resolved.latent_moe_projection_weight_precision() == "bf16" &&
+               resolved.latent_moe_projection_activation_precision() ==
+                   "fp8" &&
+               resolved.shared_expert_weight_precision() == "mxfp4" &&
+               resolved.shared_expert_activation_precision() == "mxfp8" &&
+               resolved.dense_mlp_weight_precision() == "mxfp8" &&
+               resolved.dense_mlp_activation_precision() == "bf16" &&
+               resolved.router_weight_storage_precision() == "bf16" &&
+               resolved.moe_router_weight_precision() == "bf16" &&
+               resolved.router_compute_precision() == "mxfp8" &&
+               resolved.kda_snapshot_precision() == "mxfp8",
            "operator precision overrides must round-trip and resolve");
+
+    auto legacy = config;
+    auto &legacy_precisions =
+        legacy.cluster().execution_model.analytical.operator_precisions;
+    legacy_precisions.routed_expert_weight.clear();
+    legacy_precisions.routed_expert_activation.clear();
+    legacy_precisions.latent_moe_projection_weight.clear();
+    legacy_precisions.latent_moe_projection_activation.clear();
+    legacy_precisions.shared_expert_weight.clear();
+    legacy_precisions.shared_expert_activation.clear();
+    legacy_precisions.dense_mlp_weight.clear();
+    legacy_precisions.dense_mlp_activation.clear();
+    legacy_precisions.router_weight_storage.clear();
+    legacy_precisions.moe_router_weight = "fp8";
+    legacy_precisions.router_compute.clear();
+    legacy_precisions.kda_snapshot.clear();
+    const auto legacy_resolved =
+        parse_simulation_config_json(serialize_simulation_config_json(legacy))
+            .cluster()
+            .execution_model.analytical;
+    expect(legacy_resolved.routed_expert_weight_precision() == "fp4" &&
+               legacy_resolved.routed_expert_activation_precision() == "fp8" &&
+               legacy_resolved.latent_moe_projection_weight_precision() ==
+                   "fp4" &&
+               legacy_resolved.latent_moe_projection_activation_precision() ==
+                   "fp8" &&
+               legacy_resolved.shared_expert_weight_precision() == "fp4" &&
+               legacy_resolved.shared_expert_activation_precision() == "fp8" &&
+               legacy_resolved.dense_mlp_weight_precision() == "fp8" &&
+               legacy_resolved.dense_mlp_activation_precision() == "fp8" &&
+               legacy_resolved.router_weight_storage_precision() == "fp8" &&
+               legacy_resolved.router_compute_precision() == "fp8" &&
+               legacy_resolved.kda_snapshot_precision() == "fp16",
+           "K3-native precision getters must retain legacy family fallbacks");
 
     std::string invalid = serialized;
     const std::string valid_precision = "\"moe_expert\": \"fp4\"";
@@ -213,6 +329,37 @@ void test_operator_precision_contract_round_trip() {
             static_cast<void>(parse_simulation_config_json(invalid));
         },
         "unsupported operator precision must fail fast");
+
+    std::string invalid_native = serialized;
+    const std::string valid_native_precision =
+        "\"router_compute\": \"mxfp8\"";
+    const auto native_position = invalid_native.find(valid_native_precision);
+    expect(native_position != std::string::npos,
+           "serialized K3-native precision must be present");
+    invalid_native.replace(native_position, valid_native_precision.size(),
+                           "\"router_compute\": \"mxfp16\"");
+    expect_throws<ConfigError>(
+        [&invalid_native] {
+            static_cast<void>(parse_simulation_config_json(invalid_native));
+        },
+        "unsupported K3-native precision must fail fast");
+
+    std::string invalid_router_storage = serialized;
+    const std::string valid_router_storage =
+        "\"router_weight_storage\": \"bf16\"";
+    const auto router_storage_position =
+        invalid_router_storage.find(valid_router_storage);
+    expect(router_storage_position != std::string::npos,
+           "serialized router storage precision must be present");
+    invalid_router_storage.replace(router_storage_position,
+                                   valid_router_storage.size(),
+                                   "\"router_weight_storage\": \"fp19\"");
+    expect_throws<ConfigError>(
+        [&invalid_router_storage] {
+            static_cast<void>(
+                parse_simulation_config_json(invalid_router_storage));
+        },
+        "unsupported router storage precision must fail fast");
 
     std::string unknown = serialized;
     const std::string object_marker = "\"operator_precisions\": {";
@@ -269,8 +416,8 @@ void test_gpu_memory_auto_block_calculation() {
            "smaller HBM capacity must produce fewer KV blocks");
 
     auto quantized = config;
-    auto &precisions = quantized.cluster()
-                           .execution_model.analytical.operator_precisions;
+    auto &precisions =
+        quantized.cluster().execution_model.analytical.operator_precisions;
     precisions.attention_weight = "fp8";
     precisions.dense_weight = "fp8";
     precisions.lm_head_weight = "fp8";
@@ -318,6 +465,133 @@ void test_gpu_memory_auto_block_calculation() {
            "capacity");
 }
 
+void test_kimi_k3_gated_mla_weight_memory() {
+    auto config = load("analytical_parallel_colocation.json");
+    auto &cluster = config.cluster();
+    cluster.model =
+        frontier::config::load_model_config("moonshotai/Kimi-K3");
+    cluster.gpu_memory.auto_calculate_num_blocks = true;
+    cluster.gpu_memory.capacity_bytes_per_gpu = 10'000'000'000'000'000ULL;
+    cluster.gpu_memory.runtime_reserve_fraction = 0.10;
+    frontier::config::resolve_gpu_memory_config(cluster);
+    const auto gated_weight_bytes =
+        cluster.gpu_memory.model_weight_bytes_per_gpu;
+
+    auto ungated = cluster;
+    ungated.model.mla_use_output_gate = false;
+    frontier::config::resolve_gpu_memory_config(ungated);
+    expect(cluster.model.mla_use_nope &&
+               gated_weight_bytes >
+                   ungated.gpu_memory.model_weight_bytes_per_gpu,
+           "K3 gated MLA must add output-gate weights to automatic HBM "
+           "accounting while preserving no-PE metadata");
+
+    auto without_attn_res = cluster;
+    without_attn_res.model.attn_res_block_size = 0;
+    frontier::config::resolve_gpu_memory_config(without_attn_res);
+    expect(gated_weight_bytes ==
+               without_attn_res.gpu_memory.model_weight_bytes_per_gpu,
+           "AttnRes metadata must not add automatic GPU weight memory");
+
+    auto bf16_router = cluster;
+    bf16_router.execution_model.analytical.operator_precisions
+        .router_weight_storage = "bf16";
+    bf16_router.execution_model.analytical.operator_precisions.router_compute =
+        "fp32";
+    frontier::config::resolve_gpu_memory_config(bf16_router);
+    auto fp32_router = bf16_router;
+    fp32_router.execution_model.analytical.operator_precisions
+        .router_weight_storage = "fp32";
+    frontier::config::resolve_gpu_memory_config(fp32_router);
+    expect(fp32_router.gpu_memory.model_weight_bytes_per_gpu >
+               bf16_router.gpu_memory.model_weight_bytes_per_gpu,
+           "router compute precision must not inflate resident BF16 weight "
+           "storage");
+}
+
+void test_kimi_k3_latent_moe_projection_weight_memory() {
+    auto config = load("analytical_parallel_colocation.json");
+    auto &cluster = config.cluster();
+    cluster.model =
+        frontier::config::load_model_config("moonshotai/Kimi-K3");
+    cluster.parallelism.pipeline_parallel_size = 1;
+    cluster.gpu_memory.auto_calculate_num_blocks = true;
+    cluster.gpu_memory.capacity_bytes_per_gpu = 10'000'000'000'000'000ULL;
+    frontier::config::apply_model_native_precision_defaults(
+        cluster.execution_model.analytical, cluster.model);
+    frontier::config::resolve_gpu_memory_config(cluster);
+
+    auto quantized_projection = cluster;
+    quantized_projection.execution_model.analytical.operator_precisions
+        .latent_moe_projection_weight = "mxfp4";
+    frontier::config::resolve_gpu_memory_config(quantized_projection);
+    constexpr std::uint64_t kExpectedBf16MinusMxfp4Bytes =
+        92ULL * 2ULL * 7'168ULL * 3'584ULL * 47ULL / 32ULL;
+    expect(cluster.gpu_memory.model_weight_bytes_per_gpu -
+                   quantized_projection.gpu_memory.model_weight_bytes_per_gpu ==
+               kExpectedBf16MinusMxfp4Bytes,
+           "K3 PP1 must account for both BF16 Stable LatentMoE projections "
+           "independently from MXFP4 routed experts");
+
+    auto dense = load("analytical_parallel_colocation.json").cluster();
+    dense.parallelism.pipeline_parallel_size = 1;
+    dense.gpu_memory.auto_calculate_num_blocks = true;
+    dense.gpu_memory.capacity_bytes_per_gpu = 10'000'000'000'000'000ULL;
+    frontier::config::resolve_gpu_memory_config(dense);
+    const std::uint64_t baseline = dense.gpu_memory.model_weight_bytes_per_gpu;
+    dense.execution_model.analytical.operator_precisions
+        .latent_moe_projection_weight = "fp32";
+    dense.execution_model.analytical.operator_precisions
+        .latent_moe_projection_activation = "fp32";
+    frontier::config::resolve_gpu_memory_config(dense);
+    expect(dense.gpu_memory.model_weight_bytes_per_gpu == baseline,
+           "non-latent models must ignore Stable LatentMoE projection "
+           "precision overrides in automatic HBM accounting");
+}
+
+void test_kimi_k3_tp8_dcp8_gpu_memory_layout() {
+    auto config = load("analytical_parallel_colocation.json");
+    auto replicated = config.cluster();
+    replicated.model =
+        frontier::config::load_model_config("moonshotai/Kimi-K3");
+    replicated.parallelism.tensor_parallel_size = 8;
+    replicated.parallelism.decode_context_parallel_size = 1;
+    replicated.parallelism.pipeline_parallel_size = 1;
+    replicated.parallelism.data_parallel_size = 1;
+    replicated.parallelism.moe_tensor_parallel_size = 1;
+    replicated.parallelism.moe_expert_parallel_size = 8;
+    replicated.execution_model.analytical.tensor_parallel_size = 8;
+    replicated.gpu_memory.auto_calculate_num_blocks = true;
+    replicated.gpu_memory.capacity_bytes_per_gpu =
+        10'000'000'000'000'000ULL;
+    frontier::config::resolve_gpu_memory_config(replicated);
+
+    auto dcp = replicated;
+    dcp.parallelism.decode_context_parallel_size = 8;
+    frontier::config::resolve_gpu_memory_config(dcp);
+
+    constexpr std::uint64_t kRankLocalSnapshotBytes = 29'039'616ULL;
+    const auto charged_snapshot_bytes = [](const auto &cluster) {
+        return cluster.scheduler.kda_snapshot_blocks_per_session *
+               cluster.gpu_memory.kv_cache_bytes_per_block;
+    };
+    expect(dcp.gpu_memory.model_weight_bytes_per_gpu ==
+                   replicated.gpu_memory.model_weight_bytes_per_gpu &&
+               replicated.gpu_memory.kv_cache_bytes_per_block ==
+                   8 * dcp.gpu_memory.kv_cache_bytes_per_block &&
+               dcp.scheduler.num_blocks > replicated.scheduler.num_blocks,
+           "K3 TP8/DCP8 must preserve TP-sharded weights while sharding MLA "
+           "KV capacity eight ways");
+    for (const auto *cluster : {&replicated, &dcp}) {
+        const std::uint64_t charged = charged_snapshot_bytes(*cluster);
+        expect(charged >= kRankLocalSnapshotBytes &&
+                   charged - kRankLocalSnapshotBytes <
+                       cluster->gpu_memory.kv_cache_bytes_per_block,
+               "K3 snapshot charge must preserve one TP8 shard within one "
+               "KV-block rounding unit");
+    }
+}
+
 void test_pdd_kv_precision_matches_transfer_dtype() {
     auto config = load("fixed_sequential_pdd.json");
     auto &runtime = config.pdd();
@@ -347,6 +621,75 @@ void test_pdd_kv_precision_matches_transfer_dtype() {
             static_cast<void>(parse_simulation_config_json(mismatched));
         },
         "PDD KV precision and transfer dtype mismatch must fail fast");
+}
+
+void test_pdd_kda_snapshot_precision_contract() {
+    auto config = load("fixed_sequential_pdd.json");
+    const auto fixed_prefill_execution =
+        config.pdd().clusters.prefill.execution_model;
+    const auto fixed_decode_execution =
+        config.pdd().clusters.decode.execution_model;
+    const auto k3 = frontier::config::load_model_config("moonshotai/Kimi-K3");
+    config.pdd().clusters.prefill.model = k3;
+    config.pdd().clusters.decode.model = k3;
+
+    // Fixed execution follows the native BF16 KDA snapshot on both sides.
+    expect(resolve_pdd_kda_snapshot_dtype_size_bytes(config.pdd().clusters) ==
+               2.0,
+           "fixed PDD KDA snapshots must resolve to BF16-sized payloads");
+
+    // Analytical BF16 and FP16 are both two bytes, but they are distinct
+    // state contracts and must not be silently accepted as interchangeable.
+    const auto analytical =
+        load("analytical_parallel_colocation.json")
+            .cluster()
+            .execution_model;
+    config.pdd().clusters.prefill.execution_model = analytical;
+    config.pdd().clusters.decode.execution_model = analytical;
+    config.pdd().clusters.prefill.execution_model.analytical
+        .operator_precisions.kda_snapshot = "bf16";
+    config.pdd().clusters.decode.execution_model.analytical
+        .operator_precisions.kda_snapshot = "bf16";
+    expect(resolve_pdd_kda_snapshot_dtype_size_bytes(config.pdd().clusters) ==
+               2.0,
+           "matching analytical BF16 KDA snapshots must resolve to two bytes");
+
+    config.pdd().clusters.decode.execution_model.analytical
+        .operator_precisions.kda_snapshot = "fp16";
+    expect_throws<ConfigError>(
+        [&config] {
+            static_cast<void>(resolve_pdd_kda_snapshot_dtype_size_bytes(
+                config.pdd().clusters));
+        },
+        "analytical BF16 and FP16 KDA snapshots must fail despite equal size");
+
+    // A fixed/analytical pair is valid only when the analytical side uses the
+    // fixed runtime's implicit BF16 snapshot representation.
+    config.pdd().clusters.decode.execution_model = fixed_decode_execution;
+    expect(resolve_pdd_kda_snapshot_dtype_size_bytes(config.pdd().clusters) ==
+               2.0,
+           "mixed fixed/analytical BF16 KDA snapshots must pass");
+    config.pdd().clusters.prefill.execution_model.analytical
+        .operator_precisions.kda_snapshot = "fp32";
+    expect_throws<ConfigError>(
+        [&config] {
+            static_cast<void>(resolve_pdd_kda_snapshot_dtype_size_bytes(
+                config.pdd().clusters));
+        },
+        "mixed fixed/analytical FP32 KDA snapshots must fail");
+
+    // The helper also protects in-memory callers from asymmetric model state,
+    // even though the JSON parser already enforces the full model contract.
+    config.pdd().clusters.prefill.execution_model = fixed_prefill_execution;
+    config.pdd().clusters.decode.execution_model = fixed_decode_execution;
+    config.pdd().clusters.decode.model =
+        frontier::config::load_model_config("meta-llama/Llama-2-7b-hf");
+    expect_throws<ConfigError>(
+        [&config] {
+            static_cast<void>(resolve_pdd_kda_snapshot_dtype_size_bytes(
+                config.pdd().clusters));
+        },
+        "PDD KDA snapshot resolver must reject asymmetric model state");
 }
 
 void test_analytical_attention_family_configs_parse() {
@@ -598,6 +941,176 @@ void test_model_runtime_overrides_are_optional() {
         "unknown model names without matching JSON assets must fail fast");
 }
 
+void test_kimi_k3_nested_model_asset_and_aliases() {
+    const auto k3 = frontier::config::load_model_config("moonshotai/Kimi-K3");
+    expect(k3.model_type == "kimi_k3" && k3.is_moe() && k3.num_layers == 93 &&
+               k3.hidden_size == 7'168 && k3.num_experts == 896 &&
+               k3.num_experts_per_token == 16 && k3.num_shared_experts == 2 &&
+               k3.first_k_dense_replace == 1,
+           "nested Kimi K3 text_config must expose decoder and MoE fields");
+    expect(k3.use_mla && k3.mla_use_nope && k3.mla_use_output_gate &&
+               k3.has_kda() && k3.has_hybrid_attention() &&
+               k3.num_kda_layers == 69 && k3.num_mla_layers == 24 &&
+               k3.kda_layer_indices.size() == 69 &&
+               k3.mla_layer_indices.size() == 24 && k3.is_kda_layer(0) &&
+               !k3.is_kda_layer(3) && k3.is_mla_layer(3) && k3.is_mla_layer(92),
+           "Kimi K3 hybrid metadata must preserve the official layer split");
+    expect(
+        k3.kda_num_heads == 96 && k3.kda_num_k_heads == 96 &&
+            k3.kda_num_v_heads == 96 && k3.kda_head_dim == 128 &&
+            k3.kda_key_head_dim == 128 && k3.kda_value_head_dim == 128 &&
+            k3.kda_topology_is_symmetric() &&
+            k3.kda_short_conv_kernel_size == 4 &&
+            k3.kda_conv_state_dim == 36'864 &&
+            k3.kda_recurrent_state_elements_per_layer() == 1'572'864 &&
+            k3.kda_conv_state_elements_per_layer() == 110'592 &&
+            k3.kda_state_elements_per_layer() == 1'683'456 &&
+            k3.kda_state_snapshot_bytes() == 232'316'928,
+        "Kimi K3 KDA state dimensions must match the recurrent/conv contract");
+    expect(k3.routed_expert_hidden_size == 3'584 && k3.latent_moe_use_norm &&
+               k3.attn_res_block_size == 12 && k3.has_latent_moe(),
+           "Kimi K3 latent-MoE and attention-residual metadata must parse");
+
+    const auto alias = frontier::config::load_model_config("Kimi-K3");
+    expect(alias.name == "Kimi-K3" && alias.model_type == k3.model_type &&
+               alias.kda_layer_indices == k3.kda_layer_indices &&
+               alias.mla_layer_indices == k3.mla_layer_indices,
+           "Kimi K3 short aliases must resolve the canonical nested asset");
+
+    const auto k2 =
+        frontier::config::load_model_config("moonshotai/Kimi-K2-Instruct");
+    expect(!k2.has_kda() && !k2.mla_use_nope && !k2.mla_use_output_gate &&
+               k2.num_mla_layers == k2.num_layers &&
+               k2.is_mla_layer(0),
+           "legacy flat Kimi K2 must retain all-layer MLA semantics");
+
+    std::string runtime =
+        read_text_file(fixture("fixed_moe_local_colocation.json"));
+    const std::string old_name = "\"Phi-tiny-MoE-instruct\"";
+    const std::size_t name_position = runtime.find(old_name);
+    expect(name_position != std::string::npos,
+           "MoE fixture must expose a replaceable model name");
+    runtime.replace(name_position, old_name.size(), "\"moonshotai/Kimi-K3\"");
+    const auto parsed = parse_simulation_config_json(runtime);
+    expect(parsed.cluster().model.has_kda() &&
+               parsed.cluster().scheduler.kda_snapshot_blocks_per_session ==
+                   526,
+           "K3 runtime must derive one atomic per-session snapshot charge");
+
+    std::string analytical_runtime =
+        read_text_file(fixture("analytical_moe_ep4_colocation.json"));
+    const std::size_t analytical_name_position =
+        analytical_runtime.find(old_name);
+    expect(analytical_name_position != std::string::npos,
+           "analytical MoE fixture must expose a replaceable model name");
+    analytical_runtime.replace(analytical_name_position, old_name.size(),
+                               "\"moonshotai/Kimi-K3\"");
+    const auto native = parse_simulation_config_json(analytical_runtime);
+    const auto &precision =
+        native.cluster().execution_model.analytical.operator_precisions;
+    expect(precision.routed_expert_weight == "mxfp4" &&
+               precision.routed_expert_activation == "mxfp8" &&
+               precision.latent_moe_projection_weight == "bf16" &&
+               precision.latent_moe_projection_activation == "bf16" &&
+               precision.shared_expert_weight == "bf16" &&
+               precision.shared_expert_activation == "bf16" &&
+               precision.dense_mlp_weight == "bf16" &&
+               precision.dense_mlp_activation == "bf16" &&
+               precision.router_weight_storage == "bf16" &&
+               precision.moe_router_activation == "bf16" &&
+               precision.router_compute == "fp32" &&
+               precision.lm_head == "bf16" &&
+               precision.kv_cache == "fp8" &&
+               precision.kda_snapshot == "bf16",
+           "K3 analytical runtime must install the native mixed-precision "
+           "policy");
+
+    auto overridden = native;
+    auto &overridden_execution =
+        overridden.cluster().execution_model.analytical;
+    overridden_execution.operator_precisions.routed_expert_weight = "int4";
+    overridden_execution.operator_precisions.latent_moe_projection_weight =
+        "fp8";
+    overridden_execution.operator_precisions.shared_expert_weight = "mxfp4";
+    overridden_execution.operator_precisions.router_weight_storage = "fp8";
+    overridden_execution.operator_precisions.kv_cache = "bf16";
+    overridden_execution.operator_precisions.kda_snapshot = "fp32";
+    frontier::config::apply_model_native_precision_defaults(
+        overridden_execution, overridden.cluster().model);
+    expect(overridden_execution.routed_expert_weight_precision() == "int4" &&
+               overridden_execution
+                       .latent_moe_projection_weight_precision() == "fp8" &&
+               overridden_execution.shared_expert_weight_precision() ==
+                   "mxfp4" &&
+               overridden_execution.router_weight_storage_precision() ==
+                   "fp8" &&
+               overridden_execution.kv_cache_precision() == "bf16" &&
+               overridden_execution.kda_snapshot_precision() == "fp32" &&
+               overridden_execution.router_compute_precision() == "fp32",
+           "explicit K3 precision overrides must win while unspecified "
+           "families retain native defaults");
+    frontier::config::resolve_gpu_memory_config(
+        overridden.cluster(), overridden.cluster().scheduler.num_blocks);
+    expect(overridden.cluster().scheduler.kda_snapshot_blocks_per_session ==
+               526,
+           "explicit BF16 KV and FP32 KDA snapshot overrides must preserve "
+           "the full-width snapshot charge in BF16-sized KV blocks");
+
+    const std::string disabled_prefix = "\"enabled\": false";
+    const std::size_t prefix_position = runtime.find(disabled_prefix);
+    expect(prefix_position != std::string::npos,
+           "MoE fixture must expose disabled prefix caching");
+    runtime.replace(prefix_position, disabled_prefix.size(),
+                    "\"enabled\": true");
+    expect_throws<ConfigError>(
+        [&runtime] {
+            static_cast<void>(parse_simulation_config_json(runtime));
+        },
+        "K3 prefix caching must reject a cache smaller than one snapshot");
+}
+
+void test_explicit_hybrid_attention_metadata_is_strict() {
+    const ScopedModelConfigDirectory model_fixtures{
+        std::filesystem::path{FRONTIER_TEST_FIXTURE_DIR} / "models"};
+
+    expect_throws<ConfigError>(
+        [] {
+            static_cast<void>(frontier::config::load_model_config(
+                "test/hybrid-empty-arrays"));
+        },
+        "explicitly empty KDA and MLA arrays must not fall back to all-MLA");
+    expect_throws<ConfigError>(
+        [] {
+            static_cast<void>(frontier::config::load_model_config(
+                "test/hybrid-explicit-empty-counterpart"));
+        },
+        "an explicitly empty counterpart must not be inferred as absent");
+    expect_throws<ConfigError>(
+        [] {
+            static_cast<void>(frontier::config::load_model_config(
+                "test/hybrid-explicit-zero-count"));
+        },
+        "an explicit zero hybrid count must be checked against layer arrays");
+    expect_throws<ConfigError>(
+        [] {
+            static_cast<void>(frontier::config::load_model_config(
+                "test/hybrid-asymmetric-heads"));
+        },
+        "KDA models with asymmetric Q/K/V head counts must fail fast");
+    expect_throws<ConfigError>(
+        [] {
+            static_cast<void>(frontier::config::load_model_config(
+                "test/hybrid-asymmetric-dimensions"));
+        },
+        "KDA models with asymmetric Q/K/V head dimensions must fail fast");
+
+    const auto legacy =
+        frontier::config::load_model_config("moonshotai/Kimi-K2-Instruct");
+    expect(!legacy.has_kda() && legacy.num_mla_layers == legacy.num_layers &&
+               legacy.is_mla_layer(0),
+           "metadata-free legacy MLA assets must retain all-layer fallback");
+}
+
 void test_cluster_parallelism_is_not_limited_to_one_nvl72_domain() {
     std::string text =
         read_text_file(fixture("analytical_parallel_colocation.json"));
@@ -633,8 +1146,7 @@ void test_cpu_kv_cache_contract_and_resolution() {
     config.cpu_kv_cache.read_bandwidth_gbps = 40.0;
     const auto parsed =
         parse_simulation_config_json(serialize_simulation_config_json(config));
-    const auto resolved =
-        frontier::config::resolve_cpu_kv_cache_target(parsed);
+    const auto resolved = frontier::config::resolve_cpu_kv_cache_target(parsed);
     const auto expected_block =
         frontier::kv_cache_transfer::model_kv_cache_size_bytes(
             parsed.pdd().clusters.prefill.scheduler.block_size,
@@ -643,8 +1155,7 @@ void test_cpu_kv_cache_contract_and_resolution() {
     expect(parsed == config && resolved.enabled &&
                resolved.capacity_bytes == 1'000'000'000ULL &&
                resolved.bytes_per_block == expected_block &&
-               resolved.capacity_blocks ==
-                   1'000'000'000ULL / expected_block &&
+               resolved.capacity_blocks == 1'000'000'000ULL / expected_block &&
                resolved.d2h_bandwidth_gbps == 80.0 &&
                resolved.h2d_bandwidth_gbps == 40.0,
            "direct CPU KV cache config must round-trip and resolve by model");
@@ -668,9 +1179,32 @@ void test_cpu_kv_cache_contract_and_resolution() {
     const auto kimi_resolved =
         frontier::config::resolve_cpu_kv_cache_target(kimi_target);
     expect(kimi_resolved.bytes_per_block == 2'498'560ULL &&
-               kimi_resolved.capacity_blocks ==
-                   10'000'000ULL / 2'498'560ULL,
+               kimi_resolved.capacity_blocks == 10'000'000ULL / 2'498'560ULL,
            "CPU KV cache must use TP-replicated MLA target bytes per block");
+
+    auto k3_target = parsed;
+    k3_target.cpu_kv_cache.capacity_bytes = 1'000'000'000ULL;
+    k3_target.pdd().clusters.prefill.model =
+        frontier::config::load_model_config("moonshotai/Kimi-K3");
+    k3_target.pdd().clusters.prefill.parallelism.tensor_parallel_size = 4;
+    k3_target.pdd().clusters.prefill.scheduler.block_size = 16;
+    k3_target.pdd().kv_cache_transfer.kv_cache_dtype_size_bytes = 1.0;
+    const auto k3_resolved =
+        frontier::config::resolve_cpu_kv_cache_target(k3_target);
+    expect(k3_resolved.kda_snapshot_bytes == 232'316'928ULL &&
+               k3_resolved.kda_snapshot_blocks ==
+                   (232'316'928ULL + k3_resolved.bytes_per_block - 1) /
+                       k3_resolved.bytes_per_block &&
+               k3_resolved.capacity_blocks > k3_resolved.kda_snapshot_blocks,
+           "K3 CPU tier must reserve one full atomic BF16 KDA snapshot");
+
+    k3_target.cpu_kv_cache.capacity_bytes = k3_resolved.kda_snapshot_bytes;
+    expect_throws<ConfigError>(
+        [&k3_target] {
+            static_cast<void>(
+                frontier::config::resolve_cpu_kv_cache_target(k3_target));
+        },
+        "K3 CPU tier must leave capacity for at least one MLA KV block");
 
     kimi_target.pdd()
         .clusters.prefill.parallelism.decode_context_parallel_size = 4;
@@ -691,23 +1225,23 @@ void test_cpu_kv_cache_contract_and_resolution() {
     kimi_target.pdd().clusters.decode.model =
         kimi_target.pdd().clusters.prefill.model;
     kimi_target.pdd().clusters.decode.parallelism.tensor_parallel_size = 4;
-    kimi_target.pdd()
-        .clusters.decode.parallelism.decode_context_parallel_size = 4;
-    kimi_target.pdd()
-        .clusters.prefill.parallelism.moe_expert_parallel_size = 4;
+    kimi_target.pdd().clusters.decode.parallelism.decode_context_parallel_size =
+        4;
+    kimi_target.pdd().clusters.prefill.parallelism.moe_expert_parallel_size = 4;
     kimi_target.pdd().clusters.decode.parallelism.moe_expert_parallel_size = 4;
     const auto kimi_dcp_round_trip = parse_simulation_config_json(
         serialize_simulation_config_json(kimi_target));
-    expect(kimi_dcp_round_trip.pdd()
-                   .clusters.prefill.parallelism
-                   .decode_context_parallel_size == 1 &&
-               kimi_dcp_round_trip.pdd()
-                       .clusters.decode.parallelism
-                       .decode_context_parallel_size == 4,
-           "PDD must keep PREFILL DCP1 and round-trip DECODE DCP");
+    expect(
+        kimi_dcp_round_trip.pdd()
+                    .clusters.prefill.parallelism
+                    .decode_context_parallel_size == 1 &&
+            kimi_dcp_round_trip.pdd()
+                    .clusters.decode.parallelism.decode_context_parallel_size ==
+                4,
+        "PDD must keep PREFILL DCP1 and round-trip DECODE DCP");
 
-    kimi_target.pdd()
-        .clusters.decode.parallelism.decode_context_parallel_size = 3;
+    kimi_target.pdd().clusters.decode.parallelism.decode_context_parallel_size =
+        3;
     expect_throws<ConfigError>(
         [&kimi_target] {
             static_cast<void>(parse_simulation_config_json(
@@ -715,8 +1249,8 @@ void test_cpu_kv_cache_contract_and_resolution() {
         },
         "MLA DCP size must divide TP size");
 
-    kimi_target.pdd()
-        .clusters.decode.parallelism.decode_context_parallel_size = 0;
+    kimi_target.pdd().clusters.decode.parallelism.decode_context_parallel_size =
+        0;
     expect_throws<ConfigError>(
         [&kimi_target] {
             static_cast<void>(parse_simulation_config_json(
@@ -726,8 +1260,8 @@ void test_cpu_kv_cache_contract_and_resolution() {
 
     auto dense_dcp = parsed;
     dense_dcp.pdd().clusters.decode.parallelism.tensor_parallel_size = 2;
-    dense_dcp.pdd()
-        .clusters.decode.parallelism.decode_context_parallel_size = 2;
+    dense_dcp.pdd().clusters.decode.parallelism.decode_context_parallel_size =
+        2;
     expect_throws<ConfigError>(
         [&dense_dcp] {
             static_cast<void>(parse_simulation_config_json(
@@ -741,8 +1275,8 @@ void test_cpu_kv_cache_contract_and_resolution() {
     config.cpu_kv_cache.c2c_bandwidth_gbps_per_gpu = 300.0;
     config.pdd().clusters.prefill.parallelism.tensor_parallel_size = 2;
     config.pdd().clusters.prefill.parallelism.pipeline_parallel_size = 2;
-    config.pdd().clusters.prefill.execution_model.fixed.stage_latencies_ms =
-        {1.0, 1.0};
+    config.pdd().clusters.prefill.execution_model.fixed.stage_latencies_ms = {
+        1.0, 1.0};
     const auto static_parsed =
         parse_simulation_config_json(serialize_simulation_config_json(config));
     const auto static_resolved =
@@ -810,20 +1344,30 @@ int main() {
                                     test_colocation_contract_round_trip);
     failures += frontier::test::run("PDD contract round trip",
                                     test_pdd_contract_round_trip);
-    failures += frontier::test::run(
-        "stage-specific cluster scheduler overrides",
-        test_stage_specific_cluster_scheduler_overrides);
+    failures +=
+        frontier::test::run("stage-specific cluster scheduler overrides",
+                            test_stage_specific_cluster_scheduler_overrides);
     failures += frontier::test::run("analytical contract round trip",
                                     test_analytical_contract_round_trip);
     failures +=
         frontier::test::run("operator precision contract round trip",
                             test_operator_precision_contract_round_trip);
+    failures += frontier::test::run("GPU memory auto block calculation",
+                                    test_gpu_memory_auto_block_calculation);
+    failures += frontier::test::run("Kimi K3 gated MLA weight memory",
+                                    test_kimi_k3_gated_mla_weight_memory);
     failures += frontier::test::run(
-        "GPU memory auto block calculation",
-        test_gpu_memory_auto_block_calculation);
+        "Kimi K3 latent MoE projection weight memory",
+        test_kimi_k3_latent_moe_projection_weight_memory);
+    failures += frontier::test::run(
+        "Kimi K3 TP8 DCP8 GPU memory layout",
+        test_kimi_k3_tp8_dcp8_gpu_memory_layout);
     failures +=
         frontier::test::run("PDD KV precision matches transfer dtype",
                             test_pdd_kv_precision_matches_transfer_dtype);
+    failures += frontier::test::run(
+        "PDD KDA snapshot precision contract",
+        test_pdd_kda_snapshot_precision_contract);
     failures +=
         frontier::test::run("analytical attention family configs parse",
                             test_analytical_attention_family_configs_parse);
@@ -839,6 +1383,12 @@ int main() {
                                     test_moe_contract_and_invalid_topologies);
     failures += frontier::test::run("model registry and attention binding",
                                     test_model_registry_and_attention_binding);
+    failures +=
+        frontier::test::run("nested Kimi K3 model asset and aliases",
+                            test_kimi_k3_nested_model_asset_and_aliases);
+    failures += frontier::test::run(
+        "explicit hybrid attention metadata is strict",
+        test_explicit_hybrid_attention_metadata_is_strict);
     failures += frontier::test::run("model runtime overrides are optional",
                                     test_model_runtime_overrides_are_optional);
     failures += frontier::test::run(
@@ -846,8 +1396,7 @@ int main() {
         test_cluster_parallelism_is_not_limited_to_one_nvl72_domain);
     failures += frontier::test::run("CPU KV cache contract and resolution",
                                     test_cpu_kv_cache_contract_and_resolution);
-    failures += frontier::test::run(
-        "CPU KV cache invalid combinations",
-        test_cpu_kv_cache_invalid_combinations);
+    failures += frontier::test::run("CPU KV cache invalid combinations",
+                                    test_cpu_kv_cache_invalid_combinations);
     return failures == 0 ? 0 : 1;
 }

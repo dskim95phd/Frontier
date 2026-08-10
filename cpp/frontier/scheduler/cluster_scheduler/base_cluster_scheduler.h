@@ -320,8 +320,9 @@ class BaseClusterScheduler {
         double pp_ms = 0.0;
         double remaining_moe_layer_wait_ms = 0.0;
         std::uint64_t remaining_scaled_moe_layers = 0;
+        std::vector<execution_time_predictor::ScaledMoEAttentionGroup>
+            scaled_moe_attention_groups;
         double repeated_moe_layer_pre_compute_ms = 0.0;
-        double repeated_moe_layer_pre_tp_communication_ms = 0.0;
         bool lazy_layer_prediction = false;
     };
 

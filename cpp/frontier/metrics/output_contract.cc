@@ -793,6 +793,10 @@ std::string serialize_simulation_output_json(const SimulationOutput &output) {
         {"hit_rate", hit_rate},
         {"evicted_blocks", cache.evicted_blocks},
         {"evicted_sessions", cache.evicted_sessions},
+        {"evicted_kda_snapshots", cache.evicted_kda_snapshots},
+        {"evicted_kda_snapshot_blocks", cache.evicted_kda_snapshot_blocks},
+        {"kda_snapshot_occupied_blocks", cache.kda_snapshot_occupied_blocks},
+        {"kda_snapshot_sessions", cache.kda_snapshot_sessions},
     });
     root["prefix_cache_targets"] = OrderedJson::array();
     for (const PrefixCacheTargetMetricsRecord &target :
@@ -809,6 +813,11 @@ std::string serialize_simulation_output_json(const SimulationOutput &output) {
             {"evictable_sessions", target.evictable_sessions},
             {"sessions_with_nonzero_frontier",
              target.sessions_with_nonzero_frontier},
+            {"kda_snapshot_occupied_blocks",
+             target.kda_snapshot_occupied_blocks},
+            {"kda_snapshot_sessions", target.kda_snapshot_sessions},
+            {"kda_snapshot_evictable_sessions",
+             target.kda_snapshot_evictable_sessions},
         }));
     }
 
@@ -818,12 +827,31 @@ std::string serialize_simulation_output_json(const SimulationOutput &output) {
         {"capacity_bytes", cpu.capacity_bytes},
         {"capacity_blocks", cpu.capacity_blocks},
         {"bytes_per_block", cpu.bytes_per_block},
+        {"kda_snapshot_bytes_per_session", cpu.kda_snapshot_bytes_per_session},
+        {"kda_snapshot_blocks_per_session",
+         cpu.kda_snapshot_blocks_per_session},
+        {"kda_snapshot_occupied_bytes", cpu.kda_snapshot_occupied_bytes},
+        {"kda_snapshot_occupied_blocks", cpu.kda_snapshot_occupied_blocks},
+        {"kda_snapshot_reserved_bytes", cpu.kda_snapshot_reserved_bytes},
+        {"kda_snapshot_reserved_blocks", cpu.kda_snapshot_reserved_blocks},
+        {"kda_snapshot_sessions", cpu.kda_snapshot_sessions},
+        {"kda_snapshot_evictable_sessions",
+         cpu.kda_snapshot_evictable_sessions},
+        {"evicted_kda_snapshots", cpu.evicted_kda_snapshots},
+        {"evicted_kda_snapshot_blocks", cpu.evicted_kda_snapshot_blocks},
+        {"evicted_kda_snapshot_bytes", cpu.evicted_kda_snapshot_bytes},
         {"offload_operations", cpu.offload_operations},
         {"offload_blocks", cpu.offload_blocks},
         {"offload_bytes", cpu.offload_bytes},
+        {"kda_snapshot_offload_operations",
+         cpu.kda_snapshot_offload_operations},
+        {"kda_snapshot_offload_bytes", cpu.kda_snapshot_offload_bytes},
         {"restore_operations", cpu.restore_operations},
         {"restore_blocks", cpu.restore_blocks},
         {"restore_bytes", cpu.restore_bytes},
+        {"kda_snapshot_restore_operations",
+         cpu.kda_snapshot_restore_operations},
+        {"kda_snapshot_restore_bytes", cpu.kda_snapshot_restore_bytes},
         {"d2h_queue_time_ms", cpu.d2h_queue_time_ms},
         {"d2h_service_time_ms", cpu.d2h_service_time_ms},
         {"h2d_queue_time_ms", cpu.h2d_queue_time_ms},
@@ -867,6 +895,22 @@ std::string serialize_simulation_output_json(const SimulationOutput &output) {
             {"capacity_bytes", target.capacity_bytes},
             {"capacity_blocks", target.capacity_blocks},
             {"bytes_per_block", target.bytes_per_block},
+            {"kda_snapshot_bytes_per_session",
+             target.kda_snapshot_bytes_per_session},
+            {"kda_snapshot_blocks_per_session",
+             target.kda_snapshot_blocks_per_session},
+            {"kda_snapshot_occupied_bytes", target.kda_snapshot_occupied_bytes},
+            {"kda_snapshot_occupied_blocks",
+             target.kda_snapshot_occupied_blocks},
+            {"kda_snapshot_reserved_bytes", target.kda_snapshot_reserved_bytes},
+            {"kda_snapshot_reserved_blocks",
+             target.kda_snapshot_reserved_blocks},
+            {"kda_snapshot_sessions", target.kda_snapshot_sessions},
+            {"kda_snapshot_evictable_sessions",
+             target.kda_snapshot_evictable_sessions},
+            {"evicted_kda_snapshots", target.evicted_kda_snapshots},
+            {"evicted_kda_snapshot_blocks", target.evicted_kda_snapshot_blocks},
+            {"evicted_kda_snapshot_bytes", target.evicted_kda_snapshot_bytes},
             {"resident_bytes", target.resident_bytes},
             {"resident_blocks", target.resident_blocks},
             {"reserved_bytes", target.reserved_bytes},
@@ -907,6 +951,7 @@ std::string serialize_simulation_output_json(const SimulationOutput &output) {
             {"dp_id", transfer.dp_id.value()},
             {"blocks", transfer.blocks},
             {"size_bytes", transfer.size_bytes},
+            {"kda_snapshot_bytes", transfer.kda_snapshot_bytes},
             {"submitted_at_s", transfer.submitted_at.seconds()},
             {"started_at_s", transfer.started_at.seconds()},
             {"completed_at_s", transfer.completed_at.seconds()},
@@ -931,7 +976,8 @@ std::string serialize_simulation_output_json(const SimulationOutput &output) {
     root["prefill_attention_token_pairs_by_arrival_time_bucket"] =
         OrderedJson::object();
     for (const auto &[bucket_index, token_pairs] :
-         output.aggregate.prefill_attention_token_pairs_by_arrival_time_bucket) {
+         output.aggregate
+             .prefill_attention_token_pairs_by_arrival_time_bucket) {
         root["prefill_attention_token_pairs_by_arrival_time_bucket"]
             [std::to_string(bucket_index)] = token_pairs;
     }
@@ -1146,7 +1192,8 @@ std::string serialize_simulation_summary_json(const SimulationOutput &output,
     root["prefill_attention_token_pairs_by_arrival_time_bucket"] =
         OrderedJson::object();
     for (const auto &[bucket_index, token_pairs] :
-         output.aggregate.prefill_attention_token_pairs_by_arrival_time_bucket) {
+         output.aggregate
+             .prefill_attention_token_pairs_by_arrival_time_bucket) {
         root["prefill_attention_token_pairs_by_arrival_time_bucket"]
             [std::to_string(bucket_index)] = token_pairs;
     }
@@ -1174,6 +1221,10 @@ std::string serialize_simulation_summary_json(const SimulationOutput &output,
                                static_cast<double>(cache.query_blocks)},
         {"evicted_blocks", cache.evicted_blocks},
         {"evicted_sessions", cache.evicted_sessions},
+        {"evicted_kda_snapshots", cache.evicted_kda_snapshots},
+        {"evicted_kda_snapshot_blocks", cache.evicted_kda_snapshot_blocks},
+        {"kda_snapshot_occupied_blocks", cache.kda_snapshot_occupied_blocks},
+        {"kda_snapshot_sessions", cache.kda_snapshot_sessions},
     });
     const CpuKVCacheMetricsAggregate &cpu = output.aggregate.cpu_kv_cache;
     root["cpu_kv_cache"] = OrderedJson::object({
@@ -1181,12 +1232,31 @@ std::string serialize_simulation_summary_json(const SimulationOutput &output,
         {"capacity_bytes", cpu.capacity_bytes},
         {"capacity_blocks", cpu.capacity_blocks},
         {"bytes_per_block", cpu.bytes_per_block},
+        {"kda_snapshot_bytes_per_session", cpu.kda_snapshot_bytes_per_session},
+        {"kda_snapshot_blocks_per_session",
+         cpu.kda_snapshot_blocks_per_session},
+        {"kda_snapshot_occupied_bytes", cpu.kda_snapshot_occupied_bytes},
+        {"kda_snapshot_occupied_blocks", cpu.kda_snapshot_occupied_blocks},
+        {"kda_snapshot_reserved_bytes", cpu.kda_snapshot_reserved_bytes},
+        {"kda_snapshot_reserved_blocks", cpu.kda_snapshot_reserved_blocks},
+        {"kda_snapshot_sessions", cpu.kda_snapshot_sessions},
+        {"kda_snapshot_evictable_sessions",
+         cpu.kda_snapshot_evictable_sessions},
+        {"evicted_kda_snapshots", cpu.evicted_kda_snapshots},
+        {"evicted_kda_snapshot_blocks", cpu.evicted_kda_snapshot_blocks},
+        {"evicted_kda_snapshot_bytes", cpu.evicted_kda_snapshot_bytes},
         {"offload_operations", cpu.offload_operations},
         {"offload_blocks", cpu.offload_blocks},
         {"offload_bytes", cpu.offload_bytes},
+        {"kda_snapshot_offload_operations",
+         cpu.kda_snapshot_offload_operations},
+        {"kda_snapshot_offload_bytes", cpu.kda_snapshot_offload_bytes},
         {"restore_operations", cpu.restore_operations},
         {"restore_blocks", cpu.restore_blocks},
         {"restore_bytes", cpu.restore_bytes},
+        {"kda_snapshot_restore_operations",
+         cpu.kda_snapshot_restore_operations},
+        {"kda_snapshot_restore_bytes", cpu.kda_snapshot_restore_bytes},
         {"d2h_queue_time_ms", cpu.d2h_queue_time_ms},
         {"d2h_service_time_ms", cpu.d2h_service_time_ms},
         {"h2d_queue_time_ms", cpu.h2d_queue_time_ms},

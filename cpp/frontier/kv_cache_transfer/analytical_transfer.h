@@ -51,9 +51,10 @@ model_kv_cache_size_bytes(std::uint64_t num_tokens,
                           double kv_cache_dtype_size_bytes,
                           std::uint64_t attention_tensor_parallel_size,
                           std::uint64_t decode_context_parallel_size);
-[[nodiscard]] std::uint64_t model_kv_cache_size_bytes_one_copy(
-    std::uint64_t num_tokens, const config::ModelConfig &model,
-    double kv_cache_dtype_size_bytes);
+[[nodiscard]] std::uint64_t
+model_kv_cache_size_bytes_one_copy(std::uint64_t num_tokens,
+                                   const config::ModelConfig &model,
+                                   double kv_cache_dtype_size_bytes);
 [[nodiscard]] std::uint64_t model_kv_cache_size_bytes_target_physical(
     std::uint64_t num_tokens, const config::ModelConfig &model,
     double kv_cache_dtype_size_bytes,
@@ -68,6 +69,15 @@ model_kv_cache_size_bytes(std::uint64_t num_tokens,
     double kv_cache_dtype_size_bytes,
     std::uint64_t decode_context_parallel_size,
     std::uint64_t decode_context_parallel_rank = 0);
+// KDA keeps a fixed-size recurrent/short-convolution state rather than a
+// token-proportional KV sequence.  The snapshot is independent of the MLA KV
+// block layout and is transferred atomically.
+[[nodiscard]] std::uint64_t
+model_kda_state_snapshot_size_bytes(const config::ModelConfig &model,
+                                    double state_dtype_size_bytes = 4.0);
+[[nodiscard]] std::uint64_t model_kda_state_snapshot_size_bytes_rank_local(
+    const config::ModelConfig &model, double state_dtype_size_bytes,
+    std::uint64_t attention_tensor_parallel_size);
 [[nodiscard]] TransferPrediction predict_transfer(std::uint64_t size_bytes,
                                                   const TransferConfig &config);
 
@@ -77,7 +87,8 @@ class AnalyticalKVCacheTransferPredictor final
     explicit AnalyticalKVCacheTransferPredictor(
         config::KvCacheTransferConfig config,
         std::uint64_t attention_tensor_parallel_size = 1,
-        std::uint64_t decode_context_parallel_size = 1);
+        std::uint64_t decode_context_parallel_size = 1,
+        double kda_snapshot_dtype_size_bytes = 2.0);
 
     [[nodiscard]] TransferPrediction
     predict(std::uint64_t num_tokens,
@@ -87,12 +98,14 @@ class AnalyticalKVCacheTransferPredictor final
     config::KvCacheTransferConfig config_;
     std::uint64_t attention_tensor_parallel_size_ = 1;
     std::uint64_t decode_context_parallel_size_ = 1;
+    double kda_snapshot_dtype_size_bytes_ = 2.0;
 };
 
 [[nodiscard]] std::shared_ptr<const BaseKVCacheTransferPredictor>
 make_kv_cache_transfer_predictor(
     const config::KvCacheTransferConfig &config,
     std::uint64_t attention_tensor_parallel_size = 1,
-    std::uint64_t decode_context_parallel_size = 1);
+    std::uint64_t decode_context_parallel_size = 1,
+    double kda_snapshot_dtype_size_bytes = 2.0);
 
 } // namespace frontier::kv_cache_transfer

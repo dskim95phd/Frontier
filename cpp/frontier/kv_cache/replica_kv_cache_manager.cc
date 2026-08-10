@@ -33,6 +33,372 @@ ReplicaKVCacheManager::ReplicaKVCacheManager(
     }
 }
 
+void ReplicaKVCacheManager::configure_kda_snapshot(
+    std::uint64_t charged_blocks) {
+    if (charged_blocks > capacity_blocks_) {
+        throw ReplicaKVCacheError(
+            "KDA snapshot charge exceeds GPU KV cache capacity");
+    }
+    if (charged_blocks == kda_snapshot_charge_blocks_) {
+        return;
+    }
+    if (!kda_snapshots_.empty()) {
+        throw ReplicaKVCacheError(
+            "cannot reconfigure KDA snapshot charge while snapshots exist");
+    }
+    kda_snapshot_charge_blocks_ = charged_blocks;
+    validate_accounting();
+}
+
+void ReplicaKVCacheManager::remove_kda_snapshot_from_lru(
+    KdaSnapshotEntry &entry) {
+    if (!entry.in_lru) {
+        throw ReplicaKVCacheError("KDA snapshot is not in its LRU");
+    }
+    kda_snapshot_lru_.erase(entry.lru_position);
+    entry.in_lru = false;
+}
+
+void ReplicaKVCacheManager::append_kda_snapshot_to_lru(
+    SessionId session_id, KdaSnapshotEntry &entry) {
+    if (entry.in_lru) {
+        throw ReplicaKVCacheError("KDA snapshot already appears in its LRU");
+    }
+    kda_snapshot_lru_.push_back(session_id);
+    entry.lru_position = std::prev(kda_snapshot_lru_.end());
+    entry.in_lru = true;
+}
+
+void ReplicaKVCacheManager::remove_from_reclaim_lru(
+    SessionCacheEntry &entry) {
+    if (!entry.in_reclaim_lru) {
+        return;
+    }
+    reclaim_lru_.erase(entry.reclaim_lru_position);
+    entry.in_reclaim_lru = false;
+}
+
+void ReplicaKVCacheManager::append_to_reclaim_lru(
+    SessionId session_id, SessionCacheEntry &entry) {
+    if (entry.in_reclaim_lru) {
+        throw ReplicaKVCacheError("session already appears in reclaim LRU");
+    }
+    reclaim_lru_.push_back(session_id);
+    entry.reclaim_lru_position = std::prev(reclaim_lru_.end());
+    entry.in_reclaim_lru = true;
+}
+
+void ReplicaKVCacheManager::sync_reclaim_lru(SessionId session_id) {
+    const auto position = sessions_.find(session_id);
+    if (position == sessions_.end()) {
+        return;
+    }
+    SessionCacheEntry &entry = position->second;
+    const auto snapshot = kda_snapshots_.find(session_id);
+    const bool inactive = !entry.active_request.valid();
+    const bool has_reclaimable_state =
+        inactive && (entry.resident_prefix_blocks > 0 ||
+                     (snapshot != kda_snapshots_.end() &&
+                      snapshot->second.in_lru));
+    if (has_reclaimable_state) {
+        if (!entry.in_reclaim_lru) {
+            append_to_reclaim_lru(session_id, entry);
+        }
+    } else {
+        remove_from_reclaim_lru(entry);
+    }
+}
+
+void ReplicaKVCacheManager::touch_reclaim_lru(SessionId session_id) {
+    const auto position = sessions_.find(session_id);
+    if (position == sessions_.end()) {
+        return;
+    }
+    SessionCacheEntry &entry = position->second;
+    remove_from_reclaim_lru(entry);
+    sync_reclaim_lru(session_id);
+}
+
+std::uint64_t ReplicaKVCacheManager::reclaimable_snapshot_blocks(
+    std::optional<SessionId> excluded_session) const noexcept {
+    if (kda_snapshot_charge_blocks_ == 0) {
+        return 0;
+    }
+    std::uint64_t result = 0;
+    for (const SessionId session_id : kda_snapshot_lru_) {
+        if (excluded_session.has_value() &&
+            session_id == *excluded_session) {
+            continue;
+        }
+        if (result > std::numeric_limits<std::uint64_t>::max() -
+                        kda_snapshot_charge_blocks_) {
+            return std::numeric_limits<std::uint64_t>::max();
+        }
+        result += kda_snapshot_charge_blocks_;
+    }
+    return result;
+}
+
+std::uint64_t ReplicaKVCacheManager::reclaimable_commitment_blocks(
+    std::optional<SessionId> excluded_session,
+    std::uint64_t virtual_credit) const noexcept {
+    // available_commitment_blocks() excludes all future-only reservations.
+    // A continuation may spend only its own virtual suffix; add that suffix
+    // back, then include inactive KDA groups that the unified reclaim LRU can
+    // release.  Saturate on overflow so a precheck cannot wrap around.
+    std::uint64_t result = available_commitment_blocks();
+    if (virtual_credit > std::numeric_limits<std::uint64_t>::max() - result) {
+        return std::numeric_limits<std::uint64_t>::max();
+    }
+    result += virtual_credit;
+    const std::uint64_t snapshots =
+        reclaimable_snapshot_blocks(excluded_session);
+    if (snapshots > std::numeric_limits<std::uint64_t>::max() - result) {
+        return std::numeric_limits<std::uint64_t>::max();
+    }
+    return result + snapshots;
+}
+
+bool ReplicaKVCacheManager::can_allocate_kda_snapshot() const {
+    if (kda_snapshot_charge_blocks_ == 0) {
+        return false;
+    }
+    return reclaimable_commitment_blocks() >= kda_snapshot_charge_blocks_;
+}
+
+void ReplicaKVCacheManager::reserve_kda_snapshot_capacity(
+    SessionId session_id) {
+    if (kda_snapshot_charge_blocks_ == 0 ||
+        kda_snapshots_.find(session_id) != kda_snapshots_.end()) {
+        return;
+    }
+    if (!session_id.valid()) {
+        throw ReplicaKVCacheError(
+            "KDA snapshot reservation requires a valid session");
+    }
+    // Frontier zero is a capacity reservation for the initial recurrent
+    // state.  It cannot produce a prefix hit, but it guarantees that the first
+    // real snapshot publication only updates an already charged atomic group.
+    if (!publish_kda_snapshot(session_id, 0)) {
+        throw ReplicaKVCacheError(
+            "KDA snapshot capacity was not reserved during admission");
+    }
+    // publish_kda_snapshot() is also the public materialization API and marks
+    // even frontier zero as valid. Undo only that semantic bit for this
+    // internal cold-capacity reservation.
+    kda_snapshots_.at(session_id).published = false;
+}
+
+std::uint64_t ReplicaKVCacheManager::effective_resident_frontier_blocks(
+    SessionId session_id) const noexcept {
+    const auto session = sessions_.find(session_id);
+    if (session == sessions_.end()) {
+        return 0;
+    }
+    const std::uint64_t resident = session->second.resident_prefix_blocks;
+    if (kda_snapshot_charge_blocks_ == 0) {
+        return resident;
+    }
+    const auto snapshot = kda_snapshots_.find(session_id);
+    return snapshot == kda_snapshots_.end()
+               ? 0
+               : std::min(resident, snapshot->second.frontier_blocks);
+}
+
+void ReplicaKVCacheManager::trim_resident_frontier(SessionId session_id,
+                                                   std::uint64_t keep_blocks) {
+    auto position = sessions_.find(session_id);
+    if (position == sessions_.end()) {
+        return;
+    }
+    SessionCacheEntry &entry = position->second;
+    if (keep_blocks > entry.resident_prefix_blocks) {
+        throw ReplicaKVCacheError("KDA frontier trim exceeds resident KV");
+    }
+    const std::uint64_t excess = entry.resident_prefix_blocks - keep_blocks;
+    if (excess == 0) {
+        return;
+    }
+    if (entry.active_request.valid()) {
+        throw ReplicaKVCacheError(
+            "cannot trim a resident KV frontier owned by an active request");
+    }
+    if (!entry.in_evictable_lru) {
+        throw ReplicaKVCacheError("resident KV frontier is not evictable");
+    }
+    remove_from_evictable_lru(entry);
+    if (excess > resident_blocks_ ||
+        blank_blocks_ > std::numeric_limits<std::uint64_t>::max() - excess) {
+        throw ReplicaKVCacheError("resident KV frontier accounting underflow");
+    }
+    entry.resident_prefix_blocks = keep_blocks;
+    resident_blocks_ -= excess;
+    blank_blocks_ += excess;
+    stats_.evicted_blocks += excess;
+    if (keep_blocks > 0) {
+        append_to_evictable_lru(session_id, entry);
+    }
+}
+
+void ReplicaKVCacheManager::consume_kda_snapshot_capacity() {
+    const std::uint64_t charge = kda_snapshot_charge_blocks_;
+    if (charge == 0 || !can_allocate_kda_snapshot()) {
+        throw ReplicaKVCacheError(
+            "KDA snapshot occupancy exceeds reclaimable GPU capacity");
+    }
+    // Snapshot publication uses the same unified session reclaim chain as an
+    // ordinary allocation.  A victim's resident suffix is trimmed first;
+    // when that suffix reaches zero, its inactive snapshot is removed as one
+    // atomic group before the next session can be considered.  Any group
+    // surplus remains blank capacity for the newly published snapshot.
+    consume_available_blocks(charge);
+    if (kda_snapshot_occupied_blocks_ >
+        std::numeric_limits<std::uint64_t>::max() - charge) {
+        throw ReplicaKVCacheError("KDA snapshot occupancy overflows uint64");
+    }
+    kda_snapshot_occupied_blocks_ += charge;
+}
+
+void ReplicaKVCacheManager::erase_session_if_unowned(SessionId session_id) {
+    const auto position = sessions_.find(session_id);
+    if (position == sessions_.end() ||
+        position->second.active_request.valid() ||
+        position->second.resident_prefix_blocks != 0 ||
+        kda_snapshots_.find(session_id) != kda_snapshots_.end()) {
+        return;
+    }
+    remove_from_reclaim_lru(position->second);
+    sessions_.erase(position);
+    discard_on_release_.erase(session_id);
+}
+
+void ReplicaKVCacheManager::remove_kda_snapshot(SessionId session_id,
+                                                bool count_eviction) {
+    auto position = kda_snapshots_.find(session_id);
+    if (position == kda_snapshots_.end()) {
+        return;
+    }
+    KdaSnapshotEntry &snapshot = position->second;
+    // Active snapshots are pinned and therefore absent from the LRU.  The
+    // explicit bit is authoritative for inactive snapshots.
+    if (snapshot.in_lru) {
+        remove_kda_snapshot_from_lru(snapshot);
+    }
+    if (kda_snapshot_occupied_blocks_ < kda_snapshot_charge_blocks_ ||
+        blank_blocks_ > std::numeric_limits<std::uint64_t>::max() -
+                            kda_snapshot_charge_blocks_) {
+        throw ReplicaKVCacheError(
+            "KDA snapshot occupancy accounting underflow");
+    }
+    kda_snapshot_occupied_blocks_ -= kda_snapshot_charge_blocks_;
+    blank_blocks_ += kda_snapshot_charge_blocks_;
+    if (count_eviction) {
+        ++stats_.evicted_kda_snapshots;
+        stats_.evicted_kda_snapshot_blocks += kda_snapshot_charge_blocks_;
+    }
+    kda_snapshots_.erase(position);
+    sync_reclaim_lru(session_id);
+    erase_session_if_unowned(session_id);
+}
+
+bool ReplicaKVCacheManager::publish_kda_snapshot(
+    SessionId session_id, std::uint64_t frontier_blocks) {
+    if (kda_snapshot_charge_blocks_ == 0 || !session_id.valid()) {
+        throw ReplicaKVCacheError("KDA snapshots are not configured");
+    }
+    auto existing = kda_snapshots_.find(session_id);
+    if (existing != kda_snapshots_.end()) {
+        existing->second.frontier_blocks = frontier_blocks;
+        existing->second.published = true;
+        const auto session = sessions_.find(session_id);
+        if (session != sessions_.end() &&
+            session->second.active_request.valid()) {
+            if (existing->second.in_lru) {
+                remove_kda_snapshot_from_lru(existing->second);
+            }
+        } else {
+            if (existing->second.in_lru) {
+                remove_kda_snapshot_from_lru(existing->second);
+            }
+            append_kda_snapshot_to_lru(session_id, existing->second);
+            touch_reclaim_lru(session_id);
+        }
+        validate_accounting();
+        return true;
+    }
+    if (!can_allocate_kda_snapshot()) {
+        return false;
+    }
+    consume_kda_snapshot_capacity();
+    SessionCacheEntry &session = sessions_[session_id];
+    KdaSnapshotEntry snapshot{};
+    snapshot.frontier_blocks = frontier_blocks;
+    snapshot.published = true;
+    const bool active = session.active_request.valid();
+    auto inserted = kda_snapshots_.emplace(session_id, std::move(snapshot));
+    if (!inserted.second) {
+        throw ReplicaKVCacheError("KDA snapshot replacement raced allocation");
+    }
+    if (!active) {
+        append_kda_snapshot_to_lru(session_id, inserted.first->second);
+        touch_reclaim_lru(session_id);
+    }
+    validate_accounting();
+    return true;
+}
+
+bool ReplicaKVCacheManager::has_kda_snapshot(
+    SessionId session_id) const noexcept {
+    return kda_snapshot_charge_blocks_ != 0 &&
+           kda_snapshots_.find(session_id) != kda_snapshots_.end();
+}
+
+std::uint64_t ReplicaKVCacheManager::kda_snapshot_frontier_blocks(
+    SessionId session_id) const noexcept {
+    const auto position = kda_snapshots_.find(session_id);
+    return position == kda_snapshots_.end() ? 0
+                                            : position->second.frontier_blocks;
+}
+
+KdaSnapshotCheckpoint ReplicaKVCacheManager::checkpoint_kda_snapshot(
+    SessionId session_id) const noexcept {
+    const auto position = kda_snapshots_.find(session_id);
+    if (position == kda_snapshots_.end()) {
+        return {};
+    }
+    return KdaSnapshotCheckpoint{true, position->second.frontier_blocks,
+                                 position->second.published};
+}
+
+void ReplicaKVCacheManager::restore_kda_snapshot(
+    SessionId session_id, KdaSnapshotCheckpoint checkpoint) {
+    auto current = kda_snapshots_.find(session_id);
+    if (!checkpoint.present) {
+        if (current != kda_snapshots_.end()) {
+            remove_kda_snapshot(session_id, false);
+        }
+        validate_accounting();
+        return;
+    }
+    if (current == kda_snapshots_.end()) {
+        throw ReplicaKVCacheError(
+            "cannot restore a missing GPU KDA snapshot checkpoint");
+    }
+    current->second.frontier_blocks = checkpoint.frontier_blocks;
+    current->second.published = checkpoint.published;
+    validate_accounting();
+}
+
+std::uint64_t
+ReplicaKVCacheManager::discard_kda_snapshot(SessionId session_id) {
+    if (!has_kda_snapshot(session_id)) {
+        return 0;
+    }
+    remove_kda_snapshot(session_id, false);
+    validate_accounting();
+    return kda_snapshot_charge_blocks_;
+}
+
 void ReplicaKVCacheManager::enable_full_sequence_commitments(bool enabled) {
     if (!enabled && virtual_committed_blocks_ != 0) {
         throw ReplicaKVCacheError("cannot disable full-sequence commitments "
@@ -63,7 +429,14 @@ bool ReplicaKVCacheManager::can_commit(
             return false;
         }
     }
-    return can_commit(request_id, full_sequence_tokens);
+    if (!full_sequence_commitments_enabled_ || !request_id.valid() ||
+        allocations_.find(request_id) != allocations_.end()) {
+        return false;
+    }
+    const std::uint64_t blocks = full_sequence_blocks(full_sequence_tokens);
+    return can_commit_blocks(blocks, session_id.valid()
+                                      ? std::optional<SessionId>{session_id}
+                                      : std::nullopt);
 }
 
 void ReplicaKVCacheManager::commit_virtual(RequestId request_id,
@@ -74,11 +447,15 @@ void ReplicaKVCacheManager::commit_virtual(RequestId request_id,
         throw ReplicaKVCacheError("invalid full-sequence commitment request");
     }
     const std::uint64_t committed = full_sequence_blocks(full_sequence_tokens);
-    if (!can_commit_blocks(committed)) {
-        throw ReplicaKVCacheError(
-            "full-sequence commitment exceeds capacity or watermark");
-    }
 
+    // Complete every request/session validation before reserving a cold KDA
+    // snapshot. Snapshot reservation is a mutating operation and may reclaim
+    // inactive sessions; a later validation failure cannot be repaired via
+    // release_commitment() because no request allocation exists yet.
+    if (kda_snapshot_charge_blocks_ != 0 && !session_id.valid()) {
+        throw ReplicaKVCacheError(
+            "KDA snapshot reservation requires a valid session");
+    }
     std::uint64_t resident = 0;
     if (prefix_cache_enabled_ && session_id.valid()) {
         const auto position = sessions_.find(session_id);
@@ -100,6 +477,14 @@ void ReplicaKVCacheManager::commit_virtual(RequestId request_id,
         std::numeric_limits<std::uint64_t>::max() - virtual_committed_blocks_) {
         throw ReplicaKVCacheError("virtual commitment count overflows uint64");
     }
+    if (!can_commit_blocks(committed,
+                           session_id.valid()
+                               ? std::optional<SessionId>{session_id}
+                               : std::nullopt)) {
+        throw ReplicaKVCacheError(
+            "full-sequence commitment exceeds capacity or watermark");
+    }
+    reserve_kda_snapshot_capacity(session_id);
 
     // Pin any GPU-resident prefix before the asynchronous restore starts.  A
     // resident cache suffix is physical capacity already in the cache, so
@@ -113,6 +498,31 @@ void ReplicaKVCacheManager::commit_virtual(RequestId request_id,
             active_blocks_ += resident;
         }
         entry.active_request = request_id;
+        const auto snapshot = kda_snapshots_.find(session_id);
+        if (snapshot != kda_snapshots_.end() && snapshot->second.in_lru) {
+            remove_kda_snapshot_from_lru(snapshot->second);
+        }
+        remove_from_reclaim_lru(entry);
+    }
+
+    // A virtual commitment consumes logical capacity without materializing a
+    // physical block.  If reclaimable inactive state was needed to satisfy
+    // the precheck, evict it now.  consume_available_blocks may consume a
+    // blank slot as part of that operation; restore that consumption because
+    // the slot remains reserved by the new virtual suffix.
+    const std::uint64_t before_blank = blank_blocks_;
+    const std::uint64_t strict_available = available_commitment_blocks();
+    const std::uint64_t watermark_required =
+        future > std::numeric_limits<std::uint64_t>::max() -
+                        watermark_blocks_
+            ? std::numeric_limits<std::uint64_t>::max()
+            : future + watermark_blocks_;
+    if (watermark_required > strict_available) {
+        const std::uint64_t deficit = watermark_required - strict_available;
+        consume_available_blocks(deficit);
+        if (blank_blocks_ < before_blank) {
+            blank_blocks_ += before_blank - blank_blocks_;
+        }
     }
 
     RequestKVAllocation allocation{};
@@ -151,12 +561,28 @@ void ReplicaKVCacheManager::release_commitment(RequestId request_id) {
                 throw ReplicaKVCacheError(
                     "virtual commitment does not own its session");
             }
+            const auto reserved_snapshot =
+                kda_snapshots_.find(value.session_id);
+            if (reserved_snapshot != kda_snapshots_.end() &&
+                !reserved_snapshot->second.published) {
+                // A restore/admission rollback occurred before any reusable
+                // KDA frontier was published.  Release the cold reservation
+                // instead of retaining a useless snapshot-only session.
+                remove_kda_snapshot(value.session_id, false);
+            }
             session->second.active_request = RequestId{};
+            const auto snapshot = kda_snapshots_.find(value.session_id);
+            if (snapshot != kda_snapshots_.end()) {
+                if (snapshot->second.in_lru) {
+                    remove_kda_snapshot_from_lru(snapshot->second);
+                }
+                append_kda_snapshot_to_lru(value.session_id, snapshot->second);
+            }
             if (session->second.resident_prefix_blocks > 0) {
                 append_to_evictable_lru(value.session_id, session->second);
-            } else {
-                sessions_.erase(session);
             }
+            sync_reclaim_lru(value.session_id);
+            erase_session_if_unowned(value.session_id);
         }
         discard_on_release_.erase(value.session_id);
     }
@@ -183,14 +609,38 @@ std::uint64_t ReplicaKVCacheManager::full_sequence_blocks(
     return ceil_div(full_sequence_tokens, block_size_);
 }
 
-bool ReplicaKVCacheManager::can_commit_blocks(std::uint64_t blocks) const {
-    if (!full_sequence_commitments_enabled_ || blocks == 0 ||
-        blocks >
-            std::numeric_limits<std::uint64_t>::max() - watermark_blocks_) {
+bool ReplicaKVCacheManager::can_commit_blocks(
+    std::uint64_t blocks, std::optional<SessionId> excluded_session) const {
+    if (!full_sequence_commitments_enabled_ || blocks == 0) {
         return false;
     }
-    const std::uint64_t required = blocks + watermark_blocks_;
-    return required <= available_commitment_blocks();
+    return required_capacity_fits(
+        blocks, additional_kda_snapshot_charge(excluded_session),
+        reclaimable_commitment_blocks(excluded_session));
+}
+
+std::uint64_t ReplicaKVCacheManager::additional_kda_snapshot_charge(
+    std::optional<SessionId> session_id) const noexcept {
+    if (kda_snapshot_charge_blocks_ == 0 || !session_id.has_value() ||
+        !session_id->valid() ||
+        kda_snapshots_.find(*session_id) != kda_snapshots_.end()) {
+        return 0;
+    }
+    return kda_snapshot_charge_blocks_;
+}
+
+bool ReplicaKVCacheManager::required_capacity_fits(
+    std::uint64_t blocks, std::uint64_t extra_blocks,
+    std::uint64_t available_blocks) const noexcept {
+    if (blocks == 0 ||
+        blocks > std::numeric_limits<std::uint64_t>::max() -
+                     watermark_blocks_) {
+        return false;
+    }
+    const std::uint64_t with_watermark = blocks + watermark_blocks_;
+    return extra_blocks <=
+               std::numeric_limits<std::uint64_t>::max() - with_watermark &&
+           with_watermark + extra_blocks <= available_blocks;
 }
 
 std::uint64_t ReplicaKVCacheManager::additional_blocks_required(
@@ -237,6 +687,17 @@ ReplicaKVCacheManager::lookup(const entities::Request &request) const {
     }
     result.hit_blocks =
         std::min(result.query_blocks, session->second.resident_prefix_blocks);
+    if (kda_snapshot_charge_blocks_ != 0) {
+        const auto snapshot = kda_snapshots_.find(request.session_id());
+        if (snapshot == kda_snapshots_.end()) {
+            result.hit_blocks = 0;
+        } else {
+            // A newer immutable snapshot may be valid for a shorter GPU KV
+            // frontier; never expose blocks beyond that KDA frontier.
+            result.hit_blocks =
+                std::min(result.hit_blocks, snapshot->second.frontier_blocks);
+        }
+    }
     result.cached_tokens = result.hit_blocks * block_size_;
     return result;
 }
@@ -255,6 +716,10 @@ bool ReplicaKVCacheManager::can_admit(
     const std::uint64_t resident =
         position == sessions_.end() ? 0
                                     : position->second.resident_prefix_blocks;
+    const std::uint64_t effective_resident =
+        kda_snapshot_charge_blocks_ == 0
+            ? resident
+            : effective_resident_frontier_blocks(session_id);
     if (position != sessions_.end() &&
         position->second.active_request.valid() &&
         position->second.active_request != request_id) {
@@ -263,21 +728,25 @@ bool ReplicaKVCacheManager::can_admit(
     const std::uint64_t cached_blocks = cached_tokens / block_size_;
     const std::uint64_t required =
         ceil_div(cached_tokens + scheduled_tokens, block_size_);
-    if (cached_blocks > resident || required < resident ||
-        required > available_blocks()) {
+    const std::uint64_t snapshot_charge = additional_kda_snapshot_charge(
+        std::optional<SessionId>{session_id});
+    if (cached_blocks > effective_resident ||
+        required < effective_resident ||
+        !required_capacity_fits(required, snapshot_charge,
+                                reclaimable_commitment_blocks(session_id))) {
         return false;
     }
     if (full_sequence_commitments_enabled_ && full_sequence_tokens > 0) {
         const std::uint64_t committed =
             full_sequence_blocks(full_sequence_tokens);
-        if (committed < required || !can_commit_blocks(committed)) {
+        if (committed < required || !can_commit_blocks(committed, session_id)) {
             return false;
         }
         // The full-sequence commitment already accounts for watermark
         // headroom.  Do not apply it a second time to this first chunk.
         return true;
     }
-    return available_blocks() - required >= watermark_blocks_;
+    return true;
 }
 
 void ReplicaKVCacheManager::remove_from_evictable_lru(
@@ -306,40 +775,111 @@ void ReplicaKVCacheManager::append_to_evictable_lru(SessionId session_id,
     evictable_blocks_ += entry.resident_prefix_blocks;
 }
 
-void ReplicaKVCacheManager::consume_available_blocks(std::uint64_t blocks) {
-    if (blocks > available_blocks()) {
+void ReplicaKVCacheManager::consume_available_blocks(
+    std::uint64_t blocks, std::uint64_t virtual_credit) {
+    const std::uint64_t reclaimable =
+        reclaimable_commitment_blocks(std::nullopt, virtual_credit);
+    if (blocks > reclaimable) {
         throw ReplicaKVCacheError("analytical KV cache is exhausted");
     }
-    const std::uint64_t blank = std::min(blocks, blank_blocks_);
+
+    // Future-only commitments are overlaid on blank/ordinary capacity.  A
+    // continuation may spend its own virtual suffix (virtual_credit), while
+    // all other virtual reservations remain protected.  Consume the usable
+    // blank portion first; the unified LRU below then reclaims session state.
+    const std::uint64_t ordinary_budget =
+        available_commitment_blocks() >
+                std::numeric_limits<std::uint64_t>::max() - virtual_credit
+            ? std::numeric_limits<std::uint64_t>::max()
+            : available_commitment_blocks() + virtual_credit;
+    const std::uint64_t blank =
+        std::min(blocks, std::min(blank_blocks_, ordinary_budget));
     blank_blocks_ -= blank;
     blocks -= blank;
+
     while (blocks > 0) {
-        if (evictable_lru_.empty()) {
+        if (reclaim_lru_.empty()) {
             throw ReplicaKVCacheError(
                 "reclaimable accounting has no evictable session");
         }
-        const SessionId victim_id = evictable_lru_.front();
+        const SessionId victim_id = reclaim_lru_.front();
         auto victim = sessions_.find(victim_id);
-        if (victim == sessions_.end() || !victim->second.in_evictable_lru ||
+        if (victim == sessions_.end() ||
+            !victim->second.in_reclaim_lru ||
             victim->second.active_request.valid() ||
-            victim->second.resident_prefix_blocks == 0) {
-            throw ReplicaKVCacheError("evictable-session LRU is corrupt");
+            (victim->second.resident_prefix_blocks == 0 &&
+             kda_snapshots_.find(victim_id) == kda_snapshots_.end())) {
+            throw ReplicaKVCacheError("unified reclaim LRU is corrupt");
         }
+
         SessionCacheEntry &entry = victim->second;
-        const std::uint64_t reclaimed =
-            std::min(blocks, entry.resident_prefix_blocks);
-        entry.resident_prefix_blocks -= reclaimed;
-        evictable_blocks_ -= reclaimed;
-        resident_blocks_ -= reclaimed;
-        stats_.evicted_blocks += reclaimed;
-        blocks -= reclaimed;
-        if (entry.resident_prefix_blocks == 0) {
-            evictable_lru_.pop_front();
+        if (entry.resident_prefix_blocks > 0) {
+            // Ordinary KV is always the first leg of a session's reclaim
+            // chain.  Partial suffix eviction leaves this session at the
+            // unified LRU front so subsequent pressure continues the same
+            // victim before considering a newer session.
+            const std::uint64_t reclaimed =
+                std::min(blocks, entry.resident_prefix_blocks);
+            entry.resident_prefix_blocks -= reclaimed;
+            evictable_blocks_ -= reclaimed;
+            resident_blocks_ -= reclaimed;
+            stats_.evicted_blocks += reclaimed;
+            blocks -= reclaimed;
+            if (entry.resident_prefix_blocks > 0) {
+                continue;
+            }
+
+            // The ordinary LRU node is now empty.  Remove it before touching
+            // the snapshot so all diagnostic counters remain synchronized.
+            evictable_lru_.erase(entry.lru_position);
             entry.in_evictable_lru = false;
-            sessions_.erase(victim);
             --sessions_with_nonzero_frontier_;
             ++stats_.evicted_sessions;
+
+            // Once the resident suffix reaches zero, evict this same
+            // session's inactive snapshot atomically.  A larger snapshot
+            // charge may leave surplus blank capacity after satisfying the
+            // current request; never advance to the next session for that
+            // surplus.
+            const bool has_snapshot =
+                kda_snapshots_.find(victim_id) != kda_snapshots_.end();
+            if (has_snapshot && blocks > 0) {
+                const std::uint64_t charge = kda_snapshot_charge_blocks_;
+                remove_kda_snapshot(victim_id, true);
+                const std::uint64_t used = std::min(blocks, charge);
+                if (used > blank_blocks_) {
+                    throw ReplicaKVCacheError(
+                        "KDA snapshot reclaim accounting underflow");
+                }
+                blank_blocks_ -= used;
+                blocks -= used;
+            } else {
+                // Exact-fit ordinary reclaim leaves an inactive snapshot
+                // snapshot-only victim at the unified LRU front.  It is
+                // retired on the next pressure event, before any newer
+                // session's ordinary KV is considered.
+                sync_reclaim_lru(victim_id);
+                if (!has_snapshot) {
+                    erase_session_if_unowned(victim_id);
+                }
+            }
+            continue;
         }
+
+        // Snapshot-only sessions are still full reclaim victims and must be
+        // selected by the same unified recency order as ordinary sessions.
+        const std::uint64_t charge = kda_snapshot_charge_blocks_;
+        if (charge == 0 || !has_kda_snapshot(victim_id)) {
+            throw ReplicaKVCacheError("snapshot-only reclaim LRU is corrupt");
+        }
+        remove_kda_snapshot(victim_id, true);
+        const std::uint64_t used = std::min(blocks, charge);
+        if (used > blank_blocks_) {
+            throw ReplicaKVCacheError(
+                "KDA snapshot reclaim accounting underflow");
+        }
+        blank_blocks_ -= used;
+        blocks -= used;
     }
 }
 
@@ -352,11 +892,28 @@ void ReplicaKVCacheManager::admit(RequestId request_id, SessionId session_id,
         throw ReplicaKVCacheError(
             "KV prefix admission exceeds capacity or watermark");
     }
+    reserve_kda_snapshot_capacity(session_id);
     SessionCacheEntry &session = sessions_[session_id];
     const std::uint64_t resident = session.resident_prefix_blocks;
-    if (resident > 0) {
+    const std::uint64_t effective_resident =
+        kda_snapshot_charge_blocks_ == 0
+            ? resident
+            : effective_resident_frontier_blocks(session_id);
+    if (resident > effective_resident) {
+        trim_resident_frontier(session_id, effective_resident);
+    }
+    const std::uint64_t reusable_resident = effective_resident;
+    if (reusable_resident > 0) {
         remove_from_evictable_lru(session);
     }
+    const auto snapshot = kda_snapshots_.find(session_id);
+    if (snapshot != kda_snapshots_.end() && snapshot->second.in_lru) {
+        remove_kda_snapshot_from_lru(snapshot->second);
+    }
+    // Pin the target session before reclaiming capacity so the unified LRU
+    // cannot evict its own resident range or snapshot while materializing.
+    session.active_request = request_id;
+    remove_from_reclaim_lru(session);
     const std::uint64_t required =
         ceil_div(cached_tokens + scheduled_tokens, block_size_);
     const std::uint64_t committed =
@@ -372,15 +929,15 @@ void ReplicaKVCacheManager::admit(RequestId request_id, SessionId session_id,
         std::numeric_limits<std::uint64_t>::max() - virtual_committed_blocks_) {
         throw ReplicaKVCacheError("invalid prefix commitment accounting");
     }
-    consume_available_blocks(required - resident);
+    consume_available_blocks(required - reusable_resident);
     active_blocks_ += required;
     if (future > 0) {
         virtual_committed_blocks_ += future;
     }
-    session.active_request = request_id;
     if (!allocations_
-             .emplace(request_id, RequestKVAllocation{session_id, required,
-                                                      resident, committed})
+             .emplace(request_id,
+                      RequestKVAllocation{session_id, required,
+                                          reusable_resident, committed})
              .second) {
         throw ReplicaKVCacheError("request already owns KV blocks");
     }
@@ -409,12 +966,16 @@ bool ReplicaKVCacheManager::can_admit_tiered(
     const std::uint64_t resident =
         position == sessions_.end() ? 0
                                     : position->second.resident_prefix_blocks;
+    const std::uint64_t effective_resident =
+        kda_snapshot_charge_blocks_ == 0
+            ? resident
+            : effective_resident_frontier_blocks(session_id);
     if (position != sessions_.end() &&
         position->second.active_request.valid() &&
         position->second.active_request != request_id) {
         return false;
     }
-    if (reusable_frontier_blocks < resident) {
+    if (reusable_frontier_blocks < effective_resident) {
         return false;
     }
     const std::uint64_t reusable_tokens =
@@ -427,25 +988,39 @@ bool ReplicaKVCacheManager::can_admit_tiered(
         ceil_div(reusable_tokens + scheduled_tokens, block_size_);
     const std::uint64_t allocated =
         has_virtual_commitment ? allocation->second.allocated_blocks : 0;
-    if (required < reusable_frontier_blocks || required < resident ||
-        required < allocated || required - allocated > available_blocks()) {
+    const std::uint64_t virtual_credit =
+        has_virtual_commitment
+            ? allocation->second.committed_blocks - allocated
+            : 0;
+    const std::uint64_t reclaimable =
+        reclaimable_commitment_blocks(session_id, virtual_credit);
+    const std::uint64_t snapshot_charge = additional_kda_snapshot_charge(
+        std::optional<SessionId>{session_id});
+    if (required < reusable_frontier_blocks || required < effective_resident ||
+        required < allocated) {
         return false;
     }
     if (has_virtual_commitment) {
-        if (allocation->second.committed_blocks < required) {
+        if (snapshot_charge != 0 ||
+            required - allocated > reclaimable ||
+            allocation->second.committed_blocks < required) {
             return false;
         }
         return true;
+    }
+    if (!required_capacity_fits(required - allocated, snapshot_charge,
+                                reclaimable)) {
+        return false;
     }
     if (full_sequence_commitments_enabled_ && full_sequence_tokens > 0) {
         const std::uint64_t committed =
             full_sequence_blocks(full_sequence_tokens);
-        if (committed < required || !can_commit_blocks(committed)) {
+        if (committed < required || !can_commit_blocks(committed, session_id)) {
             return false;
         }
         return true;
     }
-    return available_blocks() - required >= watermark_blocks_;
+    return true;
 }
 
 void ReplicaKVCacheManager::admit_tiered(RequestId request_id,
@@ -458,6 +1033,7 @@ void ReplicaKVCacheManager::admit_tiered(RequestId request_id,
         throw ReplicaKVCacheError(
             "tiered KV admission exceeds capacity or watermark");
     }
+    reserve_kda_snapshot_capacity(session_id);
     SessionCacheEntry &session = sessions_[session_id];
     const std::uint64_t resident = session.resident_prefix_blocks;
     const auto allocation = allocations_.find(request_id);
@@ -465,11 +1041,52 @@ void ReplicaKVCacheManager::admit_tiered(RequestId request_id,
                                         full_sequence_commitments_enabled_ &&
                                         allocation->second.committed_blocks >
                                             allocation->second.allocated_blocks;
+    const std::uint64_t effective_resident =
+        kda_snapshot_charge_blocks_ == 0
+            ? resident
+            : effective_resident_frontier_blocks(session_id);
+    if (resident > effective_resident) {
+        if (!has_virtual_commitment) {
+            trim_resident_frontier(session_id, effective_resident);
+        } else {
+            const std::uint64_t excess = resident - effective_resident;
+            RequestKVAllocation &owned = allocation->second;
+            if (owned.allocated_blocks < excess || active_blocks_ < excess ||
+                resident_blocks_ < excess ||
+                blank_blocks_ >
+                    std::numeric_limits<std::uint64_t>::max() - excess ||
+                virtual_committed_blocks_ >
+                    std::numeric_limits<std::uint64_t>::max() - excess) {
+                throw ReplicaKVCacheError(
+                    "active KDA frontier trim accounting underflow");
+            }
+            owned.allocated_blocks -= excess;
+            owned.published_blocks =
+                std::min(owned.published_blocks, effective_resident);
+            active_blocks_ -= excess;
+            resident_blocks_ -= excess;
+            blank_blocks_ += excess;
+            virtual_committed_blocks_ += excess;
+            session.resident_prefix_blocks = effective_resident;
+        }
+    }
+    const std::uint64_t reusable_resident = effective_resident;
     const std::uint64_t already_allocated =
         has_virtual_commitment ? allocation->second.allocated_blocks : 0;
-    if (resident > 0 && !has_virtual_commitment) {
+    const std::uint64_t virtual_credit =
+        has_virtual_commitment
+            ? allocation->second.committed_blocks - already_allocated
+            : 0;
+    if (reusable_resident > 0 && !has_virtual_commitment) {
         remove_from_evictable_lru(session);
     }
+    const auto snapshot = kda_snapshots_.find(session_id);
+    if (snapshot != kda_snapshots_.end() && snapshot->second.in_lru) {
+        remove_kda_snapshot_from_lru(snapshot->second);
+    }
+    // Pin the target before reclaiming any physical continuation blocks.
+    session.active_request = request_id;
+    remove_from_reclaim_lru(session);
     const std::uint64_t reusable_tokens =
         reusable_frontier_blocks * block_size_;
     const std::uint64_t required =
@@ -496,14 +1113,13 @@ void ReplicaKVCacheManager::admit_tiered(RequestId request_id,
                             virtual_committed_blocks_) {
         throw ReplicaKVCacheError("invalid staged commitment accounting");
     }
-    consume_available_blocks(physical_additional);
+    consume_available_blocks(physical_additional, virtual_credit);
     active_blocks_ += physical_additional;
-    resident_blocks_ += reusable_frontier_blocks - resident;
-    if (resident == 0 && reusable_frontier_blocks > 0) {
+    resident_blocks_ += reusable_frontier_blocks - reusable_resident;
+    if (reusable_resident == 0 && reusable_frontier_blocks > 0) {
         ++sessions_with_nonzero_frontier_;
     }
     session.resident_prefix_blocks = reusable_frontier_blocks;
-    session.active_request = request_id;
     if (has_virtual_commitment) {
         RequestKVAllocation &owned = allocation->second;
         owned.allocated_blocks = required;
@@ -541,10 +1157,19 @@ bool ReplicaKVCacheManager::can_reserve(
     std::uint64_t scheduled_tokens, std::uint64_t full_sequence_tokens) const {
     const std::uint64_t required = additional_blocks_required(
         request_id, kv_accounted_tokens, scheduled_tokens, false);
-    if (required > available_blocks()) {
+    const auto allocation = allocations_.find(request_id);
+    const std::uint64_t virtual_credit =
+        allocation != allocations_.end() &&
+                allocation->second.committed_blocks >
+                    allocation->second.allocated_blocks
+            ? allocation->second.committed_blocks -
+                  allocation->second.allocated_blocks
+            : 0;
+    const std::uint64_t reclaimable =
+        reclaimable_commitment_blocks(std::nullopt, virtual_credit);
+    if (required > reclaimable) {
         return false;
     }
-    const auto allocation = allocations_.find(request_id);
     if (allocation != allocations_.end()) {
         if (full_sequence_commitments_enabled_ && full_sequence_tokens > 0 &&
             allocation->second.committed_blocks <
@@ -561,7 +1186,7 @@ bool ReplicaKVCacheManager::can_reserve(
         // first physical chunk must consume only its own reservation.
         return true;
     }
-    return available_blocks() - required >= watermark_blocks_;
+    return reclaimable - required >= watermark_blocks_;
 }
 
 void ReplicaKVCacheManager::reserve(RequestId request_id,
@@ -627,7 +1252,8 @@ void ReplicaKVCacheManager::reserve(RequestId request_id,
         throw ReplicaKVCacheError(
             "virtual commitment underflows on materialization");
     }
-    consume_available_blocks(additional);
+    consume_available_blocks(
+        additional, had_virtual_suffix ? old_committed - old_allocated : 0);
     active_blocks_ += additional;
     if (inserted) {
         const RequestKVAllocation allocation{SessionId{}, additional, 0,
@@ -670,6 +1296,9 @@ std::uint64_t ReplicaKVCacheManager::free(RequestId request_id) {
         SessionCacheEntry &entry = session->second;
         const bool discard = discard_on_release_.erase(value.session_id) != 0;
         if (discard) {
+            // Explicit migration discard retires both ordinary GPU KV and the
+            // pinned KDA snapshot before dropping session metadata.
+            remove_kda_snapshot(value.session_id, false);
             if (entry.resident_prefix_blocks > resident_blocks_) {
                 throw ReplicaKVCacheError(
                     "discarded session resident accounting is corrupt");
@@ -681,19 +1310,33 @@ std::uint64_t ReplicaKVCacheManager::free(RequestId request_id) {
                 ++stats_.evicted_sessions;
             }
             blank_blocks_ += value.allocated_blocks;
+            remove_from_reclaim_lru(entry);
             sessions_.erase(session);
             allocations_.erase(allocation);
             validate_accounting();
             return value.allocated_blocks;
         }
         entry.resident_prefix_blocks = value.published_blocks;
+        const auto reserved_snapshot =
+            kda_snapshots_.find(value.session_id);
+        if (reserved_snapshot != kda_snapshots_.end() &&
+            !reserved_snapshot->second.published) {
+            remove_kda_snapshot(value.session_id, false);
+        }
         entry.active_request = RequestId{};
         blank_blocks_ += value.allocated_blocks - value.published_blocks;
+        const auto snapshot = kda_snapshots_.find(value.session_id);
+        if (snapshot != kda_snapshots_.end()) {
+            if (snapshot->second.in_lru) {
+                remove_kda_snapshot_from_lru(snapshot->second);
+            }
+            append_kda_snapshot_to_lru(value.session_id, snapshot->second);
+        }
         if (entry.resident_prefix_blocks > 0) {
             append_to_evictable_lru(value.session_id, entry);
-        } else {
-            sessions_.erase(session);
         }
+        sync_reclaim_lru(value.session_id);
+        erase_session_if_unowned(value.session_id);
     } else {
         blank_blocks_ += value.allocated_blocks;
     }
@@ -716,22 +1359,32 @@ std::uint64_t ReplicaKVCacheManager::discard_session(SessionId session_id) {
         discard_on_release_.insert(session_id);
         return 0;
     }
-    if (!entry.in_evictable_lru || entry.resident_prefix_blocks == 0) {
+    if (entry.resident_prefix_blocks == 0 && !has_kda_snapshot(session_id)) {
         throw ReplicaKVCacheError(
             "inactive discarded session is not evictable");
     }
     const std::uint64_t discarded = entry.resident_prefix_blocks;
-    remove_from_evictable_lru(entry);
+    if (entry.resident_prefix_blocks > 0) {
+        if (!entry.in_evictable_lru) {
+            throw ReplicaKVCacheError(
+                "inactive discarded session is not evictable");
+        }
+        remove_from_evictable_lru(entry);
+    }
     if (discarded > resident_blocks_) {
         throw ReplicaKVCacheError(
             "discarded session exceeds resident accounting");
     }
     resident_blocks_ -= discarded;
+    entry.resident_prefix_blocks = 0;
     blank_blocks_ += discarded;
-    --sessions_with_nonzero_frontier_;
-    stats_.evicted_blocks += discarded;
-    ++stats_.evicted_sessions;
-    sessions_.erase(position);
+    if (discarded > 0) {
+        --sessions_with_nonzero_frontier_;
+        stats_.evicted_blocks += discarded;
+        ++stats_.evicted_sessions;
+    }
+    remove_kda_snapshot(session_id, false);
+    erase_session_if_unowned(session_id);
     discard_on_release_.erase(session_id);
     validate_accounting();
     return discarded;
@@ -782,8 +1435,18 @@ ReplicaKVCacheManager::allocated_blocks(RequestId request_id) const noexcept {
 std::uint64_t ReplicaKVCacheManager::gpu_cache_valid_prefix_blocks(
     SessionId session_id) const noexcept {
     const auto session = sessions_.find(session_id);
-    return session == sessions_.end() ? 0
-                                      : session->second.resident_prefix_blocks;
+    if (session == sessions_.end()) {
+        return 0;
+    }
+    std::uint64_t resident = session->second.resident_prefix_blocks;
+    if (kda_snapshot_charge_blocks_ != 0) {
+        const auto snapshot = kda_snapshots_.find(session_id);
+        if (snapshot == kda_snapshots_.end()) {
+            return 0;
+        }
+        resident = std::min(resident, snapshot->second.frontier_blocks);
+    }
+    return resident;
 }
 
 bool ReplicaKVCacheManager::session_has_active_request(
@@ -792,8 +1455,7 @@ bool ReplicaKVCacheManager::session_has_active_request(
         return false;
     }
     const auto session = sessions_.find(session_id);
-    return session != sessions_.end() &&
-           session->second.active_request.valid();
+    return session != sessions_.end() && session->second.active_request.valid();
 }
 
 std::uint64_t ReplicaKVCacheManager::request_committed_blocks(
@@ -822,17 +1484,21 @@ bool ReplicaKVCacheManager::full_sequence_fits_empty(
         return false;
     }
     const std::uint64_t blocks = full_sequence_blocks(full_sequence_tokens);
-    return blocks <=
-               std::numeric_limits<std::uint64_t>::max() - watermark_blocks_ &&
-           blocks + watermark_blocks_ <= capacity_blocks_;
+    return required_capacity_fits(blocks, kda_snapshot_charge_blocks_,
+                                  capacity_blocks_);
 }
 
 void ReplicaKVCacheManager::validate_accounting() const {
-    if (active_blocks_ > capacity_blocks_ ||
-        virtual_committed_blocks_ > capacity_blocks_ - active_blocks_ ||
-        blank_blocks_ > capacity_blocks_ - active_blocks_ ||
-        evictable_blocks_ !=
-            capacity_blocks_ - active_blocks_ - blank_blocks_ ||
+    if (kda_snapshot_charge_blocks_ > capacity_blocks_ ||
+        kda_snapshot_occupied_blocks_ > capacity_blocks_ ||
+        active_blocks_ > capacity_blocks_ - kda_snapshot_occupied_blocks_ ||
+        virtual_committed_blocks_ >
+            capacity_blocks_ - active_blocks_ - kda_snapshot_occupied_blocks_ ||
+        blank_blocks_ >
+            capacity_blocks_ - active_blocks_ - kda_snapshot_occupied_blocks_ ||
+        evictable_blocks_ != capacity_blocks_ - active_blocks_ -
+                                 kda_snapshot_occupied_blocks_ -
+                                 blank_blocks_ ||
         resident_blocks_ > capacity_blocks_) {
         throw ReplicaKVCacheError(
             "analytical KV capacity partition is invalid");
@@ -880,7 +1546,8 @@ void ReplicaKVCacheManager::validate_accounting() const {
             }
             observed_evictable += entry.resident_prefix_blocks;
             ++observed_sessions;
-        } else if (!entry.active_request.valid()) {
+        } else if (!entry.active_request.valid() &&
+                   kda_snapshots_.find(session_id) == kda_snapshots_.end()) {
             throw ReplicaKVCacheError(
                 "resident session is neither active nor evictable");
         }
@@ -893,6 +1560,76 @@ void ReplicaKVCacheManager::validate_accounting() const {
         observed_sessions != evictable_lru_.size() ||
         sessions_with_nonzero_frontier_ != observed_nonzero_sessions) {
         throw ReplicaKVCacheError("analytical session LRU accounting diverged");
+    }
+    std::size_t observed_reclaim_sessions = 0;
+    for (const auto &[session_id, entry] : sessions_) {
+        const auto snapshot = kda_snapshots_.find(session_id);
+        const bool should_be_reclaimable =
+            !entry.active_request.valid() &&
+            (entry.resident_prefix_blocks > 0 ||
+             (snapshot != kda_snapshots_.end() && snapshot->second.in_lru));
+        if (entry.in_reclaim_lru != should_be_reclaimable) {
+            throw ReplicaKVCacheError(
+                "unified session reclaimability diverged");
+        }
+        if (entry.in_reclaim_lru) {
+            ++observed_reclaim_sessions;
+        }
+    }
+    for (const SessionId session_id : reclaim_lru_) {
+        const auto session = sessions_.find(session_id);
+        if (session == sessions_.end() ||
+            !session->second.in_reclaim_lru ||
+            session->second.active_request.valid()) {
+            throw ReplicaKVCacheError("unified session reclaim LRU is corrupt");
+        }
+        const auto snapshot = kda_snapshots_.find(session_id);
+        if (session->second.resident_prefix_blocks == 0 &&
+            (snapshot == kda_snapshots_.end() || !snapshot->second.in_lru)) {
+            throw ReplicaKVCacheError(
+                "unified session reclaim LRU has an empty victim");
+        }
+    }
+    if (observed_reclaim_sessions != reclaim_lru_.size()) {
+        throw ReplicaKVCacheError("unified session reclaim accounting diverged");
+    }
+    if (kda_snapshot_charge_blocks_ == 0 && !kda_snapshots_.empty()) {
+        throw ReplicaKVCacheError(
+            "KDA snapshots exist while snapshot policy is disabled");
+    }
+    std::uint64_t observed_snapshot_blocks = 0;
+    std::size_t observed_snapshot_lru = 0;
+    for (const auto &[session_id, snapshot] : kda_snapshots_) {
+        const auto session = sessions_.find(session_id);
+        if (session == sessions_.end()) {
+            throw ReplicaKVCacheError("KDA snapshot has no session metadata");
+        }
+        if (snapshot.in_lru && session->second.active_request.valid()) {
+            throw ReplicaKVCacheError("active KDA snapshot must remain pinned");
+        }
+        if (!snapshot.in_lru && !session->second.active_request.valid()) {
+            throw ReplicaKVCacheError(
+                "inactive KDA snapshot is missing from its LRU");
+        }
+        if (observed_snapshot_blocks >
+            std::numeric_limits<std::uint64_t>::max() -
+                kda_snapshot_charge_blocks_) {
+            throw ReplicaKVCacheError(
+                "KDA snapshot occupancy overflows uint64");
+        }
+        observed_snapshot_blocks += kda_snapshot_charge_blocks_;
+    }
+    for (const SessionId session_id : kda_snapshot_lru_) {
+        const auto snapshot = kda_snapshots_.find(session_id);
+        if (snapshot == kda_snapshots_.end() || !snapshot->second.in_lru ||
+            snapshot->second.lru_position == kda_snapshot_lru_.end()) {
+            throw ReplicaKVCacheError("KDA snapshot LRU is corrupt");
+        }
+        ++observed_snapshot_lru;
+    }
+    if (observed_snapshot_blocks != kda_snapshot_occupied_blocks_ ||
+        observed_snapshot_lru != kda_snapshot_lru_.size()) {
+        throw ReplicaKVCacheError("KDA snapshot accounting diverged");
     }
     for (const SessionId session_id : discard_on_release_) {
         const auto position = sessions_.find(session_id);
@@ -919,6 +1656,11 @@ PrefixCacheDiagnostics ReplicaKVCacheManager::diagnostics() const {
     result.committed_blocks = committed_blocks();
     result.virtual_committed_blocks = virtual_committed_blocks_;
     result.available_commitment_blocks = available_commitment_blocks();
+    result.kda_snapshot_occupied_blocks = kda_snapshot_occupied_blocks_;
+    result.kda_snapshot_sessions =
+        static_cast<std::uint64_t>(kda_snapshots_.size());
+    result.kda_snapshot_evictable_sessions =
+        static_cast<std::uint64_t>(kda_snapshot_lru_.size());
     return result;
 }
 

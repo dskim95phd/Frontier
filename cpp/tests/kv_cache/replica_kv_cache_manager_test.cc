@@ -20,8 +20,10 @@ using frontier::config::SchedulerConfig;
 using frontier::entities::Request;
 using frontier::kv_cache::PrefixLookupResult;
 using frontier::kv_cache::ReplicaKVCacheManager;
+using frontier::kv_cache::ReplicaKVCacheError;
 using frontier::request_generator::WorkloadRequest;
 using frontier::test::expect;
+using frontier::test::expect_throws;
 
 SchedulerConfig scheduler_config(std::uint64_t blocks) {
     SchedulerConfig config{};
@@ -299,6 +301,171 @@ void test_virtual_commitment_rejects_another_active_session_owner() {
            "successor");
 }
 
+void test_empty_fit_is_independent_of_current_commitments() {
+    SchedulerConfig config = scheduler_config(10);
+    config.watermark_blocks_fraction = 0.1;
+    ReplicaKVCacheManager cache{
+        config,
+        PrefixCacheConfig{true, PrefixCachingKeyMode::kSession}, true};
+    cache.enable_full_sequence_commitments();
+
+    Request owner = make_request(0, 24, 1, 44);
+    Request waiting = make_request(1, 16, 1, 45);
+    cache.commit_virtual(owner.id(), owner.session_id(),
+                         owner.num_prefill_tokens());
+
+    expect(cache.full_sequence_fits_empty(waiting.num_prefill_tokens()),
+           "a request that fits the fixed empty capacity must remain feasible "
+           "while another request owns a commitment");
+    expect(!cache.can_commit(waiting.id(), waiting.session_id(),
+                             waiting.num_prefill_tokens()),
+           "current commitment pressure must block admission without making "
+           "the waiting request permanently infeasible");
+    expect(!cache.full_sequence_fits_empty(40),
+           "a prompt plus watermark larger than fixed capacity must remain "
+           "permanently infeasible");
+}
+
+void test_kda_admission_reserves_cold_snapshot_capacity() {
+    ReplicaKVCacheManager cache = manager(4);
+    cache.configure_kda_snapshot(2);
+    cache.enable_full_sequence_commitments();
+
+    Request oversized = make_request(0, 12, 1, 46);
+    expect(!cache.full_sequence_fits_empty(oversized.num_prefill_tokens()) &&
+               !cache.can_admit(oversized.id(), oversized.session_id(), 0, 12,
+                                oversized.num_prefill_tokens()),
+           "a cold KDA prompt must include its atomic snapshot charge in "
+           "empty-fit and admission checks");
+
+    Request fitting = make_request(1, 8, 1, 47);
+    expect(cache.full_sequence_fits_empty(fitting.num_prefill_tokens()) &&
+               cache.can_admit(fitting.id(), fitting.session_id(), 0, 8,
+                               fitting.num_prefill_tokens()),
+           "a KDA prompt plus snapshot that exactly fills capacity must fit");
+    cache.admit(fitting.id(), fitting.session_id(), 0, 8,
+                fitting.num_prefill_tokens());
+    expect(cache.has_kda_snapshot(fitting.session_id()) &&
+               cache.kda_snapshot_frontier_blocks(fitting.session_id()) == 0 &&
+               cache.kda_snapshot_occupied_blocks() == 2 &&
+               cache.allocated_blocks(fitting.id()) == 2 &&
+               cache.available_blocks() == 0,
+           "admission must atomically reserve a cold snapshot before compute");
+    expect(cache.publish_kda_snapshot(fitting.session_id(), 2) &&
+               cache.kda_snapshot_occupied_blocks() == 2,
+           "publishing into a reserved snapshot must not consume more blocks");
+    static_cast<void>(cache.free(fitting.id()));
+
+    Request successor = make_request(2, 8, 1, 47);
+    expect(cache.can_admit(successor.id(), successor.session_id(), 0, 8,
+                           successor.num_prefill_tokens()),
+           "an existing session snapshot must not be charged twice");
+    cache.admit(successor.id(), successor.session_id(), 0, 8,
+                successor.num_prefill_tokens());
+    expect(cache.kda_snapshot_occupied_blocks() == 2,
+           "same-session admission must reuse the existing snapshot charge");
+    static_cast<void>(cache.free(successor.id()));
+
+    ReplicaKVCacheManager pending = manager(4);
+    pending.configure_kda_snapshot(2);
+    pending.enable_full_sequence_commitments();
+    Request restoring = make_request(3, 8, 1, 48);
+    expect(pending.can_commit(restoring.id(), restoring.session_id(),
+                              restoring.num_prefill_tokens()),
+           "a cold asynchronous commitment must reserve KV and snapshot");
+    pending.commit_virtual(restoring.id(), restoring.session_id(),
+                           restoring.num_prefill_tokens());
+    expect(pending.has_kda_snapshot(restoring.session_id()) &&
+               pending.kda_snapshot_frontier_blocks(restoring.session_id()) ==
+                   0 &&
+               pending.kda_snapshot_occupied_blocks() == 2 &&
+               pending.virtual_committed_blocks() == 2,
+           "virtual admission must atomically hold the cold snapshot charge");
+    pending.release_commitment(restoring.id());
+    expect(!pending.has_kda_snapshot(restoring.session_id()) &&
+               pending.kda_snapshot_occupied_blocks() == 0 &&
+               pending.virtual_committed_blocks() == 0 &&
+               pending.available_commitment_blocks() == 4,
+           "rollback before publication must release the cold snapshot "
+           "reservation");
+}
+
+void test_failed_virtual_commit_does_not_reserve_kda_snapshot() {
+    ReplicaKVCacheManager cache = manager(8);
+    cache.enable_full_sequence_commitments();
+
+    // Materialize a three-block legacy prefix before enabling the KDA charge.
+    // This represents a pre-materialized/direct-API session whose resident
+    // frontier is longer than the next supplied full-sequence commitment.
+    Request producer = make_request(0, 12, 1, 49);
+    admit_and_complete(cache, producer, 0.0);
+    cache.configure_kda_snapshot(2);
+    const auto before = cache.diagnostics();
+    const auto stats_before = cache.stats();
+    const std::uint64_t reusable_frontier_before =
+        cache.gpu_cache_valid_prefix_blocks(SessionId{49});
+
+    expect_throws<ReplicaKVCacheError>(
+        [&cache] {
+            cache.commit_virtual(RequestId{1}, SessionId{49}, 8);
+        },
+        "a commitment shorter than its resident prefix must fail");
+
+    const auto after = cache.diagnostics();
+    const auto stats_after = cache.stats();
+    expect(!cache.has_kda_snapshot(SessionId{49}) &&
+               after.kda_snapshot_occupied_blocks ==
+                   before.kda_snapshot_occupied_blocks &&
+               after.kda_snapshot_sessions == before.kda_snapshot_sessions,
+           "failed commit validation must not reserve a KDA snapshot");
+    expect(cache.allocation_count() == 0 &&
+               cache.gpu_cache_valid_prefix_blocks(SessionId{49}) ==
+                   reusable_frontier_before &&
+               !cache.session_has_active_request(SessionId{49}) &&
+               after.resident_blocks == before.resident_blocks &&
+               after.resident_blocks == 3,
+           "failed commit validation must leave request and session ownership "
+           "unchanged");
+    expect(after.evictable_blocks == before.evictable_blocks &&
+               after.available_commitment_blocks ==
+                   before.available_commitment_blocks &&
+               stats_after.evicted_blocks == stats_before.evicted_blocks &&
+               stats_after.evicted_sessions == stats_before.evicted_sessions &&
+               stats_after.evicted_kda_snapshots ==
+                   stats_before.evicted_kda_snapshots,
+           "failed commit validation must not reclaim or evict cache state");
+}
+
+void test_published_zero_frontier_kda_snapshot_survives_free() {
+    ReplicaKVCacheManager cache = manager(4);
+    cache.configure_kda_snapshot(2);
+    Request request = make_request(0, 3, 1, 50);
+    request.on_arrival(request.arrived_at());
+    expect(cache.can_admit(request.id(), request.session_id(), 0, 3),
+           "sub-block KDA prompt must fit with its snapshot charge");
+    cache.admit(request.id(), request.session_id(), 0, 3);
+    request.on_admitted(SimTime::from_seconds(0.0));
+    request.advance_scheduler_frontier(3);
+    request.on_batch_completion(SimTime::from_seconds(0.001), 3,
+                                frontier::ClusterType::kPrefill);
+    cache.mark_blocks_computed(request);
+    expect(request.is_prefill_complete() &&
+               cache.publish_kda_snapshot(request.session_id(), 0),
+           "completed sub-block PREFILL must publish a valid zero frontier");
+
+    static_cast<void>(cache.free(request.id()));
+    const auto snapshot = cache.checkpoint_kda_snapshot(request.session_id());
+    expect(snapshot.present && snapshot.published &&
+               snapshot.frontier_blocks == 0 &&
+               cache.kda_snapshot_occupied_blocks() == 2 &&
+               cache.diagnostics().kda_snapshot_evictable_sessions == 1 &&
+               cache.allocation_count() == 0,
+           "normal free must retain a published zero-frontier KDA snapshot");
+    expect(cache.discard_kda_snapshot(request.session_id()) == 2 &&
+               !cache.has_kda_snapshot(request.session_id()),
+           "published snapshot-only state must remain explicitly evictable");
+}
+
 void test_seeded_session_range_churn() {
     constexpr std::uint64_t kIterations = 20'000;
     constexpr std::uint64_t kSessions = 31;
@@ -352,6 +519,186 @@ void test_hundred_million_block_prefix_has_constant_size_state() {
            "repeated huge-prefix turns must retain range-sized metadata");
 }
 
+void test_kda_snapshot_hybrid_lookup_and_replacement() {
+    ReplicaKVCacheManager cache = manager(8);
+    cache.configure_kda_snapshot(2);
+
+    Request request = make_request(0, 8, 1, 301);
+    request.on_arrival(request.arrived_at());
+    const PrefixLookupResult cold = cache.lookup(request);
+    cache.admit(request.id(), request.session_id(), cold.cached_tokens, 8);
+    request.restore_prefix_cache_lookup(cold.query_blocks, cold.hit_blocks,
+                                        cold.cached_tokens);
+    request.on_admitted(SimTime::from_seconds(0.0));
+    request.advance_scheduler_frontier(8);
+    request.on_batch_completion(SimTime::from_seconds(0.001), 8);
+    cache.mark_blocks_computed(request);
+    expect(cache.publish_kda_snapshot(request.session_id(), 2),
+           "active request must publish a KDA snapshot");
+    expect(cache.kda_snapshot_occupied_blocks() == 2 &&
+               cache.diagnostics().kda_snapshot_evictable_sessions == 0,
+           "active snapshot must be charged once and remain pinned");
+
+    static_cast<void>(cache.free(request.id()));
+    Request successor = make_request(1, 8, 1, 301);
+    successor.on_arrival(successor.arrived_at());
+    PrefixLookupResult warm = cache.lookup(successor);
+    expect(warm.hit_blocks == 2 &&
+               cache.gpu_cache_valid_prefix_blocks(SessionId{301}) == 2,
+           "hybrid lookup must require and honor the KDA frontier");
+
+    expect(cache.publish_kda_snapshot(SessionId{301}, 1),
+           "snapshot replacement must succeed");
+    expect(cache.kda_snapshot_occupied_blocks() == 2 &&
+               cache.kda_snapshot_frontier_blocks(SessionId{301}) == 1 &&
+               cache.gpu_cache_valid_prefix_blocks(SessionId{301}) == 1,
+           "shorter replacement must not double-charge and must cap KV hits");
+    warm = cache.lookup(successor);
+    expect(warm.hit_blocks == 1,
+           "lookup must reverse to the shorter immutable snapshot frontier");
+    expect(cache.can_admit(successor.id(), successor.session_id(),
+                           warm.cached_tokens, 4),
+           "admission must use the effective KDA frontier");
+    cache.admit(successor.id(), successor.session_id(), warm.cached_tokens, 4);
+    expect(cache.allocated_blocks(successor.id()) == 2,
+           "admission must trim stale KV suffix before allocating");
+    static_cast<void>(cache.free(successor.id()));
+    expect(cache.gpu_cache_valid_prefix_blocks(SessionId{301}) == 1,
+           "free must retain the shorter effective frontier");
+}
+
+void test_kda_snapshot_eviction_orders_kv_before_snapshot_lru() {
+    ReplicaKVCacheManager cache = manager(8);
+    cache.configure_kda_snapshot(2);
+
+    Request first = make_request(0, 8, 1, 401);
+    admit_and_complete(cache, first, 0.0);
+    expect(cache.publish_kda_snapshot(SessionId{401}, 2),
+           "first snapshot must fit");
+    Request second = make_request(1, 8, 1, 402);
+    admit_and_complete(cache, second, 0.01);
+    expect(cache.publish_kda_snapshot(SessionId{402}, 2),
+           "second snapshot must fit");
+
+    expect(cache.publish_kda_snapshot(SessionId{403}, 2),
+           "new snapshot must reclaim ordinary KV first");
+    expect(cache.has_kda_snapshot(SessionId{401}) &&
+               cache.gpu_cache_valid_prefix_blocks(SessionId{401}) == 0 &&
+               cache.stats().evicted_kda_snapshots == 0,
+           "KV suffix eviction must precede snapshot eviction");
+
+    expect(cache.publish_kda_snapshot(SessionId{404}, 2),
+           "snapshot allocation must continue after KV is exhausted");
+    expect(cache.publish_kda_snapshot(SessionId{405}, 2),
+           "snapshot LRU must reclaim one whole group when needed");
+    expect(!cache.has_kda_snapshot(SessionId{401}) &&
+               cache.has_kda_snapshot(SessionId{402}) &&
+               cache.kda_snapshot_occupied_blocks() == 8 &&
+               cache.stats().evicted_kda_snapshots == 1 &&
+               cache.stats().evicted_kda_snapshot_blocks == 2,
+           "snapshot eviction must be LRU and atomic as a whole");
+}
+
+void test_kda_unified_lru_prefers_older_snapshot_over_newer_kv() {
+    ReplicaKVCacheManager cache = manager(6);
+    cache.configure_kda_snapshot(2);
+    expect(cache.publish_kda_snapshot(SessionId{701}, 4),
+           "old snapshot-only session must fit");
+
+    Request newer = make_request(0, 8, 1, 702);
+    admit_and_complete(cache, newer, 0.0);
+    expect(cache.publish_kda_snapshot(SessionId{702}, 2),
+           "completed newer request must publish into its reserved snapshot");
+    expect(cache.diagnostics().resident_blocks == 2,
+           "newer session must retain its ordinary resident KV");
+
+    expect(cache.publish_kda_snapshot(SessionId{703}, 4),
+           "first filler snapshot must evict the oldest snapshot-only session");
+    expect(!cache.has_kda_snapshot(SessionId{701}) &&
+               cache.gpu_cache_valid_prefix_blocks(SessionId{702}) == 2 &&
+               cache.stats().evicted_kda_snapshots == 1 &&
+               cache.stats().evicted_blocks == 0,
+           "older snapshot-only victim must precede the newer KDA session");
+    expect(cache.publish_kda_snapshot(SessionId{704}, 4),
+           "second filler snapshot must continue the newer session chain");
+    expect(!cache.has_kda_snapshot(SessionId{701}) &&
+               cache.has_kda_snapshot(SessionId{702}) &&
+               cache.diagnostics().resident_blocks == 0 &&
+               cache.stats().evicted_kda_snapshots == 1 &&
+               cache.stats().evicted_blocks == 2,
+           "once the older session is gone, newer ordinary KV must be evicted "
+           "before its same-session snapshot");
+}
+
+void test_kda_atomic_surplus_reclaim_stays_blank() {
+    ReplicaKVCacheManager cache = manager(10);
+    cache.configure_kda_snapshot(3);
+
+    Request older = make_request(0, 8, 1, 711);
+    admit_and_complete(cache, older, 0.0);
+    expect(cache.publish_kda_snapshot(SessionId{711}, 2),
+           "older resident session must publish a snapshot");
+
+    Request newer = make_request(1, 8, 1, 712);
+    admit_and_complete(cache, newer, 0.01);
+    expect(cache.publish_kda_snapshot(SessionId{712}, 2),
+           "newer resident session must publish a valid snapshot");
+    expect(cache.diagnostics().resident_blocks == 4,
+           "surplus fixture must retain both ordinary ranges initially");
+
+    expect(cache.can_reserve(RequestId{799}, 0, 16),
+           "reservation must use the older session's reclaim chain");
+    cache.reserve(RequestId{799}, 0, 16);
+    expect(!cache.has_kda_snapshot(SessionId{711}) &&
+               cache.diagnostics().resident_blocks == 2 &&
+               cache.allocated_blocks(RequestId{799}) == 4 &&
+               cache.stats().evicted_blocks == 2 &&
+               cache.stats().evicted_kda_snapshots == 1 &&
+               cache.stats().evicted_kda_snapshot_blocks == 3,
+           "atomic snapshot surplus must not spill into the newer KV victim");
+    static_cast<void>(cache.free(RequestId{799}));
+    expect(cache.diagnostics().resident_blocks == 2 &&
+               cache.diagnostics().available_blocks == 7,
+           "surplus snapshot blocks must return to blank capacity while the "
+           "newer session snapshot remains charged");
+}
+
+void test_kda_snapshot_keeps_zero_resident_session_and_discard_is_explicit() {
+    ReplicaKVCacheManager cache = manager(4);
+    cache.configure_kda_snapshot(2);
+    expect(cache.publish_kda_snapshot(SessionId{501}, 7),
+           "snapshot-only session must be publishable");
+    expect(cache.has_kda_snapshot(SessionId{501}) &&
+               cache.gpu_cache_valid_prefix_blocks(SessionId{501}) == 0 &&
+               cache.diagnostics().kda_snapshot_sessions == 1,
+           "snapshot ownership must survive with zero resident KV");
+    expect(cache.discard_session(SessionId{501}) == 0 &&
+               !cache.has_kda_snapshot(SessionId{501}) &&
+               cache.kda_snapshot_occupied_blocks() == 0 &&
+               cache.diagnostics().available_blocks == 4,
+           "explicit discard must retire a snapshot-only session atomically");
+}
+
+void test_kda_snapshot_active_pin_rejects_capacity_pressure() {
+    ReplicaKVCacheManager cache = manager(4);
+    cache.configure_kda_snapshot(2);
+    Request request = make_request(0, 8, 1, 601);
+    request.on_arrival(request.arrived_at());
+    cache.admit(request.id(), request.session_id(), 0, 8);
+    request.restore_prefix_cache_lookup(2, 0, 0);
+    request.on_admitted(SimTime::from_seconds(0.0));
+    request.advance_scheduler_frontier(8);
+    request.on_batch_completion(SimTime::from_seconds(0.001), 8);
+    cache.mark_blocks_computed(request);
+    expect(cache.publish_kda_snapshot(request.session_id(), 2),
+           "active pin fixture must publish");
+    expect(!cache.publish_kda_snapshot(SessionId{602}, 2),
+           "active snapshot must not be evicted under pressure");
+    static_cast<void>(cache.free(request.id()));
+    expect(cache.diagnostics().kda_snapshot_evictable_sessions == 1,
+           "free must release snapshot into its LRU");
+}
+
 } // namespace
 
 int main() {
@@ -378,10 +725,40 @@ int main() {
     failures += frontier::test::run(
         "virtual commitment rejects another active session owner",
         test_virtual_commitment_rejects_another_active_session_owner);
+    failures += frontier::test::run(
+        "empty fit is independent of current commitments",
+        test_empty_fit_is_independent_of_current_commitments);
+    failures += frontier::test::run(
+        "KDA admission reserves cold snapshot capacity",
+        test_kda_admission_reserves_cold_snapshot_capacity);
+    failures += frontier::test::run(
+        "failed virtual commit leaves no KDA snapshot charge",
+        test_failed_virtual_commit_does_not_reserve_kda_snapshot);
+    failures += frontier::test::run(
+        "published zero-frontier KDA snapshot survives free",
+        test_published_zero_frontier_kda_snapshot_survives_free);
     failures += frontier::test::run("seeded session range churn",
                                     test_seeded_session_range_churn);
     failures += frontier::test::run(
         "hundred-million-block prefix uses constant-size state",
         test_hundred_million_block_prefix_has_constant_size_state);
+    failures +=
+        frontier::test::run("KDA snapshot hybrid lookup and replacement",
+                            test_kda_snapshot_hybrid_lookup_and_replacement);
+    failures += frontier::test::run(
+        "KDA snapshot eviction orders KV before snapshot LRU",
+        test_kda_snapshot_eviction_orders_kv_before_snapshot_lru);
+    failures += frontier::test::run(
+        "KDA unified LRU prefers older snapshot over newer KV",
+        test_kda_unified_lru_prefers_older_snapshot_over_newer_kv);
+    failures += frontier::test::run(
+        "KDA snapshot atomic surplus reclaim",
+        test_kda_atomic_surplus_reclaim_stays_blank);
+    failures += frontier::test::run(
+        "KDA snapshot keeps zero-resident session",
+        test_kda_snapshot_keeps_zero_resident_session_and_discard_is_explicit);
+    failures += frontier::test::run(
+        "KDA snapshot active pin rejects pressure",
+        test_kda_snapshot_active_pin_rejects_capacity_pressure);
     return failures == 0 ? 0 : 1;
 }

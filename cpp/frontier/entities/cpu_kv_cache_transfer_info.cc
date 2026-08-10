@@ -6,8 +6,7 @@
 namespace frontier::entities {
 namespace {
 
-void validate_timing(
-    const cpu_kv_cache_transfer::CpuTransferTiming &timing) {
+void validate_timing(const cpu_kv_cache_transfer::CpuTransferTiming &timing) {
     if (!timing.submitted_at.valid() || !timing.started_at.valid() ||
         !timing.completed_at.valid() ||
         timing.started_at < timing.submitted_at ||
@@ -48,17 +47,19 @@ CpuKVCacheOffloadInfo::CpuKVCacheOffloadInfo(
     CpuKvTransferId transfer_id, RequestId request_id, ReplicaId replica_id,
     DataParallelId dp_id, CpuOffloadReservationId reservation_id,
     cpu_kv_cache_transfer::CpuTransferTiming timing,
-    std::uint64_t desired_frontier_blocks, CpuOffloadGeneration generation)
+    std::uint64_t desired_frontier_blocks, CpuOffloadGeneration generation,
+    std::uint64_t transferred_kv_blocks, std::uint64_t kda_snapshot_bytes)
     : transfer_id_(transfer_id), request_id_(request_id),
       replica_id_(replica_id), dp_id_(dp_id), reservation_id_(reservation_id),
       timing_(timing), desired_frontier_blocks_(desired_frontier_blocks),
-      generation_(generation) {
-    if (!transfer_id_.valid() || !request_id_.valid() ||
-        !replica_id_.valid() || !dp_id_.valid() || !reservation_id_.valid() ||
-        !generation_.valid() || desired_frontier_blocks_ == 0 ||
+      generation_(generation), transferred_kv_blocks_(transferred_kv_blocks),
+      kda_snapshot_bytes_(kda_snapshot_bytes) {
+    if (!transfer_id_.valid() || !request_id_.valid() || !replica_id_.valid() ||
+        !dp_id_.valid() || !reservation_id_.valid() || !generation_.valid() ||
         timing_.direction !=
             cpu_kv_cache_transfer::CpuTransferDirection::kD2H ||
-        timing_.size_bytes == 0) {
+        timing_.size_bytes == 0 ||
+        (transferred_kv_blocks_ == 0 && kda_snapshot_bytes_ == 0)) {
         throw CpuKVCacheTransferError("invalid CPU offload operation");
     }
     validate_timing(timing_);
@@ -96,18 +97,24 @@ CpuKVCacheRestoreInfo::CpuKVCacheRestoreInfo(
     CpuKvTransferId transfer_id, RequestId request_id, ReplicaId replica_id,
     DataParallelId dp_id, CpuRestoreLeaseId lease_id, TieredPrefixPlan plan,
     cpu_kv_cache_transfer::CpuTransferTiming timing,
-    Generation request_generation)
+    Generation request_generation, std::uint64_t kda_snapshot_bytes,
+    std::uint64_t kda_snapshot_frontier_blocks)
     : transfer_id_(transfer_id), request_id_(request_id),
       replica_id_(replica_id), dp_id_(dp_id), lease_id_(lease_id), plan_(plan),
-      timing_(timing), request_generation_(request_generation) {
-    if (!transfer_id_.valid() || !request_id_.valid() ||
-        !replica_id_.valid() || !dp_id_.valid() || !lease_id_.valid() ||
-        !request_generation_.valid() || plan_.cpu_begin_block >=
-                                              plan_.cpu_end_block ||
+      timing_(timing), request_generation_(request_generation),
+      kda_snapshot_bytes_(kda_snapshot_bytes),
+      kda_snapshot_frontier_blocks_(kda_snapshot_frontier_blocks) {
+    if (!transfer_id_.valid() || !request_id_.valid() || !replica_id_.valid() ||
+        !dp_id_.valid() || !lease_id_.valid() || !request_generation_.valid() ||
+        plan_.cpu_begin_block > plan_.cpu_end_block ||
+        (plan_.cpu_begin_block == plan_.cpu_end_block &&
+         kda_snapshot_bytes_ == 0) ||
         plan_.cpu_end_block > plan_.hit_frontier_blocks ||
         timing_.direction !=
             cpu_kv_cache_transfer::CpuTransferDirection::kH2D ||
-        timing_.size_bytes == 0) {
+        timing_.size_bytes == 0 ||
+        plan_.restore_kda_snapshot != (kda_snapshot_bytes_ != 0) ||
+        (kda_snapshot_bytes_ == 0 && kda_snapshot_frontier_blocks_ != 0)) {
         throw CpuKVCacheTransferError("invalid CPU restore operation");
     }
     validate_timing(timing_);

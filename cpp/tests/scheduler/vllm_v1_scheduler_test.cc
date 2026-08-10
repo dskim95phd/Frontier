@@ -1234,6 +1234,72 @@ void test_restore_completion_failure_cancels_matching_operation() {
         "H2D completion failure must cancel only its matching operation once");
 }
 
+void test_kda_restore_completion_failure_restores_gpu_snapshot() {
+    constexpr frontier::SessionId kSession{34};
+    auto requests = make_cpu_restore_requests({{48, 34}});
+    SchedulerConfig config = scheduler_config();
+    config.block_size = 16;
+    config.num_blocks = 8;
+    config.kda_snapshot_blocks_per_session = 2;
+    frontier::config::PrefixCacheConfig prefix{};
+    prefix.enabled = true;
+    frontier::config::ParallelismConfig parallelism{};
+    frontier::config::ModelConfig model{};
+    model.num_kda_layers = 1;
+    frontier::entities::Replica replica{frontier::ReplicaId{0}, parallelism,
+                                        model};
+    auto predictor = std::make_shared<
+        frontier::execution_time_predictor::FixedExecutionTimePredictor>(
+        frontier::config::FixedExecutionModelConfig{});
+    auto cpu = cpu_target_config();
+    cpu.kda_snapshot_blocks = 2;
+    cpu.kda_snapshot_bytes = 8'192;
+    VllmV1Scheduler scheduler{config,
+                              requests,
+                              predictor,
+                              replica,
+                              frontier::DataParallelId{0},
+                              frontier::ClusterType::kPrefill,
+                              prefix,
+                              cpu};
+    seed_cpu_prefix(scheduler, kSession, 2);
+    arrive_all(scheduler, requests);
+    static_cast<void>(scheduler.schedule(SimTime::from_seconds(1.0)));
+    const auto operation = scheduler.cpu_kv_cache_restore_operations().front();
+    const auto reserved = scheduler.kv_blocks().checkpoint_kda_snapshot(
+        kSession);
+    expect(reserved.present && !reserved.published &&
+               reserved.frontier_blocks == 0,
+           "restore admission must begin with a cold GPU snapshot reserve");
+
+    auto starts = scheduler.drain_auxiliary_events();
+    const auto start = std::get<frontier::CpuKVCacheRestoreStartPayload>(
+        starts.front().payload);
+    scheduler.on_cpu_kv_cache_restore_start(start.transfer_id, start.generation,
+                                            starts.front().time);
+    auto ends = scheduler.drain_auxiliary_events();
+    const auto end =
+        std::get<frontier::CpuKVCacheRestoreEndPayload>(ends.front().payload);
+    expect(scheduler.cpu_kv_cache_manager()->release_restore(
+               operation.lease_id(), false, ends.front().time),
+           "fixture must terminate the KDA restore lease before completion");
+    expect_throws<frontier::scheduler::SchedulerError>(
+        [&]() {
+            static_cast<void>(scheduler.on_cpu_kv_cache_restore_end(
+                end.transfer_id, end.generation, ends.front().time));
+        },
+        "terminal KDA lease must fail restore completion");
+
+    expect(!scheduler.kv_blocks().has_kda_snapshot(kSession) &&
+               scheduler.kv_blocks().kda_snapshot_occupied_blocks() == 0 &&
+               scheduler.allocated_kv_blocks() == 0 &&
+               scheduler.pending_cpu_restore_count() == 0 &&
+               scheduler.cpu_kv_cache_restore_operations().front().state() ==
+                   frontier::entities::CpuKVCacheTransferState::kCancelled,
+           "failed restore must roll GPU snapshot back to its cold reserve, "
+           "then release that reserve with the commitment");
+}
+
 Batch complete_prefill_schedule(VllmV1Scheduler &scheduler,
                                 std::vector<Request> &requests,
                                 const ScheduleResult &schedule,
@@ -1338,6 +1404,105 @@ void test_cpu_offload_export_barrier_both_orders() {
     };
     run_order(true);
     run_order(false);
+}
+
+void test_kda_snapshot_only_offload_and_restore() {
+    constexpr frontier::SessionId kSession{33};
+    auto requests = make_same_session_requests({{3, 1}, {3, 1}}, kSession);
+    SchedulerConfig config = scheduler_config();
+    config.block_size = 16;
+    config.num_blocks = 8;
+    config.kda_snapshot_blocks_per_session = 2;
+    frontier::config::PrefixCacheConfig prefix{};
+    prefix.enabled = true;
+    frontier::config::ParallelismConfig parallelism{};
+    frontier::config::ModelConfig model{};
+    model.num_kda_layers = 1;
+    frontier::entities::Replica replica{frontier::ReplicaId{0}, parallelism,
+                                        model};
+    auto predictor = std::make_shared<
+        frontier::execution_time_predictor::FixedExecutionTimePredictor>(
+        frontier::config::FixedExecutionModelConfig{});
+    auto cpu = cpu_target_config();
+    cpu.kda_snapshot_blocks = 2;
+    cpu.kda_snapshot_bytes = 8'192;
+    VllmV1Scheduler scheduler{config,
+                              requests,
+                              predictor,
+                              replica,
+                              frontier::DataParallelId{0},
+                              frontier::ClusterType::kPrefill,
+                              prefix,
+                              cpu};
+
+    requests[0].on_arrival(requests[0].arrived_at());
+    scheduler.add_request(RequestId{0});
+    const auto first = scheduler.schedule(SimTime::from_seconds(1.0));
+    expect(first.scheduled_requests.size() == 1 &&
+               first.scheduled_requests.front().num_tokens == 3,
+           "sub-block KDA prompt must execute without a reusable KV block");
+    static_cast<void>(
+        complete_prefill_schedule(scheduler, requests, first, 1.1));
+    expect(scheduler.prepare_cpu_kv_cache_offload(
+               RequestId{0}, SimTime::from_seconds(1.1)),
+           "sub-block KDA prompt must create a snapshot-only D2H branch");
+    auto offload_starts = scheduler.drain_auxiliary_events();
+    expect(offload_starts.size() == 1,
+           "snapshot-only offload must emit one D2H event");
+    const auto offload_start =
+        std::get<frontier::CpuKVCacheOffloadStartPayload>(
+            offload_starts.front().payload);
+    scheduler.on_cpu_kv_cache_offload_start(
+        offload_start.transfer_id, offload_start.cpu_generation,
+        offload_starts.front().time);
+    auto offload_ends = scheduler.drain_auxiliary_events();
+    const auto offload_end = std::get<frontier::CpuKVCacheOffloadEndPayload>(
+        offload_ends.front().payload);
+    expect(scheduler.on_cpu_kv_cache_offload_end(
+               offload_end.transfer_id, offload_end.cpu_generation,
+               offload_ends.front().time) &&
+               scheduler.cpu_kv_cache_manager()->has_kda_snapshot(kSession) &&
+               scheduler.cpu_kv_cache_manager()->committed_frontier_blocks(
+                   kSession) == 0,
+           "snapshot-only D2H completion must publish no ordinary CPU KV");
+
+    requests[0].on_kv_cache_transfer_start(SimTime::from_seconds(1.2));
+    requests[0].on_kv_cache_transfer_complete(SimTime::from_seconds(1.21), 1);
+    scheduler.complete_kv_transfer(RequestId{0});
+    static_cast<void>(scheduler.discard_gpu_prefix_cache_session(kSession));
+    expect(!scheduler.kv_blocks().has_kda_snapshot(kSession),
+           "test setup must remove the source GPU snapshot before restore");
+
+    requests[1].on_arrival(requests[1].arrived_at());
+    scheduler.add_request(RequestId{1});
+    const auto suspended = scheduler.schedule(SimTime::from_seconds(2.0));
+    expect(suspended.scheduled_requests.empty() &&
+               scheduler.pending_cpu_restore_count() == 1,
+           "zero CPU KV hits must still suspend for snapshot-only H2D");
+    auto restore_starts = scheduler.drain_auxiliary_events();
+    const auto restore_start =
+        std::get<frontier::CpuKVCacheRestoreStartPayload>(
+            restore_starts.front().payload);
+    scheduler.on_cpu_kv_cache_restore_start(
+        restore_start.transfer_id, restore_start.generation,
+        restore_starts.front().time);
+    auto restore_ends = scheduler.drain_auxiliary_events();
+    const auto restore_end = std::get<frontier::CpuKVCacheRestoreEndPayload>(
+        restore_ends.front().payload);
+    expect(scheduler.on_cpu_kv_cache_restore_end(
+               restore_end.transfer_id, restore_end.generation,
+               restore_ends.front().time) &&
+               requests[1].cpu_restore_transferred_blocks() == 0 &&
+               requests[1].cpu_restore_bytes() == 8'192,
+           "snapshot-only H2D must account bytes without transferred KV");
+
+    const auto admitted = scheduler.schedule(restore_ends.front().time);
+    expect(admitted.scheduled_requests.size() == 1 &&
+               admitted.scheduled_requests.front().request_id == RequestId{1} &&
+               admitted.scheduled_requests.front().num_tokens == 3 &&
+               requests[1].cached_prefill_tokens() == 0 &&
+               requests[1].cpu_prefix_hit_blocks() == 0,
+           "restored KDA state must not become a sub-block KV prefix hit");
 }
 
 void test_transfer_pending_gpu_blocks_gate_admission_until_all_exports_finish() {
@@ -1920,9 +2085,15 @@ int main() {
     failures += frontier::test::run(
         "CPU restore completion failure cleanup",
         test_restore_completion_failure_cancels_matching_operation);
+    failures += frontier::test::run(
+        "KDA restore completion failure GPU snapshot rollback",
+        test_kda_restore_completion_failure_restores_gpu_snapshot);
     failures +=
         frontier::test::run("CPU offload export barrier both orders",
                             test_cpu_offload_export_barrier_both_orders);
+    failures += frontier::test::run(
+        "KDA snapshot-only CPU offload and restore",
+        test_kda_snapshot_only_offload_and_restore);
     failures += frontier::test::run(
         "transfer-pending GPU blocks gate admission",
         test_transfer_pending_gpu_blocks_gate_admission_until_all_exports_finish);

@@ -232,6 +232,9 @@ struct PrefixCacheTargetMetricsRecord {
     std::uint64_t evictable_blocks = 0;
     std::uint64_t evictable_sessions = 0;
     std::uint64_t sessions_with_nonzero_frontier = 0;
+    std::uint64_t kda_snapshot_occupied_blocks = 0;
+    std::uint64_t kda_snapshot_sessions = 0;
+    std::uint64_t kda_snapshot_evictable_sessions = 0;
 };
 
 struct PrefixCacheMetricsAggregate {
@@ -244,6 +247,10 @@ struct PrefixCacheMetricsAggregate {
     std::uint64_t hit_blocks = 0;
     std::uint64_t evicted_blocks = 0;
     std::uint64_t evicted_sessions = 0;
+    std::uint64_t evicted_kda_snapshots = 0;
+    std::uint64_t evicted_kda_snapshot_blocks = 0;
+    std::uint64_t kda_snapshot_occupied_blocks = 0;
+    std::uint64_t kda_snapshot_sessions = 0;
 };
 
 enum class CpuKVCacheTransferKind { kOffload, kRestore };
@@ -257,6 +264,7 @@ struct CpuKVCacheTransferMetricsRecord {
     DataParallelId dp_id{0};
     std::uint64_t blocks = 0;
     std::uint64_t size_bytes = 0;
+    std::uint64_t kda_snapshot_bytes = 0;
     SimTime submitted_at;
     SimTime started_at;
     SimTime completed_at;
@@ -272,6 +280,17 @@ struct CpuKVCacheTargetMetricsRecord {
     std::uint64_t capacity_bytes = 0;
     std::uint64_t capacity_blocks = 0;
     std::uint64_t bytes_per_block = 0;
+    std::uint64_t kda_snapshot_bytes_per_session = 0;
+    std::uint64_t kda_snapshot_blocks_per_session = 0;
+    std::uint64_t kda_snapshot_occupied_bytes = 0;
+    std::uint64_t kda_snapshot_occupied_blocks = 0;
+    std::uint64_t kda_snapshot_reserved_bytes = 0;
+    std::uint64_t kda_snapshot_reserved_blocks = 0;
+    std::uint64_t kda_snapshot_sessions = 0;
+    std::uint64_t kda_snapshot_evictable_sessions = 0;
+    std::uint64_t evicted_kda_snapshots = 0;
+    std::uint64_t evicted_kda_snapshot_blocks = 0;
+    std::uint64_t evicted_kda_snapshot_bytes = 0;
     std::uint64_t resident_bytes = 0;
     std::uint64_t resident_blocks = 0;
     std::uint64_t reserved_bytes = 0;
@@ -303,12 +322,27 @@ struct CpuKVCacheMetricsAggregate {
     std::uint64_t capacity_bytes = 0;
     std::uint64_t capacity_blocks = 0;
     std::uint64_t bytes_per_block = 0;
+    std::uint64_t kda_snapshot_bytes_per_session = 0;
+    std::uint64_t kda_snapshot_blocks_per_session = 0;
+    std::uint64_t kda_snapshot_occupied_bytes = 0;
+    std::uint64_t kda_snapshot_occupied_blocks = 0;
+    std::uint64_t kda_snapshot_reserved_bytes = 0;
+    std::uint64_t kda_snapshot_reserved_blocks = 0;
+    std::uint64_t kda_snapshot_sessions = 0;
+    std::uint64_t kda_snapshot_evictable_sessions = 0;
+    std::uint64_t evicted_kda_snapshots = 0;
+    std::uint64_t evicted_kda_snapshot_blocks = 0;
+    std::uint64_t evicted_kda_snapshot_bytes = 0;
     std::uint64_t offload_operations = 0;
     std::uint64_t offload_blocks = 0;
     std::uint64_t offload_bytes = 0;
+    std::uint64_t kda_snapshot_offload_operations = 0;
+    std::uint64_t kda_snapshot_offload_bytes = 0;
     std::uint64_t restore_operations = 0;
     std::uint64_t restore_blocks = 0;
     std::uint64_t restore_bytes = 0;
+    std::uint64_t kda_snapshot_restore_operations = 0;
+    std::uint64_t kda_snapshot_restore_bytes = 0;
     double d2h_queue_time_ms = 0.0;
     double d2h_service_time_ms = 0.0;
     double h2d_queue_time_ms = 0.0;

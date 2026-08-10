@@ -712,10 +712,29 @@ void BaseClusterScheduler::begin_moe_stage(
         if (scaled_layer_prediction) {
             value.remaining_scaled_moe_layers =
                 logical_moe_layers - predicted_layers;
+            value.scaled_moe_attention_groups =
+                prediction.scaled_moe_attention_groups;
             value.repeated_moe_layer_pre_compute_ms =
                 prediction.repeated_moe_layer_pre_compute_ms;
-            value.repeated_moe_layer_pre_tp_communication_ms =
-                prediction.repeated_moe_layer_pre_tp_communication_ms;
+            std::uint64_t grouped_attention_layers = 0;
+            double remaining_attention_ms = 0.0;
+            for (const auto &attention_group :
+                 value.scaled_moe_attention_groups) {
+                grouped_attention_layers += attention_group.layer_count;
+                remaining_attention_ms +=
+                    static_cast<double>(attention_group.layer_count) *
+                    (attention_group.pre_moe_compute_ms_per_layer +
+                     (path == MoESyncPath::kDecode
+                          ? attention_group
+                                .pre_moe_tp_communication_ms_per_layer
+                          : 0.0));
+            }
+            if (grouped_attention_layers !=
+                value.remaining_scaled_moe_layers) {
+                throw std::logic_error(
+                    "scaled MoE attention groups do not cover the remaining "
+                    "logical layers");
+            }
             const double critical_lane_ms =
                 *std::max_element(value.decode_lane_times_ms.front().begin(),
                                   value.decode_lane_times_ms.front().end());
@@ -730,20 +749,14 @@ void BaseClusterScheduler::begin_moe_stage(
                 path == MoESyncPath::kDecode
                     ? value.decode_ep_communication_ms_per_layer
                     : 0.0;
-            const double repeated_layer_ms =
-                prediction.repeated_moe_layer_pre_compute_ms +
-                (path == MoESyncPath::kDecode
-                     ? prediction
-                           .repeated_moe_layer_pre_tp_communication_ms
-                     : 0.0) +
-                repeated_post_ms + repeated_transition_ms;
             // Aligned decode must use the group-level repeated critical path,
             // which is known only after all real DP lanes reach the barrier.
             // Non-decode paths retain the predictor's batch-local scaling.
             if (!aligned_decode) {
                 value.remaining_moe_layer_wait_ms =
+                    remaining_attention_ms +
                     static_cast<double>(value.remaining_scaled_moe_layers) *
-                    repeated_layer_ms;
+                        (repeated_post_ms + repeated_transition_ms);
             }
         }
         return value;
@@ -982,7 +995,9 @@ void BaseClusterScheduler::continue_moe_stage(
             aggregate_lane_times_ms.begin(), aggregate_lane_times_ms.end());
         if (aligned_decode) {
             std::optional<std::uint64_t> remaining_scaled_layers;
-            double repeated_pre_transition_ms = 0.0;
+            std::vector<execution_time_predictor::ScaledMoEAttentionGroup>
+                attention_group_layout;
+            std::vector<double> maximum_pre_transition_ms_by_family;
             for (const auto &[unused, batch_id] : group.participants) {
                 static_cast<void>(unused);
                 if (simulator.batch(batch_id).is_idle()) {
@@ -999,12 +1014,34 @@ void BaseClusterScheduler::continue_moe_stage(
                 if (state.remaining_scaled_moe_layers == 0) {
                     continue;
                 }
-                repeated_pre_transition_ms =
-                    std::max(repeated_pre_transition_ms,
-                             state.repeated_moe_layer_pre_compute_ms +
-                                 state
-                                     .repeated_moe_layer_pre_tp_communication_ms +
-                                 state.decode_ep_communication_ms_per_layer);
+                if (attention_group_layout.empty()) {
+                    attention_group_layout =
+                        state.scaled_moe_attention_groups;
+                    maximum_pre_transition_ms_by_family.assign(
+                        attention_group_layout.size(), 0.0);
+                } else if (attention_group_layout.size() !=
+                           state.scaled_moe_attention_groups.size()) {
+                    throw std::logic_error(
+                        "aligned DECODE scaled attention family counts do "
+                        "not match");
+                }
+                for (std::size_t family = 0;
+                     family < attention_group_layout.size(); ++family) {
+                    const auto &expected = attention_group_layout.at(family);
+                    const auto &local =
+                        state.scaled_moe_attention_groups.at(family);
+                    if (expected.family != local.family ||
+                        expected.layer_count != local.layer_count) {
+                        throw std::logic_error(
+                            "aligned DECODE scaled attention family layout "
+                            "does not match");
+                    }
+                    maximum_pre_transition_ms_by_family.at(family) = std::max(
+                        maximum_pre_transition_ms_by_family.at(family),
+                        local.pre_moe_compute_ms_per_layer +
+                            local.pre_moe_tp_communication_ms_per_layer +
+                            state.decode_ep_communication_ms_per_layer);
+                }
             }
 
             double maximum_pre_transition_ms = 0.0;
@@ -1032,14 +1069,21 @@ void BaseClusterScheduler::continue_moe_stage(
                 synchronization_breakdown.moe_ep_aggregation_extra_ms =
                     std::max(0.0, critical_lane_ms - local_critical_lane_ms);
                 if (state.remaining_scaled_moe_layers > 0) {
-                    const double local_repeated_pre_transition_ms =
-                        state.repeated_moe_layer_pre_compute_ms +
-                        state.repeated_moe_layer_pre_tp_communication_ms +
-                        state.decode_ep_communication_ms_per_layer;
-                    synchronization_breakdown.moe_pre_barrier_wait_ms +=
-                        static_cast<double>(state.remaining_scaled_moe_layers) *
-                        std::max(0.0, repeated_pre_transition_ms -
-                                          local_repeated_pre_transition_ms);
+                    for (std::size_t family = 0;
+                         family < attention_group_layout.size(); ++family) {
+                        const auto &local =
+                            state.scaled_moe_attention_groups.at(family);
+                        const double local_pre_transition_ms =
+                            local.pre_moe_compute_ms_per_layer +
+                            local.pre_moe_tp_communication_ms_per_layer +
+                            state.decode_ep_communication_ms_per_layer;
+                        synchronization_breakdown.moe_pre_barrier_wait_ms +=
+                            static_cast<double>(local.layer_count) *
+                            std::max(
+                                0.0,
+                                maximum_pre_transition_ms_by_family.at(family) -
+                                    local_pre_transition_ms);
+                    }
                     synchronization_breakdown.moe_ep_aggregation_extra_ms +=
                         static_cast<double>(state.remaining_scaled_moe_layers) *
                         std::max(0.0,
@@ -1054,9 +1098,16 @@ void BaseClusterScheduler::continue_moe_stage(
                     (monolithic_decode
                          ? 0.0
                          : sample_state->decode_dp_communication_ms_per_layer);
-                const double group_remaining_ms =
+                double group_remaining_ms =
                     static_cast<double>(*remaining_scaled_layers) *
-                    (repeated_pre_transition_ms + repeated_post_ms);
+                    repeated_post_ms;
+                for (std::size_t family = 0;
+                     family < attention_group_layout.size(); ++family) {
+                    group_remaining_ms +=
+                        static_cast<double>(
+                            attention_group_layout.at(family).layer_count) *
+                        maximum_pre_transition_ms_by_family.at(family);
+                }
                 for (const auto &[unused, batch_id] : group.participants) {
                     static_cast<void>(unused);
                     if (!simulator.batch(batch_id).is_idle()) {

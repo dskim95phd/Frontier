@@ -28,8 +28,10 @@ enum class Precision {
     kFp16,
     kBf16,
     kFp8,
+    kMxFp8,
     kInt8,
     kFp4,
+    kMxFp4,
     kInt4,
 };
 
@@ -130,6 +132,11 @@ struct DenseModel {
     bool gated_mlp;
     bool fused_add_norm;
     bool use_mla = false;
+    // MLA variants are explicit model metadata.  Kimi K3 enables both the
+    // full-rank output gate and NoPE; legacy MLA checkpoints leave these
+    // disabled so their historical roofline remains unchanged.
+    bool mla_use_output_gate = false;
+    bool mla_use_nope = false;
     bool use_mfa = false;
     std::uint64_t q_lora_rank = 0;
     std::uint64_t kv_lora_rank = 0;
@@ -139,6 +146,22 @@ struct DenseModel {
     std::uint64_t v_head_dim = 0;
     std::uint64_t share_q_dim = 0;
     std::uint64_t decode_context_parallel_size = 1;
+
+    // Kimi Delta Attention (KDA) dimensions.  KDA is deliberately modeled
+    // as a per-layer variant of the normal dense/MLA path: the owning
+    // predictor selects this flag for each logical layer rather than applying
+    // one uniform multiplier to an entire stage.  The fields remain zero for
+    // all legacy (MHA/GQA/MLA/MFA) models.
+    bool use_kda = false;
+    std::uint64_t kda_num_heads = 0;
+    std::uint64_t kda_num_k_heads = 0;
+    std::uint64_t kda_num_v_heads = 0;
+    std::uint64_t kda_key_head_dim = 0;
+    std::uint64_t kda_value_head_dim = 0;
+    std::uint64_t kda_head_dim = 0;
+    std::uint64_t kda_short_conv_kernel_size = 0;
+    std::uint64_t kda_conv_state_dim = 0;
+    std::uint64_t attn_res_block_size = 0;
 
     [[nodiscard]] static constexpr DenseModel llama2_7b_tp8() noexcept {
         return llama2_7b(8);
@@ -168,6 +191,18 @@ struct DenseLayerTimes {
     double mlp_norm_ms;
     double residual_add_ms;
 
+    // KDA component diagnostics.  These components are included in the
+    // existing attention_pre_projection_ms / attention_inter_norm_ms /
+    // prefill_attention_ms / decode_attention_ms buckets so duration and
+    // historical consumers retain the same contract.  They are kept
+    // separately to make KDA roofline behavior inspectable without exposing
+    // a second execution-time API.
+    double kda_projection_ms = 0.0;
+    double kda_short_conv_ms = 0.0;
+    double kda_recurrent_ms = 0.0;
+    double kda_gate_norm_ms = 0.0;
+    double attn_res_ms = 0.0;
+
     [[nodiscard]] double total_ms() const noexcept;
 };
 
@@ -179,6 +214,7 @@ struct DenseOperatorPrecisions {
     std::optional<Precision> attention_activation;
     std::optional<Precision> dense_weight;
     std::optional<Precision> dense_activation;
+    Precision kda_state = Precision::kFp32;
 };
 
 class AnalyticalModelError : public std::runtime_error {
@@ -200,6 +236,11 @@ class AnalyticalModelError : public std::runtime_error {
 [[nodiscard]] KernelWork gemm_work(std::uint64_t m, std::uint64_t k,
                                    std::uint64_t n, double weight_element_bytes,
                                    double activation_element_bytes,
+                                   std::uint64_t weight_multiplier);
+[[nodiscard]] KernelWork gemm_work(std::uint64_t m, std::uint64_t k,
+                                   std::uint64_t n, double weight_element_bytes,
+                                   double activation_element_bytes,
+                                   double output_element_bytes,
                                    std::uint64_t weight_multiplier);
 [[nodiscard]] KernelWork streaming_work(double elements_read,
                                         double elements_written, double flops,
@@ -309,6 +350,9 @@ struct MoEModel {
     std::uint64_t model_num_experts = 0;
     std::uint64_t num_shared_experts = 0;
     std::uint64_t moe_tensor_parallel_size = 1;
+    std::uint64_t routed_expert_hidden_size = 0;
+    std::uint64_t attn_res_block_size = 0;
+    bool latent_moe_use_norm = false;
     bool gated_mlp = true;
     bool fused_add_norm = false;
 };
@@ -320,6 +364,9 @@ struct MoELayerTime {
     double grouped_down_projection_ms = 0.0;
     double shuffling_ms = 0.0;
     double post_attention_norm_ms = 0.0;
+    double latent_projection_ms = 0.0;
+    double latent_norm_ms = 0.0;
+    double attn_res_ms = 0.0;
 
     [[nodiscard]] double total_ms() const noexcept;
 };
@@ -346,12 +393,22 @@ struct MoEOperatorPrecisions {
     Precision expert = Precision::kFp16;
     Precision router = Precision::kFp16;
     Precision dense = Precision::kFp16;
+    Precision shared_expert = Precision::kFp16;
     std::optional<Precision> expert_weight;
     std::optional<Precision> expert_activation;
+    // Empty preserves the pre-split behavior by inheriting the routed expert
+    // dtypes. Config-backed K3 predictors populate these with BF16.
+    std::optional<Precision> latent_moe_projection_weight;
+    std::optional<Precision> latent_moe_projection_activation;
+    std::optional<Precision> shared_expert_weight;
+    std::optional<Precision> shared_expert_activation;
     std::optional<Precision> router_weight;
     std::optional<Precision> router_activation;
     std::optional<Precision> dense_weight;
     std::optional<Precision> dense_activation;
+    // Empty means use the legacy `router` family dtype.  Config-backed
+    // predictors always populate this with router_compute_precision().
+    std::optional<Precision> router_compute;
 };
 
 [[nodiscard]] double predict_output_projection_ms(
@@ -386,7 +443,8 @@ predict_moe_lanes(const DeviceCeilings &device, const AnalyticalConfig &config,
     std::uint64_t hidden_size, std::uint64_t routed_tokens,
     std::uint64_t attention_tp_size, std::uint64_t moe_tp_size,
     std::uint64_t expert_parallel_size, std::uint64_t data_parallel_size,
-    bool has_pipeline_boundary, double element_bytes);
+    bool has_pipeline_boundary, double element_bytes,
+    std::uint64_t routed_hidden_size = 0);
 
 } // namespace detail
 
@@ -412,25 +470,27 @@ class AnalyticalRooflineExecutionTimePredictor final
     predict_stage_execution_time(const entities::Batch &batch,
                                  const std::vector<entities::Request> &requests,
                                  StageId stage_id) const override;
-    [[nodiscard]] MoEGroupLayerPrediction predict_moe_group_layer(
-        const MoEGroupLayerInput &input) const override;
+    [[nodiscard]] MoEGroupLayerPrediction
+    predict_moe_group_layer(const MoEGroupLayerInput &input) const override;
     [[nodiscard]] bool supports_lazy_moe_prediction() const noexcept override {
         return true;
     }
-    [[nodiscard]] ExecutionTimePrediction prepare_moe_stage_execution(
-        const entities::Batch &batch,
-        const std::vector<entities::Request> &requests,
-        StageId stage_id) const override;
-    [[nodiscard]] ExecutionTimePrediction predict_moe_layer_execution(
-        const entities::Batch &batch,
-        const std::vector<entities::Request> &requests, StageId stage_id,
-        std::uint64_t local_moe_layer) const override;
+    [[nodiscard]] ExecutionTimePrediction
+    prepare_moe_stage_execution(const entities::Batch &batch,
+                                const std::vector<entities::Request> &requests,
+                                StageId stage_id) const override;
+    [[nodiscard]] ExecutionTimePrediction
+    predict_moe_layer_execution(const entities::Batch &batch,
+                                const std::vector<entities::Request> &requests,
+                                StageId stage_id,
+                                std::uint64_t local_moe_layer) const override;
 
   private:
-    [[nodiscard]] ExecutionTimePrediction predict_execution(
-        const entities::Batch &batch,
-        const std::vector<entities::Request> &requests, StageId stage_id,
-        std::optional<std::uint64_t> selected_moe_layer) const;
+    [[nodiscard]] ExecutionTimePrediction
+    predict_execution(const entities::Batch &batch,
+                      const std::vector<entities::Request> &requests,
+                      StageId stage_id,
+                      std::optional<std::uint64_t> selected_moe_layer) const;
 
     config::AnalyticalExecutionModelConfig config_;
     detail::DeviceCeilings device_;

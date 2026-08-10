@@ -8,6 +8,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
@@ -87,6 +88,28 @@ void validate_inputs(
     }
 }
 
+double precision_dtype_size_bytes(std::string_view precision) {
+    if (precision == "fp32") {
+        return 4.0;
+    }
+    if (precision == "fp16" || precision == "bf16") {
+        return 2.0;
+    }
+    if (precision == "fp8" || precision == "int8") {
+        return 1.0;
+    }
+    if (precision == "mxfp8") {
+        return 1.0 + 1.0 / 32.0;
+    }
+    if (precision == "fp4" || precision == "int4") {
+        return 0.5;
+    }
+    if (precision == "mxfp4") {
+        return 0.5 + 1.0 / 32.0;
+    }
+    throw SimulationError("unsupported precision: " + std::string{precision});
+}
+
 double kv_cache_dtype_size_bytes(const config::ClusterRuntimeConfig &runtime,
                                  const config::SimulationConfig &config) {
     if (config.system_architecture ==
@@ -98,21 +121,8 @@ double kv_cache_dtype_size_bytes(const config::ClusterRuntimeConfig &runtime,
         // historical simulator contract uses BF16-sized KV by default.
         return 2.0;
     }
-    const std::string &precision =
-        runtime.execution_model.analytical.kv_cache_precision();
-    if (precision == "fp32") {
-        return 4.0;
-    }
-    if (precision == "fp16" || precision == "bf16") {
-        return 2.0;
-    }
-    if (precision == "fp8" || precision == "int8") {
-        return 1.0;
-    }
-    if (precision == "fp4" || precision == "int4") {
-        return 0.5;
-    }
-    throw SimulationError("unsupported KV-cache precision: " + precision);
+    return precision_dtype_size_bytes(
+        runtime.execution_model.analytical.kv_cache_precision());
 }
 
 std::optional<std::uint64_t>
@@ -153,11 +163,17 @@ Simulator::Simulator(
 
     if (is_pdd) {
         const config::PddClustersConfig &clusters = config_.pdd().clusters;
+        // Config parsing validates the PREFILL/DECODE KDA snapshot contract;
+        // resolve the same common dtype here so transfer accounting never
+        // silently trusts PREFILL when a caller supplies an in-memory config.
+        const double kda_snapshot_dtype_size_bytes =
+            config::resolve_pdd_kda_snapshot_dtype_size_bytes(clusters);
         kv_cache_transfer_predictor_ =
             kv_cache_transfer::make_kv_cache_transfer_predictor(
                 config_.pdd().kv_cache_transfer,
                 clusters.decode.parallelism.tensor_parallel_size,
-                clusters.decode.parallelism.decode_context_parallel_size);
+                clusters.decode.parallelism.decode_context_parallel_size,
+                kda_snapshot_dtype_size_bytes);
         clusters_.emplace(
             ClusterType::kPrefill,
             entities::Cluster{ClusterType::kPrefill, clusters.prefill});

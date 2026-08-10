@@ -86,6 +86,8 @@ make_dense_model(const config::ModelConfig &model,
     result.gated_mlp = model.gated_mlp;
     result.fused_add_norm = model.fused_add_norm;
     result.use_mla = model.use_mla;
+    result.mla_use_output_gate = model.mla_use_output_gate;
+    result.mla_use_nope = model.mla_use_nope;
     result.use_mfa = model.use_mfa;
     result.q_lora_rank = model.q_lora_rank;
     result.kv_lora_rank = model.kv_lora_rank;
@@ -96,6 +98,19 @@ make_dense_model(const config::ModelConfig &model,
     result.share_q_dim = model.share_q_dim;
     result.decode_context_parallel_size =
         parallelism.decode_context_parallel_size;
+    // KDA is selected per logical layer in predict_execution.  Keep the
+    // dimensions in the compact detail model even when this particular
+    // invocation represents an MLA layer so a stage can cheaply switch
+    // variants without rebuilding model metadata.
+    result.kda_num_heads = model.kda_num_heads;
+    result.kda_num_k_heads = model.kda_num_k_heads;
+    result.kda_num_v_heads = model.kda_num_v_heads;
+    result.kda_key_head_dim = model.kda_key_head_dim;
+    result.kda_value_head_dim = model.kda_value_head_dim;
+    result.kda_head_dim = model.kda_head_dim;
+    result.kda_short_conv_kernel_size = model.kda_short_conv_kernel_size;
+    result.kda_conv_state_dim = model.kda_conv_state_dim;
+    result.attn_res_block_size = model.attn_res_block_size;
     return result;
 }
 
@@ -107,8 +122,9 @@ detail::DenseOperatorPrecisions make_dense_operator_precisions(
         detail::precision_from_string(config.kv_cache_precision()),
         detail::precision_from_string(config.attention_weight_precision()),
         detail::precision_from_string(config.attention_activation_precision()),
-        detail::precision_from_string(config.dense_weight_precision()),
-        detail::precision_from_string(config.dense_activation_precision()),
+        detail::precision_from_string(config.dense_mlp_weight_precision()),
+        detail::precision_from_string(config.dense_mlp_activation_precision()),
+        detail::precision_from_string(config.kda_snapshot_precision()),
     };
 }
 
@@ -120,6 +136,9 @@ detail::MoEModel make_moe_model(const config::ModelConfig &model,
     result.model_num_experts = model.num_experts;
     result.num_shared_experts = model.num_shared_experts;
     result.moe_tensor_parallel_size = parallelism.moe_tensor_parallel_size;
+    result.routed_expert_hidden_size = model.routed_expert_hidden_size;
+    result.latent_moe_use_norm = model.latent_moe_use_norm;
+    result.attn_res_block_size = model.attn_res_block_size;
     result.gated_mlp = model.gated_mlp;
     result.fused_add_norm = model.fused_add_norm;
     return result;
@@ -127,17 +146,40 @@ detail::MoEModel make_moe_model(const config::ModelConfig &model,
 
 detail::MoEOperatorPrecisions make_moe_operator_precisions(
     const config::AnalyticalExecutionModelConfig &config) {
-    return detail::MoEOperatorPrecisions{
-        detail::precision_from_string(config.moe_expert_precision()),
-        detail::precision_from_string(config.moe_router_precision()),
-        detail::precision_from_string(config.dense_precision()),
-        detail::precision_from_string(config.moe_expert_weight_precision()),
-        detail::precision_from_string(config.moe_expert_activation_precision()),
-        detail::precision_from_string(config.moe_router_weight_precision()),
-        detail::precision_from_string(config.moe_router_activation_precision()),
-        detail::precision_from_string(config.dense_weight_precision()),
-        detail::precision_from_string(config.dense_activation_precision()),
-    };
+    // Router storage and compute dtypes are intentionally independent.  K3
+    // reads BF16 weights/inputs and performs the router GEMM, logits, and
+    // top-k work in FP32; conversion is assumed fused into those kernels.
+    detail::MoEOperatorPrecisions result{};
+    result.expert =
+        detail::precision_from_string(config.moe_expert_precision());
+    result.router =
+        detail::precision_from_string(config.moe_router_precision());
+    result.dense = detail::precision_from_string(config.dense_precision());
+    result.shared_expert = detail::precision_from_string(
+        config.shared_expert_weight_precision());
+    result.expert_weight = detail::precision_from_string(
+        config.routed_expert_weight_precision());
+    result.expert_activation = detail::precision_from_string(
+        config.routed_expert_activation_precision());
+    result.latent_moe_projection_weight = detail::precision_from_string(
+        config.latent_moe_projection_weight_precision());
+    result.latent_moe_projection_activation = detail::precision_from_string(
+        config.latent_moe_projection_activation_precision());
+    result.shared_expert_weight = detail::precision_from_string(
+        config.shared_expert_weight_precision());
+    result.shared_expert_activation = detail::precision_from_string(
+        config.shared_expert_activation_precision());
+    result.router_weight = detail::precision_from_string(
+        config.router_weight_storage_precision());
+    result.router_activation = detail::precision_from_string(
+        config.moe_router_activation_precision());
+    result.dense_weight =
+        detail::precision_from_string(config.dense_weight_precision());
+    result.dense_activation =
+        detail::precision_from_string(config.dense_activation_precision());
+    result.router_compute =
+        detail::precision_from_string(config.router_compute_precision());
+    return result;
 }
 
 double total_attention_layer_compute_ms(const detail::DenseLayerTimes &layer) {
@@ -145,7 +187,8 @@ double total_attention_layer_compute_ms(const detail::DenseLayerTimes &layer) {
            layer.attention_post_projection_ms + layer.rope_ms +
            layer.kv_cache_save_ms + layer.attention_norm_ms +
            layer.attention_inter_norm_ms + layer.attention_wq_projection_ms +
-           layer.prefill_attention_ms + layer.decode_attention_ms;
+           layer.prefill_attention_ms + layer.decode_attention_ms +
+           layer.attn_res_ms;
 }
 
 std::uint64_t activation_payload_bytes(std::uint64_t tokens,
@@ -199,10 +242,12 @@ void add_critical_moe_layer_time(entities::ExecutionTime &execution_time,
         critical_layer.gating_routing_topk_ms;
     execution_time.moe_grouped_gemm_ms +=
         critical_layer.grouped_up_projection_ms +
-        critical_layer.grouped_down_projection_ms;
+        critical_layer.grouped_down_projection_ms +
+        critical_layer.latent_projection_ms;
     execution_time.moe_shuffling_ms += critical_layer.shuffling_ms;
     execution_time.moe_post_attention_norm_ms +=
-        critical_layer.post_attention_norm_ms + 2.0 * residual_add_ms;
+        critical_layer.post_attention_norm_ms + critical_layer.latent_norm_ms +
+        critical_layer.attn_res_ms + 2.0 * residual_add_ms;
 }
 
 struct MoEStagePrediction {
@@ -210,11 +255,63 @@ struct MoEStagePrediction {
     std::vector<std::pair<std::string, double>> diagnostics;
     std::vector<MoERoutingDiagnostic> routing_diagnostics;
     std::uint64_t logical_moe_layer_count = 0;
+    std::vector<ScaledMoEAttentionGroup> scaled_attention_groups;
     double repeated_moe_layer_pre_compute_ms = 0.0;
-    double repeated_moe_layer_pre_tp_communication_ms = 0.0;
     double suffix_compute_ms = 0.0;
     double suffix_tp_communication_ms = 0.0;
 };
+
+ScaledMoEAttentionFamily
+scaled_attention_family(const config::ModelConfig &model,
+                        std::uint64_t model_layer) noexcept {
+    if (model.has_kda() && model.is_kda_layer(model_layer)) {
+        return ScaledMoEAttentionFamily::kKda;
+    }
+    if (model.use_mla) {
+        return ScaledMoEAttentionFamily::kMla;
+    }
+    return ScaledMoEAttentionFamily::kStandard;
+}
+
+void add_scaled_attention_layer(
+    std::vector<ScaledMoEAttentionGroup> &groups,
+    ScaledMoEAttentionFamily family, double pre_moe_compute_ms,
+    double pre_moe_tp_communication_ms) {
+    const auto position = std::find_if(
+        groups.begin(), groups.end(), [family](const auto &group) {
+            return group.family == family;
+        });
+    if (position == groups.end()) {
+        groups.push_back(ScaledMoEAttentionGroup{
+            family, 1, pre_moe_compute_ms, pre_moe_tp_communication_ms});
+        return;
+    }
+    ++position->layer_count;
+    // The analytical roofline uses one representative prediction per
+    // attention family.  Fail fast if a future layer-dependent operator is
+    // accidentally folded into this compression mode.
+    const double tolerance =
+        1e-12 * std::max({1.0, std::abs(position->pre_moe_compute_ms_per_layer),
+                          std::abs(pre_moe_compute_ms)});
+    if (std::abs(position->pre_moe_compute_ms_per_layer -
+                 pre_moe_compute_ms) > tolerance) {
+        throw ExecutionTimePredictorError(
+            "first_layer_scaled requires identical attention time within "
+            "each attention family");
+    }
+    const double communication_tolerance =
+        1e-12 * std::max(
+                    {1.0,
+                     std::abs(
+                         position->pre_moe_tp_communication_ms_per_layer),
+                     std::abs(pre_moe_tp_communication_ms)});
+    if (std::abs(position->pre_moe_tp_communication_ms_per_layer -
+                 pre_moe_tp_communication_ms) > communication_tolerance) {
+        throw ExecutionTimePredictorError(
+            "first_layer_scaled requires identical attention communication "
+            "within each attention family");
+    }
+}
 
 struct MoEStageContext {
     ClusterType cluster_type;
@@ -226,35 +323,52 @@ struct MoEStageContext {
     const config::MoeRoutingConfig &routing;
     const cc_backend::BaseCCBackend &communication_backend;
     config::PipelineStageLayerRange stage_layers;
-    const detail::DenseLayerTimes &dense_layer;
+    const std::vector<detail::DenseLayerTimes> &layer_times;
     double allreduce_ms;
     double dcp_attention_communication_ms;
     double communication_element_bytes;
     entities::ExecutionTime base_execution_time;
 
-    [[nodiscard]] double dense_layer_compute_ms() const noexcept {
-        return dense_layer.total_ms();
+    [[nodiscard]] const detail::DenseLayerTimes &
+    layer_time(std::uint64_t model_layer) const noexcept {
+        return layer_times[static_cast<std::size_t>(model_layer -
+                                                    stage_layers.begin)];
     }
 
-    [[nodiscard]] double attention_compute_ms() const noexcept {
-        return total_attention_layer_compute_ms(dense_layer);
+    [[nodiscard]] double
+    dense_layer_compute_ms(std::uint64_t model_layer) const noexcept {
+        return layer_time(model_layer).total_ms();
     }
 
-    [[nodiscard]] double tp_layer_ms() const noexcept {
-        return 2.0 * allreduce_ms + dcp_attention_communication_ms;
+    [[nodiscard]] double
+    attention_compute_ms(std::uint64_t model_layer) const noexcept {
+        return total_attention_layer_compute_ms(layer_time(model_layer));
     }
 
-    [[nodiscard]] double attention_communication_ms() const noexcept {
-        return allreduce_ms + dcp_attention_communication_ms;
+    [[nodiscard]] bool is_mla_layer(std::uint64_t model_layer) const noexcept {
+        return !(model.has_kda() && model.is_kda_layer(model_layer));
+    }
+
+    [[nodiscard]] double tp_layer_ms(std::uint64_t model_layer) const noexcept {
+        return 2.0 * allreduce_ms + (is_mla_layer(model_layer)
+                                         ? dcp_attention_communication_ms
+                                         : 0.0);
+    }
+
+    [[nodiscard]] double
+    attention_communication_ms(std::uint64_t model_layer) const noexcept {
+        return allreduce_ms + (is_mla_layer(model_layer)
+                                   ? dcp_attention_communication_ms
+                                   : 0.0);
     }
 };
 
-MoEStagePrediction predict_selected_moe_layer_execution(
-    const MoEStageContext &context, std::uint64_t selected_moe_layer) {
+MoEStagePrediction
+predict_selected_moe_layer_execution(const MoEStageContext &context,
+                                     std::uint64_t selected_moe_layer) {
     const StageBatchInfo &batch_info = context.batch_info;
     const config::ParallelismConfig &parallelism = context.parallelism;
     const config::ModelConfig &model = context.model;
-    const detail::DenseLayerTimes &dense_layer = context.dense_layer;
     MoEStagePrediction result{};
     result.execution_time = context.base_execution_time;
     result.execution_time.dense_compute_ms = 0.0;
@@ -279,25 +393,26 @@ MoEStagePrediction predict_selected_moe_layer_execution(
     for (std::uint64_t model_layer = context.stage_layers.begin;
          model_layer < context.stage_layers.end; ++model_layer) {
         if (!model.is_moe_layer(model_layer)) {
-            pending_dense_compute_ms += context.dense_layer_compute_ms();
-            pending_tp_communication_ms += context.tp_layer_ms();
+            pending_dense_compute_ms +=
+                context.dense_layer_compute_ms(model_layer);
+            pending_tp_communication_ms += context.tp_layer_ms(model_layer);
             continue;
         }
         ++result.logical_moe_layer_count;
         if (local_moe_layer == selected_moe_layer) {
             const double pre_moe_compute_ms =
-                pending_dense_compute_ms + context.attention_compute_ms();
+                pending_dense_compute_ms +
+                context.attention_compute_ms(model_layer);
             const double pre_moe_tp_communication_ms =
                 pending_tp_communication_ms +
-                context.attention_communication_ms();
+                context.attention_communication_ms(model_layer);
             result.execution_time.dense_compute_ms += pre_moe_compute_ms;
             result.execution_time.tp_communication_ms +=
                 pre_moe_tp_communication_ms;
             const detail::RoutingAllocation allocation = detail::route_tokens(
                 batch_info.dense_batch.total_tokens, model.router_topk,
-                model.total_expert_num,
-                parallelism.moe_expert_parallel_size, context.routing,
-                model_layer);
+                model.total_expert_num, parallelism.moe_expert_parallel_size,
+                context.routing, model_layer);
             const detail::MoELanePrediction lane_prediction =
                 detail::predict_moe_lanes(
                     context.device, detail::AnalyticalConfig{}, moe_model,
@@ -306,16 +421,16 @@ MoEStagePrediction predict_selected_moe_layer_execution(
                 local_moe_layer, model_layer, pre_moe_compute_ms,
                 pre_moe_tp_communication_ms, allocation, lane_prediction));
             const detail::MoELayerTime &critical =
-                lane_prediction.lane_times.at(static_cast<std::size_t>(
-                    lane_prediction.critical_lane));
-            add_critical_moe_layer_time(result.execution_time, critical,
-                                        dense_layer.residual_add_ms);
+                lane_prediction.lane_times.at(
+                    static_cast<std::size_t>(lane_prediction.critical_lane));
+            add_critical_moe_layer_time(
+                result.execution_time, critical,
+                context.layer_time(model_layer).residual_add_ms);
             result.diagnostics.emplace_back(
                 "layer_" + std::to_string(model_layer) + "_critical_lane",
                 static_cast<double>(lane_prediction.critical_lane));
             result.diagnostics.emplace_back(
-                "layer_" + std::to_string(model_layer) +
-                    "_critical_lane_ms",
+                "layer_" + std::to_string(model_layer) + "_critical_lane_ms",
                 lane_prediction.critical_lane_time_ms);
         }
         pending_dense_compute_ms = 0.0;
@@ -344,7 +459,8 @@ MoEStagePrediction predict_selected_moe_layer_execution(
             parallelism.moe_tensor_parallel_size,
             parallelism.moe_expert_parallel_size,
             parallelism.data_parallel_size, false,
-            context.communication_element_bytes);
+            context.communication_element_bytes,
+            model.routed_expert_hidden_size);
     result.execution_time.moe_tp_communication_ms =
         communication_time.moe_tp_ms;
     result.execution_time.ep_dispatch_ms = communication_time.ep_dispatch_ms;
@@ -365,9 +481,6 @@ MoEStagePrediction predict_moe_stage_execution(const MoEStageContext &context) {
     const config::ModelConfig &model = context.model;
     const config::MoeRoutingConfig &routing = context.routing;
     const config::PipelineStageLayerRange &stage_layers = context.stage_layers;
-    const detail::DenseLayerTimes &dense_layer = context.dense_layer;
-    const double dense_layer_compute_ms = context.dense_layer_compute_ms();
-    const double attention_compute_ms = context.attention_compute_ms();
     MoEStagePrediction result{};
     result.execution_time = context.base_execution_time;
     result.execution_time.dense_compute_ms = 0.0;
@@ -394,23 +507,35 @@ MoEStagePrediction predict_moe_stage_execution(const MoEStageContext &context) {
                     "first_layer_scaled requires a contiguous MoE suffix "
                     "within each pipeline stage");
             }
-            result.execution_time.dense_compute_ms += dense_layer_compute_ms;
-            result.execution_time.tp_communication_ms += context.tp_layer_ms();
-            pending_pre_moe_compute_ms += dense_layer_compute_ms;
-            pending_pre_moe_tp_communication_ms += context.tp_layer_ms();
+            result.execution_time.dense_compute_ms +=
+                context.dense_layer_compute_ms(model_layer);
+            result.execution_time.tp_communication_ms +=
+                context.tp_layer_ms(model_layer);
+            pending_pre_moe_compute_ms +=
+                context.dense_layer_compute_ms(model_layer);
+            pending_pre_moe_tp_communication_ms +=
+                context.tp_layer_ms(model_layer);
             continue;
         }
+        const double attention_compute_ms =
+            context.attention_compute_ms(model_layer);
         result.execution_time.dense_compute_ms += attention_compute_ms;
         result.execution_time.tp_communication_ms +=
-            context.attention_communication_ms();
+            context.attention_communication_ms(model_layer);
         ++result.logical_moe_layer_count;
         if (first_layer_scaled && repeated_lane_prediction.has_value()) {
+            add_scaled_attention_layer(
+                result.scaled_attention_groups,
+                scaled_attention_family(model, model_layer),
+                attention_compute_ms,
+                context.attention_communication_ms(model_layer));
             const detail::MoELayerTime &critical =
                 repeated_lane_prediction->lane_times.at(
                     static_cast<std::size_t>(
                         repeated_lane_prediction->critical_lane));
-            add_critical_moe_layer_time(result.execution_time, critical,
-                                        dense_layer.residual_add_ms);
+            add_critical_moe_layer_time(
+                result.execution_time, critical,
+                context.layer_time(model_layer).residual_add_ms);
             continue;
         }
         pending_pre_moe_compute_ms += attention_compute_ms;
@@ -425,12 +550,13 @@ MoEStagePrediction predict_moe_stage_execution(const MoEStageContext &context) {
         result.routing_diagnostics.push_back(make_moe_routing_diagnostic(
             moe_layer_index, model_layer, pending_pre_moe_compute_ms,
             pending_pre_moe_tp_communication_ms +
-                context.attention_communication_ms(),
+                context.attention_communication_ms(model_layer),
             allocation, lane_prediction));
         const detail::MoELayerTime &critical = lane_prediction.lane_times.at(
             static_cast<std::size_t>(lane_prediction.critical_lane));
-        add_critical_moe_layer_time(result.execution_time, critical,
-                                    dense_layer.residual_add_ms);
+        add_critical_moe_layer_time(
+            result.execution_time, critical,
+            context.layer_time(model_layer).residual_add_ms);
         result.diagnostics.emplace_back(
             "layer_" + std::to_string(model_layer) + "_critical_lane",
             static_cast<double>(lane_prediction.critical_lane));
@@ -443,8 +569,6 @@ MoEStagePrediction predict_moe_stage_execution(const MoEStageContext &context) {
         if (first_layer_scaled) {
             repeated_lane_prediction = lane_prediction;
             result.repeated_moe_layer_pre_compute_ms = attention_compute_ms;
-            result.repeated_moe_layer_pre_tp_communication_ms =
-                context.attention_communication_ms();
         }
     }
     result.suffix_compute_ms = pending_pre_moe_compute_ms;
@@ -459,7 +583,8 @@ MoEStagePrediction predict_moe_stage_execution(const MoEStageContext &context) {
             parallelism.moe_tensor_parallel_size,
             parallelism.moe_expert_parallel_size,
             parallelism.data_parallel_size, false,
-            context.communication_element_bytes);
+            context.communication_element_bytes,
+            model.routed_expert_hidden_size);
     const double moe_layers =
         static_cast<double>(result.logical_moe_layer_count);
     result.execution_time.moe_tp_communication_ms =
@@ -481,13 +606,21 @@ double
 kv_cache_bytes_per_token_per_layer(const config::ModelConfig &model,
                                    detail::Precision kv_cache_precision) {
     if (model.use_mla) {
-        return attention::mla_kv_cache_bytes_per_token(
-            attention::MlaKvCacheLayout{
+        const double bytes =
+            attention::mla_kv_cache_bytes_per_token(attention::MlaKvCacheLayout{
                 model.kv_lora_rank,
                 model.qk_rope_head_dim,
                 detail::bytes_per_element(kv_cache_precision),
                 2.0,
             });
+        // Hybrid KDA/MLA models only materialize latent KV entries on MLA
+        // layers.  Report an average per logical layer for diagnostics and
+        // transfer accounting; legacy flat MLA models retain the exact value.
+        if (model.has_kda() && model.num_layers != 0) {
+            return bytes * static_cast<double>(model.num_mla_layers) /
+                   static_cast<double>(model.num_layers);
+        }
+        return bytes;
     }
     return static_cast<double>(model.runtime_num_kv_heads()) *
            static_cast<double>(model.runtime_head_size()) *
@@ -543,6 +676,7 @@ AnalyticalRooflineExecutionTimePredictor::
       device_(detail::DeviceCeilings::from_config(config_)),
       parallelism_(parallelism), model_(std::move(model)), routing_(routing),
       communication_backend_(std::move(communication_backend)) {
+    config::apply_model_native_precision_defaults(config_, model_);
     if (parallelism_.tensor_parallel_size == 0) {
         parallelism_.tensor_parallel_size = config_.tensor_parallel_size;
     }
@@ -566,10 +700,20 @@ AnalyticalRooflineExecutionTimePredictor::
         !supported_precision(config_.attention_activation_precision()) ||
         !supported_precision(config_.dense_weight_precision()) ||
         !supported_precision(config_.dense_activation_precision()) ||
-        !supported_precision(config_.moe_expert_weight_precision()) ||
-        !supported_precision(config_.moe_expert_activation_precision()) ||
-        !supported_precision(config_.moe_router_weight_precision()) ||
+        !supported_precision(config_.routed_expert_weight_precision()) ||
+        !supported_precision(config_.routed_expert_activation_precision()) ||
+        !supported_precision(
+            config_.latent_moe_projection_weight_precision()) ||
+        !supported_precision(
+            config_.latent_moe_projection_activation_precision()) ||
+        !supported_precision(config_.shared_expert_weight_precision()) ||
+        !supported_precision(config_.shared_expert_activation_precision()) ||
+        !supported_precision(config_.dense_mlp_weight_precision()) ||
+        !supported_precision(config_.dense_mlp_activation_precision()) ||
+        !supported_precision(config_.router_weight_storage_precision()) ||
         !supported_precision(config_.moe_router_activation_precision()) ||
+        !supported_precision(config_.router_compute_precision()) ||
+        !supported_precision(config_.kda_snapshot_precision()) ||
         !supported_precision(config_.lm_head_weight_precision()) ||
         !supported_precision(config_.lm_head_activation_precision()) ||
         (config_.moe_layer_event_mode != "detailed" &&
@@ -687,9 +831,39 @@ AnalyticalRooflineExecutionTimePredictor::predict_execution(
         make_dense_operator_precisions(config_);
     const detail::Precision communication_precision =
         detail::precision_from_string(config_.communication_precision());
-    const detail::DenseLayerTimes layer = detail::predict_dense_layer(
-        device_, detail::AnalyticalConfig{},
-        make_dense_model(model_, parallelism_), dense_batch, dense_precisions);
+    const config::PipelineStageLayerRange stage_layers =
+        config::pipeline_stage_layer_range(model_.num_layers,
+                                           parallelism_.pipeline_parallel_size,
+                                           stage_id.index());
+    detail::DenseModel dense_model = make_dense_model(model_, parallelism_);
+    std::vector<detail::DenseLayerTimes> layer_times;
+    layer_times.reserve(static_cast<std::size_t>(stage_layers.size()));
+    std::optional<detail::DenseLayerTimes> standard_layer_times;
+    std::optional<detail::DenseLayerTimes> mla_layer_times;
+    std::optional<detail::DenseLayerTimes> kda_layer_times;
+    for (std::uint64_t model_layer = stage_layers.begin;
+         model_layer < stage_layers.end; ++model_layer) {
+        dense_model.use_kda =
+            model_.has_kda() && model_.is_kda_layer(model_layer);
+        // KDA and MLA are mutually exclusive attention implementations on a
+        // logical layer.  Existing non-hybrid MLA models retain the old path.
+        dense_model.use_mla = !dense_model.use_kda && model_.use_mla;
+        std::optional<detail::DenseLayerTimes> *representative =
+            dense_model.use_kda
+                ? &kda_layer_times
+                : (dense_model.use_mla ? &mla_layer_times
+                                       : &standard_layer_times);
+        if (!representative->has_value()) {
+            *representative = detail::predict_dense_layer(
+                device_, detail::AnalyticalConfig{}, dense_model, dense_batch,
+                dense_precisions);
+        }
+        layer_times.push_back(representative->value());
+    }
+    if (layer_times.empty()) {
+        throw ExecutionTimePredictorError(
+            "analytical stage has no logical layers");
+    }
 
     const double communication_element_bytes =
         detail::bytes_per_element(communication_precision);
@@ -702,9 +876,13 @@ AnalyticalRooflineExecutionTimePredictor::predict_execution(
                   activation_bytes, parallelism_.tensor_parallel_size, true)
             : 0.0;
     double dcp_attention_communication_ms = 0.0;
-    if (model_.use_mla &&
-        parallelism_.decode_context_parallel_size > 1 &&
-        !dense_batch.decode_requests.empty()) {
+    if (model_.use_mla && parallelism_.decode_context_parallel_size > 1 &&
+        !dense_batch.decode_requests.empty() &&
+        std::any_of(layer_times.begin(), layer_times.end(),
+                    [](const detail::DenseLayerTimes &times) {
+                        return times.kda_projection_ms == 0.0 &&
+                               times.kda_recurrent_ms == 0.0;
+                    })) {
         const std::uint64_t local_query_heads =
             model_.num_query_heads / parallelism_.tensor_parallel_size;
         std::uint64_t decode_tokens = 0;
@@ -713,9 +891,8 @@ AnalyticalRooflineExecutionTimePredictor::predict_execution(
             decode_tokens += request.query_tokens;
         }
         const std::uint64_t query_bytes = activation_payload_bytes(
-            decode_tokens, local_query_heads *
-                               (model_.kv_lora_rank +
-                                model_.qk_rope_head_dim),
+            decode_tokens,
+            local_query_heads * (model_.kv_lora_rank + model_.qk_rope_head_dim),
             communication_element_bytes);
         const std::uint64_t gathered_output_bytes = activation_payload_bytes(
             decode_tokens,
@@ -724,24 +901,30 @@ AnalyticalRooflineExecutionTimePredictor::predict_execution(
             communication_element_bytes);
         dcp_attention_communication_ms =
             communication_backend_->allgather_ms(
-                query_bytes, parallelism_.decode_context_parallel_size,
-                true) +
+                query_bytes, parallelism_.decode_context_parallel_size, true) +
             communication_backend_->reduce_scatter_ms(
                 gathered_output_bytes,
                 parallelism_.decode_context_parallel_size, true);
     }
-    const double dense_layer_compute_ms = layer.total_ms();
-    const double tp_layer_ms =
-        2.0 * allreduce_ms + dcp_attention_communication_ms;
-    const config::PipelineStageLayerRange stage_layers =
-        config::pipeline_stage_layer_range(model_.num_layers,
-                                           parallelism_.pipeline_parallel_size,
-                                           stage_id.index());
     const std::uint64_t layers_per_stage = stage_layers.size();
-    double dense_compute_ms =
-        static_cast<double>(layers_per_stage) * dense_layer_compute_ms;
-    double tp_communication_ms =
-        static_cast<double>(layers_per_stage) * tp_layer_ms;
+    double dense_compute_ms = 0.0;
+    double tp_communication_ms = 0.0;
+    for (std::size_t index = 0; index < layer_times.size(); ++index) {
+        dense_compute_ms += layer_times[index].total_ms();
+        const std::uint64_t model_layer =
+            stage_layers.begin + static_cast<std::uint64_t>(index);
+        const bool kda_layer =
+            model_.has_kda() && model_.is_kda_layer(model_layer);
+        tp_communication_ms +=
+            2.0 * allreduce_ms +
+            (kda_layer ? 0.0 : dcp_attention_communication_ms);
+    }
+    const double first_layer_compute_ms = layer_times.front().total_ms();
+    const double first_tp_layer_ms =
+        2.0 * allreduce_ms +
+        ((model_.has_kda() && model_.is_kda_layer(stage_layers.begin))
+             ? 0.0
+             : dcp_attention_communication_ms);
     const double pp_communication_ms =
         stage_id.index() + 1 < parallelism_.pipeline_parallel_size
             ? communication_backend_->point_to_point_ms(activation_bytes, true)
@@ -766,8 +949,8 @@ AnalyticalRooflineExecutionTimePredictor::predict_execution(
     std::vector<std::pair<std::string, double>> moe_diagnostics;
     std::vector<MoERoutingDiagnostic> routing_diagnostics;
     std::uint64_t logical_moe_layer_count = 0;
+    std::vector<ScaledMoEAttentionGroup> scaled_moe_attention_groups;
     double repeated_moe_layer_pre_compute_ms = 0.0;
-    double repeated_moe_layer_pre_tp_communication_ms = 0.0;
     double moe_suffix_compute_ms = 0.0;
     double moe_suffix_tp_communication_ms = 0.0;
     if (model_.is_moe()) {
@@ -781,7 +964,7 @@ AnalyticalRooflineExecutionTimePredictor::predict_execution(
             routing_,
             *communication_backend_,
             stage_layers,
-            layer,
+            layer_times,
             allreduce_ms,
             dcp_attention_communication_ms,
             communication_element_bytes,
@@ -796,10 +979,10 @@ AnalyticalRooflineExecutionTimePredictor::predict_execution(
         moe_diagnostics = moe_prediction.diagnostics;
         routing_diagnostics = moe_prediction.routing_diagnostics;
         logical_moe_layer_count = moe_prediction.logical_moe_layer_count;
+        scaled_moe_attention_groups =
+            std::move(moe_prediction.scaled_attention_groups);
         repeated_moe_layer_pre_compute_ms =
             moe_prediction.repeated_moe_layer_pre_compute_ms;
-        repeated_moe_layer_pre_tp_communication_ms =
-            moe_prediction.repeated_moe_layer_pre_tp_communication_ms;
         moe_suffix_compute_ms = moe_prediction.suffix_compute_ms;
         moe_suffix_tp_communication_ms =
             moe_prediction.suffix_tp_communication_ms;
@@ -820,13 +1003,34 @@ AnalyticalRooflineExecutionTimePredictor::predict_execution(
         throw ExecutionTimePredictorError(
             "analytical stage duration is invalid");
     }
+    std::uint64_t kda_layer_count = 0;
+    for (std::uint64_t model_layer = stage_layers.begin;
+         model_layer < stage_layers.end; ++model_layer) {
+        kda_layer_count += static_cast<std::uint64_t>(
+            model_.has_kda() && model_.is_kda_layer(model_layer));
+    }
+    std::uint64_t mla_layer_count = 0;
+    if (model_.use_mla) {
+        mla_layer_count = layers_per_stage - kda_layer_count;
+    }
+    double kda_projection_ms = 0.0;
+    double kda_short_conv_ms = 0.0;
+    double kda_recurrent_ms = 0.0;
+    double kda_gate_norm_ms = 0.0;
+    double attn_res_ms = 0.0;
+    for (const detail::DenseLayerTimes &times : layer_times) {
+        kda_projection_ms += times.kda_projection_ms;
+        kda_short_conv_ms += times.kda_short_conv_ms;
+        kda_recurrent_ms += times.kda_recurrent_ms;
+        kda_gate_norm_ms += times.kda_gate_norm_ms;
+        attn_res_ms += times.attn_res_ms;
+    }
     const double kv_cache_bytes_per_token =
         kv_cache_bytes_per_token_per_layer(model_, dense_precisions.kv_cache);
     const double kv_cache_rank_local_bytes_per_token =
         model_.use_mla
             ? kv_cache_bytes_per_token /
-                  static_cast<double>(
-                      parallelism_.decode_context_parallel_size)
+                  static_cast<double>(parallelism_.decode_context_parallel_size)
             : kv_cache_bytes_per_token;
 
     ExecutionTimePrediction result{};
@@ -842,7 +1046,10 @@ AnalyticalRooflineExecutionTimePredictor::predict_execution(
             "decode_request_count",
             static_cast<double>(dense_batch.decode_requests.size()),
         },
-        {"dense_layer_compute_ms", dense_layer_compute_ms},
+        // Retain the historical single-layer diagnostic as the first logical
+        // layer, and expose stage sums/counts for heterogeneous KDA/MLA
+        // schedules.
+        {"dense_layer_compute_ms", first_layer_compute_ms},
         {"attention_weight_element_bytes",
          detail::bytes_per_element(*dense_precisions.attention_weight)},
         {"attention_activation_element_bytes",
@@ -851,6 +1058,36 @@ AnalyticalRooflineExecutionTimePredictor::predict_execution(
          detail::bytes_per_element(*dense_precisions.dense_weight)},
         {"dense_activation_element_bytes",
          detail::bytes_per_element(*dense_precisions.dense_activation)},
+        {"routed_expert_weight_element_bytes",
+         detail::bytes_per_element(detail::precision_from_string(
+             config_.routed_expert_weight_precision()))},
+        {"routed_expert_activation_element_bytes",
+         detail::bytes_per_element(detail::precision_from_string(
+             config_.routed_expert_activation_precision()))},
+        {"latent_moe_projection_weight_element_bytes",
+         detail::bytes_per_element(detail::precision_from_string(
+             config_.latent_moe_projection_weight_precision()))},
+        {"latent_moe_projection_activation_element_bytes",
+         detail::bytes_per_element(detail::precision_from_string(
+             config_.latent_moe_projection_activation_precision()))},
+        {"shared_expert_weight_element_bytes",
+         detail::bytes_per_element(detail::precision_from_string(
+             config_.shared_expert_weight_precision()))},
+        {"shared_expert_activation_element_bytes",
+         detail::bytes_per_element(detail::precision_from_string(
+             config_.shared_expert_activation_precision()))},
+        {"router_weight_storage_element_bytes",
+         detail::bytes_per_element(detail::precision_from_string(
+             config_.router_weight_storage_precision()))},
+        {"router_activation_storage_element_bytes",
+         detail::bytes_per_element(detail::precision_from_string(
+             config_.moe_router_activation_precision()))},
+        {"router_compute_element_bytes",
+         detail::bytes_per_element(detail::precision_from_string(
+             config_.router_compute_precision()))},
+        {"kda_snapshot_element_bytes",
+         detail::bytes_per_element(detail::precision_from_string(
+             config_.kda_snapshot_precision()))},
         {"kv_cache_element_bytes",
          detail::bytes_per_element(dense_precisions.kv_cache)},
         {"kv_cache_bytes_per_token_per_layer", kv_cache_bytes_per_token},
@@ -858,13 +1095,12 @@ AnalyticalRooflineExecutionTimePredictor::predict_execution(
          kv_cache_rank_local_bytes_per_token},
         {"communication_element_bytes", communication_element_bytes},
         {"tp_allreduce_ms", allreduce_ms},
-        {"dcp_attention_communication_ms",
-         dcp_attention_communication_ms},
+        {"dcp_attention_communication_ms", dcp_attention_communication_ms},
         {"decode_context_parallel_size",
          static_cast<double>(parallelism_.decode_context_parallel_size)},
         {
             "dense_layer_total_ms",
-            dense_layer_compute_ms + tp_layer_ms,
+            first_layer_compute_ms + first_tp_layer_ms,
         },
         {
             "num_layers",
@@ -872,6 +1108,18 @@ AnalyticalRooflineExecutionTimePredictor::predict_execution(
         },
         {"dense_compute_ms", dense_compute_ms},
         {"tp_communication_ms", tp_communication_ms},
+        {"kda_layer_count", static_cast<double>(kda_layer_count)},
+        {"mla_layer_count", static_cast<double>(mla_layer_count)},
+        {"kda_projection_ms", kda_projection_ms},
+        {"kda_short_conv_ms", kda_short_conv_ms},
+        {"kda_recurrent_ms", kda_recurrent_ms},
+        {"kda_gate_norm_ms", kda_gate_norm_ms},
+        {"attn_res_ms", attn_res_ms},
+        {"routed_expert_hidden_size",
+         static_cast<double>(model_.routed_expert_hidden_size)},
+        {"latent_moe_use_norm", model_.latent_moe_use_norm ? 1.0 : 0.0},
+        {"attn_res_block_size",
+         static_cast<double>(model_.attn_res_block_size)},
         {"pp_communication_ms", pp_communication_ms},
         {"lm_head_ms", execution_time.lm_head_ms},
         {"lm_head_tokens", static_cast<double>(batch_info.lm_head_tokens)},
@@ -880,10 +1128,10 @@ AnalyticalRooflineExecutionTimePredictor::predict_execution(
     };
     result.moe_routing = std::move(routing_diagnostics);
     result.logical_moe_layer_count = logical_moe_layer_count;
+    result.scaled_moe_attention_groups =
+        std::move(scaled_moe_attention_groups);
     result.repeated_moe_layer_pre_compute_ms =
         repeated_moe_layer_pre_compute_ms;
-    result.repeated_moe_layer_pre_tp_communication_ms =
-        repeated_moe_layer_pre_tp_communication_ms;
     result.moe_suffix_compute_ms = moe_suffix_compute_ms;
     result.moe_suffix_tp_communication_ms =
         moe_suffix_tp_communication_ms;
@@ -993,7 +1241,7 @@ double DenseLayerTimes::total_ms() const noexcept {
            attention_inter_norm_ms + attention_wq_projection_ms +
            prefill_attention_ms + decode_attention_ms + mlp_up_projection_ms +
            mlp_activation_ms + mlp_down_projection_ms + mlp_norm_ms +
-           2.0 * residual_add_ms;
+           2.0 * residual_add_ms + attn_res_ms;
 }
 
 Precision precision_from_string(std::string_view precision) {
@@ -1009,11 +1257,17 @@ Precision precision_from_string(std::string_view precision) {
     if (precision == "fp8") {
         return Precision::kFp8;
     }
+    if (precision == "mxfp8") {
+        return Precision::kMxFp8;
+    }
     if (precision == "int8") {
         return Precision::kInt8;
     }
     if (precision == "fp4") {
         return Precision::kFp4;
+    }
+    if (precision == "mxfp4") {
+        return Precision::kMxFp4;
     }
     if (precision == "int4") {
         return Precision::kInt4;
@@ -1032,9 +1286,15 @@ double bytes_per_element(Precision precision) noexcept {
     case Precision::kFp8:
     case Precision::kInt8:
         return 1.0;
+    case Precision::kMxFp8:
+        // One byte per value plus one E8M0 scale byte per 32-value block.
+        return 1.0 + 1.0 / 32.0;
     case Precision::kFp4:
     case Precision::kInt4:
         return 0.5;
+    case Precision::kMxFp4:
+        // Two packed values per byte plus one E8M0 scale byte per 32 values.
+        return 0.5 + 1.0 / 32.0;
     }
     return 0.0;
 }
@@ -1050,10 +1310,12 @@ double peak_tflops(const DeviceCeilings &device, Precision precision) {
         peak = device.fp16_tflops;
         break;
     case Precision::kFp8:
+    case Precision::kMxFp8:
     case Precision::kInt8:
         peak = device.fp8_tflops;
         break;
     case Precision::kFp4:
+    case Precision::kMxFp4:
     case Precision::kInt4:
         peak = device.fp4_tflops;
         break;
@@ -1130,10 +1392,21 @@ KernelWork gemm_work(std::uint64_t m, std::uint64_t k, std::uint64_t n,
                      double weight_element_bytes,
                      double activation_element_bytes,
                      std::uint64_t weight_multiplier) {
+    return gemm_work(m, k, n, weight_element_bytes, activation_element_bytes,
+                     activation_element_bytes, weight_multiplier);
+}
+
+KernelWork gemm_work(std::uint64_t m, std::uint64_t k, std::uint64_t n,
+                     double weight_element_bytes,
+                     double activation_element_bytes,
+                     double output_element_bytes,
+                     std::uint64_t weight_multiplier) {
     require_finite_nonnegative(weight_element_bytes, "weight element bytes");
     require_finite_nonnegative(activation_element_bytes,
                                "activation element bytes");
-    if (weight_element_bytes == 0.0 || activation_element_bytes == 0.0) {
+    require_finite_nonnegative(output_element_bytes, "output element bytes");
+    if (weight_element_bytes == 0.0 || activation_element_bytes == 0.0 ||
+        output_element_bytes == 0.0) {
         throw AnalyticalModelError("GEMM element bytes must be positive");
     }
     if (weight_multiplier == 0) {
@@ -1158,7 +1431,7 @@ KernelWork gemm_work(std::uint64_t m, std::uint64_t k, std::uint64_t n,
         value.hbm_bytes =
             activation_element_bytes * resolved_m * resolved_k +
             weight_element_bytes * multiplier * resolved_k * resolved_n +
-            activation_element_bytes * multiplier * resolved_m * resolved_n;
+            output_element_bytes * multiplier * resolved_m * resolved_n;
         return value;
     }();
 }
@@ -1190,8 +1463,7 @@ std::uint64_t prefill_attention_token_pairs(
         return lhs + rhs;
     };
     const auto checked_mul = [](std::uint64_t lhs, std::uint64_t rhs) {
-        if (lhs != 0 &&
-            rhs > std::numeric_limits<std::uint64_t>::max() / lhs) {
+        if (lhs != 0 && rhs > std::numeric_limits<std::uint64_t>::max() / lhs) {
             throw AnalyticalModelError(
                 "PREFILL attention token-pair count overflows uint64");
         }
@@ -1384,6 +1656,7 @@ struct DenseLayerContext {
     double dense_weight_element_bytes;
     double dense_element_bytes;
     double kv_cache_element_bytes;
+    double kda_state_element_bytes;
     std::uint64_t local_query_heads;
     std::uint64_t local_kv_heads;
     std::uint64_t local_intermediate;
@@ -1401,7 +1674,16 @@ struct AttentionLayerWork {
     KernelWork kv_cache_save{0.0, 0.0};
     KernelWork prefill_attention{0.0, 0.0};
     KernelWork decode_attention{0.0, 0.0};
+    KernelWork kda_projection{0.0, 0.0};
+    KernelWork kda_short_conv{0.0, 0.0};
+    KernelWork kda_recurrent_prefill{0.0, 0.0};
+    KernelWork kda_recurrent_decode{0.0, 0.0};
+    KernelWork kda_gate_norm{0.0, 0.0};
 };
+
+KernelWork add_kernel_work(const KernelWork &lhs, const KernelWork &rhs) {
+    return KernelWork{lhs.flops + rhs.flops, lhs.hbm_bytes + rhs.hbm_bytes};
+}
 
 std::uint64_t
 sum_query_tokens(const std::vector<AttentionRequestSlice> &requests) {
@@ -1448,10 +1730,15 @@ void validate_dense_layer_inputs(const AnalyticalConfig &config,
             "tensor parallel size must be divisible by decode context "
             "parallel size");
     }
-    if (model.decode_context_parallel_size > 1 && !model.use_mla) {
+    // Hybrid K3 reuses the same TP ranks as a DCP group only on MLA layers.
+    // A KDA layer still carries the replica-level DCP size in DenseModel, but
+    // its recurrent state and projections remain sharded solely by TP and do
+    // not issue DCP collectives.
+    if (model.decode_context_parallel_size > 1 && !model.use_mla &&
+        !model.use_kda) {
         throw AnalyticalModelError(
             "decode context parallelism is currently supported only for "
-            "MLA models");
+            "MLA or TP-only KDA layers");
     }
     if (model.use_mla &&
         (model.kv_lora_rank == 0 || model.qk_nope_head_dim == 0 ||
@@ -1465,6 +1752,33 @@ void validate_dense_layer_inputs(const AnalyticalConfig &config,
     if (model.use_mfa && (model.share_q_dim == 0 || model.num_kv_heads != 1)) {
         throw AnalyticalModelError(
             "MFA requires share_q_dim and exactly one KV head");
+    }
+    if (model.use_kda &&
+        (model.kda_num_heads == 0 || model.kda_num_k_heads == 0 ||
+         model.kda_num_v_heads == 0 || model.kda_key_head_dim == 0 ||
+         model.kda_value_head_dim == 0 || model.kda_head_dim == 0 ||
+         model.kda_short_conv_kernel_size == 0 ||
+         model.kda_conv_state_dim == 0)) {
+        throw AnalyticalModelError(
+            "KDA requires positive heads, head dimension, short-conv kernel, "
+            "and convolution state dimensions");
+    }
+    if (model.use_kda &&
+        (model.kda_num_heads != model.kda_num_k_heads ||
+         model.kda_num_heads != model.kda_num_v_heads ||
+         model.kda_head_dim != model.kda_key_head_dim ||
+         model.kda_head_dim != model.kda_value_head_dim)) {
+        throw AnalyticalModelError(
+            "KDA currently supports only symmetric Q/K/V head counts and "
+            "dimensions");
+    }
+    if (model.use_kda &&
+        (model.kda_num_heads % model.tensor_parallel_size != 0 ||
+         model.kda_num_k_heads % model.tensor_parallel_size != 0 ||
+         model.kda_num_v_heads % model.tensor_parallel_size != 0)) {
+        throw AnalyticalModelError(
+            "KDA Q/K/V head counts must be divisible by tensor parallel "
+            "size");
     }
 }
 
@@ -1493,6 +1807,7 @@ make_dense_layer_context(const DeviceCeilings &device,
         bytes_per_element(dense_weight_precision),
         bytes_per_element(dense_activation_precision),
         bytes_per_element(precisions.kv_cache),
+        bytes_per_element(precisions.kda_state),
         dense_ceil_div(model.num_query_heads, model.tensor_parallel_size),
         dense_ceil_div(model.num_kv_heads, model.tensor_parallel_size),
         dense_ceil_div(model.intermediate_size, model.tensor_parallel_size),
@@ -1582,8 +1897,9 @@ KernelWork mla_unabsorbed_kv_expansion_work(const DenseLayerContext &context,
     };
 }
 
-std::uint64_t mla_dcp_busiest_new_token_count(
-    const DenseBatch &batch, std::uint64_t decode_context_parallel_size) {
+std::uint64_t
+mla_dcp_busiest_new_token_count(const DenseBatch &batch,
+                                std::uint64_t decode_context_parallel_size) {
     std::vector<std::uint64_t> tokens_by_rank(
         static_cast<std::size_t>(decode_context_parallel_size), 0);
     const auto add_requests = [&](const auto &requests) {
@@ -1594,16 +1910,16 @@ std::uint64_t mla_dcp_busiest_new_token_count(
                 throw AnalyticalModelError(
                     "MLA DCP token interval overflows uint64");
             }
-            const std::uint64_t end = request.past_context +
-                                      request.query_tokens;
-            for (std::uint64_t rank = 0;
-                 rank < decode_context_parallel_size; ++rank) {
+            const std::uint64_t end =
+                request.past_context + request.query_tokens;
+            for (std::uint64_t rank = 0; rank < decode_context_parallel_size;
+                 ++rank) {
                 tokens_by_rank[static_cast<std::size_t>(rank)] +=
                     attention::mla_dcp_local_token_count(
                         end, decode_context_parallel_size, rank) -
                     attention::mla_dcp_local_token_count(
-                        request.past_context,
-                        decode_context_parallel_size, rank);
+                        request.past_context, decode_context_parallel_size,
+                        rank);
             }
         }
     };
@@ -1692,9 +2008,34 @@ predict_mla_attention_work(const DenseLayerContext &context) {
                             model.hidden_size),
         gemm_efficiency_for(context, context.decode_tokens));
 
+    if (model.mla_use_output_gate) {
+        // Kimi K3 computes a full-rank sigmoid gate from the layer input,
+        // applies it elementwise to the per-head attention output, and only
+        // then runs o_proj.  Account for the gate projection with the
+        // attention weight/activation dtypes and for the fused sigmoid +
+        // multiply as a streaming kernel.  The latter reads both the gate
+        // and attention output and writes the gated output once.
+        const std::uint64_t gate_dim =
+            context.local_query_heads * model.v_head_dim;
+        work.post_projection_ms += predict_attention_work_ms(
+            context,
+            attention_gemm_work(context, context.batch.total_tokens,
+                                model.hidden_size, gate_dim),
+            gemm_efficiency_for(context, context.batch.total_tokens));
+        const double gate_elements = tokens * static_cast<double>(gate_dim);
+        work.post_projection_ms += predict_attention_work_ms(
+            context,
+            streaming_work(2.0 * gate_elements, gate_elements,
+                           8.0 * gate_elements,
+                           context.attention_element_bytes),
+            context.config.streaming);
+    }
+
     work.rope_elements =
-        tokens * (static_cast<double>(context.local_query_heads) + 1.0) *
-        static_cast<double>(model.qk_rope_head_dim);
+        model.mla_use_nope
+            ? 0.0
+            : tokens * (static_cast<double>(context.local_query_heads) + 1.0) *
+                  static_cast<double>(model.qk_rope_head_dim);
     const double mla_cache_bytes_per_token =
         attention::mla_kv_cache_bytes_per_token(attention::MlaKvCacheLayout{
             model.kv_lora_rank,
@@ -1702,8 +2043,8 @@ predict_mla_attention_work(const DenseLayerContext &context) {
             context.kv_cache_element_bytes,
             kMlaRopeCacheElementBytes,
         });
-    const double rank_local_cache_tokens = static_cast<double>(
-        mla_dcp_busiest_new_token_count(
+    const double rank_local_cache_tokens =
+        static_cast<double>(mla_dcp_busiest_new_token_count(
             context.batch, context.model.decode_context_parallel_size));
     work.kv_cache_save = KernelWork{
         0.0,
@@ -1726,8 +2067,7 @@ predict_mla_attention_work(const DenseLayerContext &context) {
     }
     work.decode_attention = mla_absorbed_attention_work(
         dcp_decode_requests,
-        context.local_query_heads *
-            context.model.decode_context_parallel_size,
+        context.local_query_heads * context.model.decode_context_parallel_size,
         model.kv_lora_rank, model.qk_rope_head_dim,
         context.attention_element_bytes, context.kv_cache_element_bytes,
         kMlaRopeCacheElementBytes);
@@ -1828,7 +2168,125 @@ predict_mha_attention_work(const DenseLayerContext &context) {
     return work;
 }
 
+// Kimi Delta Attention keeps a fixed recurrent matrix per head instead of
+// reading a sequence-length-dependent KV cache.  This helper intentionally
+// models the major roofline terms separately: the three Q/K/V projections,
+// depthwise short convolutions, the gated delta-rule state update, and the
+// output gate/norm.  It is not intended to reproduce a particular CUDA kernel
+// schedule; it provides a stable analytical contract that scales with batch
+// tokens, KDA dimensions, and the configured short-convolution width.
+AttentionLayerWork
+predict_kda_attention_work(const DenseLayerContext &context) {
+    const DenseModel &model = context.model;
+    if (!model.use_kda) {
+        throw AnalyticalModelError("KDA work requested for a non-KDA layer");
+    }
+    const std::uint64_t local_k_heads =
+        dense_ceil_div(model.kda_num_k_heads, model.tensor_parallel_size);
+    const std::uint64_t local_v_heads =
+        dense_ceil_div(model.kda_num_v_heads, model.tensor_parallel_size);
+    const std::uint64_t local_key_dim = model.kda_key_head_dim;
+    const std::uint64_t local_value_dim = model.kda_value_head_dim;
+    const std::uint64_t local_qk_channels = local_k_heads * local_key_dim;
+    const std::uint64_t local_v_channels = local_v_heads * local_value_dim;
+    if (local_k_heads == 0 || local_v_heads == 0 || local_key_dim == 0 ||
+        local_value_dim == 0 || local_qk_channels == 0 ||
+        local_v_channels == 0) {
+        throw AnalyticalModelError("KDA local dimensions must be positive");
+    }
+    const std::uint64_t tokens = context.batch.total_tokens;
+    const std::uint64_t conv_kernel = model.kda_short_conv_kernel_size;
+    const double token_count = static_cast<double>(tokens);
+    const double qk_channels = static_cast<double>(local_qk_channels);
+    const double v_channels = static_cast<double>(local_v_channels);
+    const double conv_channels = static_cast<double>(std::max(
+        local_qk_channels * 2 + local_v_channels,
+        dense_ceil_div(model.kda_conv_state_dim, model.tensor_parallel_size)));
+    const double v_heads = static_cast<double>(local_v_heads);
+    const double key_dim = static_cast<double>(local_key_dim);
+    const double value_dim = static_cast<double>(local_value_dim);
+
+    AttentionLayerWork work{};
+
+    // q/k use key heads while v and the output gate use value heads.  K3's
+    // released dimensions happen to match; keeping them separate also makes
+    // the predictor useful for smaller Kimi-Linear checkpoints.
+    const KernelWork qk =
+        gemm_work(tokens, model.hidden_size, local_qk_channels,
+                  context.attention_weight_element_bytes,
+                  context.attention_element_bytes, 2);
+    const KernelWork v = gemm_work(tokens, model.hidden_size, local_v_channels,
+                                   context.attention_weight_element_bytes,
+                                   context.attention_element_bytes, 1);
+    const KernelWork full_rank_gate =
+        gemm_work(tokens, model.hidden_size, local_v_channels,
+                  context.attention_weight_element_bytes,
+                  context.attention_element_bytes, 1);
+    const KernelWork f_a =
+        gemm_work(tokens, model.hidden_size, model.kda_head_dim,
+                  context.attention_weight_element_bytes,
+                  context.attention_element_bytes, 1);
+    const KernelWork f_b =
+        gemm_work(tokens, model.kda_head_dim, local_v_channels,
+                  context.attention_weight_element_bytes,
+                  context.attention_element_bytes, 1);
+    const KernelWork beta = gemm_work(tokens, model.hidden_size, local_v_heads,
+                                      context.attention_weight_element_bytes,
+                                      context.attention_element_bytes, 1);
+    work.kda_projection = add_kernel_work(
+        add_kernel_work(add_kernel_work(qk, v), add_kernel_work(f_a, f_b)),
+        add_kernel_work(full_rank_gate, beta));
+
+    // Each of Q/K/V is passed through a depthwise short convolution.  The
+    // history window is fixed, so this cost is linear in tokens and does not
+    // depend on request past_context.  HBM traffic accounts for a window read
+    // and one output write for each channel.
+    const double conv_history_elements =
+        token_count * conv_channels * static_cast<double>(conv_kernel);
+    const double conv_output_elements = token_count * conv_channels;
+    const KernelWork short_conv{
+        2.0 * conv_history_elements,
+        conv_history_elements * context.kda_state_element_bytes +
+            conv_output_elements * context.attention_element_bytes,
+    };
+    work.kda_short_conv = short_conv;
+
+    // The delta-rule update performs a query/state product and a key/value
+    // outer-product update for each head.  The fixed recurrent state is
+    // touched once per token in this conservative roofline model.  It keeps
+    // decode work O(1) in context length while retaining the quadratic head
+    // dimension dependence of the state matrix.
+    const auto recurrent_work =
+        [&](const std::vector<AttentionRequestSlice> &requests) {
+            const double request_tokens =
+                static_cast<double>(sum_query_tokens(requests));
+            const double state_elements = v_heads * key_dim * value_dim;
+            // q*S, delta outer-product, decay/gate application, and the output
+            // contraction are represented by four matrix-like operations.
+            const double flops =
+                request_tokens * v_heads * key_dim * value_dim * 8.0;
+            const double hbm =
+                request_tokens *
+                (2.0 * state_elements * context.kda_state_element_bytes +
+                 (qk_channels + v_channels) * context.attention_element_bytes);
+            return KernelWork{flops, hbm};
+        };
+    work.kda_recurrent_prefill = recurrent_work(context.batch.prefill_requests);
+    work.kda_recurrent_decode = recurrent_work(context.batch.decode_requests);
+
+    // Fused RMSNorm + sigmoid gate: one read/write pass over the projected
+    // output with a small constant amount of scalar work per element.
+    work.kda_gate_norm = streaming_work(
+        token_count * v_channels, token_count * v_channels,
+        8.0 * token_count * v_channels, context.attention_element_bytes);
+
+    return work;
+}
+
 AttentionLayerWork predict_attention_work(const DenseLayerContext &context) {
+    if (context.model.use_kda) {
+        return predict_kda_attention_work(context);
+    }
     if (context.model.use_mla) {
         return predict_mla_attention_work(context);
     }
@@ -1841,6 +2299,47 @@ AttentionLayerWork predict_attention_work(const DenseLayerContext &context) {
 void populate_attention_times(const DenseLayerContext &context,
                               const AttentionLayerWork &work,
                               DenseLayerTimes &times) {
+    if (context.model.use_kda) {
+        // Keep the historical attention buckets populated while exposing the
+        // KDA sub-components for diagnostics and focused tests.
+        times.kda_projection_ms = predict_attention_work_ms(
+            context, work.kda_projection,
+            gemm_efficiency_for(context, context.batch.total_tokens));
+        times.kda_short_conv_ms = predict_attention_work_ms(
+            context, work.kda_short_conv, context.config.streaming);
+        times.kda_recurrent_ms =
+            predict_attention_work_ms(context, work.kda_recurrent_prefill,
+                                      context.config.prefill_attention) +
+            predict_attention_work_ms(context, work.kda_recurrent_decode,
+                                      context.config.decode_attention);
+        times.kda_gate_norm_ms = predict_attention_work_ms(
+            context, work.kda_gate_norm, context.config.streaming);
+
+        times.attention_pre_projection_ms =
+            times.kda_projection_ms + times.kda_short_conv_ms;
+        times.attention_post_projection_ms = predict_attention_work_ms(
+            context,
+            attention_gemm_work(
+                context, context.batch.total_tokens,
+                dense_ceil_div(context.model.kda_num_v_heads,
+                               context.model.tensor_parallel_size) *
+                    context.model.kda_value_head_dim,
+                context.model.hidden_size),
+            gemm_efficiency_for(context, context.batch.total_tokens));
+        times.attention_inter_norm_ms = times.kda_gate_norm_ms;
+        times.prefill_attention_ms =
+            predict_attention_work_ms(context, work.kda_recurrent_prefill,
+                                      context.config.prefill_attention);
+        times.decode_attention_ms =
+            predict_attention_work_ms(context, work.kda_recurrent_decode,
+                                      context.config.decode_attention);
+        // KDA does not use RoPE or a sequence-growing KV cache.
+        times.rope_ms = 0.0;
+        times.kv_cache_save_ms = 0.0;
+        times.attention_norm_ms = 0.0;
+        times.attention_wq_projection_ms = 0.0;
+        return;
+    }
     const double tokens = static_cast<double>(context.batch.total_tokens);
     const double hidden = static_cast<double>(context.model.hidden_size);
     const double norm_factor = context.model.fused_add_norm ? 3.0 : 2.0;
@@ -1908,6 +2407,10 @@ void populate_dense_mlp_and_norm_times(const DenseLayerContext &context,
                            residual_elements, context.dense_element_bytes),
             context.config.streaming);
     }
+    // K3 AttnRes metadata is retained for architecture fidelity, but its
+    // operator cost is intentionally omitted.  The operation is expected to
+    // be negligible/fused, while the former block-width streaming heuristic
+    // had no measured kernel basis and could substantially overcharge HBM.
 }
 
 } // namespace
@@ -2027,19 +2530,29 @@ struct MoELayerContext {
     std::uint64_t input_tokens;
     std::uint64_t router_topk;
     Precision expert_weight_precision;
+    Precision latent_moe_projection_weight_precision;
+    Precision shared_expert_weight_precision;
     Precision router_weight_precision;
+    Precision router_compute_precision;
     Precision dense_weight_precision;
     double expert_weight_element_bytes;
     double expert_element_bytes;
+    double latent_moe_projection_weight_element_bytes;
+    double latent_moe_projection_element_bytes;
+    double shared_expert_weight_element_bytes;
+    double shared_expert_element_bytes;
     double router_weight_element_bytes;
     double router_element_bytes;
+    double dense_weight_element_bytes;
     double dense_element_bytes;
     std::uint64_t local_intermediate;
 };
 
 struct ExpertGemmWork {
-    KernelWork up;
-    KernelWork down;
+    KernelWork routed_up;
+    KernelWork routed_down;
+    KernelWork shared_up;
+    KernelWork shared_down;
     std::uint64_t routed_tokens = 0;
 };
 
@@ -2061,10 +2574,22 @@ make_moe_layer_context(const DeviceCeilings &device,
         precisions.expert_weight.value_or(precisions.expert);
     const Precision expert_activation_precision =
         precisions.expert_activation.value_or(precisions.expert);
+    const Precision latent_moe_projection_weight_precision =
+        precisions.latent_moe_projection_weight.value_or(
+            expert_weight_precision);
+    const Precision latent_moe_projection_activation_precision =
+        precisions.latent_moe_projection_activation.value_or(
+            expert_activation_precision);
+    const Precision shared_expert_weight_precision =
+        precisions.shared_expert_weight.value_or(precisions.shared_expert);
+    const Precision shared_expert_activation_precision =
+        precisions.shared_expert_activation.value_or(precisions.shared_expert);
     const Precision router_weight_precision =
         precisions.router_weight.value_or(precisions.router);
     const Precision router_activation_precision =
         precisions.router_activation.value_or(precisions.router);
+    const Precision router_compute_precision =
+        precisions.router_compute.value_or(precisions.router);
     const Precision dense_weight_precision =
         precisions.dense_weight.value_or(precisions.dense);
     const Precision dense_activation_precision =
@@ -2076,12 +2601,20 @@ make_moe_layer_context(const DeviceCeilings &device,
         input_tokens,
         router_topk,
         expert_weight_precision,
+        latent_moe_projection_weight_precision,
+        shared_expert_weight_precision,
         router_weight_precision,
+        router_compute_precision,
         dense_weight_precision,
         bytes_per_element(expert_weight_precision),
         bytes_per_element(expert_activation_precision),
+        bytes_per_element(latent_moe_projection_weight_precision),
+        bytes_per_element(latent_moe_projection_activation_precision),
+        bytes_per_element(shared_expert_weight_precision),
+        bytes_per_element(shared_expert_activation_precision),
         bytes_per_element(router_weight_precision),
         bytes_per_element(router_activation_precision),
+        bytes_per_element(dense_weight_precision),
         bytes_per_element(dense_activation_precision),
         ceil_div(model.intermediate_size, model.moe_tensor_parallel_size),
     };
@@ -2094,10 +2627,26 @@ double predict_expert_work_ms(const MoELayerContext &context,
                       efficiency, context.config.kernel_launch_latency_us);
 }
 
+double predict_latent_moe_projection_work_ms(
+    const MoELayerContext &context, const KernelWork &work,
+    const Efficiency &efficiency) {
+    return predict_ms(context.device,
+                      context.latent_moe_projection_weight_precision, work,
+                      efficiency, context.config.kernel_launch_latency_us);
+}
+
+double predict_shared_expert_work_ms(const MoELayerContext &context,
+                                     const KernelWork &work,
+                                     const Efficiency &efficiency) {
+    return predict_ms(context.device, context.shared_expert_weight_precision,
+                      work, efficiency,
+                      context.config.kernel_launch_latency_us);
+}
+
 double predict_router_work_ms(const MoELayerContext &context,
                               const KernelWork &work,
                               const Efficiency &efficiency) {
-    return predict_ms(context.device, context.router_weight_precision, work,
+    return predict_ms(context.device, context.router_compute_precision, work,
                       efficiency, context.config.kernel_launch_latency_us);
 }
 
@@ -2121,15 +2670,26 @@ void add_expert_gemm_work(ExpertGemmWork &work, const MoELayerContext &context,
     if (count_as_routed) {
         work.routed_tokens += tokens;
     }
-    add_kernel_work(work.up, gemm_work(tokens, context.model.hidden_size,
-                                       context.local_intermediate,
-                                       context.expert_weight_element_bytes,
-                                       context.expert_element_bytes,
-                                       context.model.gated_mlp ? 2 : 1));
-    add_kernel_work(work.down, gemm_work(tokens, context.local_intermediate,
-                                         context.model.hidden_size,
-                                         context.expert_weight_element_bytes,
-                                         context.expert_element_bytes, 1));
+    const std::uint64_t expert_input_size =
+        !count_as_routed || context.model.routed_expert_hidden_size == 0
+            ? context.model.hidden_size
+            : context.model.routed_expert_hidden_size;
+    KernelWork &up = count_as_routed ? work.routed_up : work.shared_up;
+    KernelWork &down = count_as_routed ? work.routed_down : work.shared_down;
+    const double weight_bytes =
+        count_as_routed ? context.expert_weight_element_bytes
+                        : context.shared_expert_weight_element_bytes;
+    const double activation_bytes =
+        count_as_routed ? context.expert_element_bytes
+                        : context.shared_expert_element_bytes;
+    add_kernel_work(up, gemm_work(tokens, expert_input_size,
+                                  context.local_intermediate, weight_bytes,
+                                  activation_bytes,
+                                  context.model.gated_mlp ? 2 : 1));
+    add_kernel_work(down,
+                    gemm_work(tokens, context.local_intermediate,
+                              expert_input_size, weight_bytes,
+                              activation_bytes, 1));
 }
 
 ExpertGemmWork
@@ -2160,7 +2720,8 @@ const Efficiency &router_gemm_efficiency(const MoELayerContext &context) {
 double MoELayerTime::total_ms() const noexcept {
     return gating_linear_ms + gating_routing_topk_ms +
            grouped_up_projection_ms + grouped_down_projection_ms +
-           shuffling_ms + post_attention_norm_ms;
+           shuffling_ms + post_attention_norm_ms + latent_projection_ms +
+           latent_norm_ms + attn_res_ms;
 }
 
 double MoECommunicationTime::total_ms() const noexcept {
@@ -2184,6 +2745,10 @@ predict_moe_layer(const DeviceCeilings &device, const AnalyticalConfig &config,
     const double experts = static_cast<double>(context.model.model_num_experts);
     const double routed = static_cast<double>(expert_work.routed_tokens);
     const double norm_factor = context.model.fused_add_norm ? 3.0 : 2.0;
+    const std::uint64_t latent_hidden_size =
+        context.model.routed_expert_hidden_size == 0
+            ? context.model.hidden_size
+            : context.model.routed_expert_hidden_size;
 
     MoELayerTime result{};
     result.gating_linear_ms = predict_router_work_ms(
@@ -2191,23 +2756,72 @@ predict_moe_layer(const DeviceCeilings &device, const AnalyticalConfig &config,
         gemm_work(context.input_tokens, context.model.hidden_size,
                   context.model.model_num_experts,
                   context.router_weight_element_bytes,
-                  context.router_element_bytes, 1),
+                  context.router_element_bytes,
+                  bytes_per_element(context.router_compute_precision), 1),
         router_gemm_efficiency(context));
     result.gating_routing_topk_ms = predict_router_work_ms(
         context,
         streaming_work(tokens * experts,
                        tokens * static_cast<double>(context.router_topk),
-                       4.0 * tokens * experts, context.router_element_bytes),
+                       4.0 * tokens * experts,
+                       bytes_per_element(context.router_compute_precision)),
         context.config.routing);
-    result.grouped_up_projection_ms =
-        predict_expert_work_ms(context, expert_work.up, context.config.moe);
-    result.grouped_down_projection_ms =
-        predict_expert_work_ms(context, expert_work.down, context.config.moe);
+    const bool shared_uses_routed_kernel =
+        context.shared_expert_weight_precision ==
+            context.expert_weight_precision &&
+        context.shared_expert_weight_element_bytes ==
+            context.expert_weight_element_bytes &&
+        context.shared_expert_element_bytes == context.expert_element_bytes;
+    if (shared_uses_routed_kernel) {
+        KernelWork combined_up = expert_work.routed_up;
+        KernelWork combined_down = expert_work.routed_down;
+        add_kernel_work(combined_up, expert_work.shared_up);
+        add_kernel_work(combined_down, expert_work.shared_down);
+        result.grouped_up_projection_ms = predict_expert_work_ms(
+            context, combined_up, context.config.moe);
+        result.grouped_down_projection_ms = predict_expert_work_ms(
+            context, combined_down, context.config.moe);
+    } else {
+        result.grouped_up_projection_ms =
+            predict_expert_work_ms(context, expert_work.routed_up,
+                                   context.config.moe) +
+            predict_shared_expert_work_ms(context, expert_work.shared_up,
+                                          context.config.moe);
+        result.grouped_down_projection_ms =
+            predict_expert_work_ms(context, expert_work.routed_down,
+                                   context.config.moe) +
+            predict_shared_expert_work_ms(context, expert_work.shared_down,
+                                          context.config.moe);
+    }
     result.shuffling_ms = predict_expert_work_ms(
         context,
-        streaming_work(routed * hidden, routed * hidden, 0.0,
+        streaming_work(routed * static_cast<double>(latent_hidden_size),
+                       routed * static_cast<double>(latent_hidden_size), 0.0,
                        context.expert_element_bytes),
         context.config.streaming);
+    if (context.model.routed_expert_hidden_size != 0) {
+        const KernelWork latent_projection = add_kernel_work(
+            gemm_work(context.input_tokens, context.model.hidden_size,
+                      latent_hidden_size,
+                      context.latent_moe_projection_weight_element_bytes,
+                      context.latent_moe_projection_element_bytes, 1),
+            gemm_work(context.input_tokens, latent_hidden_size,
+                      context.model.hidden_size,
+                      context.latent_moe_projection_weight_element_bytes,
+                      context.latent_moe_projection_element_bytes, 1));
+        result.latent_projection_ms = predict_latent_moe_projection_work_ms(
+            context, latent_projection, router_gemm_efficiency(context));
+        if (context.model.latent_moe_use_norm) {
+            result.latent_norm_ms = predict_dense_work_ms(
+                context,
+                streaming_work(tokens * static_cast<double>(latent_hidden_size),
+                               tokens * static_cast<double>(latent_hidden_size),
+                               5.0 * tokens *
+                                   static_cast<double>(latent_hidden_size),
+                               context.dense_element_bytes),
+                context.config.streaming);
+        }
+    }
     result.post_attention_norm_ms = predict_dense_work_ms(
         context,
         streaming_work(tokens * hidden * (norm_factor - 1.0), tokens * hidden,
@@ -2224,7 +2838,7 @@ predict_moe_layer(const DeviceCeilings &device, const AnalyticalConfig &config,
                   Precision precision) {
     return predict_moe_layer(
         device, config, model, input_tokens, router_topk, local_expert_tokens,
-        MoEOperatorPrecisions{precision, precision, precision});
+        MoEOperatorPrecisions{precision, precision, precision, precision});
 }
 
 MoELanePrediction predict_moe_lanes(const DeviceCeilings &device,
@@ -2260,7 +2874,7 @@ predict_moe_lanes(const DeviceCeilings &device, const AnalyticalConfig &config,
                   std::uint64_t router_topk, Precision precision) {
     return predict_moe_lanes(
         device, config, model, routing, router_topk,
-        MoEOperatorPrecisions{precision, precision, precision});
+        MoEOperatorPrecisions{precision, precision, precision, precision});
 }
 
 double predict_output_projection_ms(
@@ -2289,11 +2903,14 @@ MoECommunicationTime predict_moe_communication(
     std::uint64_t hidden_size, std::uint64_t routed_tokens,
     std::uint64_t attention_tp_size, std::uint64_t moe_tp_size,
     std::uint64_t expert_parallel_size, std::uint64_t data_parallel_size,
-    bool has_pipeline_boundary, double element_bytes) {
+    bool has_pipeline_boundary, double element_bytes,
+    std::uint64_t routed_hidden_size) {
     const std::uint64_t activation_bytes =
         payload_bytes(input_tokens, hidden_size, element_bytes);
-    const std::uint64_t routed_bytes =
-        payload_bytes(routed_tokens, hidden_size, element_bytes);
+    const std::uint64_t routed_bytes = payload_bytes(
+        routed_tokens,
+        routed_hidden_size == 0 ? hidden_size : routed_hidden_size,
+        element_bytes);
     return [&]() {
         MoECommunicationTime value{};
         value.attention_tp_ms =

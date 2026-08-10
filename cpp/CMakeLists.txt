@@ -531,6 +531,25 @@ if(BUILD_TESTING)
     NAME frontier_simulator.cpu_kv_cache
     COMMAND $<TARGET_FILE:frontier_cpu_kv_cache_integration_test>
   )
+
+  add_executable(
+    frontier_k3_cpu_kv_cache_integration_test
+    tests/simulator/k3_cpu_kv_cache_integration_test.cc
+  )
+  target_compile_definitions(
+    frontier_k3_cpu_kv_cache_integration_test
+    PRIVATE
+      FRONTIER_EXAMPLE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/examples"
+  )
+  target_link_libraries(
+    frontier_k3_cpu_kv_cache_integration_test
+    PRIVATE frontier_core
+  )
+  frontier_enable_warnings(frontier_k3_cpu_kv_cache_integration_test)
+  add_test(
+    NAME frontier_simulator.k3_cpu_kv_cache
+    COMMAND $<TARGET_FILE:frontier_k3_cpu_kv_cache_integration_test>
+  )
   find_package(Python3 COMPONENTS Interpreter QUIET)
   if(Python3_Interpreter_FOUND)
     add_test(
