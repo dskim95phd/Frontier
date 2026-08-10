@@ -20,14 +20,19 @@ TraceLab rows, the fresh logical prompt is therefore::
         - previous.output_tokens
 
 The first row of each simulator session uses its full ``input_tokens_total``.
-If the logical delta is non-positive or gap timing is missing, the current row
-starts a new simulator session with its full input as ISL.  Its absolute root
-arrival is not reset to zero: it is the seed-shuffled source root arrival plus
-the observed source-relative elapsed time to that segment (or the previous
-segment's output time when the current input timestamp is unavailable).  A
-negative observed gap is clamped to zero while retaining the session.  At the
-first non-adjacent source round index, that row and the rest of the source
-session are discarded because the intervening requests are not observable.
+A non-positive logical delta is accepted as compaction only when the current
+total input is at most 25% of the preceding total input (a reduction of at
+least 75%).  Accepted compactions start a new simulator session with their
+full input as ISL.  Smaller reductions and token-accounting discontinuities
+truncate the source session at that row because their later context cannot be
+reconstructed safely.  Missing gap timing also starts a new simulator session.
+Its absolute root arrival is not reset to zero: it is the seed-shuffled source
+root arrival plus the observed source-relative elapsed time to that segment
+(or the previous segment's output time when the current input timestamp is
+unavailable).  A negative observed gap is clamped to zero while retaining the
+session.  At the first non-adjacent source round index, that row and the rest
+of the source session are discarded because the intervening requests are not
+observable.
 
 The CLI requires an explicit ``--session-arrival-rate``.  Retained source
 sessions are Fisher-Yates shuffled with ``--seed`` and roots are placed in
@@ -61,7 +66,9 @@ import statistics
 from typing import Any, Mapping, Sequence
 
 
-CONVERTER_VERSION = "tracelab-v0.0.2-frontier-csv-v2"
+CONVERTER_VERSION = "tracelab-v0.0.2-frontier-csv-v3"
+MIN_COMPACTION_REDUCTION_PERCENT = 75
+MAX_COMPACTION_RETAINED_PERCENT = 100 - MIN_COMPACTION_REDUCTION_PERCENT
 CSV_FIELDS = (
     "session_start_at",
     "think_time",
@@ -119,6 +126,20 @@ def _flatten_filters(values: Sequence[str] | None) -> list[str]:
     for value in values or ():
         result.extend(item.strip() for item in value.split(",") if item.strip())
     return result
+
+
+def _is_accepted_compaction(
+    previous_input_tokens: int, current_input_tokens: int
+) -> bool:
+    """Return whether total input fell by at least 75%, including the boundary."""
+
+    # The input totals have already passed the positive-token filter.  Compare
+    # integers so an exact 75% reduction is deterministic and has no floating-
+    # point boundary ambiguity.
+    return (
+        current_input_tokens * 100
+        <= previous_input_tokens * MAX_COMPACTION_RETAINED_PERCENT
+    )
 
 
 def _source_key(source_round: "_Round") -> tuple[str, str, str, str]:
@@ -486,6 +507,34 @@ def _filter_and_sample_groups(
     return groups, dropped
 
 
+def count_eligible_source_sessions(
+    db_path: Path,
+    *,
+    providers: Sequence[str] | None = None,
+    models: Sequence[str] | None = None,
+    session_ids: Sequence[str] | None = None,
+) -> int:
+    """Count source sessions retained by conversion before optional sampling.
+
+    This uses the same database query, grouping key, and positive-token filters
+    as :func:`convert_database`, allowing long-running experiment drivers to
+    size the number of repeated epochs without first materializing a probe CSV.
+    """
+
+    records = _query_rounds(
+        Path(db_path),
+        providers=_flatten_filters(providers),
+        models=_flatten_filters(models),
+        session_ids=_flatten_filters(session_ids),
+    )
+    if not records:
+        raise ValueError("no TraceLab rounds matched the requested filters")
+    groups, _ = _filter_and_sample_groups(records, sample_sessions=None, seed=0)
+    if not groups:
+        raise ValueError("all TraceLab rounds matched the filters but had nonpositive token counts")
+    return len(groups)
+
+
 def _build_output_rows(
     groups: Mapping[tuple[str, str, str, str], Sequence[_Round]],
     *,
@@ -513,6 +562,8 @@ def _build_output_rows(
         "negative_gap_clamped": 0,
         "index_break_truncations": 0,
         "rows_discarded_after_index_break": 0,
+        "insufficient_compaction_truncations": 0,
+        "rows_discarded_after_insufficient_compaction": 0,
         "segment_arrival_timing_fallbacks": 0,
     }
     gaps: list[float] = []
@@ -665,6 +716,15 @@ def _build_output_rows(
             if reason is None and isl_mode == "logical_delta" and (
                 item.input_tokens_total - previous.input_tokens_total - previous.output_tokens <= 0
             ):
+                if not _is_accepted_compaction(
+                    previous.input_tokens_total, item.input_tokens_total
+                ):
+                    policy_counts["insufficient_compaction_truncations"] += 1
+                    policy_counts["rows_discarded_after_insufficient_compaction"] += (
+                        len(source_rows) - item_offset
+                    )
+                    flush_segment()
+                    break
                 reason = "logical_delta_nonpositive"
             elif reason is None and isl_mode == "raw_append" and item.newly_append_tokens <= 0:
                 reason = "raw_append_nonpositive"
@@ -734,6 +794,8 @@ def convert_database(
         "negative_gap_clamped": 0,
         "index_break_truncations": 0,
         "rows_discarded_after_index_break": 0,
+        "insufficient_compaction_truncations": 0,
+        "rows_discarded_after_insufficient_compaction": 0,
         "segment_arrival_timing_fallbacks": 0,
     }
     gaps: list[float] = []
@@ -857,6 +919,9 @@ def convert_database(
             "dropped_nonpositive_input": dropped["nonpositive_input"],
             "dropped_nonpositive_output": dropped["nonpositive_output"],
             "rows_discarded_after_index_break": policy_counts["rows_discarded_after_index_break"],
+            "rows_discarded_after_insufficient_compaction": policy_counts[
+                "rows_discarded_after_insufficient_compaction"
+            ],
             "split_segments": sum(split_reasons.values()),
             "think_time_successor_rows": len(gaps),
         },
@@ -897,6 +962,9 @@ def convert_database(
         "token_assumptions": {
             "first_segment_isl": "rounds.input_tokens_total",
             "successor_isl": "current input_tokens_total - previous input_tokens_total - previous output_tokens",
+            "compaction_acceptance": "a nonpositive logical delta splits only when current input_tokens_total is at most 25% of previous input_tokens_total",
+            "minimum_compaction_reduction_fraction": MIN_COMPACTION_REDUCTION_PERCENT / 100,
+            "insufficient_compaction_policy": "discard the candidate row and all later rows in that source session",
             "raw_append_diagnostic": "rounds.newly_append_tokens is used only by --isl-mode raw_append",
             "osl": "rounds.output_tokens (including reasoning output where TraceLab includes it)",
         },

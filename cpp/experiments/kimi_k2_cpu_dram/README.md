@@ -11,6 +11,47 @@ configuration, server commands, resume behavior, measurement horizons, and
 detailed result collector are documented in
 [`docs/experiments/tracelab-cache-aware-arrival-sweep.md`](../../../docs/experiments/tracelab-cache-aware-arrival-sweep.md).
 
+## Dense CPU-capacity / session-rate server sweep
+
+`run_dense_cpu_capacity_rate_sweep.py` runs the 10-hour P8/D16 CPU-off matrix
+used to locate the rate knee at each physical CPU capacity.  Edit the
+`CPU_CAPACITY_RATE_RANGES` mapping at the top of the file; each value is an
+inclusive `(min_rate, max_rate)` pair and is expanded at `RATE_STEP=0.01`.
+`MAX_CONCURRENT_SIMULATIONS` is the default number of simulator processes that
+may run at once and can be overridden with `--jobs`.
+
+```powershell
+python .\cpp\experiments\kimi_k2_cpu_dram\run_dense_cpu_capacity_rate_sweep.py `
+  --binary .\cpp\build\Release\frontier_sim.exe `
+  --resume `
+  --jobs 8
+```
+
+The output layout is `r<rate>/cpu<capacity>gb/r1`.  Workloads are generated
+once per distinct rate and shared by every capacity at that rate.  Sampling is
+disabled, so every source session retained by the current converter is used.
+With the default `SESSION_REPETITIONS=None`, the runner counts those eligible
+sessions and selects the minimum number of repeated epochs needed to keep
+injection active for the full ten hours at the highest configured rate.  Set a
+positive integer only when a fixed repetition count is intentional.  The
+runner records the Git revision and SHA-256 hashes of the database, binary,
+config, and generated workload in `sweep_plan.json`.
+
+After the simulations, reports are generated automatically.  They can also be
+regenerated during or after a partial/resumed sweep; only cases containing
+both `summary.json` and `requests.csv` are included:
+
+```powershell
+python .\cpp\experiments\kimi_k2_cpu_dram\generate_dense_cpu_capacity_rate_reports.py `
+  --output-root .\outputs\tracelab_vera_rubin_p8_d16_cpu_capacity_rate_dense_10h
+```
+
+`index.html` links one existing-style capacity/time report per tested session
+rate.  Its final-hour experiment table includes arrivals/completions, PREFILL
+busy, request-weighted TTFT/TPOT means, conservative maximum five-minute p90,
+GPU/CPU/combined cache hits, active sessions, queue, backlog, CPU-transfer
+bandwidth, and the operational QoS result.
+
 The frozen topology in `configs/base_pdd.json` is sequential online PDD:
 
 | side | GPUs | replicas | attention TP | DCP | PP | DP | MoE TP | EP |
@@ -82,9 +123,13 @@ The default mapping is:
   cache-accounting field `newly_append_tokens`.
 
 TraceLab context-max and tokenizer metadata are intentionally ignored.  When a
-context reduction/compaction makes that ISL nonpositive or timing is missing,
-the current row begins a new numeric simulator session and its full observed
-input becomes the new root ISL.  A negative timestamp gap is clamped to
+nonpositive logical ISL coincides with a reduction of at least 75% in total
+input tokens, the row is treated as a compaction: it begins a new numeric
+simulator session and its full observed input becomes the new root ISL.  If the
+logical ISL is nonpositive but the total-input reduction is smaller than 75%,
+the candidate row and all later rows in that source session are discarded
+because the discontinuity is not large enough to accept as compaction.  Missing
+timing starts a new simulator session.  A negative timestamp gap is clamped to
 `think_time=0` while retaining the session.  At the first non-adjacent
 `round_index`, that row and all later rows in the source session are discarded:
 the missing requests make their compute time and context evolution

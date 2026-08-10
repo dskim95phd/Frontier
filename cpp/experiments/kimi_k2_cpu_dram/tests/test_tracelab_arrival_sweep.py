@@ -76,6 +76,7 @@ def test_metadata_validation_rejects_a_different_rate(tmp_path: Path) -> None:
     metadata.write_text(
         json.dumps(
             {
+                "converter_version": runner.CONVERTER_VERSION,
                 "sampling": {
                     "sample_sessions": 3000,
                     "seed": 20260803,
@@ -97,6 +98,18 @@ def test_metadata_validation_rejects_a_different_rate(tmp_path: Path) -> None:
         runner.validate_workload_metadata(
             metadata,
             rate=0.06,
+            seed=20260803,
+            sample_sessions=3000,
+            repetitions=2,
+        )
+
+    payload = json.loads(metadata.read_text(encoding="utf-8"))
+    payload["converter_version"] = "tracelab-v0.0.2-frontier-csv-v2"
+    metadata.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="converter_version"):
+        runner.validate_workload_metadata(
+            metadata,
+            rate=0.05,
             seed=20260803,
             sample_sessions=3000,
             repetitions=2,

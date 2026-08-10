@@ -3,6 +3,10 @@ from __future__ import annotations
 from cpp.experiments.kimi_k2_cpu_dram import generate_per_gpu_scaling_report as report
 
 
+def test_default_ttft_p90_service_limit_is_five_seconds() -> None:
+    assert report.DEFAULT_TTFT_P90_SLO_MS == 5_000.0
+
+
 def _point(rate: float, dram: float, verified: bool) -> dict[str, object]:
     return {
         "session_injection_rate_per_s": rate,

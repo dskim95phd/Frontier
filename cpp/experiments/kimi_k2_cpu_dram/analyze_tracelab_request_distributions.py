@@ -13,8 +13,9 @@ Definitions used by this analysis:
 * tool-result gap: the previous same-session model-output event to a
   ``tool_result`` event;
 * tools between user messages: tool calls in ``[user_i, user_(i+1))``;
-* logical ISL: Frontier's logical new input delta for an adjacent request,
-  otherwise the request's full input after a cold start/compaction/index break;
+* logical ISL: a source-audit estimate using Frontier's logical new-input delta
+  for an adjacent request, otherwise the request's full input as a conservative
+  reset estimate; this metric does not apply the converter's retention policy;
 * request sequence length: ``rounds.input_tokens_total``;
 * OSL: ``rounds.output_tokens``.
 """
@@ -451,7 +452,7 @@ def analyze(db_path: Path, output_dir: Path) -> list[Path]:
         },
         {
             "metric": "logical_isl_tokens",
-            "definition": "If previous source round is adjacent and current_input_total - previous_input_total - previous_output > 0, use that delta; otherwise use full input_tokens_total.",
+            "definition": "Source-audit estimate: if the previous source round is adjacent and current_input_total - previous_input_total - previous_output > 0, use that delta; otherwise use full input_tokens_total. This does not apply the converter's compaction/truncation retention policy.",
         },
         {
             "metric": "source_newly_append_tokens",

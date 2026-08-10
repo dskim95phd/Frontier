@@ -17,31 +17,42 @@ REPO_ROOT = HERE.parents[2]
 DEFAULT_OUTPUT_DIR = (
     REPO_ROOT
     / "outputs"
-    / "tracelab_vera_rubin_p8_d16_per_gpu_cpu_dram_scaling_20260809"
+    / "tracelab_vera_rubin_p8_d16_per_gpu_cpu_dram_scaling_20260811"
 )
 DEFAULT_REPORTS = (
     REPO_ROOT
     / "outputs"
-    / "tracelab_vera_rubin_p8_d16_cpu_capacity_sweep_continuous_10h_r0p30_20260809"
+    / "tracelab_vera_rubin_p8_d16_cpu_capacity_knee_rebuild_10h_r0p30_20260811"
     / "r0p3_capacity_sweep_10h.json",
     REPO_ROOT
     / "outputs"
-    / "tracelab_vera_rubin_p8_d16_cpu_capacity_sweep_continuous_10h_r0p35_20260809"
+    / "tracelab_vera_rubin_p8_d16_cpu_capacity_knee_10h_r0p325_20260810"
+    / "r0p325_capacity_sweep_10h.json",
+    REPO_ROOT
+    / "outputs"
+    / "tracelab_vera_rubin_p8_d16_cpu_capacity_knee_rebuild_10h_r0p35_20260811"
     / "r0p35_capacity_sweep_10h.json",
     REPO_ROOT
     / "outputs"
-    / "tracelab_vera_rubin_p8_d16_cpu_capacity_sweep_continuous_10h_r0p4_20260808"
+    / "tracelab_vera_rubin_p8_d16_cpu_capacity_knee_10h_r0p375_20260810"
+    / "r0p375_capacity_sweep_10h.json",
+    REPO_ROOT
+    / "outputs"
+    / "tracelab_vera_rubin_p8_d16_cpu_capacity_knee_rebuild_10h_r0p40_20260811"
     / "r0p4_capacity_sweep_10h.json",
     REPO_ROOT
     / "outputs"
-    / "tracelab_vera_rubin_p8_d16_cpu_capacity_sweep_continuous_10h_r0p45_20260809"
+    / "tracelab_vera_rubin_p8_d16_cpu_capacity_knee_10h_r0p425_20260810"
+    / "r0p425_capacity_sweep_10h.json",
+    REPO_ROOT
+    / "outputs"
+    / "tracelab_vera_rubin_p8_d16_cpu_capacity_knee_rebuild_10h_r0p45_20260811"
     / "r0p45_capacity_sweep_10h.json",
 )
 PREFILL_GPUS = 8
 GPUS_PER_CPU_POOL = 2
 FINAL_WINDOW_SECONDS = 3_600.0
-DEFAULT_TTFT_P90_SLO_MS = 60_000.0
-STRICT_TTFT_P90_SLO_MS = 5_000.0
+DEFAULT_TTFT_P90_SLO_MS = 5_000.0
 DEFAULT_MIN_COMPLETION_RATIO = 0.99
 DEFAULT_MAX_WAITING_QUEUE = 1_000.0
 DEFAULT_MAX_BACKLOG_REQUESTS = 1_000.0
@@ -152,14 +163,6 @@ def extract_points(
                 and queue_pass
                 and backlog_pass
             )
-            strict_5s_verified = (
-                source_stable
-                and ttft_p90_max is not None
-                and ttft_p90_max <= STRICT_TTFT_P90_SLO_MS
-                and completion_pass
-                and queue_pass
-                and backlog_pass
-            )
             if verified:
                 status = "verified"
             elif ttft_pass and completion_pass:
@@ -220,7 +223,6 @@ def extract_points(
                 "waiting_queue_pass": queue_pass,
                 "backlog_pass": backlog_pass,
                 "verified_sustainable": verified,
-                "strict_5s_verified_sustainable": strict_5s_verified,
                 "report_status": status,
                 "source_report": str(path.resolve()),
             }
@@ -445,7 +447,6 @@ def _status_label(point: Mapping[str, Any]) -> str:
 def _html_report(document: Mapping[str, Any]) -> str:
     points = list(document["points"])
     envelope = list(document["load_envelope"])
-    strict_envelope = list(document["strict_5s_load_envelope"])
     capacity_summary = list(document["capacity_summary"])
     ttft_slo_s = float(document["criteria"]["ttft_p90_slo_ms"]) / 1_000.0
 
@@ -477,23 +478,6 @@ def _html_report(document: Mapping[str, Any]) -> str:
             "</tr>"
         )
 
-    strict_rows = []
-    for row in strict_envelope:
-        if not row.get("verified"):
-            strict_rows.append(
-                f"<tr><td>{float(row['session_injection_rate_per_s']):.2f}</td><td colspan='4'>No verified point</td></tr>"
-            )
-            continue
-        strict_rows.append(
-            "<tr>"
-            f"<td>{float(row['session_injection_rate_per_s']):.2f}</td>"
-            f"<td>{_fmt(row['active_sessions_per_prefill_gpu'],1)}</td>"
-            f"<td>{_fmt(row['completion_requests_per_s_per_prefill_gpu'],3)}</td>"
-            f"<td>{_fmt(row['verified_dram_gb_per_gpu'],0)}</td>"
-            f"<td>{_fmt(row['physical_pool_gb_per_two_prefill_gpus'],0)}</td>"
-            "</tr>"
-        )
-
     capacity_rows = []
     for row in capacity_summary:
         capacity_rows.append(
@@ -517,7 +501,10 @@ def _html_report(document: Mapping[str, Any]) -> str:
     for rate in rates:
         cells = [f"<th>{rate:.2f}/s</th>"]
         for capacity in capacities:
-            point = by_key[(rate, capacity)]
+            point = by_key.get((rate, capacity))
+            if point is None:
+                cells.append("<td class='status missing'>Not tested</td>")
+                continue
             status = str(point["report_status"])
             cells.append(
                 f"<td class='status {status}'><strong>{_status_label(point)}</strong><br>"
@@ -571,6 +558,52 @@ def _html_report(document: Mapping[str, Any]) -> str:
         y_label="Completed requests/s per PREFILL GPU",
     )
 
+    verified_rows = [row for row in envelope if row.get("verified")]
+    strongest = max(
+        verified_rows,
+        key=lambda row: float(row["session_injection_rate_per_s"]),
+        default=None,
+    )
+    if strongest is None:
+        strongest_html = "No rate has a verified operating point in this grid."
+    else:
+        rate = float(strongest["session_injection_rate_per_s"])
+        dram = float(strongest["verified_dram_gb_per_gpu"])
+        active = float(strongest["active_sessions_per_prefill_gpu"])
+        throughput = float(strongest["completion_requests_per_s_per_prefill_gpu"])
+        strongest_html = (
+            f"The highest tested rate with a passing point is {rate:.3f} session/s: "
+            f"about {_fmt(active,1)} active sessions/GPU and {_fmt(throughput,3)} "
+            f"completed req/s/GPU at {_fmt(dram,0)} GB/GPU. On P8/D16 this is "
+            f"about {_fmt(active * PREFILL_GPUS,0)} active sessions, "
+            f"{_fmt(throughput * PREFILL_GPUS,2)} completed req/s, and "
+            f"{_fmt(dram * PREFILL_GPUS / 1_000.0,2)} TB aggregate CPU DRAM."
+        )
+    exception_rows = [
+        row
+        for row in verified_rows
+        if row.get("higher_capacity_nonverified_gb_per_gpu")
+    ]
+    if exception_rows:
+        exception_text = "; ".join(
+            f"{float(row['session_injection_rate_per_s']):.3f}/s: "
+            + ", ".join(
+                f"{float(value):g} GB/GPU"
+                for value in row["higher_capacity_nonverified_gb_per_gpu"]
+            )
+            for row in exception_rows
+        )
+        exception_html = (
+            "Higher-capacity non-verified observations remain in the sparse grid ("
+            + html.escape(exception_text)
+            + "), so the envelope is an observed operating boundary rather than a monotonic capacity law."
+        )
+    else:
+        exception_html = (
+            "No higher-capacity exception appears among the tested points, but untested cells prevent a universal monotonic-capacity claim."
+        )
+    rate_min, rate_max = min(rates), max(rates)
+
     return f"""<!doctype html>
 <html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
 <title>Per-GPU CPU-DRAM sizing from TraceLab P8/D16</title>
@@ -585,24 +618,21 @@ h1 {{ margin:0 0 6px; }} h2 {{ margin:30px 0 12px; }} h3 {{ margin:0 0 8px; }} .
 @media (max-width:900px) {{ main {{ padding:16px; }} .charts {{ grid-template-columns:1fr; }} }}
 </style></head><body><main>
 <h1>Per-GPU CPU-DRAM sizing from the 10-hour TraceLab sweeps</h1>
-<p class='muted'>Kimi K2 · P8/D16 · session injection 0.30–0.45/s · 8 PREFILL GPUs · 16 DECODE GPUs</p>
+<p class='muted'>Kimi K2 · P8/D16 · {len(rates)} session-injection rates from {rate_min:.3f} to {rate_max:.3f}/s · 8 PREFILL GPUs · 16 DECODE GPUs</p>
 <div class='note'><strong>Interpretation.</strong> The report normalizes the measured system by PREFILL GPU. One physical CPU-DRAM pool serves two PREFILL GPUs, so a 4 TB experiment label means 2 TB/GPU and 16 TB aggregate CPU DRAM across P8. Proportional extrapolation assumes PREFILL GPUs, DECODE GPUs, CPU pools, memory bandwidth, and routing are all scaled together while preserving the TraceLab session mix.</div>
+<div class='note'><strong>Fresh-run provenance.</strong> The original 0.30/0.35/0.40/0.45 source artifacts were unavailable after the pre-K3 checkout, so their boundary cases were rerun with the restored official TraceLab v0.0.2 database, seed 20260803, a 1,000-source-session sample repeated for 20 epochs, and the same pre-K3 simulator used for the new intermediate rates. Treat this report as one internally consistent fresh-run dataset; do not splice individual rows into the older archived report.</div>
 
 <h2>Verified sizing envelope</h2>
-<p>“Verified” follows the existing operational gates: stable source classifications in both the final one-hour and two-hour windows, at least {100*float(document['criteria']['min_completion_ratio']):.0f}% completions/arrivals, final-hour waiting queue and backlog no greater than 1,000 requests, and every five-minute TTFT p90 at or below {ttft_slo_s:g} seconds. The memory value is the smallest passing point among the tested capacities, not an exact analytical minimum.</p>
+<p>“Verified” uses one unified service criterion: stable source classifications in both the final one-hour and two-hour windows, at least {100*float(document['criteria']['min_completion_ratio']):.0f}% completions/arrivals, final-hour waiting queue and backlog no greater than 1,000 requests, and every five-minute TTFT p90 in the final hour at or below {ttft_slo_s:g} seconds. The memory value is the smallest passing point among the tested capacities, not an exact analytical minimum.</p>
 <div class='charts'>{charts}</div>
 <div class='table-wrap'><table><thead><tr><th>Session injection</th><th>Active sessions/GPU</th><th>Completed req/s/GPU</th><th>Observed DRAM bracket (GB/GPU)</th><th>Passing pool GB/2 GPUs</th><th>TTFT p90 max</th><th>TPOT p90 max</th><th>Combined hit</th><th>Higher-capacity exceptions (GB/GPU)</th></tr></thead><tbody>{''.join(envelope_rows)}</tbody></table></div>
 
-<h2>Sensitivity to a strict 5-second TTFT guardrail</h2>
-<p>The 60-second threshold above is inherited from the existing analyzer and is not a universal service SLO. With a stricter 5-second final-hour TTFT p90 guardrail, only the 0.30/s row changes: its tested requirement rises from 250 to 375 GB/GPU.</p>
-<div class='table-wrap'><table><thead><tr><th>Session injection</th><th>Active sessions/GPU</th><th>Completed req/s/GPU</th><th>Strict DRAM GB/GPU</th><th>Pool GB/2 GPUs</th></tr></thead><tbody>{''.join(strict_rows)}</tbody></table></div>
-
 <h2>How to scale the claim</h2>
 <p>For a target tier, multiply the per-GPU active-session and request-rate values by the number of PREFILL GPUs. Provision <code>DRAM/GPU × PREFILL GPUs</code> aggregate CPU memory, implemented as one pool of <code>2 × DRAM/GPU</code> for each two-GPU pair. Keep the measured P8:D16 ratio, so doubling users from a verified point means P16/D32 and twice the aggregate CPU DRAM.</p>
-<p>The strongest clean point in the sampled grid is 0.40 session/s: about 173 active sessions/GPU and 2.63 completed req/s/GPU with 750 GB/GPU. That is about 1,385 active sessions and 21.0 req/s on P8/D16, or about 2,770 active sessions and 42.1 req/s on P16/D32 with 12 TB aggregate CPU DRAM.</p>
+<p>{strongest_html}</p>
 
 <h2>Maximum tested verified load by installed DRAM</h2>
-<p>These are lower bounds: “0.40” means the configuration passed at 0.40/s; it does not imply that 0.41–0.44/s would fail.</p>
+<p>These are lower bounds: a listed rate means the configuration passed at that tested rate; it does not locate the exact failure rate between sampled rows.</p>
 <div class='table-wrap'><table><thead><tr><th>DRAM GB/GPU</th><th>Pool GB/2 GPUs</th><th>Max tested verified injection</th><th>Active sessions/GPU</th><th>Completed req/s/GPU</th><th>TTFT p90 max</th></tr></thead><tbody>{''.join(capacity_rows)}</tbody></table></div>
 
 <h2>All observed operating points</h2>
@@ -612,9 +642,9 @@ h1 {{ margin:0 0 6px; }} h2 {{ margin:30px 0 12px; }} h3 {{ margin:0 0 8px; }} .
 <details><summary>Exact final-hour measurements</summary><div class='table-wrap'><table><thead><tr>{''.join(f'<th>{html.escape(header)}</th>' for header in point_headers)}</tr></thead><tbody>{''.join(point_rows)}</tbody></table></div></details>
 
 <h2>Claim boundary and follow-up</h2>
-<p>Use the envelope as a trace-conditioned sizing statement, not a model-independent constant. The 0.45/s row has higher-capacity trend exceptions, so the current data support an observed 1.5 TB/GPU passing point but not a monotonic sufficiency claim above it. A publication-strength 0.45/s claim needs repeated seeds or a finer 0.40–0.45 load sweep at 1.5–2.0 TB/GPU.</p>
+<p>Use the envelope as a trace-conditioned sizing statement, not a model-independent constant. {exception_html}</p>
 <p>Capacity comparisons within each injection rate use an identical workload. Across rates, the source sample and seed are shared, but arrival spacing and the final-hour session subsequence differ. Historical run records do not contain an executable hash or Git revision, so exact binary identity across every old case cannot be certified; future publication runs should persist both.</p>
-<p class='muted'>Machine-readable JSON and CSV are stored beside this report. Generated from the four existing 10-hour capacity sweeps.</p>
+<p class='muted'>Machine-readable JSON and CSV are stored beside this report. Generated from {len(document['source_reports'])} ten-hour capacity-sweep reports.</p>
 </main></body></html>"""
 
 
@@ -660,9 +690,6 @@ def write_report(
             "binary_identity": "historical run.json files record a binary path but not an executable hash or Git revision",
         },
         "load_envelope": build_load_envelope(points),
-        "strict_5s_load_envelope": build_load_envelope(
-            points, verified_key="strict_5s_verified_sustainable"
-        ),
         "capacity_summary": build_capacity_summary(points),
         "points": points,
     }

@@ -22,6 +22,11 @@ import sys
 import time
 from typing import Any, Sequence
 
+try:
+    from .convert_tracelab_workload import CONVERTER_VERSION
+except ImportError:  # Direct script execution.
+    from convert_tracelab_workload import CONVERTER_VERSION
+
 
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parents[2]
@@ -148,16 +153,22 @@ def validate_workload_metadata(
     sampling = metadata.get("sampling", {})
     if not isinstance(sampling, dict):
         raise ValueError(f"invalid sampling metadata: {path}")
+    mismatches: list[str] = []
+    actual_version = metadata.get("converter_version")
+    if actual_version != CONVERTER_VERSION:
+        mismatches.append(
+            f"converter_version={actual_version!r} (expected {CONVERTER_VERSION!r})"
+        )
     expected = {
         "sample_sessions": sample_sessions,
         "seed": seed,
         "session_repetitions": repetitions,
     }
-    mismatches = [
+    mismatches.extend(
         f"{key}={sampling.get(key)!r} (expected {value!r})"
         for key, value in expected.items()
         if sampling.get(key) != value
-    ]
+    )
     actual_rate = sampling.get("session_arrival_rate_per_second")
     if actual_rate is None or not math.isclose(float(actual_rate), rate, rel_tol=0.0, abs_tol=1e-12):
         mismatches.append(f"session_arrival_rate_per_second={actual_rate!r} (expected {rate!r})")
