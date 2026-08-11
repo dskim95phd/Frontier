@@ -1,0 +1,11 @@
+metric,definition
+turn,One LLM model step retained and emitted by converter v3.
+simulator_session,Numeric Frontier session after v3 compaction and missing-timing splits.
+trigger_type:human,The retained round's first_input_event_type is user_message; event-count fallback is used only when that field is missing.
+trigger_type:tool,The retained round's first_input_event_type is tool_result; event-count fallback is used only when that field is missing.
+turn_gap_seconds,"Current first user_message/tool_result timestamp (fallback first timing event) minus previous latest reasoning/text/tool_call timestamp (fallback first event), only within the same emitted simulator session; negative values are clamped to zero."
+isl_tokens,"Converter v3 num_prefill_tokens: full input_tokens_total for a simulator-session root, otherwise current input_total - previous input_total - previous output_tokens."
+osl_tokens,TraceLab rounds.output_tokens for a retained turn.
+context_length_tokens,Prompt context when the retained model step arrives: TraceLab rounds.input_tokens_total. It is cross-checked against Frontier session materialization.
+v3_compaction,A nonpositive logical ISL candidate is accepted only when current input_tokens_total <= 25% of previous input_tokens_total (at least 75% reduction); otherwise that row and the remaining source-session tail are discarded.
+distribution_csv_bins,The four distribution CSVs contain no raw request/session rows. Values use 20 shared logarithmic upper bounds per decade; bin_count/share are per interval and cumulative_count/share form the CDF. Plot bin_upper_inclusive on x and cumulative_share on y.
