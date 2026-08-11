@@ -690,9 +690,22 @@ metrics::SimulationOutput Simulator::run() {
 }
 
 metrics::SimulationOutput Simulator::run_until(SimTime end_time) {
+    return run_until(end_time, 0.0, {});
+}
+
+metrics::SimulationOutput
+Simulator::run_until(SimTime end_time, double progress_interval_s,
+                     const ProgressCallback &progress_callback) {
     if (!end_time.valid() || end_time.seconds() <= 0.0) {
         throw SimulationError("simulation end time must be finite and positive");
     }
+    if (!std::isfinite(progress_interval_s) || progress_interval_s < 0.0) {
+        throw SimulationError(
+            "simulation progress interval must be finite and nonnegative");
+    }
+    const bool report_progress =
+        static_cast<bool>(progress_callback) && progress_interval_s > 0.0;
+    double next_progress_s = progress_interval_s;
     const events::EventDispatcher dispatcher;
     while (!event_queue_.empty() && event_queue_.top().time <= end_time) {
         Event event = event_queue_.pop();
@@ -700,6 +713,12 @@ metrics::SimulationOutput Simulator::run_until(SimTime end_time) {
         metrics_.record_event(event);
         dispatcher.dispatch(event, *this);
         record_gpu_kv_occupancy_for_event(event);
+        while (report_progress &&
+               last_event_time_.seconds() >= next_progress_s &&
+               next_progress_s <= end_time.seconds()) {
+            progress_callback(SimTime::from_seconds(next_progress_s));
+            next_progress_s += progress_interval_s;
+        }
     }
     // A bounded experiment intentionally leaves future session turns and
     // possibly in-flight requests outside the observation horizon.  Export

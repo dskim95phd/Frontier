@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <stdexcept>
@@ -27,11 +28,16 @@ class SimulationError : public std::runtime_error {
 
 class Simulator {
   public:
+    using ProgressCallback = std::function<void(SimTime)>;
+
     Simulator(const config::SimulationConfig &config,
               const std::vector<request_generator::WorkloadRequest> &workload);
 
     [[nodiscard]] metrics::SimulationOutput run();
     [[nodiscard]] metrics::SimulationOutput run_until(SimTime end_time);
+    [[nodiscard]] metrics::SimulationOutput
+    run_until(SimTime end_time, double progress_interval_s,
+              const ProgressCallback &progress_callback);
     [[nodiscard]] const config::SimulationConfig &config() const noexcept {
         return config_;
     }

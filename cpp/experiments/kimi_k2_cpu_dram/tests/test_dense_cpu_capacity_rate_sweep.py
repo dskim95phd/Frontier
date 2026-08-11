@@ -100,6 +100,43 @@ def test_all_session_converter_command_omits_sampling_flag(tmp_path: Path) -> No
     assert command[command.index("--session-repetitions") + 1] == "3"
 
 
+def test_case_start_message_prints_complete_experiment_condition(tmp_path: Path) -> None:
+    case = runner.build_matrix(
+        {500: ("0.30", "0.30")},
+        step="0.01",
+        workload_root=tmp_path / "workloads",
+        output_root=tmp_path / "runs",
+        seed=7,
+    )[0]
+
+    message = runner._case_start_message(
+        case,
+        source_sessions_per_epoch=8041,
+        session_repetitions=3,
+    )
+
+    assert message == (
+        "[running] r0p30/cpu0500gb rate=0.30/s physical_cpu=500GB "
+        "per_prefill_gpu=250GB source_sessions=8041 epochs=3 horizon=10h"
+    )
+
+
+def test_case_progress_message_reports_simulated_hours(tmp_path: Path) -> None:
+    case = runner.build_matrix(
+        {4000: ("0.45", "0.45")},
+        step="0.01",
+        workload_root=tmp_path / "workloads",
+        output_root=tmp_path / "runs",
+        seed=7,
+    )[0]
+
+    assert runner._case_progress_message(
+        case,
+        simulation_time_s=3 * 3600,
+        wall_seconds=42.125,
+    ) == "[progress] r0p45/cpu4000gb simulated=3/10h (30%) wall=42.1s"
+
+
 def test_report_discovery_includes_only_completed_points(tmp_path: Path) -> None:
     completed = tmp_path / "r0p3" / "cpu0500gb" / "r1"
     incomplete = tmp_path / "r0p3" / "cpu0750gb" / "r1"

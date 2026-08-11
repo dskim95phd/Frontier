@@ -36,6 +36,7 @@ struct RunOptions {
     bool runtime_validation = true;
     bool gpu_kv_occupancy = true;
     std::optional<double> simulation_end_time_s;
+    std::optional<double> progress_interval_s;
 };
 
 void print_usage(std::ostream &stream) {
@@ -52,7 +53,8 @@ void print_usage(std::ostream &stream) {
            "[--output-mode summary|requests|full] "
            "[--runtime-validation true|false] "
            "[--gpu-kv-occupancy true|false] "
-           "[--simulation-end-time-s <seconds>]\n\n"
+           "[--simulation-end-time-s <seconds>] "
+           "[--progress-interval-s <seconds>]\n\n"
         << "Without --output-dir, the complete deterministic JSON trace is "
            "written to stdout.\n"
         << "With --output-dir, normalized inputs and summary.json are always "
@@ -114,6 +116,7 @@ std::optional<RunOptions> parse_run_options(int argc, char *argv[]) {
     std::optional<bool> runtime_validation;
     std::optional<bool> gpu_kv_occupancy;
     std::optional<double> simulation_end_time_s;
+    std::optional<double> progress_interval_s;
     for (int index = 1; index < argc; index += 2) {
         const std::string_view option{argv[index]};
         const std::string_view value{argv[index + 1]};
@@ -159,13 +162,28 @@ std::optional<RunOptions> parse_run_options(int argc, char *argv[]) {
             } catch (const std::exception &) {
                 return std::nullopt;
             }
+        } else if (option == "--progress-interval-s" &&
+                   !progress_interval_s.has_value()) {
+            try {
+                std::size_t consumed = 0;
+                const double parsed = std::stod(std::string{value}, &consumed);
+                if (consumed != value.size() || !std::isfinite(parsed) ||
+                    parsed <= 0.0) {
+                    return std::nullopt;
+                }
+                progress_interval_s = parsed;
+            } catch (const std::exception &) {
+                return std::nullopt;
+            }
         } else {
             return std::nullopt;
         }
     }
 
     if (!config_path.has_value() || !workload_path.has_value() ||
-        (output_mode.has_value() && !output_dir.has_value())) {
+        (output_mode.has_value() && !output_dir.has_value()) ||
+        (progress_interval_s.has_value() &&
+         !simulation_end_time_s.has_value())) {
         return std::nullopt;
     }
     RunOptions result{};
@@ -176,6 +194,7 @@ std::optional<RunOptions> parse_run_options(int argc, char *argv[]) {
     result.runtime_validation = runtime_validation.value_or(true);
     result.gpu_kv_occupancy = gpu_kv_occupancy.value_or(true);
     result.simulation_end_time_s = simulation_end_time_s;
+    result.progress_interval_s = progress_interval_s;
     return result;
 }
 
@@ -276,11 +295,24 @@ int main(int argc, char *argv[]) {
             options->output_mode != OutputMode::kFull) {
             simulator.metrics().set_detailed_traces_enabled(false);
         }
-        const frontier::metrics::SimulationOutput output =
-            options->simulation_end_time_s.has_value()
-                ? simulator.run_until(frontier::SimTime::from_seconds(
-                      options->simulation_end_time_s.value()))
-                : simulator.run();
+        frontier::metrics::SimulationOutput output{};
+        if (options->simulation_end_time_s.has_value()) {
+            const frontier::SimTime end_time = frontier::SimTime::from_seconds(
+                options->simulation_end_time_s.value());
+            if (options->progress_interval_s.has_value()) {
+                output = simulator.run_until(
+                    end_time, options->progress_interval_s.value(),
+                    [](frontier::SimTime progress_time) {
+                        std::cerr << "simulation_progress_s="
+                                  << progress_time.seconds() << '\n'
+                                  << std::flush;
+                    });
+            } else {
+                output = simulator.run_until(end_time);
+            }
+        } else {
+            output = simulator.run();
+        }
         const double wall_clock_seconds =
             std::chrono::duration<double>(std::chrono::steady_clock::now() -
                                           started_at)

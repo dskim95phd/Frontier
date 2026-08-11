@@ -60,6 +60,7 @@ CPU_CAPACITY_RATE_RANGES: dict[int, tuple[str, str]] = {
 RATE_STEP = "0.01"
 MAX_CONCURRENT_SIMULATIONS = 4
 SIMULATION_END_TIME_S = 10 * 60 * 60
+PROGRESS_INTERVAL_S = 60 * 60
 # None means use every eligible source session.  SESSION_REPETITIONS=None
 # selects the minimum number of full epochs that keeps injection active for
 # the entire simulation at the highest configured rate.
@@ -391,7 +392,40 @@ def _simulator_command(args: argparse.Namespace, case: MatrixCase) -> list[str]:
         "true" if args.gpu_kv_occupancy else "false",
         "--simulation-end-time-s",
         format(SIMULATION_END_TIME_S, "g"),
+        "--progress-interval-s",
+        format(PROGRESS_INTERVAL_S, "g"),
     ]
+
+
+def _case_start_message(
+    case: MatrixCase,
+    *,
+    source_sessions_per_epoch: int,
+    session_repetitions: int,
+) -> str:
+    return (
+        f"[running] {case.label} rate={format(case.rate, 'f')}/s "
+        f"physical_cpu={case.capacity_gb}GB "
+        f"per_prefill_gpu={case.capacity_gb / 2.0:g}GB "
+        f"source_sessions={source_sessions_per_epoch} "
+        f"epochs={session_repetitions} "
+        f"horizon={SIMULATION_END_TIME_S / 3600.0:g}h"
+    )
+
+
+def _case_progress_message(
+    case: MatrixCase,
+    *,
+    simulation_time_s: float,
+    wall_seconds: float,
+) -> str:
+    simulated_hours = simulation_time_s / 3600.0
+    horizon_hours = SIMULATION_END_TIME_S / 3600.0
+    percent = 100.0 * simulation_time_s / SIMULATION_END_TIME_S
+    return (
+        f"[progress] {case.label} simulated={simulated_hours:g}/{horizon_hours:g}h "
+        f"({percent:.0f}%) wall={wall_seconds:.1f}s"
+    )
 
 
 def run_case(
@@ -431,18 +465,53 @@ def run_case(
     }
     _json_write(case.output_dir / "run.json", record)
     started = time.perf_counter()
+    print(
+        _case_start_message(
+            case,
+            source_sessions_per_epoch=source_sessions_per_epoch,
+            session_repetitions=session_repetitions,
+        ),
+        flush=True,
+    )
     with (case.output_dir / "simulator.log").open("w", encoding="utf-8") as log:
-        completed = subprocess.run(
+        process = subprocess.Popen(
             command,
             cwd=REPO_ROOT,
-            stdout=log,
+            stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            check=False,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
         )
+        if process.stdout is None:
+            raise RuntimeError("simulator stdout pipe was not created")
+        for line in process.stdout:
+            log.write(line)
+            if not line.startswith("simulation_progress_s="):
+                continue
+            log.flush()
+            try:
+                simulation_time_s = float(line.split("=", 1)[1].strip())
+            except ValueError:
+                continue
+            wall_seconds = time.perf_counter() - started
+            record["last_progress_simulation_time_s"] = simulation_time_s
+            record["last_progress_wall_clock_seconds"] = wall_seconds
+            _json_write(case.output_dir / "run.json", record)
+            print(
+                _case_progress_message(
+                    case,
+                    simulation_time_s=simulation_time_s,
+                    wall_seconds=wall_seconds,
+                ),
+                flush=True,
+            )
+        returncode = process.wait()
     record.update(
         {
-            "status": "completed" if completed.returncode == 0 else "failed",
-            "exit_code": completed.returncode,
+            "status": "completed" if returncode == 0 else "failed",
+            "exit_code": returncode,
             "finished_at_unix_s": time.time(),
             "process_wall_clock_seconds": time.perf_counter() - started,
         }
@@ -452,7 +521,7 @@ def run_case(
         f"[{record['status']}] {case.label} wall={record['process_wall_clock_seconds']:.1f}s",
         flush=True,
     )
-    return case.label, completed.returncode == 0
+    return case.label, returncode == 0
 
 
 def _parse_capacity_filter(text: str) -> set[int]:

@@ -37,6 +37,13 @@ positive integer only when a fixed repetition count is intentional.  The
 runner records the Git revision and SHA-256 hashes of the database, binary,
 config, and generated workload in `sweep_plan.json`.
 
+Each simulation prints its full condition when it starts and reports actual
+DES time once per simulated hour, for example
+`[progress] r0p30/cpu0500gb simulated=3/10h (30%) wall=42.1s`.  This is not a
+wall-clock estimate: the simulator emits the crossed simulation-time
+milestones through `--progress-interval-s 3600`, and the runner also stores the
+latest milestone in that case's `run.json`.
+
 After the simulations, reports are generated automatically.  They can also be
 regenerated during or after a partial/resumed sweep; only cases containing
 both `summary.json` and `requests.csv` are included:
