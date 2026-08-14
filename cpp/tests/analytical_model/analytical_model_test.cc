@@ -1715,6 +1715,151 @@ void test_stage_group_scaled_pp_signatures_and_routing_guard() {
            "separate KDA/MLA attention groups");
 }
 
+void test_kimi_k3_stage_group_scaled_all_pp_stages() {
+    const auto model =
+        frontier::config::load_model_config("moonshotai/Kimi-K3");
+    const auto make_batch = [] {
+        std::vector<Request> requests;
+        requests.emplace_back([&]() {
+            WorkloadRequest value{};
+            value.request_id = RequestId{0};
+            value.session_start_at = SimTime::from_seconds(0.0);
+            value.num_prefill_tokens = 128;
+            value.num_decode_tokens = 1;
+            return value;
+        }());
+        requests.front().on_arrival(SimTime::from_seconds(0.0));
+        requests.front().on_admitted(SimTime::from_seconds(0.0));
+        requests.front().advance_scheduler_frontier(128);
+        RequestBatchSnapshot snapshot{};
+        snapshot.request_id = RequestId{0};
+        snapshot.scheduled_tokens = 128;
+        snapshot.scheduler_frontier = 128;
+        const Batch batch{BatchId{0}, IterationId{0}, {snapshot},
+                          SimTime::from_seconds(0.0), Generation{0}};
+        return std::make_pair(std::move(requests), batch);
+    };
+
+    for (const std::uint64_t pp : {1ULL, 4ULL, 24ULL}) {
+        frontier::config::ParallelismConfig parallelism{};
+        parallelism.tensor_parallel_size = 4;
+        parallelism.pipeline_parallel_size = pp;
+        parallelism.moe_tensor_parallel_size = 1;
+        parallelism.moe_expert_parallel_size = 16;
+
+        frontier::config::AnalyticalExecutionModelConfig detailed_config{};
+        detailed_config.precision = "fp8";
+        auto grouped_config = detailed_config;
+        grouped_config.moe_layer_event_mode = "stage_group_scaled";
+        const predictor::AnalyticalRooflineExecutionTimePredictor detailed{
+            detailed_config, parallelism, model,
+            frontier::config::MoeRoutingConfig{}};
+        const predictor::AnalyticalRooflineExecutionTimePredictor grouped{
+            grouped_config, parallelism, model,
+            frontier::config::MoeRoutingConfig{}};
+        auto detailed_input = make_batch();
+        auto grouped_input = make_batch();
+
+        std::uint64_t total_kda = 0;
+        std::uint64_t total_mla = 0;
+        std::uint64_t total_moe = 0;
+        std::vector<std::uint64_t> seen_timing_groups;
+        for (std::uint64_t stage = 0; stage < pp; ++stage) {
+            const auto layers = frontier::config::pipeline_stage_layer_range(
+                model.num_layers, pp, stage);
+            std::uint64_t expected_kda = 0;
+            std::uint64_t expected_mla = 0;
+            std::uint64_t expected_moe = 0;
+            std::uint64_t repeated_kda = 0;
+            std::uint64_t repeated_mla = 0;
+            bool saw_first_moe = false;
+            for (std::uint64_t layer = layers.begin; layer < layers.end;
+                 ++layer) {
+                expected_kda +=
+                    static_cast<std::uint64_t>(model.is_kda_layer(layer));
+                expected_mla +=
+                    static_cast<std::uint64_t>(model.is_mla_layer(layer));
+                if (!model.is_moe_layer(layer)) {
+                    continue;
+                }
+                ++expected_moe;
+                if (!saw_first_moe) {
+                    saw_first_moe = true;
+                } else if (model.is_kda_layer(layer)) {
+                    ++repeated_kda;
+                } else {
+                    ++repeated_mla;
+                }
+            }
+            total_kda += expected_kda;
+            total_mla += expected_mla;
+            total_moe += expected_moe;
+
+            const auto detailed_prediction =
+                detailed.predict_stage_execution_time(
+                    detailed_input.second, detailed_input.first,
+                    frontier::StageId{stage});
+            const auto grouped_prediction = grouped.predict_stage_execution_time(
+                grouped_input.second, grouped_input.first,
+                frontier::StageId{stage});
+            expect(detailed_prediction.execution_time ==
+                       grouped_prediction.execution_time,
+                   "K3 detailed and grouped PP stage times must match");
+            expect(saw_first_moe &&
+                       detailed_prediction.logical_moe_layer_count ==
+                           expected_moe &&
+                       grouped_prediction.logical_moe_layer_count ==
+                           expected_moe &&
+                       grouped_prediction.moe_routing.size() == 1 &&
+                       grouped_prediction.scaled_moe_layer_prediction,
+                   "K3 grouped PP stage must preserve its exact MoE count");
+            expect(diagnostic_value(grouped_prediction, "kda_layer_count") ==
+                           static_cast<double>(expected_kda) &&
+                       diagnostic_value(grouped_prediction,
+                                        "mla_layer_count") ==
+                           static_cast<double>(expected_mla),
+                   "K3 grouped PP stage must preserve KDA/MLA counts");
+
+            std::uint64_t actual_repeated_kda = 0;
+            std::uint64_t actual_repeated_mla = 0;
+            for (const auto &group :
+                 grouped_prediction.scaled_moe_attention_groups) {
+                if (group.family ==
+                    predictor::ScaledMoEAttentionFamily::kKda) {
+                    actual_repeated_kda += group.layer_count;
+                } else if (group.family ==
+                           predictor::ScaledMoEAttentionFamily::kMla) {
+                    actual_repeated_mla += group.layer_count;
+                }
+            }
+            expect(actual_repeated_kda == repeated_kda &&
+                       actual_repeated_mla == repeated_mla,
+                   "K3 grouped PP stage must preserve repeated family counts");
+
+            const bool final_stage = stage + 1 == pp;
+            expect((grouped_prediction.execution_time.pp_communication_ms >
+                    0.0) == !final_stage,
+                   "K3 PP sends must exist only on non-final stages");
+            const auto timing_group = static_cast<std::uint64_t>(
+                diagnostic_value(grouped_prediction, "timing_group_id"));
+            const bool repeated_group =
+                std::find(seen_timing_groups.begin(),
+                          seen_timing_groups.end(), timing_group) !=
+                seen_timing_groups.end();
+            expect(diagnostic_value(
+                       grouped_prediction,
+                       repeated_group ? "timing_cache_hit"
+                                      : "timing_cache_miss") == 1.0,
+                   "K3 timing groups must miss once and then reuse cache");
+            if (!repeated_group) {
+                seen_timing_groups.push_back(timing_group);
+            }
+        }
+        expect(total_kda == 69 && total_mla == 24 && total_moe == 92,
+               "K3 PP stages must reconstruct the complete hybrid model");
+    }
+}
+
 void test_invalid_analytical_inputs_are_rejected() {
     expect_throws<analytical::AnalyticalModelError>(
         [] {
@@ -1900,6 +2045,9 @@ int main() {
     failures += frontier::test::run(
         "stage-group scaled PP signatures and routing guard",
         test_stage_group_scaled_pp_signatures_and_routing_guard);
+    failures += frontier::test::run(
+        "Kimi K3 stage-group scaled all PP stages",
+        test_kimi_k3_stage_group_scaled_all_pp_stages);
     failures +=
         frontier::test::run("invalid analytical inputs are rejected",
                             test_invalid_analytical_inputs_are_rejected);

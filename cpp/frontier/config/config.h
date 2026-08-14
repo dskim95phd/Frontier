@@ -481,9 +481,13 @@ struct ParallelismConfig {
     std::uint64_t moe_expert_parallel_size = 1;
     // DCP reuses ranks inside each TP group and shards KV entries along the
     // token axis. It therefore does not contribute to accelerator count.
-    // Keep this extension last so positional aggregate initialization of the
-    // legacy fields remains source-compatible.
+    // Keep extensions after the legacy fields so positional aggregate
+    // initialization remains source-compatible.
     std::uint64_t decode_context_parallel_size = 1;
+    // When enabled, each pipeline stage owns its execution resources
+    // exclusively. This is an opt-in topology contract; the default keeps
+    // legacy parallelism behavior unchanged.
+    bool pipeline_exclusive = false;
 
     [[nodiscard]] std::uint64_t attention_parallel_size() const noexcept {
         return tensor_parallel_size * data_parallel_size;
@@ -498,12 +502,14 @@ struct ParallelismConfig {
                         lhs.pipeline_parallel_size, lhs.data_parallel_size,
                         lhs.moe_tensor_parallel_size,
                         lhs.moe_expert_parallel_size,
-                        lhs.decode_context_parallel_size) ==
+                        lhs.decode_context_parallel_size,
+                        lhs.pipeline_exclusive) ==
                std::tie(rhs.num_replicas, rhs.tensor_parallel_size,
                         rhs.pipeline_parallel_size, rhs.data_parallel_size,
                         rhs.moe_tensor_parallel_size,
                         rhs.moe_expert_parallel_size,
-                        rhs.decode_context_parallel_size);
+                        rhs.decode_context_parallel_size,
+                        rhs.pipeline_exclusive);
     }
 };
 
@@ -553,6 +559,12 @@ struct SchedulerConfig {
     std::uint64_t num_blocks = 1;
     double watermark_blocks_fraction = 0.0;
     std::uint64_t num_preallocate_tokens = 0;
+    // Controls how pipeline-stage causality is represented in the DES.
+    // "exact" retains one arrival/schedule/end chain per stage;
+    // "collapsed" fuses safe pipeline transitions while preserving the
+    // stage-local resource calendar. Unsupported synchronized paths fall
+    // back to the exact chain.
+    std::string pipeline_event_mode = "exact";
     // Derived per-session KDA recurrent-state footprint, expressed in GPU
     // scheduler blocks.  It is populated by memory resolution and omitted
     // from user-authored JSON unless a caller explicitly normalizes it.
@@ -565,14 +577,14 @@ struct SchedulerConfig {
                         lhs.enable_chunked_prefill,
                         lhs.long_prefill_token_threshold, lhs.block_size,
                         lhs.num_blocks, lhs.watermark_blocks_fraction,
-                        lhs.num_preallocate_tokens,
+                        lhs.num_preallocate_tokens, lhs.pipeline_event_mode,
                         lhs.kda_snapshot_blocks_per_session) ==
                std::tie(rhs.type, rhs.scheduling_policy, rhs.batch_size_cap,
                         rhs.max_tokens_in_batch, rhs.enable_preemption,
                         rhs.enable_chunked_prefill,
                         rhs.long_prefill_token_threshold, rhs.block_size,
                         rhs.num_blocks, rhs.watermark_blocks_fraction,
-                        rhs.num_preallocate_tokens,
+                        rhs.num_preallocate_tokens, rhs.pipeline_event_mode,
                         rhs.kda_snapshot_blocks_per_session);
     }
 };
@@ -1176,6 +1188,12 @@ resolve_cpu_kv_cache_target(const SimulationConfig &config);
 // aggregate transfer helpers intentionally remain separate from this view.
 [[nodiscard]] std::vector<PipelineStageMemoryProfile>
 build_pipeline_stage_memory_profiles(const ClusterRuntimeConfig &cluster);
+
+// Build the canonical execution signature for one physical PP stage. Both
+// configuration/metrics grouping and predictor caching must use this helper.
+[[nodiscard]] StageTimingSignature build_pipeline_stage_timing_signature(
+    const ModelConfig &model, const ParallelismConfig &parallelism,
+    std::uint64_t stage);
 
 // Build deterministic first-occurrence-order timing and memory groups for a
 // profile set.  `profiles` must be ordered by stage id and cover every PP

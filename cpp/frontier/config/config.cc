@@ -279,10 +279,12 @@ std::uint64_t resolve_total_gpu_reserve_bytes(const GpuMemoryConfig &memory,
     return memory.runtime_reserve_bytes + reserve_from_fraction;
 }
 
-StageTimingSignature stage_timing_signature(const ClusterRuntimeConfig &cluster,
-                                            std::uint64_t stage) {
-    const auto &model = cluster.model;
-    const auto pp = cluster.parallelism.pipeline_parallel_size;
+} // namespace
+
+StageTimingSignature build_pipeline_stage_timing_signature(
+    const ModelConfig &model, const ParallelismConfig &parallelism,
+    std::uint64_t stage) {
+    const auto pp = parallelism.pipeline_parallel_size;
     const auto layers = pipeline_stage_layer_range(model.num_layers, pp, stage);
     StageTimingSignature signature{};
     signature.owns_input_embedding = stage == 0;
@@ -300,13 +302,12 @@ StageTimingSignature stage_timing_signature(const ClusterRuntimeConfig &cluster,
             layer_signature.attention_family = AttentionFamily::kStandard;
         }
         layer_signature.is_moe = model.is_moe_layer(layer);
-        layer_signature.has_dense_mlp = !layer_signature.is_moe;
+        layer_signature.has_dense_mlp =
+            !layer_signature.is_moe || model.num_shared_experts != 0;
         signature.ordered_layers.push_back(layer_signature);
     }
     return signature;
 }
-
-} // namespace
 
 double resolve_pdd_kda_snapshot_dtype_size_bytes(
     const PddClustersConfig &clusters) {
@@ -545,7 +546,9 @@ PipelineStageGroupCatalogue build_pipeline_stage_group_catalogue(
     catalogue.stage_to_memory_group.reserve(profiles.size());
     for (std::size_t index = 0; index < profiles.size(); ++index) {
         const auto stage = static_cast<std::uint64_t>(index);
-        const StageTimingSignature timing = stage_timing_signature(cluster, stage);
+        const StageTimingSignature timing =
+            build_pipeline_stage_timing_signature(
+                cluster.model, cluster.parallelism, stage);
         const StageMemorySignature memory = profiles[index].memory_signature();
 
         auto timing_it = std::find(catalogue.timing_groups.begin(),

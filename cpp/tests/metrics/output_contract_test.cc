@@ -409,6 +409,17 @@ void test_summary_contract() {
     expect(json.at("prefill_attention_token_pairs_by_arrival_time_bucket")
                    .at("0") == 87,
            "summary must expose arrival-side PREFILL attention demand");
+
+    SimulationOutput bounded = make_output();
+    bounded.observation_window_seconds = 43'200.0;
+    const Json bounded_summary = Json::parse(
+        serialize_simulation_summary_json(bounded, 0.25));
+    expect(bounded_summary.at("simulation_window_seconds") == 43'200.0,
+           "bounded summary must retain its explicit observation horizon");
+    const Json bounded_output =
+        Json::parse(serialize_simulation_output_json(bounded));
+    expect(bounded_output.at("observation_window_seconds") == 43'200.0,
+           "bounded full output must expose its observation horizon");
 }
 
 } // namespace

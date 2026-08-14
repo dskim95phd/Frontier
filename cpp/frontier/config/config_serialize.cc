@@ -74,6 +74,7 @@ OrderedJson serialize_scheduler(const SchedulerConfig &scheduler) {
             scheduler.watermark_blocks_fraction,
         },
         {"num_preallocate_tokens", scheduler.num_preallocate_tokens},
+        {"pipeline_event_mode", scheduler.pipeline_event_mode},
     });
 }
 
@@ -95,6 +96,7 @@ OrderedJson serialize_parallelism(const ParallelismConfig &parallelism) {
             "moe_expert_parallel_size",
             parallelism.moe_expert_parallel_size,
         },
+        {"pipeline_exclusive", parallelism.pipeline_exclusive},
     });
 }
 

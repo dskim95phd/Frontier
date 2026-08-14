@@ -550,6 +550,46 @@ if(BUILD_TESTING)
     NAME frontier_simulator.k3_cpu_kv_cache
     COMMAND $<TARGET_FILE:frontier_k3_cpu_kv_cache_integration_test>
   )
+
+  add_executable(
+    frontier_k3_pipeline_exclusive_offload_matrix_test
+    tests/simulator/k3_pipeline_exclusive_offload_matrix_test.cc
+  )
+  target_compile_definitions(
+    frontier_k3_pipeline_exclusive_offload_matrix_test
+    PRIVATE
+      FRONTIER_EXAMPLE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/examples"
+  )
+  target_link_libraries(
+    frontier_k3_pipeline_exclusive_offload_matrix_test
+    PRIVATE frontier_core
+  )
+  frontier_enable_warnings(frontier_k3_pipeline_exclusive_offload_matrix_test)
+  add_test(
+    NAME frontier_simulator.k3_pipeline_exclusive_offload_matrix
+    COMMAND $<TARGET_FILE:frontier_k3_pipeline_exclusive_offload_matrix_test>
+  )
+
+  add_executable(
+    frontier_pipeline_exclusive_matrix_test
+    tests/simulator/pipeline_exclusive_matrix_test.cc
+  )
+  target_compile_definitions(
+    frontier_pipeline_exclusive_matrix_test
+    PRIVATE
+      FRONTIER_EXAMPLE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/examples"
+  )
+  target_link_libraries(
+    frontier_pipeline_exclusive_matrix_test
+    PRIVATE
+      frontier_core
+      nlohmann_json::nlohmann_json
+  )
+  frontier_enable_warnings(frontier_pipeline_exclusive_matrix_test)
+  add_test(
+    NAME frontier_simulator.pipeline_exclusive_matrix
+    COMMAND $<TARGET_FILE:frontier_pipeline_exclusive_matrix_test>
+  )
   find_package(Python3 COMPONENTS Interpreter QUIET)
   if(Python3_Interpreter_FOUND)
     add_test(

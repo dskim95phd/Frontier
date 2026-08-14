@@ -1010,9 +1010,13 @@ ScheduleResult VllmV1Scheduler::schedule_requests(SimTime time) {
             ++running_index;
             continue;
         }
-        if (request_is_active(request_id) &&
-            (cluster_type() != ClusterType::kPrefill ||
-             value.is_prefill_complete())) {
+        // A request must have at most one in-flight scheduler batch.  In
+        // particular, chunked PREFILL batches can have different PP pipeline
+        // durations and may otherwise complete out of order.  Advancing the
+        // scheduler frontier for a second chunk before the first completes
+        // can strand the request with no schedulable tokens while its
+        // processed frontier is still behind.
+        if (request_is_active(request_id)) {
             ++running_index;
             continue;
         }
@@ -1304,6 +1308,17 @@ ScheduleResult VllmV1Scheduler::schedule_requests(SimTime time) {
     result.running_count_after =
         checked_size(running_.size(), "running queue size overflows uint64");
     const bool empty_iteration = result.scheduled_requests.empty();
+    if (empty_iteration && cluster_type() == ClusterType::kPrefill) {
+        for (const RequestId request_id : running_) {
+            const entities::Request &value = request(request_id);
+            if (!value.completed() && !value.is_prefill_complete() &&
+                !request_is_active(request_id) && next_num_tokens(value) == 0) {
+                throw SchedulerError(
+                    "PREFILL request is stranded behind an exhausted "
+                    "scheduler frontier");
+            }
+        }
+    }
     advance_terminal_release_boundary();
     if (empty_iteration) {
         result.available_blocks_after = kv_blocks_.available_blocks();

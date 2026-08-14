@@ -603,6 +603,14 @@ void MetricsStore::collect_completed_requests(
     }
 }
 
+void MetricsStore::set_observation_window_seconds(double seconds) {
+    if (!std::isfinite(seconds) || seconds <= 0.0) {
+        throw std::invalid_argument(
+            "observation window must be finite and positive");
+    }
+    output_.observation_window_seconds = seconds;
+}
+
 void MetricsStore::record_prefix_cache_target(
     const kv_cache::PrefixCacheStats &stats,
     const kv_cache::PrefixCacheDiagnostics &diagnostics,

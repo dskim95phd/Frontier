@@ -138,6 +138,68 @@ void test_pp4_fill_drain_and_terminal_release() {
            "PP4 terminal drain must emit an observable empty scheduler poll");
 }
 
+void test_collapsed_pp_calendar_matches_exact_timeline() {
+    const SimulationConfig exact_config =
+        load_config("fixed_pp4_colocation.json");
+    SimulationConfig collapsed_config = exact_config;
+    collapsed_config.cluster().scheduler.pipeline_event_mode = "collapsed";
+    const auto workload = load_workload();
+    const SimulationOutput exact = run_simulation(exact_config, workload);
+    const SimulationOutput collapsed =
+        run_simulation(collapsed_config, workload);
+
+    const Json exact_json =
+        Json::parse(serialize_simulation_output_json(exact));
+    const Json collapsed_json =
+        Json::parse(serialize_simulation_output_json(collapsed));
+    expect(exact_json.at("requests") == collapsed_json.at("requests") &&
+               exact_json.at("batches") == collapsed_json.at("batches"),
+           "collapsed PP must preserve request and batch completion output");
+
+    auto sort_stages = [](Json value) {
+        std::sort(value.begin(), value.end(), [](const Json &lhs,
+                                                 const Json &rhs) {
+            if (lhs.at("batch_id") != rhs.at("batch_id")) {
+                return lhs.at("batch_id") < rhs.at("batch_id");
+            }
+            return lhs.at("stage_id") < rhs.at("stage_id");
+        });
+        return value;
+    };
+    expect(sort_stages(exact_json.at("batch_stages")) ==
+               sort_stages(collapsed_json.at("batch_stages")),
+           "collapsed PP must preserve every stage interval and duration");
+
+    const auto count_events = [](const SimulationOutput &output,
+                                 EventType type) {
+        return static_cast<std::size_t>(std::count_if(
+            output.event_trace.begin(), output.event_trace.end(),
+            [type](const auto &event) { return event.type() == type; }));
+    };
+    expect(collapsed.aggregate.event_count < exact.aggregate.event_count &&
+               count_events(collapsed, EventType::kBatchPipelineEnd) > 0 &&
+               count_events(collapsed, EventType::kBatchStageEnd) == 0 &&
+               count_events(collapsed, EventType::kBatchStageArrival) <
+                   count_events(exact, EventType::kBatchStageArrival),
+           "collapsed PP must reduce intermediate stage events");
+}
+
+void test_collapsed_pp_falls_back_for_synchronized_moe() {
+    SimulationConfig config =
+        load_config("analytical_moe_ep4_colocation.json");
+    config.cluster().scheduler.pipeline_event_mode = "collapsed";
+    const SimulationOutput output = run_simulation(config, load_workload());
+    expect(std::none_of(output.event_trace.begin(), output.event_trace.end(),
+                        [](const auto &event) {
+                            return event.type() == EventType::kBatchPipelineEnd;
+                        }) &&
+               std::any_of(output.event_trace.begin(), output.event_trace.end(),
+                           [](const auto &event) {
+                               return event.type() == EventType::kBatchStageEnd;
+                           }),
+           "synchronized MoE collapsed mode must retain exact stage events");
+}
+
 void test_dp_target_local_pressure_and_preemption() {
     const SimulationOutput output =
         run_simulation(load_config("fixed_dp2_pressure_colocation.json"),
@@ -265,6 +327,12 @@ int main() {
         test_pipeline_serialization_overlap_and_fixed_timing);
     failures += frontier::test::run("PP4 fill, drain, and terminal release",
                                     test_pp4_fill_drain_and_terminal_release);
+    failures += frontier::test::run(
+        "collapsed PP calendar timeline and event reduction",
+        test_collapsed_pp_calendar_matches_exact_timeline);
+    failures += frontier::test::run(
+        "collapsed PP synchronized MoE fallback",
+        test_collapsed_pp_falls_back_for_synchronized_moe);
     failures +=
         frontier::test::run("DP target-local pressure and preemption",
                             test_dp_target_local_pressure_and_preemption);

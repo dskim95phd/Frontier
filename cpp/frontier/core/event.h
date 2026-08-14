@@ -70,6 +70,11 @@ enum class EventType : std::uint8_t {
     kCpuKvCacheOffloadEnd,
     kCpuKvCacheRestoreStart,
     kCpuKvCacheRestoreEnd,
+    // Collapsed PP mode reserves all stage intervals up front and emits one
+    // terminal event after the final reserved stage.  Exact mode never emits
+    // this event.  Keep it appended so legacy event numeric values remain
+    // stable for exact-mode traces.
+    kBatchPipelineEnd,
 };
 
 enum class MoESyncPhase : std::uint8_t {
@@ -124,6 +129,15 @@ struct BatchStageEndPayload {
     ReplicaId replica_id;
     DataParallelId dp_id;
     StageId stage_id;
+    Generation generation;
+    ClusterType cluster_type;
+};
+
+struct BatchPipelineEndPayload {
+    static constexpr EventType kType = EventType::kBatchPipelineEnd;
+    BatchId batch_id;
+    ReplicaId replica_id;
+    DataParallelId dp_id;
     Generation generation;
     ClusterType cluster_type;
 };
@@ -267,7 +281,8 @@ struct CpuKVCacheRestoreEndPayload {
 using EventPayload = std::variant<
     RequestArrivalPayload, GlobalSchedulePayload, ClusterSchedulePayload,
     ReplicaSchedulePayload, BatchStageArrivalPayload,
-    ReplicaStageSchedulePayload, BatchStageEndPayload, ClusterBatchEndPayload,
+    ReplicaStageSchedulePayload, BatchStageEndPayload,
+    BatchPipelineEndPayload, ClusterBatchEndPayload,
     GlobalBatchEndPayload, KVCacheTransferStartPayload,
     KVCacheTransferEndPayload, PrefillSyncPayload, PrefillSyncCollectivePayload,
     DecodeSyncPayload, DecodeSyncCollectivePayload,
@@ -337,8 +352,9 @@ class Event {
                     std::remove_cv_t<std::remove_reference_t<decltype(value)>>;
                 if constexpr (detail::has_generation<Payload>::value) {
                     return value.generation != current_generation;
+                } else {
+                    return false;
                 }
-                return false;
             },
             payload);
     }

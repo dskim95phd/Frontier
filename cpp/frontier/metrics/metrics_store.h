@@ -80,6 +80,7 @@ class MetricsStore {
 
     void collect_completed_requests(const config::SimulationConfig &config,
                                     const simulator::EntityArena &entities);
+    void set_observation_window_seconds(double seconds);
     void record_prefix_cache_target(
         const kv_cache::PrefixCacheStats &stats,
         const kv_cache::PrefixCacheDiagnostics &diagnostics,

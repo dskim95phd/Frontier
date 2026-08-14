@@ -116,6 +116,7 @@ class Simulator {
   private:
     void enqueue_request_arrival(RequestId request_id, SimTime ready_at);
     void record_gpu_kv_occupancy_for_event(const Event &event);
+    void record_bounded_run_cache_diagnostics(SimTime observation_time);
 
     config::SimulationConfig config_;
     EntityArena entities_;

@@ -20,6 +20,16 @@ Replica::Replica(ReplicaId replica_id, config::ParallelismConfig parallelism,
         throw ReplicaError(
             "replica currently supports only symmetric KDA Q/K/V topology");
     }
+    if (parallelism_.pipeline_exclusive &&
+        (parallelism_.pipeline_parallel_size <= 1 ||
+         parallelism_.data_parallel_size != 1 ||
+         parallelism_.moe_expert_parallel_size != 1 ||
+         parallelism_.moe_tensor_parallel_size !=
+             parallelism_.tensor_parallel_size)) {
+        throw ReplicaError(
+            "pipeline-exclusive replica requires PP > 1, DP = 1, MoE EP = "
+            "1, and MoE TP = attention TP");
+    }
     if (parallelism_.tensor_parallel_size %
                 parallelism_.decode_context_parallel_size !=
             0 ||

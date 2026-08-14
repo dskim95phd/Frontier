@@ -18,8 +18,11 @@ Implemented:
   exact dynamic prefill/decode attention slices;
 - mandatory positive per-GPU HBM capacity for manual and automatic configs;
 - exact physical validation of manually configured logical block counts; and
-- a PP1/PP4/PP24 benchmark-driven decision to retain the causal stage calendar
-  rather than add a speculative collapsed-event mode.
+- an opt-in PP collapsed calendar that preserves stage-local reservations and
+  falls back to the causal event chain for synchronized MoE execution; and
+- an opt-in pipeline-exclusive K3 experiment contract (`PP>1`, `DP=1`,
+  `MoE EP=1`, `MoE TP=attention TP`) that makes the collapsed path eligible
+  without changing the general hybrid PP+DP+EP surface.
 
 The following observability work is now implemented:
 
@@ -53,11 +56,41 @@ only and are not release thresholds:
 | 4 | 47.172 | 1,488 | 168 | 3 | 111 / 57 | 17 |
 | 24 | 241.273 | 8,175 | 1,008 | 4 | 932 / 76 | 17 |
 
-The current stage-level event calendar is retained.  PP24's queue remains
-bounded and stage transitions carry resource-causality information, so
-collapsing stage events would change scheduling semantics without a measured
-production benefit.  Revisit that optimization only after collecting larger
-production-shaped workloads where event overhead is material.
+The original benchmark justified retaining `exact` as the default. A later
+opt-in `collapsed` implementation was added without changing that default. On
+the current dense Debug fixture it reduces PP4 events from 642 to 286 and PP24
+events from 3,207 to 331 while producing identical request, batch, and
+per-stage timing output. This fixture remains diagnostic rather than a release
+performance threshold; predictor work can still dominate wall time even after
+event collapse.
+
+## Pipeline-Exclusive K3 Validation Matrix
+
+The pipeline-exclusive path is covered by a bounded pairwise matrix rather
+than only one uniform PP layout:
+
+| Area | Covered points |
+|---|---|
+| topology | `(TP,PP,DCP) = (1,2,1), (2,3,1), (4,4,1), (8,8,1), (8,24,8)` |
+| execution model | fixed and analytical `stage_group_scaled` |
+| workload shape | prefill-heavy, decode-heavy, concurrent batches, staggered arrivals |
+| calendar parity | analytical exact versus collapsed at PP3, PP8, and PP24 |
+| PDD/offload | K3 PP2, PP4, and PP8; exact and collapsed; concurrent/staggered multi-turn sessions |
+
+The matrix asserts that every batch visits every physical stage, intervals on
+one stage never overlap, pipeline-exclusive runs emit no EP/MoE synchronization
+events, and exact/collapsed calendars produce identical request, batch, and
+stage results. It also verifies positive stage-aggregate KV footprints and
+stage-local HBM/snapshot constraints. With DCP, an individual rank may own
+zero tokens for a small logical block, so non-zero KV is intentionally checked
+at the stage aggregate rather than incorrectly required on every rank.
+
+For CPU offload, the matrix preserves the asymmetric contract: GPU admission
+uses stage-local profiles, while a CPU transfer contains one full-model KDA
+snapshot. Publication starts only after the final PP stage and a restored
+batch cannot enter PP0 until the atomic H2D transfer completes. Invalid
+pipeline-exclusive DP>1 and MoE EP>1 configurations are rejected at parse
+time.
 
 ## Decisions
 
@@ -467,10 +500,13 @@ finish[b, s] = start[b, s] + predicted_stage_time[b, s]
 There is no all-stage barrier after every local layer. MoE synchronization is
 local to the participating physical domain for the same aligned layer.
 
-The first implementation keeps `BatchStageArrivalEvent` and
-`BatchStageEndEvent` for every visited PP stage. A future collapsed calendar
-mode may reserve all stage intervals and emit fewer DES events, but it is out
-of scope until profiling shows that stage events dominate simulator wall time.
+The default `scheduler.pipeline_event_mode = exact` keeps
+`BatchStageArrivalEvent` and `BatchStageEndEvent` for every visited PP stage.
+The opt-in `collapsed` mode reserves safe stage intervals against each
+stage-local calendar and emits one final pipeline-completion event instead of
+the intermediate arrival/schedule/end chain. Runtime-synchronized MoE stages
+fall back to the exact path; their aligned barrier outcome is not known when a
+batch first enters the pipeline.
 
 ## Proposed Implementation Areas
 
@@ -623,8 +659,9 @@ count. Record:
 - simulator wall time; and
 - peak event-queue size.
 
-Do not add collapsed PP events until the benchmark demonstrates a material
-bottleneck.
+Compare `exact` and `collapsed` PP calendars in the benchmark. The collapsed
+mode must preserve batch/stage timestamps and request results while materially
+reducing processed DES events for non-synchronized pipelines.
 
 ## Implementation Phases
 

@@ -220,7 +220,8 @@ Co-location has exactly one `monolithic` cluster:
         "pipeline_parallel_size": 2,
         "data_parallel_size": 2,
         "moe_tensor_parallel_size": 1,
-        "moe_expert_parallel_size": 1
+        "moe_expert_parallel_size": 1,
+        "pipeline_exclusive": false
       },
       "scheduler": {
         "type": "vllm_v1",
@@ -233,7 +234,8 @@ Co-location has exactly one `monolithic` cluster:
         "block_size": 4,
         "num_blocks": 16,
         "watermark_blocks_fraction": 0.0,
-        "num_preallocate_tokens": 0
+        "num_preallocate_tokens": 0,
+        "pipeline_event_mode": "exact"
       },
       "gpu_memory": {"capacity_bytes_per_gpu": 288000000000},
       "execution_model": {
@@ -509,6 +511,28 @@ layer-invariant routing (legacy uniform or balanced simulation routing).
 Layer-dependent routing and non-contiguous MoE layouts automatically use the
 detailed per-layer prediction path instead of reusing a mismatched first
 layer. PP stage arrival/end events remain unchanged.
+
+`scheduler.pipeline_event_mode` independently controls the DES pipeline
+calendar. It defaults to `exact`. Setting it to `collapsed` reserves safe
+stage-local execution intervals for a batch and replaces intermediate PP
+arrival/schedule/end transitions with one pipeline-completion event. This
+reduces event overhead without treating all PP HBM or compute resources as one
+device: each stage still serializes against its own reservation calendar.
+Stages that require runtime MoE synchronization automatically retain the exact
+event path because their completion cannot be reserved before the aligned
+participants reach the synchronization point.
+For PP1, `collapsed` is intentionally a no-op because there are no intermediate
+pipeline transitions to remove.
+
+For experiments that use PP specifically to partition large layer-resident
+weights such as Kimi K3 KDA, set `parallelism.pipeline_exclusive=true`. This
+mode requires `PP > 1`, `DP = 1`, `MoE EP = 1`, and `MoE TP = attention TP`.
+It intentionally removes DP/EP MoE barriers while retaining TP collectives,
+PP activation transfers, stage-local HBM/KV/snapshot accounting, and optional
+DCP inside the attention TP group. Combine it with
+`scheduler.pipeline_event_mode="collapsed"` to use the full collapsed PP
+calendar for K3/MoE batches. The flag is opt-in; hybrid PP+DP+EP configurations
+remain supported when it is false.
 
 ## Workload contract
 

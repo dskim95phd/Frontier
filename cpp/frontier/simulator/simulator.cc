@@ -792,10 +792,65 @@ metrics::SimulationOutput Simulator::run_until(SimTime end_time) {
     }
     // A bounded experiment intentionally leaves future session turns and
     // possibly in-flight requests outside the observation horizon.  Export
-    // only requests that reached canonical completion; do not run quiescence
-    // validation or emit terminal cache diagnostics for this partial state.
+    // only requests that reached canonical completion, while snapshotting
+    // (without quiescence validation) cache state and completed transfers at
+    // the boundary.
+    metrics_.set_observation_window_seconds(end_time.seconds());
+    record_bounded_run_cache_diagnostics(end_time);
     metrics_.collect_completed_requests(config_, entities_);
     return take_output();
+}
+
+void Simulator::record_bounded_run_cache_diagnostics(SimTime observation_time) {
+    for (const auto &[cluster_type, cluster_entity] : clusters_) {
+        scheduler::BaseClusterScheduler &cluster_scheduler =
+            cluster(cluster_type);
+        for (const auto &[replica_id, dp_id] : cluster_scheduler.targets()) {
+            scheduler::BaseReplicaScheduler &replica_scheduler =
+                cluster_scheduler.get_replica_scheduler(replica_id, dp_id);
+            const config::ClusterRuntimeConfig &runtime =
+                cluster_entity.runtime_config();
+            const GpuKvPhysicalBlockLayout bytes =
+                gpu_kv_physical_block_layout(runtime, config_);
+            metrics_.record_gpu_kv_cache_occupancy(
+                observation_time, replica_scheduler, bytes.max_rank_bytes,
+                bytes.pipeline_bytes, total_hbm_bytes_per_gpu(runtime), true);
+            if (config_.prefix_cache.enabled &&
+                cluster_type != ClusterType::kDecode) {
+                metrics_.record_prefix_cache_target(
+                    replica_scheduler.prefix_cache_stats(),
+                    replica_scheduler.prefix_cache_diagnostics(),
+                    scheduler::ReplicaTarget{replica_id, dp_id}, cluster_type,
+                    runtime.scheduler.block_size, config_.prefix_cache.key_mode);
+            }
+            const auto *cpu_manager =
+                replica_scheduler.cpu_kv_cache_manager();
+            if (cpu_manager == nullptr) {
+                continue;
+            }
+            const auto *cpu_config =
+                replica_scheduler.cpu_kv_cache_target_config();
+            if (cpu_config == nullptr) {
+                throw std::runtime_error(
+                    "CPU KV-cache manager has no resolved target config");
+            }
+            metrics_.record_cpu_kv_cache_target(
+                *cpu_config, cpu_manager->stats(), cpu_manager->diagnostics(),
+                scheduler::ReplicaTarget{replica_id, dp_id}, cluster_type,
+                replica_scheduler.pending_cpu_restore_count(),
+                replica_scheduler.staged_cpu_restore_count());
+            for (const auto &operation :
+                 replica_scheduler.cpu_kv_cache_offload_operations()) {
+                metrics_.record_cpu_kv_cache_offload(
+                    operation, cluster_type, cpu_config->bytes_per_block);
+            }
+            for (const auto &operation :
+                 replica_scheduler.cpu_kv_cache_restore_operations()) {
+                metrics_.record_cpu_kv_cache_restore(
+                    operation, cluster_type, cpu_config->bytes_per_block);
+            }
+        }
+    }
 }
 
 metrics::SimulationOutput run_simulation(

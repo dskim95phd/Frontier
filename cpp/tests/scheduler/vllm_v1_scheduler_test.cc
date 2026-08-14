@@ -172,6 +172,68 @@ void test_chunked_prefill_runs_before_new_waiting_work() {
            "remaining budget must mix waiting and running prefill work");
 }
 
+void test_chunked_prefill_does_not_overlap_same_request_across_pp_batches() {
+    auto requests = make_requests({{12, 1}});
+    SchedulerConfig config = scheduler_config();
+    config.max_tokens_in_batch = 4;
+    config.enable_chunked_prefill = true;
+    config.long_prefill_token_threshold = 4;
+
+    frontier::config::ParallelismConfig parallelism{};
+    parallelism.pipeline_parallel_size = 2;
+    frontier::config::ModelConfig model{};
+    model.num_layers = 2;
+    frontier::entities::Replica replica{frontier::ReplicaId{0}, parallelism,
+                                        model};
+    auto predictor = std::make_shared<
+        frontier::execution_time_predictor::FixedExecutionTimePredictor>(
+        frontier::config::FixedExecutionModelConfig{});
+    VllmV1Scheduler scheduler{config,
+                              requests,
+                              predictor,
+                              replica,
+                              frontier::DataParallelId{0},
+                              frontier::ClusterType::kPrefill};
+    arrive_all(scheduler, requests);
+
+    const ScheduleResult first = scheduler.schedule(SimTime::from_seconds(0));
+    expect(first.scheduled_requests.size() == 1 &&
+               first.scheduled_requests.front().num_tokens == 4,
+           "first PP PREFILL batch must schedule one prompt chunk");
+    const Request &request = requests.front();
+    std::vector<RequestBatchSnapshot> snapshots{[&]() {
+        RequestBatchSnapshot value{};
+        value.request_id = request.id();
+        value.scheduled_tokens = first.scheduled_requests.front().num_tokens;
+        value.runtime_epoch = request.runtime_epoch();
+        value.execution_epoch = request.execution_epoch();
+        value.processed_tokens = request.num_processed_tokens();
+        value.scheduler_frontier = request.scheduler_num_computed_tokens();
+        return value;
+    }()};
+    Batch first_batch{BatchId{0}, first.iteration_id, std::move(snapshots),
+                      first.simulation_time, Generation{1}};
+    scheduler.mark_batch_started(first_batch);
+
+    const ScheduleResult overlapping =
+        scheduler.schedule(SimTime::from_seconds(0.0005));
+    expect(overlapping.scheduled_requests.empty() &&
+               requests.front().scheduler_num_computed_tokens() == 4,
+           "an active chunked PREFILL request must not enter a second PP "
+           "batch before its first chunk completes");
+
+    expect(scheduler.on_batch_completed(first_batch,
+                                        SimTime::from_seconds(0.001)),
+           "first PP PREFILL chunk must complete normally");
+    const ScheduleResult continuation =
+        scheduler.schedule(SimTime::from_seconds(0.001));
+    expect(continuation.scheduled_requests.size() == 1 &&
+               continuation.scheduled_requests.front().request_id ==
+                   RequestId{0} &&
+               continuation.scheduled_requests.front().num_tokens == 4,
+           "chunked PREFILL must resume after its active PP batch completes");
+}
+
 void test_pdd_chunked_prefill_commits_full_isl_without_self_preemption() {
     // Each request's first four-token chunk fits in one physical block, but
     // the two full eight-token prompts require four blocks together.  A
@@ -2032,6 +2094,9 @@ int main() {
     failures +=
         frontier::test::run("chunked prefill runs before waiting work",
                             test_chunked_prefill_runs_before_new_waiting_work);
+    failures += frontier::test::run(
+        "chunked PREFILL excludes same-request PP overlap",
+        test_chunked_prefill_does_not_overlap_same_request_across_pp_batches);
     failures += frontier::test::run(
         "PDD chunked PREFILL commits full ISL without self-preemption",
         test_pdd_chunked_prefill_commits_full_isl_without_self_preemption);

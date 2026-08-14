@@ -96,19 +96,40 @@ class ScopedModelConfigDirectory {
 };
 
 void test_colocation_contract_round_trip() {
-    const auto config = load("fixed_parallel_colocation.json");
+    auto config = load("fixed_parallel_colocation.json");
     expect(config.schema_version == kSchemaVersion,
            "the current schema version must parse");
     expect(config.system_architecture == SystemArchitecture::kCoLocation,
            "co-location architecture must parse");
     expect(config.cluster().parallelism.num_replicas == 2 &&
-               config.cluster().parallelism.data_parallel_size == 2,
+               config.cluster().parallelism.data_parallel_size == 2 &&
+               !config.cluster().parallelism.pipeline_exclusive,
            "monolithic cluster topology must parse");
     expect(config.cluster().execution_model.type == ExecutionModelType::kFixed,
            "fixed execution model must parse");
     expect(parse_simulation_config_json(
                serialize_simulation_config_json(config)) == config,
            "co-location config must round-trip deterministically");
+
+    config.cluster().scheduler.pipeline_event_mode = "collapsed";
+    const auto collapsed = parse_simulation_config_json(
+        serialize_simulation_config_json(config));
+    expect(collapsed.cluster().scheduler.pipeline_event_mode == "collapsed" &&
+               collapsed == config,
+           "collapsed pipeline event mode must round-trip");
+
+    std::string invalid = serialize_simulation_config_json(config);
+    const std::string valid_mode = "\"pipeline_event_mode\": \"collapsed\"";
+    const auto position = invalid.find(valid_mode);
+    expect(position != std::string::npos,
+           "serialized scheduler must expose pipeline_event_mode");
+    invalid.replace(position, valid_mode.size(),
+                    "\"pipeline_event_mode\": \"invalid\"");
+    expect_throws<ConfigError>(
+        [&invalid] {
+            static_cast<void>(parse_simulation_config_json(invalid));
+        },
+        "invalid pipeline event mode must fail fast");
 }
 
 void test_pdd_contract_round_trip() {
@@ -924,6 +945,56 @@ void test_moe_contract_and_invalid_topologies() {
         "PDD clusters must share the same MoE model contract");
 }
 
+void test_pipeline_exclusive_contract() {
+    auto exclusive = load("analytical_moe_ep4_colocation.json");
+    auto &parallelism = exclusive.cluster().parallelism;
+    parallelism.pipeline_exclusive = true;
+    parallelism.data_parallel_size = 1;
+    parallelism.moe_tensor_parallel_size = parallelism.tensor_parallel_size;
+    parallelism.moe_expert_parallel_size = 1;
+    const auto round_tripped = parse_simulation_config_json(
+        serialize_simulation_config_json(exclusive));
+    expect(round_tripped == exclusive &&
+               round_tripped.cluster().parallelism.pipeline_exclusive,
+           "pipeline-exclusive parallelism must round-trip deterministically");
+
+    auto bad_pipeline = exclusive;
+    bad_pipeline.cluster().parallelism.pipeline_parallel_size = 1;
+    expect_throws<ConfigError>(
+        [&bad_pipeline] {
+            static_cast<void>(parse_simulation_config_json(
+                serialize_simulation_config_json(bad_pipeline)));
+        },
+        "pipeline-exclusive mode requires multiple pipeline stages");
+
+    auto bad_data = exclusive;
+    bad_data.cluster().parallelism.data_parallel_size = 2;
+    expect_throws<ConfigError>(
+        [&bad_data] {
+            static_cast<void>(parse_simulation_config_json(
+                serialize_simulation_config_json(bad_data)));
+        },
+        "pipeline-exclusive mode forbids data parallelism");
+
+    auto bad_expert = exclusive;
+    bad_expert.cluster().parallelism.moe_expert_parallel_size = 2;
+    expect_throws<ConfigError>(
+        [&bad_expert] {
+            static_cast<void>(parse_simulation_config_json(
+                serialize_simulation_config_json(bad_expert)));
+        },
+        "pipeline-exclusive mode forbids expert parallelism");
+
+    auto bad_moe_tensor = exclusive;
+    bad_moe_tensor.cluster().parallelism.moe_tensor_parallel_size = 1;
+    expect_throws<ConfigError>(
+        [&bad_moe_tensor] {
+            static_cast<void>(parse_simulation_config_json(
+                serialize_simulation_config_json(bad_moe_tensor)));
+        },
+        "pipeline-exclusive mode requires matching MoE and attention TP");
+}
+
 void test_model_registry_and_attention_binding() {
     const auto llama =
         frontier::config::load_model_config("meta-llama/Llama-2-7b-hf");
@@ -1469,6 +1540,16 @@ void test_pipeline_stage_profiles_k3_partitions_and_groups() {
                    groups.stage_to_timing_group.size() == pp &&
                    groups.stage_to_memory_group.size() == pp,
                "stage timing/memory groups must be deterministic");
+        expect(std::all_of(
+                   groups.timing_groups.begin(), groups.timing_groups.end(),
+                   [](const auto &group) {
+                       return std::all_of(
+                           group.ordered_layers.begin(),
+                           group.ordered_layers.end(), [](const auto &layer) {
+                               return !layer.is_moe || layer.has_dense_mlp;
+                           });
+                   }),
+               "K3 timing signatures must retain shared-expert MLP work");
 
         frontier::config::resolve_gpu_memory_config(cluster);
         const auto expected_capacity =
@@ -1605,6 +1686,9 @@ int main() {
         test_schema_version_range_is_checked_before_conversion);
     failures += frontier::test::run("MoE contract and invalid topologies",
                                     test_moe_contract_and_invalid_topologies);
+    failures += frontier::test::run(
+        "pipeline-exclusive parallelism contract",
+        test_pipeline_exclusive_contract);
     failures += frontier::test::run("model registry and attention binding",
                                     test_model_registry_and_attention_binding);
     failures +=

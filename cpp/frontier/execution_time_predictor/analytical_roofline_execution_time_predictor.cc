@@ -300,19 +300,6 @@ bool has_contiguous_moe_suffix(const config::ModelConfig &model,
     return true;
 }
 
-config::AttentionFamily static_attention_family(
-    const config::ModelConfig &model, std::uint64_t model_layer) noexcept {
-    switch (scaled_attention_family(model, model_layer)) {
-    case ScaledMoEAttentionFamily::kKda:
-        return config::AttentionFamily::kKda;
-    case ScaledMoEAttentionFamily::kMla:
-        return config::AttentionFamily::kMla;
-    case ScaledMoEAttentionFamily::kStandard:
-        return config::AttentionFamily::kStandard;
-    }
-    return config::AttentionFamily::kStandard;
-}
-
 void add_scaled_attention_layer(
     std::vector<ScaledMoEAttentionGroup> &groups,
     ScaledMoEAttentionFamily family, double pre_moe_compute_ms,
@@ -700,28 +687,8 @@ kv_cache_bytes_per_token_per_layer(const config::ModelConfig &model,
 config::StageTimingSignature
 AnalyticalRooflineExecutionTimePredictor::make_stage_timing_signature(
     std::uint64_t stage) const {
-    const config::PipelineStageLayerRange layers =
-        config::pipeline_stage_layer_range(
-            model_.num_layers, parallelism_.pipeline_parallel_size, stage);
-    config::StageTimingSignature result{};
-    result.ordered_layers.reserve(static_cast<std::size_t>(layers.size()));
-    for (std::uint64_t layer = layers.begin; layer < layers.end; ++layer) {
-        const bool is_moe = model_.is_moe_layer(layer);
-        // A dense MLP is present on every dense layer.  MoE layers may also
-        // carry a shared/dense expert path; preserve that distinction in the
-        // signature so a stage with different resident work is not grouped.
-        const bool has_dense_mlp =
-            !is_moe || model_.num_shared_experts != 0;
-        result.ordered_layers.push_back(config::LayerStaticSignature{
-            static_attention_family(model_, layer), is_moe, has_dense_mlp});
-    }
-    result.owns_input_embedding = stage == 0;
-    result.owns_final_norm =
-        stage + 1 == parallelism_.pipeline_parallel_size;
-    result.owns_lm_head = result.owns_final_norm;
-    result.emits_pp_send =
-        stage + 1 < parallelism_.pipeline_parallel_size;
-    return result;
+    return config::build_pipeline_stage_timing_signature(
+        model_, parallelism_, stage);
 }
 
 void AnalyticalRooflineExecutionTimePredictor::build_stage_timing_groups() {

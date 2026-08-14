@@ -367,6 +367,7 @@ OrderedJson serialize_batch(const BatchMetricsRecord &batch,
         batch.parallelism.moe_tensor_parallel_size;
     json["moe_expert_parallel_size"] =
         batch.parallelism.moe_expert_parallel_size;
+    json["pipeline_exclusive"] = batch.parallelism.pipeline_exclusive;
     if (batch.moe_sync_group_id.valid()) {
         json["moe_sync_group_id"] = batch.moe_sync_group_id.value();
     }
@@ -466,6 +467,7 @@ OrderedJson serialize_batch_stage(const BatchStageMetricsRecord &stage) {
          stage.parallelism.moe_tensor_parallel_size},
         {"moe_expert_parallel_size",
          stage.parallelism.moe_expert_parallel_size},
+        {"pipeline_exclusive", stage.parallelism.pipeline_exclusive},
     });
     if (stage.moe_sync_group_id.valid()) {
         json["moe_sync_group_id"] = stage.moe_sync_group_id.value();
@@ -647,6 +649,8 @@ std::string_view to_string(EventType event_type) noexcept {
         return "replica_stage_schedule";
     case EventType::kBatchStageEnd:
         return "batch_stage_end";
+    case EventType::kBatchPipelineEnd:
+        return "batch_pipeline_end";
     case EventType::kClusterBatchEnd:
         return "cluster_batch_end";
     case EventType::kGlobalBatchEnd:
@@ -686,6 +690,10 @@ std::string serialize_simulation_output_json(const SimulationOutput &output) {
 
     OrderedJson root = OrderedJson::object();
     root["schema_version"] = output.schema_version;
+    if (output.observation_window_seconds.has_value()) {
+        root["observation_window_seconds"] =
+            output.observation_window_seconds.value();
+    }
     root["run"] = OrderedJson::object({
         {"run_id", output.run.run_id},
         {
@@ -1133,8 +1141,11 @@ std::string serialize_simulation_summary_json(const SimulationOutput &output,
         }
     }
 
-    const double simulation_window_s =
-        output.requests.empty() ? 0.0 : last_completion_s - first_arrival_s;
+    const double simulation_window_s = output.observation_window_seconds
+                                           .value_or(output.requests.empty()
+                                                         ? 0.0
+                                                         : last_completion_s -
+                                                               first_arrival_s);
     const auto rate = [simulation_window_s](std::uint64_t count) {
         return simulation_window_s > 0.0
                    ? static_cast<double>(count) / simulation_window_s

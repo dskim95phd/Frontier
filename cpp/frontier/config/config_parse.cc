@@ -460,7 +460,8 @@ SchedulerConfig parse_scheduler(const Json &root) {
                      "watermark_blocks_fraction",
                      "num_preallocate_tokens",
                  },
-                 {"num_blocks"}, "config.scheduler");
+                 {"num_blocks", "pipeline_event_mode"},
+                 "config.scheduler");
 
     SchedulerConfig parsed = [&]() {
         SchedulerConfig value{};
@@ -488,6 +489,10 @@ SchedulerConfig parse_scheduler(const Json &root) {
             scheduler, "watermark_blocks_fraction", "config.scheduler");
         value.num_preallocate_tokens = require_uint64(
             scheduler, "num_preallocate_tokens", "config.scheduler");
+        if (scheduler.contains("pipeline_event_mode")) {
+            value.pipeline_event_mode = require_string(
+                scheduler, "pipeline_event_mode", "config.scheduler");
+        }
         return value;
     }();
 
@@ -514,6 +519,12 @@ SchedulerConfig parse_scheduler(const Json &root) {
         throw ConfigError(
             "config.scheduler.long_prefill_token_threshold > 0 requires "
             "enable_chunked_prefill=true");
+    }
+    if (parsed.pipeline_event_mode != "exact" &&
+        parsed.pipeline_event_mode != "collapsed") {
+        throw ConfigError(
+            "config.scheduler.pipeline_event_mode must be 'exact' or "
+            "'collapsed'");
     }
     return parsed;
 }
@@ -575,7 +586,8 @@ ParallelismConfig parse_parallelism(const Json &root,
                      "moe_tensor_parallel_size",
                      "moe_expert_parallel_size",
                  },
-                 {"decode_context_parallel_size"}, "config.parallelism");
+                 {"decode_context_parallel_size", "pipeline_exclusive"},
+                 "config.parallelism");
     ParallelismConfig parsed = [&]() {
         ParallelismConfig value{};
         value.num_replicas =
@@ -586,6 +598,11 @@ ParallelismConfig parse_parallelism(const Json &root,
             value.decode_context_parallel_size =
                 require_uint64(parallelism, "decode_context_parallel_size",
                                "config.parallelism");
+        }
+        if (parallelism.contains("pipeline_exclusive")) {
+            value.pipeline_exclusive =
+                require_bool(parallelism, "pipeline_exclusive",
+                             "config.parallelism");
         }
         value.pipeline_parallel_size = require_uint64(
             parallelism, "pipeline_parallel_size", "config.parallelism");
@@ -603,6 +620,28 @@ ParallelismConfig parse_parallelism(const Json &root,
         parsed.moe_tensor_parallel_size == 0 ||
         parsed.moe_expert_parallel_size == 0) {
         throw ConfigError("all config.parallelism dimensions must be positive");
+    }
+    if (parsed.pipeline_exclusive) {
+        if (parsed.pipeline_parallel_size <= 1) {
+            throw ConfigError(
+                "config.parallelism.pipeline_exclusive requires "
+                "pipeline_parallel_size > 1");
+        }
+        if (parsed.data_parallel_size != 1) {
+            throw ConfigError(
+                "config.parallelism.pipeline_exclusive requires "
+                "data_parallel_size == 1");
+        }
+        if (parsed.moe_expert_parallel_size != 1) {
+            throw ConfigError(
+                "config.parallelism.pipeline_exclusive requires "
+                "moe_expert_parallel_size == 1");
+        }
+        if (parsed.moe_tensor_parallel_size != parsed.tensor_parallel_size) {
+            throw ConfigError(
+                "config.parallelism.pipeline_exclusive requires "
+                "moe_tensor_parallel_size == tensor_parallel_size");
+        }
     }
     if (parsed.tensor_parallel_size != 1 && parsed.tensor_parallel_size != 2 &&
         parsed.tensor_parallel_size != 4 && parsed.tensor_parallel_size != 8) {

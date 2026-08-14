@@ -448,6 +448,10 @@ struct MetricsAggregate {
 struct SimulationOutput {
     int schema_version = kOutputSchemaVersion;
     RunMetadata run;
+    // Explicit observation horizon for bounded runs.  Full, quiescent runs
+    // leave this unset and retain the legacy first-arrival/last-completion
+    // window derivation used by the summary contract.
+    std::optional<double> observation_window_seconds;
     std::vector<RequestMetricsRecord> requests;
     std::vector<BatchMetricsRecord> batches;
     std::vector<BatchStageMetricsRecord> batch_stages;
