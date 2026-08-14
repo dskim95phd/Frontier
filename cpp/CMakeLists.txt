@@ -110,6 +110,10 @@ add_library(
   frontier/execution_time_predictor/execution_time_predictor_factory.cc
   frontier/execution_time_predictor/fixed_execution_time_predictor.cc
   frontier/execution_time_predictor/analytical_roofline_execution_time_predictor.cc
+  frontier/execution_time_predictor/analytical_dense_layer.cc
+  frontier/execution_time_predictor/analytical_expert_parallel.cc
+  frontier/execution_time_predictor/analytical_moe_layer.cc
+  frontier/execution_time_predictor/analytical_moe_routing.cc
   frontier/kv_cache_transfer/analytical_transfer.cc
   frontier/cpu_kv_cache_transfer/analytical_transfer.cc
   frontier/metrics/output_contract.cc
