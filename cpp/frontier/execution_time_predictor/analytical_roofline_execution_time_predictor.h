@@ -556,6 +556,25 @@ class AnalyticalRooflineExecutionTimePredictor final
     make_stage_timing_signature(std::uint64_t stage) const;
     void build_stage_timing_groups();
 
+    // Stage-local quantities needed both when populating a timing template
+    // and when predicting a stage directly.  Keeping one definition of each
+    // is what makes the cached and uncached paths provably equivalent.
+    [[nodiscard]] std::vector<detail::DenseLayerTimes> build_stage_layer_times(
+        const config::PipelineStageLayerRange &stage_layers,
+        const detail::DenseBatch &dense_batch,
+        const detail::DenseOperatorPrecisions &precisions) const;
+    [[nodiscard]] double
+    compute_allreduce_ms(std::uint64_t activation_bytes) const;
+    // Zero unless this is an MLA model with DCP > 1 and the stage actually
+    // has an MLA layer serving decode tokens.
+    [[nodiscard]] double compute_dcp_attention_communication_ms(
+        const detail::DenseBatch &dense_batch,
+        const config::PipelineStageLayerRange &stage_layers,
+        double communication_element_bytes) const;
+    [[nodiscard]] detail::MoECommunicationTime
+    compute_moe_communication(const detail::DenseBatch &dense_batch,
+                              double communication_element_bytes) const;
+
     [[nodiscard]] ExecutionTimePrediction
     predict_execution(const entities::Batch &batch,
                       const std::vector<entities::Request> &requests,

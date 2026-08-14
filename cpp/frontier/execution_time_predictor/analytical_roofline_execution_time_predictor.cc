@@ -395,6 +395,26 @@ struct MoEStageContext {
     }
 };
 
+// Both MoE stage assemblers charge the same per-layer collective set; each
+// decides for itself whether to multiply it by the layer count.
+detail::MoECommunicationTime
+moe_stage_communication(const MoEStageContext &context) {
+    if (context.reusable_moe_communication != nullptr) {
+        return *context.reusable_moe_communication;
+    }
+    const std::uint64_t input_tokens =
+        context.batch_info.dense_batch.total_tokens;
+    return detail::predict_moe_communication(
+        context.communication_backend, input_tokens, context.model.hidden_size,
+        input_tokens * context.model.router_topk,
+        context.parallelism.tensor_parallel_size,
+        context.parallelism.moe_tensor_parallel_size,
+        context.parallelism.moe_expert_parallel_size,
+        context.parallelism.data_parallel_size, false,
+        context.communication_element_bytes,
+        context.model.routed_expert_hidden_size);
+}
+
 MoEStagePrediction
 predict_selected_moe_layer_execution(const MoEStageContext &context,
                                      std::uint64_t selected_moe_layer) {
@@ -486,18 +506,7 @@ predict_selected_moe_layer_execution(const MoEStageContext &context,
     }
 
     const detail::MoECommunicationTime communication_time =
-        context.reusable_moe_communication != nullptr
-            ? *context.reusable_moe_communication
-            : detail::predict_moe_communication(
-                  context.communication_backend,
-                  batch_info.dense_batch.total_tokens, model.hidden_size,
-                  batch_info.dense_batch.total_tokens * model.router_topk,
-                  parallelism.tensor_parallel_size,
-                  parallelism.moe_tensor_parallel_size,
-                  parallelism.moe_expert_parallel_size,
-                  parallelism.data_parallel_size, false,
-                  context.communication_element_bytes,
-                  model.routed_expert_hidden_size);
+        moe_stage_communication(context);
     result.execution_time.moe_tp_communication_ms =
         communication_time.moe_tp_ms;
     result.execution_time.ep_dispatch_ms = communication_time.ep_dispatch_ms;
@@ -627,18 +636,7 @@ MoEStagePrediction predict_moe_stage_execution(const MoEStageContext &context) {
     result.suffix_tp_communication_ms =
         pending_pre_moe_tp_communication_ms;
     const detail::MoECommunicationTime communication_time =
-        context.reusable_moe_communication != nullptr
-            ? *context.reusable_moe_communication
-            : detail::predict_moe_communication(
-                  context.communication_backend,
-                  batch_info.dense_batch.total_tokens, model.hidden_size,
-                  batch_info.dense_batch.total_tokens * model.router_topk,
-                  parallelism.tensor_parallel_size,
-                  parallelism.moe_tensor_parallel_size,
-                  parallelism.moe_expert_parallel_size,
-                  parallelism.data_parallel_size, false,
-                  context.communication_element_bytes,
-                  model.routed_expert_hidden_size);
+        moe_stage_communication(context);
     const double moe_layers =
         static_cast<double>(result.logical_moe_layer_count);
     result.execution_time.moe_tp_communication_ms =
@@ -720,6 +718,110 @@ void AnalyticalRooflineExecutionTimePredictor::build_stage_timing_groups() {
     }
 }
 
+std::vector<detail::DenseLayerTimes>
+AnalyticalRooflineExecutionTimePredictor::build_stage_layer_times(
+    const config::PipelineStageLayerRange &stage_layers,
+    const detail::DenseBatch &dense_batch,
+    const detail::DenseOperatorPrecisions &precisions) const {
+    std::vector<detail::DenseLayerTimes> result;
+    result.reserve(static_cast<std::size_t>(stage_layers.size()));
+    detail::DenseModel dense_model = make_dense_model(model_, parallelism_);
+    // One representative prediction per attention family is enough: layers of
+    // the same family in one stage see the same batch and dimensions.
+    std::optional<detail::DenseLayerTimes> standard_layer_times;
+    std::optional<detail::DenseLayerTimes> mla_layer_times;
+    std::optional<detail::DenseLayerTimes> kda_layer_times;
+    for (std::uint64_t model_layer = stage_layers.begin;
+         model_layer < stage_layers.end; ++model_layer) {
+        dense_model.use_kda =
+            model_.has_kda() && model_.is_kda_layer(model_layer);
+        // KDA and MLA are mutually exclusive on a logical layer.  Non-hybrid
+        // MLA checkpoints retain the old path.
+        dense_model.use_mla = !dense_model.use_kda && model_.use_mla;
+        std::optional<detail::DenseLayerTimes> *representative =
+            dense_model.use_kda
+                ? &kda_layer_times
+                : (dense_model.use_mla ? &mla_layer_times
+                                       : &standard_layer_times);
+        if (!representative->has_value()) {
+            *representative = detail::predict_dense_layer(
+                device_, detail::AnalyticalConfig{}, dense_model, dense_batch,
+                precisions);
+        }
+        result.push_back(representative->value());
+    }
+    return result;
+}
+
+double AnalyticalRooflineExecutionTimePredictor::compute_allreduce_ms(
+    std::uint64_t activation_bytes) const {
+    if (parallelism_.tensor_parallel_size <= 1) {
+        return 0.0;
+    }
+    return communication_backend_->allreduce_ms(
+        activation_bytes, parallelism_.tensor_parallel_size, true);
+}
+
+double
+AnalyticalRooflineExecutionTimePredictor::compute_dcp_attention_communication_ms(
+    const detail::DenseBatch &dense_batch,
+    const config::PipelineStageLayerRange &stage_layers,
+    double communication_element_bytes) const {
+    if (!model_.use_mla || parallelism_.decode_context_parallel_size <= 1 ||
+        dense_batch.decode_requests.empty()) {
+        return 0.0;
+    }
+    // DCP collectives are charged per MLA layer, so a stage made entirely of
+    // KDA layers pays nothing.  Decide that from model metadata rather than
+    // from predicted KDA component times.
+    bool has_mla_layer = false;
+    for (std::uint64_t model_layer = stage_layers.begin;
+         model_layer < stage_layers.end; ++model_layer) {
+        if (!(model_.has_kda() && model_.is_kda_layer(model_layer))) {
+            has_mla_layer = true;
+            break;
+        }
+    }
+    if (!has_mla_layer) {
+        return 0.0;
+    }
+
+    const std::uint64_t local_query_heads =
+        model_.num_query_heads / parallelism_.tensor_parallel_size;
+    std::uint64_t decode_tokens = 0;
+    for (const detail::AttentionRequestSlice &request :
+         dense_batch.decode_requests) {
+        decode_tokens += request.query_tokens;
+    }
+    const std::uint64_t query_bytes = activation_payload_bytes(
+        decode_tokens,
+        local_query_heads * (model_.kv_lora_rank + model_.qk_rope_head_dim),
+        communication_element_bytes);
+    const std::uint64_t gathered_output_bytes = activation_payload_bytes(
+        decode_tokens,
+        local_query_heads * parallelism_.decode_context_parallel_size *
+            model_.v_head_dim,
+        communication_element_bytes);
+    return communication_backend_->allgather_ms(
+               query_bytes, parallelism_.decode_context_parallel_size, true) +
+           communication_backend_->reduce_scatter_ms(
+               gathered_output_bytes,
+               parallelism_.decode_context_parallel_size, true);
+}
+
+detail::MoECommunicationTime
+AnalyticalRooflineExecutionTimePredictor::compute_moe_communication(
+    const detail::DenseBatch &dense_batch,
+    double communication_element_bytes) const {
+    return detail::predict_moe_communication(
+        *communication_backend_, dense_batch.total_tokens, model_.hidden_size,
+        dense_batch.total_tokens * model_.router_topk,
+        parallelism_.tensor_parallel_size,
+        parallelism_.moe_tensor_parallel_size,
+        parallelism_.moe_expert_parallel_size, parallelism_.data_parallel_size,
+        false, communication_element_bytes, model_.routed_expert_hidden_size);
+}
+
 std::size_t AnalyticalRooflineExecutionTimePredictor::
     StageTimingCacheKeyHash::operator()(
         const StageTimingCacheKey &key) const noexcept {
@@ -790,28 +892,8 @@ AnalyticalRooflineExecutionTimePredictor::lookup_stage_timing_template(
     auto value = std::make_shared<StageTimingCacheValue>();
     const detail::DenseOperatorPrecisions dense_precisions =
         make_dense_operator_precisions(config_);
-    detail::DenseModel dense_model = make_dense_model(model_, parallelism_);
-    std::optional<detail::DenseLayerTimes> standard_layer_times;
-    std::optional<detail::DenseLayerTimes> mla_layer_times;
-    std::optional<detail::DenseLayerTimes> kda_layer_times;
-    value->layer_times.reserve(static_cast<std::size_t>(stage_layers.size()));
-    for (std::uint64_t model_layer = stage_layers.begin;
-         model_layer < stage_layers.end; ++model_layer) {
-        dense_model.use_kda =
-            model_.has_kda() && model_.is_kda_layer(model_layer);
-        dense_model.use_mla = !dense_model.use_kda && model_.use_mla;
-        std::optional<detail::DenseLayerTimes> *representative =
-            dense_model.use_kda
-                ? &kda_layer_times
-                : (dense_model.use_mla ? &mla_layer_times
-                                       : &standard_layer_times);
-        if (!representative->has_value()) {
-            *representative = detail::predict_dense_layer(
-                device_, detail::AnalyticalConfig{}, dense_model, dense_batch,
-                dense_precisions);
-        }
-        value->layer_times.push_back(representative->value());
-    }
+    value->layer_times =
+        build_stage_layer_times(stage_layers, dense_batch, dense_precisions);
 
     const detail::Precision communication_precision =
         detail::precision_from_string(config_.communication_precision());
@@ -820,43 +902,10 @@ AnalyticalRooflineExecutionTimePredictor::lookup_stage_timing_template(
     const std::uint64_t activation_bytes = activation_payload_bytes(
         dense_batch.total_tokens, model_.hidden_size,
         communication_element_bytes);
-    value->allreduce_ms =
-        parallelism_.tensor_parallel_size > 1
-            ? communication_backend_->allreduce_ms(
-                  activation_bytes, parallelism_.tensor_parallel_size, true)
-            : 0.0;
-
-    if (model_.use_mla && parallelism_.decode_context_parallel_size > 1 &&
-        !dense_batch.decode_requests.empty() &&
-        std::any_of(value->layer_times.begin(), value->layer_times.end(),
-                    [](const detail::DenseLayerTimes &times) {
-                        return times.kda_projection_ms == 0.0 &&
-                               times.kda_recurrent_ms == 0.0;
-                    })) {
-        const std::uint64_t local_query_heads =
-            model_.num_query_heads / parallelism_.tensor_parallel_size;
-        std::uint64_t decode_tokens = 0;
-        for (const detail::AttentionRequestSlice &request :
-             dense_batch.decode_requests) {
-            decode_tokens += request.query_tokens;
-        }
-        const std::uint64_t query_bytes = activation_payload_bytes(
-            decode_tokens,
-            local_query_heads *
-                (model_.kv_lora_rank + model_.qk_rope_head_dim),
-            communication_element_bytes);
-        const std::uint64_t gathered_output_bytes = activation_payload_bytes(
-            decode_tokens,
-            local_query_heads * parallelism_.decode_context_parallel_size *
-                model_.v_head_dim,
-            communication_element_bytes);
-        value->dcp_attention_communication_ms =
-            communication_backend_->allgather_ms(
-                query_bytes, parallelism_.decode_context_parallel_size, true) +
-            communication_backend_->reduce_scatter_ms(
-                gathered_output_bytes,
-                parallelism_.decode_context_parallel_size, true);
-    }
+    value->allreduce_ms = compute_allreduce_ms(activation_bytes);
+    value->dcp_attention_communication_ms =
+        compute_dcp_attention_communication_ms(dense_batch, stage_layers,
+                                               communication_element_bytes);
 
     // stage_group_scaled is only allowed to reuse a representative lane for
     // layer-invariant routing and a contiguous MoE suffix.  The caller only
@@ -888,16 +937,8 @@ AnalyticalRooflineExecutionTimePredictor::lookup_stage_timing_template(
                 device_, detail::AnalyticalConfig{}, moe_model, allocation,
                 model_.router_topk, moe_precisions);
             value->has_representative_moe_lane = true;
-            value->moe_communication = detail::predict_moe_communication(
-                *communication_backend_, dense_batch.total_tokens,
-                model_.hidden_size,
-                dense_batch.total_tokens * model_.router_topk,
-                parallelism_.tensor_parallel_size,
-                parallelism_.moe_tensor_parallel_size,
-                parallelism_.moe_expert_parallel_size,
-                parallelism_.data_parallel_size, false,
-                communication_element_bytes,
-                model_.routed_expert_hidden_size);
+            value->moe_communication = compute_moe_communication(
+                dense_batch, communication_element_bytes);
             value->has_moe_communication = true;
         }
     }
@@ -1144,30 +1185,8 @@ AnalyticalRooflineExecutionTimePredictor::predict_execution(
         timing_template = timing_cache_lookup.value;
         layer_times = timing_template->layer_times;
     } else {
-        detail::DenseModel dense_model = make_dense_model(model_, parallelism_);
-        std::optional<detail::DenseLayerTimes> standard_layer_times;
-        std::optional<detail::DenseLayerTimes> mla_layer_times;
-        std::optional<detail::DenseLayerTimes> kda_layer_times;
-        for (std::uint64_t model_layer = stage_layers.begin;
-             model_layer < stage_layers.end; ++model_layer) {
-            dense_model.use_kda =
-                model_.has_kda() && model_.is_kda_layer(model_layer);
-            // KDA and MLA are mutually exclusive attention implementations on
-            // a logical layer.  Existing non-hybrid MLA checkpoints retain
-            // the old path.
-            dense_model.use_mla = !dense_model.use_kda && model_.use_mla;
-            std::optional<detail::DenseLayerTimes> *representative =
-                dense_model.use_kda
-                    ? &kda_layer_times
-                    : (dense_model.use_mla ? &mla_layer_times
-                                           : &standard_layer_times);
-            if (!representative->has_value()) {
-                *representative = detail::predict_dense_layer(
-                    device_, detail::AnalyticalConfig{}, dense_model,
-                    dense_batch, dense_precisions);
-            }
-            layer_times.push_back(representative->value());
-        }
+        layer_times =
+            build_stage_layer_times(stage_layers, dense_batch, dense_precisions);
     }
     if (layer_times.empty()) {
         throw ExecutionTimePredictorError(
@@ -1179,49 +1198,14 @@ AnalyticalRooflineExecutionTimePredictor::predict_execution(
     const std::uint64_t activation_bytes =
         activation_payload_bytes(dense_batch.total_tokens, model_.hidden_size,
                                  communication_element_bytes);
-    const double allreduce_ms = timing_template != nullptr
-                                    ? timing_template->allreduce_ms
-                                    : (parallelism_.tensor_parallel_size > 1
-                                           ? communication_backend_->allreduce_ms(
-                                                 activation_bytes,
-                                                 parallelism_.tensor_parallel_size,
-                                                 true)
-                                           : 0.0);
-    double dcp_attention_communication_ms = 0.0;
-    if (timing_template != nullptr) {
-        dcp_attention_communication_ms =
-            timing_template->dcp_attention_communication_ms;
-    } else if (model_.use_mla &&
-               parallelism_.decode_context_parallel_size > 1 &&
-               !dense_batch.decode_requests.empty() &&
-               std::any_of(layer_times.begin(), layer_times.end(),
-                           [](const detail::DenseLayerTimes &times) {
-                               return times.kda_projection_ms == 0.0 &&
-                                      times.kda_recurrent_ms == 0.0;
-                           })) {
-        const std::uint64_t local_query_heads =
-            model_.num_query_heads / parallelism_.tensor_parallel_size;
-        std::uint64_t decode_tokens = 0;
-        for (const detail::AttentionRequestSlice &request :
-             dense_batch.decode_requests) {
-            decode_tokens += request.query_tokens;
-        }
-        const std::uint64_t query_bytes = activation_payload_bytes(
-            decode_tokens,
-            local_query_heads * (model_.kv_lora_rank + model_.qk_rope_head_dim),
-            communication_element_bytes);
-        const std::uint64_t gathered_output_bytes = activation_payload_bytes(
-            decode_tokens,
-            local_query_heads * parallelism_.decode_context_parallel_size *
-                model_.v_head_dim,
-            communication_element_bytes);
-        dcp_attention_communication_ms =
-            communication_backend_->allgather_ms(
-                query_bytes, parallelism_.decode_context_parallel_size, true) +
-            communication_backend_->reduce_scatter_ms(
-                gathered_output_bytes,
-                parallelism_.decode_context_parallel_size, true);
-    }
+    const double allreduce_ms =
+        timing_template != nullptr ? timing_template->allreduce_ms
+                                   : compute_allreduce_ms(activation_bytes);
+    const double dcp_attention_communication_ms =
+        timing_template != nullptr
+            ? timing_template->dcp_attention_communication_ms
+            : compute_dcp_attention_communication_ms(
+                  dense_batch, stage_layers, communication_element_bytes);
     const std::uint64_t layers_per_stage = stage_layers.size();
     double dense_compute_ms = 0.0;
     double tp_communication_ms = 0.0;
