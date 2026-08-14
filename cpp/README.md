@@ -1,7 +1,9 @@
 # Frontier C++ Core
 
-This directory contains the deterministic C++ port of Frontier's dense
-co-location and sequential PDD simulation paths.
+This directory contains Frontier's deterministic C++ simulation core for the
+co-location and sequential PDD architectures. It is the primary
+implementation; see [`../AGENTS.md`](../AGENTS.md) for how it relates to the
+Python simulator.
 
 Implemented behavior includes:
 
@@ -10,16 +12,19 @@ Implemented behavior includes:
   completions, and PDD KV-cache transfers;
 - FCFS vLLM V1-style continuous batching, chunked prefill, KV-block
   accounting, and recompute preemption;
-- multiple replicas plus TP, PP, and DP;
-- fixed per-stage and configurable Rubin/GB300 analytical execution models;
+- multiple replicas plus TP, PP, DP, and decode context parallelism;
+- MoE with expert parallelism, routing/imbalance modeling, and lockstep
+  synchronization;
+- fixed per-stage and configurable Rubin/GB300 analytical execution models
+  with per-operator precisions down to MXFP4;
+- session prefix caching;
 - sequential prefill/decode clusters with analytical KV-cache transfer;
 - finite target-local PREFILL CPU KV-cache offload/restore for sequential PDD;
-- strict JSON configuration and CSV workload contracts; and
-- CTest plus production-Python differential tests.
+- automatic KV block sizing from physical per-GPU HBM; and
+- strict JSON configuration and CSV workload contracts.
 
-Session prefix caching and MoE/expert parallelism are implemented. Block-hash
-prefix caching, parallel PDD clusters, and topology-aware communication
-backends remain outside the current C++ surface.
+Block-hash prefix caching, parallel PDD clusters, `pd-af-disaggregation`, and
+topology-aware communication backends remain outside the C++ surface.
 
 ## Build in WSL
 
@@ -102,14 +107,31 @@ stdout:
 ```
 
 Every output-directory run writes `config.normalized.json`,
-`workload.normalized.csv`, and `summary.json`. Mode `requests` also writes
-`requests.csv`; mode `full` additionally retains detailed runtime records and
-writes `trace.json`. Summary and requests modes disable detailed event,
-scheduler, batch, and analytical traces during the run.
+`workload.normalized.csv`, `summary.json`, and `gpu_kv_occupancy.csv`. Mode
+`requests` also writes `requests.csv`; mode `full` additionally retains
+detailed runtime records and writes `trace.json`. Summary and requests modes
+disable detailed event, scheduler, batch, and analytical traces during the
+run. Occupancy samples are compact change events and are retained in every
+mode.
 
 `summary.json` reports request/token throughput, latency mean/p50/p90/p99,
 preemptions, cluster batch distributions, KV-transfer latency, and prefix-cache
 hit rate.
+
+### Run options
+
+| Option | Default | Effect |
+| --- | --- | --- |
+| `--output-mode summary\|requests\|full` | `summary` | Which artifacts to write. Requires `--output-dir`. |
+| `--runtime-validation true\|false` | `true` | Per-iteration scheduler, KV-accounting, and CPU-ownership invariant checks. Disable for throughput once a configuration is trusted. |
+| `--gpu-kv-occupancy true\|false` | `true` | Whether to record the GPU KV occupancy sample stream. |
+| `--simulation-end-time-s <seconds>` | unset | Stop at a bounded observation horizon instead of running to quiescence. |
+
+`--simulation-end-time-s` runs a bounded experiment: only requests that
+reached canonical completion are exported, quiescence validation is skipped,
+and cache/transfer diagnostics are snapshotted at the horizon. The output
+then carries `observation_window_seconds`, and `summary.json` computes rates
+against that window rather than against first-arrival-to-last-completion.
 
 Read-only normalization:
 
@@ -151,11 +173,30 @@ Common top-level fields are:
 The fields shown above are required. The additional top-level `cpu_kv_cache`
 object may be omitted and then normalizes to the disabled default. Unknown
 fields and unsupported values are rejected.
-`enable_parallel_clusters` must currently be `false`. Session prefix caching
-is supported with `prefix_cache.enabled=true`, `key_mode="session"`, and
-either `sticky_round_robin` or `cache_aware` when more than one replica/DP
-target is available. `cache_aware` queries the actual GPU-resident prefix and
-may migrate to a least-loaded target; migration discards the old target's
+`enable_parallel_clusters` must currently be `false`.
+
+`cluster_scheduler.type` selects how requests are routed to a
+`(replica_id, dp_id)` target:
+
+| Type | Routing policy |
+| --- | --- |
+| `round_robin` | Cyclic assignment across targets |
+| `sticky_round_robin` | Cyclic, but pins a session to its first target |
+| `cache_aware` | Queries each target's actual GPU-resident prefix |
+| `kv_aware` | Compares projected KV-block pressure per target |
+| `vllm_queue_aware` | Smallest observable outstanding queue (running + waiting) |
+
+`type` is always required. For PDD, the optional `prefill_type` and
+`decode_type` override it per cluster; an absent override falls back to
+`type`. The optional `cache_threshold` (default `0.5`, in `[0, 1]`),
+`balance_abs_threshold` (default `32`), and `balance_rel_threshold`
+(default `1.1`, `>= 1`) tune when `cache_aware` prefers prefix affinity over
+migrating to a less loaded target.
+
+Session prefix caching is supported with `prefix_cache.enabled=true`,
+`key_mode="session"`, and either `sticky_round_robin` or `cache_aware` when
+more than one replica/DP target is available. `cache_aware` may migrate a
+session to a least-loaded target; migration discards the old target's
 session KV.
 
 ### GPU HBM and KV-block capacity
@@ -586,7 +627,7 @@ Timestamps use seconds with `_s` suffixes. Latencies use milliseconds with
 `_ms` suffixes. TTFT is measured from request arrival to completion of the
 first generated token. Arrival-to-Prefill completion is reported separately as
 `prefill_latency_ms`.
-IDs, token counts, arrays, and event order are exact; floating-point parity
+IDs, token counts, arrays, and event order are exact; floating-point
 comparisons use `1e-12` absolute and relative tolerance.
 
 ## JSON dependency
@@ -595,17 +636,23 @@ The contracts use `nlohmann/json` 3.11.3. CMake resolves an installed package,
 `FRONTIER_NLOHMANN_JSON_SOURCE_DIR`, or the pinned upstream archive when
 `FRONTIER_FETCH_DEPENDENCIES=ON`.
 
-## Python/C++ differential gate
+## Determinism
 
-From Windows PowerShell:
+One configuration and workload always produce the same output: the same
+event order, the same timestamps, and the same MoE routing. This holds
+across platforms and standard-library implementations, so a run on Linux and
+a run on Windows are comparable.
 
-```powershell
-$env:FRONTIER_CPP_BINARY = "/home/dskim/frontier-build/cxx-port/frontier_sim"
-$env:FRONTIER_CPP_RUNNER = '["wsl","-d","Ubuntu","-e"]'
-$env:FRONTIER_CPP_PATH_STYLE = "wsl"
-python -m pytest cpp/tests/parity/test_differential.py -q -p no:cacheprovider
-```
+The routing RNG is a `std::mt19937_64` engine with conversions implemented
+in-tree rather than taken from `<random>`'s distributions, whose sequences
+are implementation-defined. Routing golden vectors in
+`tests/execution_time_predictor/` pin that behavior; regenerate them only
+for a deliberate, documented routing change.
 
-The matrix covers offline and online workloads, fixed and analytical timing,
-multiple replica/TP/PP/DP combinations, chunking, watermark and preallocation
-settings, pressure/preemption, sequential PDD routing, and transfer timing.
+Earlier revisions reproduced NumPy's PCG64 bit stream so results could be
+diffed against the Python simulator. That correspondence is no longer
+maintained, and the Python differential harness has been retired. Analytical
+MoE runs using `moe_routing.mode="uniform_random"` or
+`distribution="random"` are therefore not comparable across that change at
+the same seed; the other routing modes never consumed the RNG and are
+unaffected.

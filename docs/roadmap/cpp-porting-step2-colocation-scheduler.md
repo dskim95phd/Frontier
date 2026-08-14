@@ -4,6 +4,14 @@
 
 Complete on the `cxx-port` branch.
 
+The Python/C++ differential harness referenced below (`cpp/tests/parity/`,
+`cpp/tests/differential/`, `FRONTIER_CPP_BINARY`, `FRONTIER_CPP_RUNNER`) has
+since been retired: the port goal is met and the C++ core is now the primary
+implementation. Those instructions are kept as a record of how the milestone
+was validated at the time and are no longer runnable. Current gates are the
+CTest suite and the contracts in `cpp/README.md`.
+
+
 Step 2 starts from the completed Step 1 foundation commit:
 
 ```text

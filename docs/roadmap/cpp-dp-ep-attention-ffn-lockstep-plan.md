@@ -5,6 +5,14 @@
 PDD and co-location pure-`DECODE` milestones implemented and validated,
 2026-08-06.
 
+The Python/C++ differential harness referenced below (`cpp/tests/parity/`,
+`cpp/tests/differential/`, `FRONTIER_CPP_BINARY`, `FRONTIER_CPP_RUNNER`) has
+since been retired: the port goal is met and the C++ core is now the primary
+implementation. Those instructions are kept as a record of how the milestone
+was validated at the time and are no longer runnable. Current gates are the
+CTest suite and the contracts in `cpp/README.md`.
+
+
 The implementation keeps the existing `DecodeSyncEvent` and
 `DecodeSyncCollectiveEvent` flow. It adds coordinator-owned generations for
 both decode architectures, a stage-lifetime shared-domain reservation, and

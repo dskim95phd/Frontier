@@ -239,6 +239,10 @@ paper/2026-ISCA/figures
 # collective-sim runtime artifact accidentally written to repo root
 idmap.txt
 
+# sanitizer logs and agent tooling scratch
+asan-review.*
+.codex-remote-attachments/
+
 tests/debug/e2e-level/monolith_mode/output/
 worktrees/
 worktreess/

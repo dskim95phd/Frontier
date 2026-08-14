@@ -590,17 +590,6 @@ if(BUILD_TESTING)
     NAME frontier_simulator.pipeline_exclusive_matrix
     COMMAND $<TARGET_FILE:frontier_pipeline_exclusive_matrix_test>
   )
-  find_package(Python3 COMPONENTS Interpreter QUIET)
-  if(Python3_Interpreter_FOUND)
-    add_test(
-      NAME frontier_simulator.cpu_kv_cache_python_diff
-      COMMAND
-        ${Python3_EXECUTABLE}
-        "${CMAKE_CURRENT_SOURCE_DIR}/tests/differential/cpu_kv_cache_logical_diff.py"
-        --binary $<TARGET_FILE:frontier_sim>
-        --repo-root "${CMAKE_CURRENT_SOURCE_DIR}/.."
-    )
-  endif()
 
   add_executable(
     frontier_cpu_kv_cache_stress_test
