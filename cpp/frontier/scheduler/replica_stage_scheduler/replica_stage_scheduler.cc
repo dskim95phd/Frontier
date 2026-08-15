@@ -117,21 +117,22 @@ SimTime ReplicaStageScheduler::collapsed_start_time(SimTime requested,
             "collapsed stage interval duration is nonfinite");
     }
     prune_collapsed_reservations(requested);
+    // The exact calendar runs each stage first-in-first-out in arrival order,
+    // and a batch cannot overtake an earlier one because every stage is
+    // serialized.  Reservations are therefore installed in that same order, so
+    // this batch starts once every still-live reservation on the stage has
+    // ended.  Searching for the earliest free gap instead would let a later
+    // batch backfill ahead of an earlier one, which exact mode never does and
+    // which measurably understates pipeline latency once three or more batches
+    // are in flight.
     double candidate = requested.seconds();
-    for (const CollapsedReservation &reservation :
-         collapsed_reservations_) {
-        if (reservation.end.seconds() <= candidate) {
-            continue;
-        }
-        const double candidate_end = candidate + duration_seconds;
-        if (!std::isfinite(candidate_end)) {
-            throw ReplicaStageSchedulerError(
-                "collapsed stage interval end is nonfinite");
-        }
-        if (reservation.start.seconds() >= candidate_end) {
-            break;
-        }
+    for (const CollapsedReservation &reservation : collapsed_reservations_) {
         candidate = std::max(candidate, reservation.end.seconds());
+    }
+    const double candidate_end = candidate + duration_seconds;
+    if (!std::isfinite(candidate_end)) {
+        throw ReplicaStageSchedulerError(
+            "collapsed stage interval end is nonfinite");
     }
     return SimTime::from_seconds(candidate);
 }

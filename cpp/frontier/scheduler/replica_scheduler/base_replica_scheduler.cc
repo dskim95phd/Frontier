@@ -151,7 +151,15 @@ void BaseReplicaScheduler::mark_batch_started(const entities::Batch &batch) {
         auto [position, inserted] =
             active_requests_.try_emplace(snapshot.request_id, 0);
         static_cast<void>(inserted);
-        if (cluster_type() != ClusterType::kPrefill && position->second != 0) {
+        // Several chunks of one prefill may be in flight at once: chunk N+1
+        // depends on chunk N only through the KV of the stage it is entering,
+        // which chunk N wrote before leaving that stage.  That holds wherever
+        // the prefill runs, so the test is the request's phase and not the
+        // cluster role -- a monolithic replica chunks prefills exactly like a
+        // PDD PREFILL cluster.  A decode step, by contrast, consumes the token
+        // its predecessor sampled and stays limited to one in-flight batch.
+        if (request(snapshot.request_id).is_prefill_complete() &&
+            position->second != 0) {
             throw SchedulerError(
                 "request is already active in another pipeline batch");
         }

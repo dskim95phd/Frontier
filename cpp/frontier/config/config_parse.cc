@@ -286,6 +286,18 @@ MoeRoutingDistribution parse_moe_routing_distribution(std::string_view value) {
                       std::string{value} + "'");
 }
 
+MoeRoutingLayerScope parse_moe_routing_layer_scope(std::string_view value) {
+    if (value == "shared") {
+        return MoeRoutingLayerScope::kShared;
+    }
+    if (value == "per_layer") {
+        return MoeRoutingLayerScope::kPerLayer;
+    }
+    throw ConfigError("config.moe_routing.layer_scope must be 'shared' or "
+                      "'per_layer', got '" +
+                      std::string{value} + "'");
+}
+
 ModelConfig parse_model(const Json &cluster, std::string_view context) {
     ModelConfig parsed =
         load_model_config(require_string(cluster, "model_name", context));
@@ -333,8 +345,8 @@ ModelConfig parse_model(const Json &cluster, std::string_view context) {
 
 MoeRoutingConfig parse_moe_routing(const Json &root) {
     const Json &routing = root.at("moe_routing");
-    require_exact_keys(routing, {"mode", "distribution", "seed"},
-                       "config.moe_routing");
+    require_keys(routing, {"mode", "distribution", "seed"}, {"layer_scope"},
+                 "config.moe_routing");
     return [&]() {
         MoeRoutingConfig value{};
         value.mode = parse_moe_routing_mode(
@@ -342,6 +354,15 @@ MoeRoutingConfig parse_moe_routing(const Json &root) {
         value.distribution = parse_moe_routing_distribution(
             require_string(routing, "distribution", "config.moe_routing"));
         value.seed = require_uint64(routing, "seed", "config.moe_routing");
+        // Omitting the field keeps whatever the mode and distribution implied
+        // before it existed, so configs written against the older schema keep
+        // producing identical numbers.
+        value.layer_scope =
+            routing.contains("layer_scope")
+                ? parse_moe_routing_layer_scope(require_string(
+                      routing, "layer_scope", "config.moe_routing"))
+                : default_moe_routing_layer_scope(value.mode,
+                                                  value.distribution);
         return value;
     }();
 }

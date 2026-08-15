@@ -132,6 +132,53 @@ void test_colocation_contract_round_trip() {
         "invalid pipeline event mode must fail fast");
 }
 
+void test_moe_routing_layer_scope_contract() {
+    using frontier::config::MoeRoutingLayerScope;
+
+    // The fixture predates the field and selects a seed-weighted distribution,
+    // so it must resolve to the scope that distribution implied before
+    // layer_scope existed.  Configs in the wild must not shift behavior.
+    auto config = load("analytical_moe_ep4_colocation.json");
+    expect(config.cluster().moe_routing.layer_scope ==
+               MoeRoutingLayerScope::kPerLayer,
+           "omitted layer_scope must keep the legacy per-distribution default");
+    expect(parse_simulation_config_json(
+               serialize_simulation_config_json(config)) == config,
+           "layer_scope must round-trip deterministically");
+
+    // Serialization always writes the resolved value, so the normalized config
+    // states the scope explicitly even when the input omitted it.
+    const std::string serialized = serialize_simulation_config_json(config);
+    expect(serialized.find("\"layer_scope\": \"per_layer\"") !=
+               std::string::npos,
+           "serialized moe_routing must expose the resolved layer_scope");
+
+    // The field is orthogonal to the distribution: a seed-weighted
+    // distribution may still share one assignment across layers.
+    config.cluster().moe_routing.layer_scope = MoeRoutingLayerScope::kShared;
+    const auto shared = parse_simulation_config_json(
+        serialize_simulation_config_json(config));
+    expect(shared.cluster().moe_routing.layer_scope ==
+                   MoeRoutingLayerScope::kShared &&
+               shared.cluster().moe_routing.distribution ==
+                   frontier::config::MoeRoutingDistribution::kZipf &&
+               shared == config,
+           "explicit layer_scope must override the distribution default");
+
+    std::string invalid = serialize_simulation_config_json(config);
+    const std::string valid_scope = "\"layer_scope\": \"shared\"";
+    const auto position = invalid.find(valid_scope);
+    expect(position != std::string::npos,
+           "serialized moe_routing must expose layer_scope");
+    invalid.replace(position, valid_scope.size(),
+                    "\"layer_scope\": \"invalid\"");
+    expect_throws<ConfigError>(
+        [&invalid] {
+            static_cast<void>(parse_simulation_config_json(invalid));
+        },
+        "invalid layer_scope must fail fast");
+}
+
 void test_pdd_contract_round_trip() {
     const auto config = load("fixed_sequential_pdd.json");
     expect(config.schema_version == kSchemaVersion &&
@@ -1646,6 +1693,8 @@ int main() {
                                     test_colocation_contract_round_trip);
     failures += frontier::test::run("PDD contract round trip",
                                     test_pdd_contract_round_trip);
+    failures += frontier::test::run("MoE routing layer scope contract",
+                                    test_moe_routing_layer_scope_contract);
     failures +=
         frontier::test::run("stage-specific cluster scheduler overrides",
                             test_stage_specific_cluster_scheduler_overrides);

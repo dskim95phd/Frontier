@@ -1,7 +1,9 @@
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <stdexcept>
@@ -27,6 +29,10 @@ class SimulationError : public std::runtime_error {
 
 class Simulator {
   public:
+    using WallClockProgressCallback =
+        std::function<void(SimTime simulation_time,
+                           double wall_clock_elapsed_seconds)>;
+
     Simulator(const config::SimulationConfig &config,
               const std::vector<request_generator::WorkloadRequest> &workload);
 
@@ -43,6 +49,14 @@ class Simulator {
     }
     [[nodiscard]] metrics::MetricsStore &metrics() noexcept { return metrics_; }
     void set_runtime_validation_enabled(bool enabled);
+    // Progress reporting is observational only. The callback runs on the
+    // simulator thread after an event is dispatched whenever the configured
+    // wall-clock interval has elapsed.
+    void set_wall_clock_progress_callback(
+        double interval_seconds, WallClockProgressCallback callback);
+    // Keeps metrics retention and predictor-side diagnostic construction in
+    // sync for compact output modes.
+    void set_detailed_traces_enabled(bool enabled);
     [[nodiscard]] scheduler::GlobalScheduler &global_scheduler() noexcept {
         return *global_scheduler_;
     }
@@ -117,6 +131,8 @@ class Simulator {
     void enqueue_request_arrival(RequestId request_id, SimTime ready_at);
     void record_gpu_kv_occupancy_for_event(const Event &event);
     void record_bounded_run_cache_diagnostics(SimTime observation_time);
+    void start_wall_clock_progress();
+    void maybe_report_wall_clock_progress(SimTime simulation_time);
 
     config::SimulationConfig config_;
     EntityArena entities_;
@@ -133,6 +149,10 @@ class Simulator {
     metrics::MetricsStore metrics_;
     std::unique_ptr<scheduler::GlobalScheduler> global_scheduler_;
     SimTime last_event_time_ = SimTime::from_seconds(0.0);
+    std::chrono::steady_clock::duration wall_clock_progress_interval_{};
+    WallClockProgressCallback wall_clock_progress_callback_;
+    std::chrono::steady_clock::time_point wall_clock_progress_started_at_{};
+    std::chrono::steady_clock::time_point wall_clock_progress_next_at_{};
 };
 
 [[nodiscard]] metrics::SimulationOutput

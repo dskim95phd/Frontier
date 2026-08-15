@@ -36,12 +36,27 @@ struct StageBatchInfo {
     std::uint64_t lm_head_tokens = 0;
 };
 
+// A chunk covering [start, start + scheduled_tokens) attends to exactly the
+// tokens ahead of its own queries, and that offset is fixed for the chunk's
+// entire life: no sibling chunk of the same request can move it.  The
+// scheduler advances the optimistic frontier before it builds the snapshot,
+// so the offset is recoverable from the snapshot alone -- this is the same
+// identity VllmV1Scheduler::apply_batch_completion uses to decide which
+// completion belongs to which chunk.
+std::uint64_t
+snapshot_past_context(const entities::RequestBatchSnapshot &snapshot) {
+    if (snapshot.scheduler_frontier < snapshot.scheduled_tokens) {
+        throw ExecutionTimePredictorError(
+            "batch snapshot scheduler frontier underflows");
+    }
+    return snapshot.scheduler_frontier - snapshot.scheduled_tokens;
+}
+
 detail::AttentionRequestSlice
-make_attention_request_slice(const entities::RequestBatchSnapshot &snapshot,
-                             const entities::Request &request) {
+make_attention_request_slice(const entities::RequestBatchSnapshot &snapshot) {
     return detail::AttentionRequestSlice{
         snapshot.scheduled_tokens,
-        request.num_processed_tokens(),
+        snapshot_past_context(snapshot),
     };
 }
 
@@ -53,16 +68,22 @@ build_stage_batch_info(const entities::Batch &batch,
     for (const entities::RequestBatchSnapshot &snapshot : batch.requests()) {
         const entities::Request &request =
             get_request(requests, snapshot.request_id);
-        // Production Python evaluates analytical attention from the request's
-        // mutable state when each PP stage starts, rather than from the batch
-        // creation snapshot. Earlier overlapping stages may have made
-        // additional progress visible by then.
+        // Every attention input comes from the batch's own snapshot rather
+        // than from live request state.  A request may hold several prefill
+        // chunks at once, and its live frontier then advances while an earlier
+        // chunk is still traversing the pipeline, so reading it here would make
+        // a stage's predicted work depend on when that stage happened to run.
+        // That is what made "collapsed" and "exact" pipeline event modes
+        // disagree, and it understated attention under both: the live counter
+        // only reaches this chunk's true offset once every earlier chunk has
+        // retired, which may be after the chunk has already left the pipeline.
         const detail::AttentionRequestSlice slice =
-            make_attention_request_slice(snapshot, request);
-        if (!request.is_prefill_complete()) {
+            make_attention_request_slice(snapshot);
+        if (slice.past_context < request.num_prefill_tokens()) {
             result.dense_batch.prefill_requests.push_back(slice);
-            if (snapshot.processed_tokens + snapshot.scheduled_tokens >=
-                request.num_prefill_tokens()) {
+            // The chunk that reaches the end of the prompt is the one that
+            // samples the request's first token.
+            if (snapshot.scheduler_frontier >= request.num_prefill_tokens()) {
                 ++result.lm_head_tokens;
             }
         } else {
@@ -155,24 +176,24 @@ detail::MoEOperatorPrecisions make_moe_operator_precisions(
     result.router =
         detail::precision_from_string(config.moe_router_precision());
     result.dense = detail::precision_from_string(config.dense_precision());
-    result.shared_expert = detail::precision_from_string(
-        config.shared_expert_weight_precision());
-    result.expert_weight = detail::precision_from_string(
-        config.routed_expert_weight_precision());
+    result.shared_expert =
+        detail::precision_from_string(config.shared_expert_weight_precision());
+    result.expert_weight =
+        detail::precision_from_string(config.routed_expert_weight_precision());
     result.expert_activation = detail::precision_from_string(
         config.routed_expert_activation_precision());
     result.latent_moe_projection_weight = detail::precision_from_string(
         config.latent_moe_projection_weight_precision());
     result.latent_moe_projection_activation = detail::precision_from_string(
         config.latent_moe_projection_activation_precision());
-    result.shared_expert_weight = detail::precision_from_string(
-        config.shared_expert_weight_precision());
+    result.shared_expert_weight =
+        detail::precision_from_string(config.shared_expert_weight_precision());
     result.shared_expert_activation = detail::precision_from_string(
         config.shared_expert_activation_precision());
-    result.router_weight = detail::precision_from_string(
-        config.router_weight_storage_precision());
-    result.router_activation = detail::precision_from_string(
-        config.moe_router_activation_precision());
+    result.router_weight =
+        detail::precision_from_string(config.router_weight_storage_precision());
+    result.router_activation =
+        detail::precision_from_string(config.moe_router_activation_precision());
     result.dense_weight =
         detail::precision_from_string(config.dense_weight_precision());
     result.dense_activation =
@@ -267,24 +288,38 @@ scaled_attention_family(const config::ModelConfig &model,
     if (model.has_kda() && model.is_kda_layer(model_layer)) {
         return ScaledMoEAttentionFamily::kKda;
     }
-    if (model.is_mla_layer(model_layer) ||
-        (model.use_mla && !model.has_kda() && model.mla_layer_indices.empty())) {
+    if (model.is_mla_layer(model_layer) || (model.use_mla && !model.has_kda() &&
+                                            model.mla_layer_indices.empty())) {
         return ScaledMoEAttentionFamily::kMla;
     }
     return ScaledMoEAttentionFamily::kStandard;
 }
 
-// Routing allocations generated by these two modes are independent of the
-// logical model layer.  Every other mode/distribution intentionally includes
-// the layer ID in its seed or weight calculation and must be recomputed by
-// stage_group_scaled rather than reusing a representative lane allocation.
+// Stage-group compression is exact only when the configured layer scope makes
+// the routing allocation independent of the logical model layer.
 bool routing_is_layer_invariant(
     const config::MoeRoutingConfig &routing) noexcept {
-    if (routing.mode == config::MoeRoutingMode::kUniformLegacy) {
-        return true;
-    }
-    return routing.mode == config::MoeRoutingMode::kSimulation &&
-           routing.distribution == config::MoeRoutingDistribution::kBalanced;
+    return routing.layer_scope == config::MoeRoutingLayerScope::kShared;
+}
+
+bool routing_is_batch_shared(
+    const config::AnalyticalExecutionModelConfig &config,
+    const config::MoeRoutingConfig &routing) noexcept {
+    // first_layer_scaled is defined by one representative expert path for the
+    // whole batch. It therefore always uses one batch-shared draw, even when a
+    // caller leaves layer_scope set to per_layer.
+    return config.moe_layer_event_mode == "first_layer_scaled" ||
+           routing_is_layer_invariant(routing);
+}
+
+// A shared assignment must not depend on which layer asked for it: two
+// pipeline stages hold different layers of the same batch, and if the seed
+// moved with the layer they would charge different routing for one batch.
+// Seeding from a fixed layer makes every layer and every stage agree, which
+// is the property the stage timing templates rely on.
+std::uint64_t routing_seed_layer(bool batch_shared,
+                                 std::uint64_t model_layer) noexcept {
+    return batch_shared ? 0 : model_layer;
 }
 
 bool has_contiguous_moe_suffix(const config::ModelConfig &model,
@@ -300,17 +335,17 @@ bool has_contiguous_moe_suffix(const config::ModelConfig &model,
     return true;
 }
 
-void add_scaled_attention_layer(
-    std::vector<ScaledMoEAttentionGroup> &groups,
-    ScaledMoEAttentionFamily family, double pre_moe_compute_ms,
-    double pre_moe_tp_communication_ms) {
-    const auto position = std::find_if(
-        groups.begin(), groups.end(), [family](const auto &group) {
+void add_scaled_attention_layer(std::vector<ScaledMoEAttentionGroup> &groups,
+                                ScaledMoEAttentionFamily family,
+                                double pre_moe_compute_ms,
+                                double pre_moe_tp_communication_ms) {
+    const auto position =
+        std::find_if(groups.begin(), groups.end(), [family](const auto &group) {
             return group.family == family;
         });
     if (position == groups.end()) {
-        groups.push_back(ScaledMoEAttentionGroup{
-            family, 1, pre_moe_compute_ms, pre_moe_tp_communication_ms});
+        groups.push_back(ScaledMoEAttentionGroup{family, 1, pre_moe_compute_ms,
+                                                 pre_moe_tp_communication_ms});
         return;
     }
     ++position->layer_count;
@@ -320,18 +355,17 @@ void add_scaled_attention_layer(
     const double tolerance =
         1e-12 * std::max({1.0, std::abs(position->pre_moe_compute_ms_per_layer),
                           std::abs(pre_moe_compute_ms)});
-    if (std::abs(position->pre_moe_compute_ms_per_layer -
-                 pre_moe_compute_ms) > tolerance) {
+    if (std::abs(position->pre_moe_compute_ms_per_layer - pre_moe_compute_ms) >
+        tolerance) {
         throw ExecutionTimePredictorError(
             "scaled MoE prediction requires identical attention time within "
             "each attention family");
     }
     const double communication_tolerance =
-        1e-12 * std::max(
-                    {1.0,
-                     std::abs(
-                         position->pre_moe_tp_communication_ms_per_layer),
-                     std::abs(pre_moe_tp_communication_ms)});
+        1e-12 *
+        std::max({1.0,
+                  std::abs(position->pre_moe_tp_communication_ms_per_layer),
+                  std::abs(pre_moe_tp_communication_ms)});
     if (std::abs(position->pre_moe_tp_communication_ms_per_layer -
                  pre_moe_tp_communication_ms) > communication_tolerance) {
         throw ExecutionTimePredictorError(
@@ -360,6 +394,12 @@ struct MoEStageContext {
     // of the enclosing predictor call; null preserves detailed routing.
     const detail::MoELanePrediction *reusable_moe_lane_prediction = nullptr;
     const detail::MoECommunicationTime *reusable_moe_communication = nullptr;
+    // Shared layer scope makes one assignment serve every MoE layer of the
+    // batch, so it is memoized once per batch and handed to each stage and
+    // each lazily predicted layer.  Null means the caller wants this layer's
+    // own draw.
+    const detail::RoutingAllocation *reusable_routing_allocation = nullptr;
+    bool detailed_diagnostics_enabled = true;
 
     [[nodiscard]] const detail::DenseLayerTimes &
     layer_time(std::uint64_t model_layer) const noexcept {
@@ -461,32 +501,46 @@ predict_selected_moe_layer_execution(const MoEStageContext &context,
             result.execution_time.dense_compute_ms += pre_moe_compute_ms;
             result.execution_time.tp_communication_ms +=
                 pre_moe_tp_communication_ms;
-            const detail::RoutingAllocation allocation = detail::route_tokens(
-                batch_info.dense_batch.total_tokens, model.router_topk,
-                model.total_expert_num, parallelism.moe_expert_parallel_size,
-                context.routing, model_layer);
-            const detail::MoELanePrediction lane_prediction =
-                context.reusable_moe_lane_prediction != nullptr
-                    ? *context.reusable_moe_lane_prediction
-                    : detail::predict_moe_lanes(
-                          context.device, detail::AnalyticalConfig{},
-                          moe_model, allocation, model.router_topk,
-                          moe_precisions);
+            std::optional<detail::RoutingAllocation> owned_allocation;
+            const detail::RoutingAllocation *allocation =
+                context.reusable_routing_allocation;
+            if (allocation == nullptr) {
+                owned_allocation.emplace(detail::route_tokens(
+                    batch_info.dense_batch.total_tokens, model.router_topk,
+                    model.total_expert_num,
+                    parallelism.moe_expert_parallel_size, context.routing,
+                    routing_seed_layer(routing_is_batch_shared(context.config,
+                                                               context.routing),
+                                       model_layer)));
+                allocation = &*owned_allocation;
+            }
+            std::optional<detail::MoELanePrediction> owned_lane_prediction;
+            const detail::MoELanePrediction *lane_prediction =
+                context.reusable_moe_lane_prediction;
+            if (lane_prediction == nullptr) {
+                owned_lane_prediction.emplace(detail::predict_moe_lanes(
+                    context.device, detail::AnalyticalConfig{}, moe_model,
+                    *allocation, model.router_topk, moe_precisions));
+                lane_prediction = &*owned_lane_prediction;
+            }
             result.routing_diagnostics.push_back(make_moe_routing_diagnostic(
                 local_moe_layer, model_layer, pre_moe_compute_ms,
-                pre_moe_tp_communication_ms, allocation, lane_prediction));
+                pre_moe_tp_communication_ms, *allocation, *lane_prediction));
             const detail::MoELayerTime &critical =
-                lane_prediction.lane_times.at(
-                    static_cast<std::size_t>(lane_prediction.critical_lane));
+                lane_prediction->lane_times.at(
+                    static_cast<std::size_t>(lane_prediction->critical_lane));
             add_critical_moe_layer_time(
                 result.execution_time, critical,
                 context.layer_time(model_layer).residual_add_ms);
-            result.diagnostics.emplace_back(
-                "layer_" + std::to_string(model_layer) + "_critical_lane",
-                static_cast<double>(lane_prediction.critical_lane));
-            result.diagnostics.emplace_back(
-                "layer_" + std::to_string(model_layer) + "_critical_lane_ms",
-                lane_prediction.critical_lane_time_ms);
+            if (context.detailed_diagnostics_enabled) {
+                result.diagnostics.emplace_back(
+                    "layer_" + std::to_string(model_layer) + "_critical_lane",
+                    static_cast<double>(lane_prediction->critical_lane));
+                result.diagnostics.emplace_back(
+                    "layer_" + std::to_string(model_layer) +
+                        "_critical_lane_ms",
+                    lane_prediction->critical_lane_time_ms);
+            }
         }
         pending_dense_compute_ms = 0.0;
         pending_tp_communication_ms = 0.0;
@@ -542,7 +596,7 @@ MoEStagePrediction predict_moe_stage_execution(const MoEStageContext &context) {
     double pending_pre_moe_compute_ms = 0.0;
     double pending_pre_moe_tp_communication_ms = 0.0;
     std::uint64_t moe_layer_index = 0;
-    std::optional<detail::MoELanePrediction> repeated_lane_prediction;
+    const detail::MoELanePrediction *repeated_lane_prediction = nullptr;
     const bool first_layer_scaled =
         config.moe_layer_event_mode == "first_layer_scaled";
     const bool stage_group_requested =
@@ -554,10 +608,21 @@ MoEStagePrediction predict_moe_stage_execution(const MoEStageContext &context) {
     const bool stage_group_scaled =
         stage_group_requested && routing_is_layer_invariant(routing) &&
         has_contiguous_moe_suffix(model, stage_layers);
+    // Shared routing gives every MoE layer the same assignment, so the
+    // allocation and the expert roofline it feeds are computed once and reused
+    // for the rest of the stage. first_layer_scaled has the same batch-shared
+    // contract even when the raw layer_scope is per_layer.
+    const bool layer_shared = routing_is_batch_shared(config, routing);
+    std::optional<detail::RoutingAllocation> owned_allocation;
+    std::optional<detail::MoELanePrediction> owned_lane_prediction;
+    const detail::RoutingAllocation *shared_allocation =
+        context.reusable_routing_allocation;
+    const detail::MoELanePrediction *shared_lane_prediction =
+        context.reusable_moe_lane_prediction;
     for (std::uint64_t model_layer = stage_layers.begin;
          model_layer < stage_layers.end; ++model_layer) {
         if (!model.is_moe_layer(model_layer)) {
-            if (first_layer_scaled && repeated_lane_prediction.has_value()) {
+            if (first_layer_scaled && repeated_lane_prediction != nullptr) {
                 throw ExecutionTimePredictorError(
                     "first_layer_scaled requires a contiguous MoE suffix "
                     "within each pipeline stage");
@@ -579,7 +644,7 @@ MoEStagePrediction predict_moe_stage_execution(const MoEStageContext &context) {
             context.attention_communication_ms(model_layer);
         ++result.logical_moe_layer_count;
         if ((first_layer_scaled || stage_group_scaled) &&
-            repeated_lane_prediction.has_value()) {
+            repeated_lane_prediction != nullptr) {
             add_scaled_attention_layer(
                 result.scaled_attention_groups,
                 scaled_attention_family(model, model_layer),
@@ -598,32 +663,46 @@ MoEStagePrediction predict_moe_stage_execution(const MoEStageContext &context) {
             continue;
         }
         pending_pre_moe_compute_ms += attention_compute_ms;
-        const detail::RoutingAllocation allocation = detail::route_tokens(
-            batch_info.dense_batch.total_tokens, model.router_topk,
-            model.total_expert_num, parallelism.moe_expert_parallel_size,
-            routing, model_layer);
-        const detail::MoELanePrediction lane_prediction =
-            context.reusable_moe_lane_prediction != nullptr
-                ? *context.reusable_moe_lane_prediction
-                : detail::predict_moe_lanes(
-                      context.device, detail::AnalyticalConfig{}, moe_model,
-                      allocation, model.router_topk, moe_precisions);
+        const detail::RoutingAllocation *allocation = shared_allocation;
+        if (allocation == nullptr || !layer_shared) {
+            owned_allocation.emplace(detail::route_tokens(
+                batch_info.dense_batch.total_tokens, model.router_topk,
+                model.total_expert_num, parallelism.moe_expert_parallel_size,
+                routing, routing_seed_layer(layer_shared, model_layer)));
+            allocation = &*owned_allocation;
+            if (layer_shared) {
+                shared_allocation = allocation;
+            }
+        }
+        const detail::MoELanePrediction *lane_prediction =
+            shared_lane_prediction;
+        if (lane_prediction == nullptr || !layer_shared) {
+            owned_lane_prediction.emplace(detail::predict_moe_lanes(
+                context.device, detail::AnalyticalConfig{}, moe_model,
+                *allocation, model.router_topk, moe_precisions));
+            lane_prediction = &*owned_lane_prediction;
+            if (layer_shared) {
+                shared_lane_prediction = lane_prediction;
+            }
+        }
         result.routing_diagnostics.push_back(make_moe_routing_diagnostic(
             moe_layer_index, model_layer, pending_pre_moe_compute_ms,
             pending_pre_moe_tp_communication_ms +
                 context.attention_communication_ms(model_layer),
-            allocation, lane_prediction));
-        const detail::MoELayerTime &critical = lane_prediction.lane_times.at(
-            static_cast<std::size_t>(lane_prediction.critical_lane));
+            *allocation, *lane_prediction));
+        const detail::MoELayerTime &critical = lane_prediction->lane_times.at(
+            static_cast<std::size_t>(lane_prediction->critical_lane));
         add_critical_moe_layer_time(
             result.execution_time, critical,
             context.layer_time(model_layer).residual_add_ms);
-        result.diagnostics.emplace_back(
-            "layer_" + std::to_string(model_layer) + "_critical_lane",
-            static_cast<double>(lane_prediction.critical_lane));
-        result.diagnostics.emplace_back("layer_" + std::to_string(model_layer) +
-                                            "_critical_lane_ms",
-                                        lane_prediction.critical_lane_time_ms);
+        if (context.detailed_diagnostics_enabled) {
+            result.diagnostics.emplace_back(
+                "layer_" + std::to_string(model_layer) + "_critical_lane",
+                static_cast<double>(lane_prediction->critical_lane));
+            result.diagnostics.emplace_back(
+                "layer_" + std::to_string(model_layer) + "_critical_lane_ms",
+                lane_prediction->critical_lane_time_ms);
+        }
         pending_pre_moe_compute_ms = 0.0;
         pending_pre_moe_tp_communication_ms = 0.0;
         ++moe_layer_index;
@@ -633,8 +712,7 @@ MoEStagePrediction predict_moe_stage_execution(const MoEStageContext &context) {
         }
     }
     result.suffix_compute_ms = pending_pre_moe_compute_ms;
-    result.suffix_tp_communication_ms =
-        pending_pre_moe_tp_communication_ms;
+    result.suffix_tp_communication_ms = pending_pre_moe_tp_communication_ms;
     const detail::MoECommunicationTime communication_time =
         moe_stage_communication(context);
     const double moe_layers =
@@ -680,13 +758,47 @@ kv_cache_bytes_per_token_per_layer(const config::ModelConfig &model,
            detail::bytes_per_element(kv_cache_precision);
 }
 
+std::uint64_t
+model_layer_for_local_moe(const config::ModelConfig &model,
+                          const config::PipelineStageLayerRange &stage_layers,
+                          std::uint64_t local_moe_layer) {
+    std::uint64_t current = 0;
+    for (std::uint64_t model_layer = stage_layers.begin;
+         model_layer < stage_layers.end; ++model_layer) {
+        if (!model.is_moe_layer(model_layer)) {
+            continue;
+        }
+        if (current == local_moe_layer) {
+            return model_layer;
+        }
+        ++current;
+    }
+    throw ExecutionTimePredictorError(
+        "cached MoE layer index is outside the pipeline stage");
+}
+
+ExecutionTimePrediction materialize_cached_prediction(
+    const ExecutionTimePrediction &cached, const config::ModelConfig &model,
+    const config::PipelineStageLayerRange &stage_layers) {
+    ExecutionTimePrediction result = cached;
+    for (MoERoutingDiagnostic &routing : result.moe_routing) {
+        if (!routing.layer_id.valid()) {
+            throw ExecutionTimePredictorError(
+                "cached MoE routing has an invalid local layer ID");
+        }
+        routing.model_layer_id = model_layer_for_local_moe(
+            model, stage_layers, routing.layer_id.index());
+    }
+    return result;
+}
+
 } // namespace
 
 config::StageTimingSignature
 AnalyticalRooflineExecutionTimePredictor::make_stage_timing_signature(
     std::uint64_t stage) const {
-    return config::build_pipeline_stage_timing_signature(
-        model_, parallelism_, stage);
+    return config::build_pipeline_stage_timing_signature(model_, parallelism_,
+                                                         stage);
 }
 
 void AnalyticalRooflineExecutionTimePredictor::build_stage_timing_groups() {
@@ -695,13 +807,13 @@ void AnalyticalRooflineExecutionTimePredictor::build_stage_timing_groups() {
     timing_catalogue_.timing_group_multiplicity.clear();
     timing_catalogue_.stage_to_timing_group.reserve(
         static_cast<std::size_t>(parallelism_.pipeline_parallel_size));
-    for (std::uint64_t stage = 0;
-         stage < parallelism_.pipeline_parallel_size; ++stage) {
+    for (std::uint64_t stage = 0; stage < parallelism_.pipeline_parallel_size;
+         ++stage) {
         config::StageTimingSignature signature =
             make_stage_timing_signature(stage);
-        const auto existing = std::find(timing_catalogue_.timing_groups.begin(),
-                                         timing_catalogue_.timing_groups.end(),
-                                         signature);
+        const auto existing =
+            std::find(timing_catalogue_.timing_groups.begin(),
+                      timing_catalogue_.timing_groups.end(), signature);
         std::uint32_t group_id = 0;
         if (existing == timing_catalogue_.timing_groups.end()) {
             group_id = static_cast<std::uint32_t>(
@@ -709,9 +821,8 @@ void AnalyticalRooflineExecutionTimePredictor::build_stage_timing_groups() {
             timing_catalogue_.timing_groups.push_back(std::move(signature));
             timing_catalogue_.timing_group_multiplicity.push_back(0);
         } else {
-            group_id = static_cast<std::uint32_t>(
-                std::distance(timing_catalogue_.timing_groups.begin(),
-                              existing));
+            group_id = static_cast<std::uint32_t>(std::distance(
+                timing_catalogue_.timing_groups.begin(), existing));
         }
         timing_catalogue_.stage_to_timing_group.push_back(group_id);
         ++timing_catalogue_.timing_group_multiplicity.at(group_id);
@@ -739,10 +850,9 @@ AnalyticalRooflineExecutionTimePredictor::build_stage_layer_times(
         // MLA checkpoints retain the old path.
         dense_model.use_mla = !dense_model.use_kda && model_.use_mla;
         std::optional<detail::DenseLayerTimes> *representative =
-            dense_model.use_kda
-                ? &kda_layer_times
-                : (dense_model.use_mla ? &mla_layer_times
-                                       : &standard_layer_times);
+            dense_model.use_kda ? &kda_layer_times
+                                : (dense_model.use_mla ? &mla_layer_times
+                                                       : &standard_layer_times);
         if (!representative->has_value()) {
             *representative = detail::predict_dense_layer(
                 device_, detail::AnalyticalConfig{}, dense_model, dense_batch,
@@ -762,11 +872,11 @@ double AnalyticalRooflineExecutionTimePredictor::compute_allreduce_ms(
         activation_bytes, parallelism_.tensor_parallel_size, true);
 }
 
-double
-AnalyticalRooflineExecutionTimePredictor::compute_dcp_attention_communication_ms(
-    const detail::DenseBatch &dense_batch,
-    const config::PipelineStageLayerRange &stage_layers,
-    double communication_element_bytes) const {
+double AnalyticalRooflineExecutionTimePredictor::
+    compute_dcp_attention_communication_ms(
+        const detail::DenseBatch &dense_batch,
+        const config::PipelineStageLayerRange &stage_layers,
+        double communication_element_bytes) const {
     if (!model_.use_mla || parallelism_.decode_context_parallel_size <= 1 ||
         dense_batch.decode_requests.empty()) {
         return 0.0;
@@ -805,8 +915,8 @@ AnalyticalRooflineExecutionTimePredictor::compute_dcp_attention_communication_ms
     return communication_backend_->allgather_ms(
                query_bytes, parallelism_.decode_context_parallel_size, true) +
            communication_backend_->reduce_scatter_ms(
-               gathered_output_bytes,
-               parallelism_.decode_context_parallel_size, true);
+               gathered_output_bytes, parallelism_.decode_context_parallel_size,
+               true);
 }
 
 detail::MoECommunicationTime
@@ -822,71 +932,29 @@ AnalyticalRooflineExecutionTimePredictor::compute_moe_communication(
         false, communication_element_bytes, model_.routed_expert_hidden_size);
 }
 
-std::size_t AnalyticalRooflineExecutionTimePredictor::
-    StageTimingCacheKeyHash::operator()(
-        const StageTimingCacheKey &key) const noexcept {
-    std::size_t seed = std::hash<std::uint64_t>{}(key.timing_group_id);
-    const auto combine = [&seed](std::uint64_t value) {
-        constexpr std::size_t kGoldenRatio =
-            static_cast<std::size_t>(0x9e3779b97f4a7c15ULL);
-        seed ^= std::hash<std::uint64_t>{}(value) + kGoldenRatio +
-                (seed << 6U) + (seed >> 2U);
-    };
-    combine(key.cluster_type);
-    combine(key.selected_moe_layer_valid ? 1U : 0U);
-    combine(key.selected_moe_layer);
-    combine(key.total_tokens);
-    const auto combine_requests = [&combine](
-                                      const auto &requests) {
-        combine(static_cast<std::uint64_t>(requests.size()));
-        for (const auto &[query_tokens, past_context] : requests) {
-            combine(query_tokens);
-            combine(past_context);
-        }
-    };
-    combine_requests(key.prefill_requests);
-    combine_requests(key.decode_requests);
-    return seed;
-}
-
 AnalyticalRooflineExecutionTimePredictor::StageTimingCacheLookup
 AnalyticalRooflineExecutionTimePredictor::lookup_stage_timing_template(
-    std::uint32_t timing_group_id, const detail::DenseBatch &dense_batch,
-    ClusterType cluster_type,
-    std::optional<std::uint64_t> selected_moe_layer,
+    BatchId batch_id, std::uint32_t timing_group_id,
+    const detail::DenseBatch &dense_batch,
     const config::PipelineStageLayerRange &stage_layers) const {
-    StageTimingCacheKey key{};
-    key.timing_group_id = timing_group_id;
-    key.cluster_type = static_cast<std::uint8_t>(cluster_type);
-    key.selected_moe_layer_valid = selected_moe_layer.has_value();
-    key.selected_moe_layer = selected_moe_layer.value_or(0);
-    key.total_tokens = dense_batch.total_tokens;
-    key.prefill_requests.reserve(dense_batch.prefill_requests.size());
-    for (const detail::AttentionRequestSlice &slice :
-         dense_batch.prefill_requests) {
-        key.prefill_requests.emplace_back(slice.query_tokens,
-                                           slice.past_context);
-    }
-    key.decode_requests.reserve(dense_batch.decode_requests.size());
-    for (const detail::AttentionRequestSlice &slice :
-         dense_batch.decode_requests) {
-        key.decode_requests.emplace_back(slice.query_tokens,
-                                          slice.past_context);
+    if (!batch_id.valid()) {
+        throw ExecutionTimePredictorError(
+            "stage timing cache requires a valid batch ID");
     }
 
-    // This bound is intentionally small: the useful reuse window is the set
-    // of equivalent PP stages for a batch.  Clearing the table at the bound
-    // prevents an online workload with ever-changing batch shapes from
-    // retaining unbounded request metadata.
-    constexpr std::size_t kMaxTimingCacheEntries = 256;
     std::lock_guard<std::mutex> lock(timing_cache_mutex_);
-    const auto existing = timing_cache_.find(key);
-    if (existing != timing_cache_.end()) {
-        ++timing_cache_hits_total_;
-        return StageTimingCacheLookup{
-            existing->second, true, timing_cache_hits_total_,
-            timing_cache_misses_total_, timing_cache_unique_templates_total_,
-            static_cast<std::uint64_t>(timing_cache_.size())};
+    const auto batch_position = timing_cache_by_batch_.find(batch_id);
+    if (batch_position != timing_cache_by_batch_.end()) {
+        const auto existing = batch_position->second.find(timing_group_id);
+        if (existing != batch_position->second.end()) {
+            ++timing_cache_hits_total_;
+            return StageTimingCacheLookup{existing->second,
+                                          true,
+                                          timing_cache_hits_total_,
+                                          timing_cache_misses_total_,
+                                          timing_cache_unique_templates_total_,
+                                          timing_cache_entries_};
+        }
     }
 
     auto value = std::make_shared<StageTimingCacheValue>();
@@ -899,60 +967,114 @@ AnalyticalRooflineExecutionTimePredictor::lookup_stage_timing_template(
         detail::precision_from_string(config_.communication_precision());
     const double communication_element_bytes =
         detail::bytes_per_element(communication_precision);
-    const std::uint64_t activation_bytes = activation_payload_bytes(
-        dense_batch.total_tokens, model_.hidden_size,
-        communication_element_bytes);
+    const std::uint64_t activation_bytes =
+        activation_payload_bytes(dense_batch.total_tokens, model_.hidden_size,
+                                 communication_element_bytes);
     value->allreduce_ms = compute_allreduce_ms(activation_bytes);
     value->dcp_attention_communication_ms =
         compute_dcp_attention_communication_ms(dense_batch, stage_layers,
                                                communication_element_bytes);
 
-    // stage_group_scaled is only allowed to reuse a representative lane for
-    // layer-invariant routing and a contiguous MoE suffix.  The caller only
-    // requests this template on that guarded path, so the first MoE layer is
-    // a stable canonical route seed for every stage in the timing group.
+    // The representative expert lane lives in the batch-level shared-routing
+    // memo. Keeping it out of each timing group avoids recalculating the same
+    // routing allocation and expert roofline on every template miss.
     if (model_.is_moe() &&
         config_.moe_layer_event_mode == "stage_group_scaled" &&
         routing_is_layer_invariant(routing_) &&
         has_contiguous_moe_suffix(model_, stage_layers)) {
-        std::optional<std::uint64_t> first_moe;
-        for (std::uint64_t layer = stage_layers.begin;
-             layer < stage_layers.end; ++layer) {
-            if (model_.is_moe_layer(layer)) {
-                first_moe = layer;
-                break;
-            }
-        }
-        if (first_moe.has_value()) {
-            const detail::MoEModel moe_model =
-                make_moe_model(model_, parallelism_);
-            const detail::MoEOperatorPrecisions moe_precisions =
-                make_moe_operator_precisions(config_);
-            const detail::RoutingAllocation allocation = detail::route_tokens(
-                dense_batch.total_tokens, model_.router_topk,
-                model_.total_expert_num,
-                parallelism_.moe_expert_parallel_size, routing_,
-                first_moe.value());
-            value->representative_moe_lane = detail::predict_moe_lanes(
-                device_, detail::AnalyticalConfig{}, moe_model, allocation,
-                model_.router_topk, moe_precisions);
-            value->has_representative_moe_lane = true;
-            value->moe_communication = compute_moe_communication(
-                dense_batch, communication_element_bytes);
-            value->has_moe_communication = true;
-        }
+        value->moe_communication =
+            compute_moe_communication(dense_batch, communication_element_bytes);
+        value->has_moe_communication = true;
     }
 
-    if (timing_cache_.size() >= kMaxTimingCacheEntries) {
-        timing_cache_.clear();
-    }
-    timing_cache_.emplace(std::move(key), value);
+    timing_cache_by_batch_[batch_id].emplace(timing_group_id, value);
+    ++timing_cache_entries_;
     ++timing_cache_misses_total_;
     ++timing_cache_unique_templates_total_;
-    return StageTimingCacheLookup{
-        std::move(value), false, timing_cache_hits_total_,
-        timing_cache_misses_total_, timing_cache_unique_templates_total_,
-        static_cast<std::uint64_t>(timing_cache_.size())};
+    return StageTimingCacheLookup{std::move(value),
+                                  false,
+                                  timing_cache_hits_total_,
+                                  timing_cache_misses_total_,
+                                  timing_cache_unique_templates_total_,
+                                  timing_cache_entries_};
+}
+
+std::shared_ptr<const ExecutionTimePrediction>
+AnalyticalRooflineExecutionTimePredictor::lookup_complete_prediction(
+    BatchId batch_id, std::uint32_t timing_group_id) const {
+    std::lock_guard<std::mutex> lock(timing_cache_mutex_);
+    const auto batch_position = timing_cache_by_batch_.find(batch_id);
+    if (batch_position == timing_cache_by_batch_.end()) {
+        return nullptr;
+    }
+    const auto group_position = batch_position->second.find(timing_group_id);
+    if (group_position == batch_position->second.end() ||
+        group_position->second->complete_prediction == nullptr) {
+        return nullptr;
+    }
+    ++timing_cache_hits_total_;
+    return group_position->second->complete_prediction;
+}
+
+void AnalyticalRooflineExecutionTimePredictor::store_complete_prediction(
+    BatchId batch_id, std::uint32_t timing_group_id,
+    const ExecutionTimePrediction &prediction) const {
+    auto stored = std::make_shared<const ExecutionTimePrediction>(prediction);
+    std::lock_guard<std::mutex> lock(timing_cache_mutex_);
+    const auto batch_position = timing_cache_by_batch_.find(batch_id);
+    if (batch_position == timing_cache_by_batch_.end()) {
+        throw ExecutionTimePredictorError(
+            "complete prediction requires an existing timing template");
+    }
+    const auto group_position = batch_position->second.find(timing_group_id);
+    if (group_position == batch_position->second.end()) {
+        throw ExecutionTimePredictorError(
+            "complete prediction timing group is not cached");
+    }
+    group_position->second->complete_prediction = std::move(stored);
+}
+
+std::shared_ptr<
+    const AnalyticalRooflineExecutionTimePredictor::SharedRoutingValue>
+AnalyticalRooflineExecutionTimePredictor::shared_routing_for_batch(
+    BatchId batch_id, const detail::DenseBatch &dense_batch) const {
+    if (!batch_id.valid()) {
+        throw ExecutionTimePredictorError(
+            "shared routing memo requires a valid batch ID");
+    }
+    std::lock_guard<std::mutex> lock(timing_cache_mutex_);
+    const auto existing = shared_routing_by_batch_.find(batch_id);
+    if (existing != shared_routing_by_batch_.end()) {
+        return existing->second;
+    }
+    auto value = std::make_shared<SharedRoutingValue>();
+    // Layer zero is the canonical seed: a shared assignment must not depend on
+    // which layer or stage happened to ask for it first.
+    value->allocation = detail::route_tokens(
+        dense_batch.total_tokens, model_.router_topk, model_.total_expert_num,
+        parallelism_.moe_expert_parallel_size, routing_, 0);
+    value->lane_prediction = detail::predict_moe_lanes(
+        device_, detail::AnalyticalConfig{},
+        make_moe_model(model_, parallelism_), value->allocation,
+        model_.router_topk, make_moe_operator_precisions(config_));
+    shared_routing_by_batch_.emplace(batch_id, value);
+    return value;
+}
+
+void AnalyticalRooflineExecutionTimePredictor::release_batch_timing_cache(
+    BatchId batch_id) const {
+    if (!batch_id.valid()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(timing_cache_mutex_);
+    shared_routing_by_batch_.erase(batch_id);
+    const auto position = timing_cache_by_batch_.find(batch_id);
+    if (position == timing_cache_by_batch_.end()) {
+        return;
+    }
+    timing_cache_entries_ -=
+        static_cast<std::uint64_t>(position->second.size());
+    timing_cache_by_batch_.erase(position);
 }
 
 AnalyticalRooflineExecutionTimePredictor::
@@ -1153,13 +1275,6 @@ AnalyticalRooflineExecutionTimePredictor::predict_execution(
             "analytical stage ID exceeds pipeline size");
     }
 
-    const StageBatchInfo batch_info = build_stage_batch_info(batch, requests);
-    const detail::DenseBatch &dense_batch = batch_info.dense_batch;
-
-    const detail::DenseOperatorPrecisions dense_precisions =
-        make_dense_operator_precisions(config_);
-    const detail::Precision communication_precision =
-        detail::precision_from_string(config_.communication_precision());
     const config::PipelineStageLayerRange stage_layers =
         config::pipeline_stage_layer_range(model_.num_layers,
                                            parallelism_.pipeline_parallel_size,
@@ -1174,19 +1289,46 @@ AnalyticalRooflineExecutionTimePredictor::predict_execution(
         timing_catalogue_.stage_to_timing_group.at(stage_id.index());
     const std::uint64_t timing_group_multiplicity =
         timing_catalogue_.timing_group_multiplicity.at(timing_group_id);
+    // A singleton timing group has no second stage that can consume a cached
+    // value for this batch. Avoid allocating, inserting, copying, and later
+    // erasing a template that is structurally guaranteed never to hit.
+    const bool reusable_timing_group = stage_group_active &&
+                                       timing_group_multiplicity > 1 &&
+                                       !selected_moe_layer.has_value();
+    if (!detailed_diagnostics_enabled_ && reusable_timing_group) {
+        const std::shared_ptr<const ExecutionTimePrediction> cached =
+            lookup_complete_prediction(batch.id(), timing_group_id);
+        if (cached != nullptr) {
+            return materialize_cached_prediction(*cached, model_, stage_layers);
+        }
+    }
+
+    const StageBatchInfo batch_info = build_stage_batch_info(batch, requests);
+    const detail::DenseBatch &dense_batch = batch_info.dense_batch;
+    const detail::DenseOperatorPrecisions dense_precisions =
+        make_dense_operator_precisions(config_);
+    const detail::Precision communication_precision =
+        detail::precision_from_string(config_.communication_precision());
     std::vector<detail::DenseLayerTimes> layer_times;
     layer_times.reserve(static_cast<std::size_t>(stage_layers.size()));
     StageTimingCacheLookup timing_cache_lookup{};
     std::shared_ptr<const StageTimingCacheValue> timing_template;
-    if (stage_group_active && !selected_moe_layer.has_value()) {
+    if (reusable_timing_group) {
         timing_cache_lookup = lookup_stage_timing_template(
-            timing_group_id, dense_batch, batch.cluster_type(),
-            selected_moe_layer, stage_layers);
+            batch.id(), timing_group_id, dense_batch, stage_layers);
         timing_template = timing_cache_lookup.value;
         layer_times = timing_template->layer_times;
     } else {
-        layer_times =
-            build_stage_layer_times(stage_layers, dense_batch, dense_precisions);
+        {
+            std::lock_guard<std::mutex> lock(timing_cache_mutex_);
+            timing_cache_lookup.hits_total = timing_cache_hits_total_;
+            timing_cache_lookup.misses_total = timing_cache_misses_total_;
+            timing_cache_lookup.unique_templates_total =
+                timing_cache_unique_templates_total_;
+            timing_cache_lookup.entries = timing_cache_entries_;
+        }
+        layer_times = build_stage_layer_times(stage_layers, dense_batch,
+                                              dense_precisions);
     }
     if (layer_times.empty()) {
         throw ExecutionTimePredictorError(
@@ -1198,9 +1340,9 @@ AnalyticalRooflineExecutionTimePredictor::predict_execution(
     const std::uint64_t activation_bytes =
         activation_payload_bytes(dense_batch.total_tokens, model_.hidden_size,
                                  communication_element_bytes);
-    const double allreduce_ms =
-        timing_template != nullptr ? timing_template->allreduce_ms
-                                   : compute_allreduce_ms(activation_bytes);
+    const double allreduce_ms = timing_template != nullptr
+                                    ? timing_template->allreduce_ms
+                                    : compute_allreduce_ms(activation_bytes);
     const double dcp_attention_communication_ms =
         timing_template != nullptr
             ? timing_template->dcp_attention_communication_ms
@@ -1254,6 +1396,13 @@ AnalyticalRooflineExecutionTimePredictor::predict_execution(
     double moe_suffix_compute_ms = 0.0;
     double moe_suffix_tp_communication_ms = 0.0;
     if (model_.is_moe()) {
+        // Shared layer scope and first_layer_scaled both reuse one assignment
+        // for every MoE layer of the batch. Resolving it here covers whole
+        // stages, stage-group templates, and single lazy-layer predictions.
+        const std::shared_ptr<const SharedRoutingValue> shared_routing =
+            routing_is_batch_shared(config_, routing_)
+                ? shared_routing_for_batch(batch.id(), dense_batch)
+                : nullptr;
         const MoEStageContext moe_context{
             batch.cluster_type(),
             batch_info,
@@ -1269,23 +1418,22 @@ AnalyticalRooflineExecutionTimePredictor::predict_execution(
             dcp_attention_communication_ms,
             communication_element_bytes,
             execution_time,
-            timing_template != nullptr &&
-                    timing_template->has_representative_moe_lane
-                ? &timing_template->representative_moe_lane
-                : nullptr,
-            timing_template != nullptr &&
-                    timing_template->has_moe_communication
+            shared_routing != nullptr ? &shared_routing->lane_prediction
+                                      : nullptr,
+            timing_template != nullptr && timing_template->has_moe_communication
                 ? &timing_template->moe_communication
                 : nullptr,
+            shared_routing != nullptr ? &shared_routing->allocation : nullptr,
+            detailed_diagnostics_enabled_,
         };
-        const MoEStagePrediction moe_prediction =
+        MoEStagePrediction moe_prediction =
             selected_moe_layer.has_value()
                 ? predict_selected_moe_layer_execution(
                       moe_context, selected_moe_layer.value())
                 : predict_moe_stage_execution(moe_context);
         execution_time = moe_prediction.execution_time;
-        moe_diagnostics = moe_prediction.diagnostics;
-        routing_diagnostics = moe_prediction.routing_diagnostics;
+        moe_diagnostics = std::move(moe_prediction.diagnostics);
+        routing_diagnostics = std::move(moe_prediction.routing_diagnostics);
         logical_moe_layer_count = moe_prediction.logical_moe_layer_count;
         scaled_moe_attention_groups =
             std::move(moe_prediction.scaled_attention_groups);
@@ -1311,185 +1459,194 @@ AnalyticalRooflineExecutionTimePredictor::predict_execution(
         throw ExecutionTimePredictorError(
             "analytical stage duration is invalid");
     }
-    std::uint64_t kda_layer_count = 0;
-    for (std::uint64_t model_layer = stage_layers.begin;
-         model_layer < stage_layers.end; ++model_layer) {
-        kda_layer_count += static_cast<std::uint64_t>(
-            model_.has_kda() && model_.is_kda_layer(model_layer));
-    }
-    std::uint64_t mla_layer_count = 0;
-    if (model_.use_mla) {
-        mla_layer_count = layers_per_stage - kda_layer_count;
-    }
-    double kda_projection_ms = 0.0;
-    double kda_short_conv_ms = 0.0;
-    double kda_recurrent_ms = 0.0;
-    double kda_gate_norm_ms = 0.0;
-    double attn_res_ms = 0.0;
-    for (const detail::DenseLayerTimes &times : layer_times) {
-        kda_projection_ms += times.kda_projection_ms;
-        kda_short_conv_ms += times.kda_short_conv_ms;
-        kda_recurrent_ms += times.kda_recurrent_ms;
-        kda_gate_norm_ms += times.kda_gate_norm_ms;
-        attn_res_ms += times.attn_res_ms;
-    }
-    const double kv_cache_bytes_per_token =
-        kv_cache_bytes_per_token_per_layer(model_, dense_precisions.kv_cache);
-    const double kv_cache_rank_local_bytes_per_token =
-        model_.use_mla
-            ? kv_cache_bytes_per_token /
-                  static_cast<double>(parallelism_.decode_context_parallel_size)
-            : kv_cache_bytes_per_token;
-
     ExecutionTimePrediction result{};
     result.duration_ms = duration_ms;
     result.execution_time = execution_time;
-    result.diagnostics = {
-        {"total_tokens", static_cast<double>(dense_batch.total_tokens)},
-        {"stage_id", static_cast<double>(stage_id.index())},
-        {"timing_group_id", static_cast<double>(timing_group_id)},
-        {"timing_group_multiplicity",
-         static_cast<double>(timing_group_multiplicity)},
-        {"timing_cache_enabled", timing_template != nullptr ? 1.0 : 0.0},
-        {"timing_cache_hit", timing_cache_lookup.hit ? 1.0 : 0.0},
-        {"timing_cache_miss",
-         timing_template != nullptr && !timing_cache_lookup.hit ? 1.0 : 0.0},
-        {"timing_cache_hits_total",
-         static_cast<double>(timing_cache_lookup.hits_total)},
-        {"timing_cache_misses_total",
-         static_cast<double>(timing_cache_lookup.misses_total)},
-        {"timing_cache_unique_templates_total",
-         static_cast<double>(timing_cache_lookup.unique_templates_total)},
-        {"timing_cache_entries",
-         static_cast<double>(timing_cache_lookup.entries)},
-        {"timing_group_layer_count",
-         static_cast<double>(timing_catalogue_.timing_groups.at(timing_group_id)
-                                 .ordered_layers.size())},
-        {"timing_owns_input_embedding",
-         timing_catalogue_.timing_groups.at(timing_group_id)
-                 .owns_input_embedding
-             ? 1.0
-             : 0.0},
-        {"timing_owns_final_norm",
-         timing_catalogue_.timing_groups.at(timing_group_id).owns_final_norm
-             ? 1.0
-             : 0.0},
-        {"timing_owns_lm_head",
-         timing_catalogue_.timing_groups.at(timing_group_id).owns_lm_head
-             ? 1.0
-             : 0.0},
-        {"timing_emits_pp_send",
-         timing_catalogue_.timing_groups.at(timing_group_id).emits_pp_send
-             ? 1.0
-             : 0.0},
-        {"stage_group_requested", stage_group_requested ? 1.0 : 0.0},
-        {"stage_group_active", stage_group_active ? 1.0 : 0.0},
-        {"stage_group_routing_layer_invariant",
-         routing_is_layer_invariant(routing_) ? 1.0 : 0.0},
-        {
-            "prefill_request_count",
-            static_cast<double>(dense_batch.prefill_requests.size()),
-        },
-        {
-            "decode_request_count",
-            static_cast<double>(dense_batch.decode_requests.size()),
-        },
-        // Retain the historical single-layer diagnostic as the first logical
-        // layer, and expose stage sums/counts for heterogeneous KDA/MLA
-        // schedules.
-        {"dense_layer_compute_ms", first_layer_compute_ms},
-        {"attention_weight_element_bytes",
-         detail::bytes_per_element(*dense_precisions.attention_weight)},
-        {"attention_activation_element_bytes",
-         detail::bytes_per_element(*dense_precisions.attention_activation)},
-        {"dense_weight_element_bytes",
-         detail::bytes_per_element(*dense_precisions.dense_weight)},
-        {"dense_activation_element_bytes",
-         detail::bytes_per_element(*dense_precisions.dense_activation)},
-        {"routed_expert_weight_element_bytes",
-         detail::bytes_per_element(detail::precision_from_string(
-             config_.routed_expert_weight_precision()))},
-        {"routed_expert_activation_element_bytes",
-         detail::bytes_per_element(detail::precision_from_string(
-             config_.routed_expert_activation_precision()))},
-        {"latent_moe_projection_weight_element_bytes",
-         detail::bytes_per_element(detail::precision_from_string(
-             config_.latent_moe_projection_weight_precision()))},
-        {"latent_moe_projection_activation_element_bytes",
-         detail::bytes_per_element(detail::precision_from_string(
-             config_.latent_moe_projection_activation_precision()))},
-        {"shared_expert_weight_element_bytes",
-         detail::bytes_per_element(detail::precision_from_string(
-             config_.shared_expert_weight_precision()))},
-        {"shared_expert_activation_element_bytes",
-         detail::bytes_per_element(detail::precision_from_string(
-             config_.shared_expert_activation_precision()))},
-        {"router_weight_storage_element_bytes",
-         detail::bytes_per_element(detail::precision_from_string(
-             config_.router_weight_storage_precision()))},
-        {"router_activation_storage_element_bytes",
-         detail::bytes_per_element(detail::precision_from_string(
-             config_.moe_router_activation_precision()))},
-        {"router_compute_element_bytes",
-         detail::bytes_per_element(detail::precision_from_string(
-             config_.router_compute_precision()))},
-        {"kda_snapshot_element_bytes",
-         detail::bytes_per_element(detail::precision_from_string(
-             config_.kda_snapshot_precision()))},
-        {"kv_cache_element_bytes",
-         detail::bytes_per_element(dense_precisions.kv_cache)},
-        {"kv_cache_bytes_per_token_per_layer", kv_cache_bytes_per_token},
-        {"kv_cache_rank_local_bytes_per_token_per_layer",
-         kv_cache_rank_local_bytes_per_token},
-        {"communication_element_bytes", communication_element_bytes},
-        {"tp_allreduce_ms", allreduce_ms},
-        {"dcp_attention_communication_ms", dcp_attention_communication_ms},
-        {"decode_context_parallel_size",
-         static_cast<double>(parallelism_.decode_context_parallel_size)},
-        {
-            "dense_layer_total_ms",
-            first_layer_compute_ms + first_tp_layer_ms,
-        },
-        {
-            "num_layers",
-            static_cast<double>(layers_per_stage),
-        },
-        {"dense_compute_ms", dense_compute_ms},
-        {"tp_communication_ms", tp_communication_ms},
-        {"kda_layer_count", static_cast<double>(kda_layer_count)},
-        {"mla_layer_count", static_cast<double>(mla_layer_count)},
-        {"kda_projection_ms", kda_projection_ms},
-        {"kda_short_conv_ms", kda_short_conv_ms},
-        {"kda_recurrent_ms", kda_recurrent_ms},
-        {"kda_gate_norm_ms", kda_gate_norm_ms},
-        {"attn_res_ms", attn_res_ms},
-        {"routed_expert_hidden_size",
-         static_cast<double>(model_.routed_expert_hidden_size)},
-        {"latent_moe_use_norm", model_.latent_moe_use_norm ? 1.0 : 0.0},
-        {"attn_res_block_size",
-         static_cast<double>(model_.attn_res_block_size)},
-        {"pp_communication_ms", pp_communication_ms},
-        {"lm_head_ms", execution_time.lm_head_ms},
-        {"lm_head_tokens", static_cast<double>(batch_info.lm_head_tokens)},
-        {"stage_duration_ms", duration_ms},
-        {"batch_duration_ms", duration_ms},
-    };
+    if (detailed_diagnostics_enabled_) {
+        std::uint64_t kda_layer_count = 0;
+        for (std::uint64_t model_layer = stage_layers.begin;
+             model_layer < stage_layers.end; ++model_layer) {
+            kda_layer_count += static_cast<std::uint64_t>(
+                model_.has_kda() && model_.is_kda_layer(model_layer));
+        }
+        std::uint64_t mla_layer_count = 0;
+        if (model_.use_mla) {
+            mla_layer_count = layers_per_stage - kda_layer_count;
+        }
+        double kda_projection_ms = 0.0;
+        double kda_short_conv_ms = 0.0;
+        double kda_recurrent_ms = 0.0;
+        double kda_gate_norm_ms = 0.0;
+        double attn_res_ms = 0.0;
+        for (const detail::DenseLayerTimes &times : layer_times) {
+            kda_projection_ms += times.kda_projection_ms;
+            kda_short_conv_ms += times.kda_short_conv_ms;
+            kda_recurrent_ms += times.kda_recurrent_ms;
+            kda_gate_norm_ms += times.kda_gate_norm_ms;
+            attn_res_ms += times.attn_res_ms;
+        }
+        const double kv_cache_bytes_per_token =
+            kv_cache_bytes_per_token_per_layer(model_,
+                                               dense_precisions.kv_cache);
+        const double kv_cache_rank_local_bytes_per_token =
+            model_.use_mla ? kv_cache_bytes_per_token /
+                                 static_cast<double>(
+                                     parallelism_.decode_context_parallel_size)
+                           : kv_cache_bytes_per_token;
+
+        result.diagnostics = {
+            {"total_tokens", static_cast<double>(dense_batch.total_tokens)},
+            {"stage_id", static_cast<double>(stage_id.index())},
+            {"timing_group_id", static_cast<double>(timing_group_id)},
+            {"timing_group_multiplicity",
+             static_cast<double>(timing_group_multiplicity)},
+            {"timing_cache_enabled", timing_template != nullptr ? 1.0 : 0.0},
+            {"timing_cache_hit", timing_cache_lookup.hit ? 1.0 : 0.0},
+            {"timing_cache_miss",
+             timing_template != nullptr && !timing_cache_lookup.hit ? 1.0
+                                                                    : 0.0},
+            {"timing_cache_hits_total",
+             static_cast<double>(timing_cache_lookup.hits_total)},
+            {"timing_cache_misses_total",
+             static_cast<double>(timing_cache_lookup.misses_total)},
+            {"timing_cache_unique_templates_total",
+             static_cast<double>(timing_cache_lookup.unique_templates_total)},
+            {"timing_cache_entries",
+             static_cast<double>(timing_cache_lookup.entries)},
+            {"timing_group_layer_count",
+             static_cast<double>(
+                 timing_catalogue_.timing_groups.at(timing_group_id)
+                     .ordered_layers.size())},
+            {"timing_owns_input_embedding",
+             timing_catalogue_.timing_groups.at(timing_group_id)
+                     .owns_input_embedding
+                 ? 1.0
+                 : 0.0},
+            {"timing_owns_final_norm",
+             timing_catalogue_.timing_groups.at(timing_group_id).owns_final_norm
+                 ? 1.0
+                 : 0.0},
+            {"timing_owns_lm_head",
+             timing_catalogue_.timing_groups.at(timing_group_id).owns_lm_head
+                 ? 1.0
+                 : 0.0},
+            {"timing_emits_pp_send",
+             timing_catalogue_.timing_groups.at(timing_group_id).emits_pp_send
+                 ? 1.0
+                 : 0.0},
+            {"stage_group_requested", stage_group_requested ? 1.0 : 0.0},
+            {"stage_group_active", stage_group_active ? 1.0 : 0.0},
+            {"stage_group_routing_layer_invariant",
+             routing_is_layer_invariant(routing_) ? 1.0 : 0.0},
+            {
+                "prefill_request_count",
+                static_cast<double>(dense_batch.prefill_requests.size()),
+            },
+            {
+                "decode_request_count",
+                static_cast<double>(dense_batch.decode_requests.size()),
+            },
+            // Retain the historical single-layer diagnostic as the first
+            // logical layer, and expose stage sums/counts for heterogeneous
+            // KDA/MLA schedules.
+            {"dense_layer_compute_ms", first_layer_compute_ms},
+            {"attention_weight_element_bytes",
+             detail::bytes_per_element(*dense_precisions.attention_weight)},
+            {"attention_activation_element_bytes",
+             detail::bytes_per_element(*dense_precisions.attention_activation)},
+            {"dense_weight_element_bytes",
+             detail::bytes_per_element(*dense_precisions.dense_weight)},
+            {"dense_activation_element_bytes",
+             detail::bytes_per_element(*dense_precisions.dense_activation)},
+            {"routed_expert_weight_element_bytes",
+             detail::bytes_per_element(detail::precision_from_string(
+                 config_.routed_expert_weight_precision()))},
+            {"routed_expert_activation_element_bytes",
+             detail::bytes_per_element(detail::precision_from_string(
+                 config_.routed_expert_activation_precision()))},
+            {"latent_moe_projection_weight_element_bytes",
+             detail::bytes_per_element(detail::precision_from_string(
+                 config_.latent_moe_projection_weight_precision()))},
+            {"latent_moe_projection_activation_element_bytes",
+             detail::bytes_per_element(detail::precision_from_string(
+                 config_.latent_moe_projection_activation_precision()))},
+            {"shared_expert_weight_element_bytes",
+             detail::bytes_per_element(detail::precision_from_string(
+                 config_.shared_expert_weight_precision()))},
+            {"shared_expert_activation_element_bytes",
+             detail::bytes_per_element(detail::precision_from_string(
+                 config_.shared_expert_activation_precision()))},
+            {"router_weight_storage_element_bytes",
+             detail::bytes_per_element(detail::precision_from_string(
+                 config_.router_weight_storage_precision()))},
+            {"router_activation_storage_element_bytes",
+             detail::bytes_per_element(detail::precision_from_string(
+                 config_.moe_router_activation_precision()))},
+            {"router_compute_element_bytes",
+             detail::bytes_per_element(detail::precision_from_string(
+                 config_.router_compute_precision()))},
+            {"kda_snapshot_element_bytes",
+             detail::bytes_per_element(detail::precision_from_string(
+                 config_.kda_snapshot_precision()))},
+            {"kv_cache_element_bytes",
+             detail::bytes_per_element(dense_precisions.kv_cache)},
+            {"kv_cache_bytes_per_token_per_layer", kv_cache_bytes_per_token},
+            {"kv_cache_rank_local_bytes_per_token_per_layer",
+             kv_cache_rank_local_bytes_per_token},
+            {"communication_element_bytes", communication_element_bytes},
+            {"tp_allreduce_ms", allreduce_ms},
+            {"dcp_attention_communication_ms", dcp_attention_communication_ms},
+            {"decode_context_parallel_size",
+             static_cast<double>(parallelism_.decode_context_parallel_size)},
+            {
+                "dense_layer_total_ms",
+                first_layer_compute_ms + first_tp_layer_ms,
+            },
+            {
+                "num_layers",
+                static_cast<double>(layers_per_stage),
+            },
+            {"dense_compute_ms", dense_compute_ms},
+            {"tp_communication_ms", tp_communication_ms},
+            {"kda_layer_count", static_cast<double>(kda_layer_count)},
+            {"mla_layer_count", static_cast<double>(mla_layer_count)},
+            {"kda_projection_ms", kda_projection_ms},
+            {"kda_short_conv_ms", kda_short_conv_ms},
+            {"kda_recurrent_ms", kda_recurrent_ms},
+            {"kda_gate_norm_ms", kda_gate_norm_ms},
+            {"attn_res_ms", attn_res_ms},
+            {"routed_expert_hidden_size",
+             static_cast<double>(model_.routed_expert_hidden_size)},
+            {"latent_moe_use_norm", model_.latent_moe_use_norm ? 1.0 : 0.0},
+            {"attn_res_block_size",
+             static_cast<double>(model_.attn_res_block_size)},
+            {"pp_communication_ms", pp_communication_ms},
+            {"lm_head_ms", execution_time.lm_head_ms},
+            {"lm_head_tokens", static_cast<double>(batch_info.lm_head_tokens)},
+            {"stage_duration_ms", duration_ms},
+            {"batch_duration_ms", duration_ms},
+        };
+    }
     result.moe_routing = std::move(routing_diagnostics);
     result.logical_moe_layer_count = logical_moe_layer_count;
-    result.scaled_moe_attention_groups =
-        std::move(scaled_moe_attention_groups);
+    result.scaled_moe_attention_groups = std::move(scaled_moe_attention_groups);
     result.repeated_moe_layer_pre_compute_ms =
         repeated_moe_layer_pre_compute_ms;
     result.moe_suffix_compute_ms = moe_suffix_compute_ms;
-    result.moe_suffix_tp_communication_ms =
-        moe_suffix_tp_communication_ms;
+    result.moe_suffix_tp_communication_ms = moe_suffix_tp_communication_ms;
     result.lazy_moe_layer_prediction = selected_moe_layer.has_value();
     result.scaled_moe_layer_prediction =
         !selected_moe_layer.has_value() &&
         (config_.moe_layer_event_mode == "first_layer_scaled" ||
          stage_group_active);
-    result.diagnostics.insert(result.diagnostics.end(), moe_diagnostics.begin(),
-                              moe_diagnostics.end());
+    if (detailed_diagnostics_enabled_) {
+        result.diagnostics.insert(result.diagnostics.end(),
+                                  moe_diagnostics.begin(),
+                                  moe_diagnostics.end());
+    }
+    if (!detailed_diagnostics_enabled_ && reusable_timing_group) {
+        store_complete_prediction(batch.id(), timing_group_id, result);
+    }
     return result;
 }
 

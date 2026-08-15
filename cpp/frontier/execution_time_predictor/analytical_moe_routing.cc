@@ -85,6 +85,42 @@ distribution_weights(std::uint64_t experts,
     return weights;
 }
 
+void accumulate_uniform_topk_counts(
+    std::uint64_t input_tokens, std::uint64_t router_topk,
+    std::uint64_t total_experts, RoutingRng &generator,
+    std::vector<std::uint64_t> &counts) {
+    // A router selects a set of k distinct experts for each input token. Keep
+    // only the aggregate expert loads needed by the timing model, but obtain
+    // them from a real without-replacement top-k draw. The partial
+    // Fisher-Yates shuffle costs O(input_tokens * topk), and undoing its swaps
+    // leaves the expert pool canonical for the next token without an
+    // O(total_experts) reset.
+    std::vector<std::uint64_t> expert_pool(
+        static_cast<std::size_t>(total_experts));
+    std::iota(expert_pool.begin(), expert_pool.end(), 0);
+    std::vector<std::uint64_t> swap_positions(
+        static_cast<std::size_t>(router_topk));
+
+    for (std::uint64_t token = 0; token < input_tokens; ++token) {
+        for (std::uint64_t pick = 0; pick < router_topk; ++pick) {
+            const std::uint64_t swap_position =
+                pick + generator.bounded(total_experts - pick);
+            swap_positions[static_cast<std::size_t>(pick)] = swap_position;
+            std::swap(expert_pool[static_cast<std::size_t>(pick)],
+                      expert_pool[static_cast<std::size_t>(swap_position)]);
+            ++counts[static_cast<std::size_t>(
+                expert_pool[static_cast<std::size_t>(pick)])];
+        }
+        for (std::uint64_t pick = router_topk; pick > 0; --pick) {
+            const std::uint64_t index = pick - 1;
+            const std::uint64_t swap_position =
+                swap_positions[static_cast<std::size_t>(index)];
+            std::swap(expert_pool[static_cast<std::size_t>(index)],
+                      expert_pool[static_cast<std::size_t>(swap_position)]);
+        }
+    }
+}
+
 } // namespace
 
 std::vector<std::uint64_t>
@@ -164,10 +200,8 @@ route_tokens(std::uint64_t input_tokens, std::uint64_t router_topk,
         }
     } else if (config.mode == config::MoeRoutingMode::kUniformRandom) {
         RoutingRng generator(config.seed + layer_id);
-        for (std::uint64_t token = 0; token < routed_tokens; ++token) {
-            ++counts[static_cast<std::size_t>(
-                generator.bounded(total_experts))];
-        }
+        accumulate_uniform_topk_counts(input_tokens, router_topk,
+                                       total_experts, generator, counts);
     } else {
         counts = discretize_expert_weights(
             routed_tokens,

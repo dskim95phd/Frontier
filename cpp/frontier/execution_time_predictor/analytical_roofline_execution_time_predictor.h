@@ -476,6 +476,11 @@ class AnalyticalRooflineExecutionTimePredictor final
                                  StageId stage_id) const override;
     [[nodiscard]] MoEGroupLayerPrediction
     predict_moe_group_layer(const MoEGroupLayerInput &input) const override;
+    void release_batch_timing_cache(BatchId batch_id) const override;
+    void
+    set_detailed_diagnostics_enabled(bool enabled) const noexcept override {
+        detailed_diagnostics_enabled_ = enabled;
+    }
     [[nodiscard]] bool supports_lazy_moe_prediction() const noexcept override {
         return true;
     }
@@ -490,48 +495,41 @@ class AnalyticalRooflineExecutionTimePredictor final
                                 std::uint64_t local_moe_layer) const override;
 
   private:
-    // stage_group_scaled reuses the expensive operator/routing template for
-    // stages with the same static signature.  The key still carries every
-    // dynamic batch feature consumed by the analytical model, so a cache hit
-    // is observationally equivalent to recomputing the stage.  The cache is
-    // mutable because predictor calls are const from the scheduler's point of
-    // view; access is serialized explicitly for shared predictor instances.
-    struct StageTimingCacheKey {
-        std::uint32_t timing_group_id = 0;
-        std::uint8_t cluster_type = 0;
-        bool selected_moe_layer_valid = false;
-        std::uint64_t selected_moe_layer = 0;
-        std::uint64_t total_tokens = 0;
-        std::vector<std::pair<std::uint64_t, std::uint64_t>> prefill_requests;
-        std::vector<std::pair<std::uint64_t, std::uint64_t>> decode_requests;
-
-        friend bool operator==(const StageTimingCacheKey &lhs,
-                               const StageTimingCacheKey &rhs) noexcept {
-            return std::tie(lhs.timing_group_id, lhs.cluster_type,
-                            lhs.selected_moe_layer_valid,
-                            lhs.selected_moe_layer, lhs.total_tokens,
-                            lhs.prefill_requests, lhs.decode_requests) ==
-                   std::tie(rhs.timing_group_id, rhs.cluster_type,
-                            rhs.selected_moe_layer_valid,
-                            rhs.selected_moe_layer, rhs.total_tokens,
-                            rhs.prefill_requests, rhs.decode_requests);
-        }
-    };
-
-    struct StageTimingCacheKeyHash {
-        [[nodiscard]] std::size_t
-        operator()(const StageTimingCacheKey &key) const noexcept;
-    };
-
+    // stage_group_scaled reuses the expensive operator/routing template only
+    // while one immutable batch traverses equivalent PP stages. Batch IDs are
+    // simulator-wide unique, and release_batch_timing_cache() removes every
+    // template when that batch entity leaves the arena. The cache is mutable
+    // because predictor calls are const from the scheduler's point of view;
+    // access is serialized explicitly for shared predictor instances.
     struct StageTimingCacheValue {
         std::vector<detail::DenseLayerTimes> layer_times;
         double allreduce_ms = 0.0;
         double dcp_attention_communication_ms = 0.0;
-        detail::MoELanePrediction representative_moe_lane;
-        bool has_representative_moe_lane = false;
         detail::MoECommunicationTime moe_communication;
         bool has_moe_communication = false;
+        // Populated only when detailed diagnostics are disabled. Absolute
+        // model-layer IDs are remapped when materializing an equivalent stage.
+        mutable std::shared_ptr<const ExecutionTimePrediction>
+            complete_prediction;
     };
+
+    using BatchStageTimingCache =
+        std::unordered_map<std::uint32_t,
+                           std::shared_ptr<const StageTimingCacheValue>>;
+
+    // With MoeRoutingLayerScope::kShared, or with first_layer_scaled, one
+    // assignment serves every MoE layer of a batch. Memoizing it per batch is
+    // what lets each stage and each lazily predicted layer reuse the routing
+    // and expert roofline instead of redrawing them. Released with the batch,
+    // exactly like the stage timing templates.
+    struct SharedRoutingValue {
+        detail::RoutingAllocation allocation;
+        detail::MoELanePrediction lane_prediction;
+    };
+
+    [[nodiscard]] std::shared_ptr<const SharedRoutingValue>
+    shared_routing_for_batch(BatchId batch_id,
+                             const detail::DenseBatch &dense_batch) const;
 
     struct StageTimingCacheLookup {
         std::shared_ptr<const StageTimingCacheValue> value;
@@ -543,10 +541,15 @@ class AnalyticalRooflineExecutionTimePredictor final
     };
 
     [[nodiscard]] StageTimingCacheLookup lookup_stage_timing_template(
-        std::uint32_t timing_group_id, const detail::DenseBatch &dense_batch,
-        ClusterType cluster_type,
-        std::optional<std::uint64_t> selected_moe_layer,
+        BatchId batch_id, std::uint32_t timing_group_id,
+        const detail::DenseBatch &dense_batch,
         const config::PipelineStageLayerRange &stage_layers) const;
+    [[nodiscard]] std::shared_ptr<const ExecutionTimePrediction>
+    lookup_complete_prediction(BatchId batch_id,
+                               std::uint32_t timing_group_id) const;
+    void
+    store_complete_prediction(BatchId batch_id, std::uint32_t timing_group_id,
+                              const ExecutionTimePrediction &prediction) const;
 
     // Timing signatures intentionally live in config so memory/profile and
     // predictor diagnostics use one canonical value type. Dynamic batch
@@ -589,13 +592,18 @@ class AnalyticalRooflineExecutionTimePredictor final
     std::shared_ptr<const cc_backend::BaseCCBackend> communication_backend_;
     config::PipelineStageGroupCatalogue timing_catalogue_;
     mutable std::mutex timing_cache_mutex_;
-    mutable std::unordered_map<StageTimingCacheKey,
-                               std::shared_ptr<const StageTimingCacheValue>,
-                               StageTimingCacheKeyHash>
-        timing_cache_;
+    mutable std::unordered_map<BatchId, BatchStageTimingCache,
+                               StrongIdHash<BatchId>>
+        timing_cache_by_batch_;
+    mutable std::unordered_map<BatchId,
+                               std::shared_ptr<const SharedRoutingValue>,
+                               StrongIdHash<BatchId>>
+        shared_routing_by_batch_;
+    mutable std::uint64_t timing_cache_entries_ = 0;
     mutable std::uint64_t timing_cache_hits_total_ = 0;
     mutable std::uint64_t timing_cache_misses_total_ = 0;
     mutable std::uint64_t timing_cache_unique_templates_total_ = 0;
+    mutable bool detailed_diagnostics_enabled_ = true;
 };
 
 } // namespace frontier::execution_time_predictor

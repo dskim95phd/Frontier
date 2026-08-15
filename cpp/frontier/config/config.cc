@@ -769,6 +769,32 @@ std::string_view to_string(MoeRoutingMode mode) noexcept {
     return "unknown";
 }
 
+std::string_view to_string(MoeRoutingLayerScope layer_scope) noexcept {
+    switch (layer_scope) {
+    case MoeRoutingLayerScope::kShared:
+        return "shared";
+    case MoeRoutingLayerScope::kPerLayer:
+        return "per_layer";
+    }
+    return "unknown";
+}
+
+MoeRoutingLayerScope
+default_moe_routing_layer_scope(MoeRoutingMode mode,
+                                MoeRoutingDistribution distribution) noexcept {
+    // uniform_legacy spreads tokens evenly without consulting the seed at all,
+    // and simulation/balanced weights every expert identically, so both
+    // produced one assignment for every layer before the field existed.
+    if (mode == MoeRoutingMode::kUniformLegacy) {
+        return MoeRoutingLayerScope::kShared;
+    }
+    if (mode == MoeRoutingMode::kSimulation &&
+        distribution == MoeRoutingDistribution::kBalanced) {
+        return MoeRoutingLayerScope::kShared;
+    }
+    return MoeRoutingLayerScope::kPerLayer;
+}
+
 std::string_view to_string(MoeRoutingDistribution distribution) noexcept {
     switch (distribution) {
     case MoeRoutingDistribution::kBalanced:

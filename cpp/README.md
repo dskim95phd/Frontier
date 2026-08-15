@@ -125,6 +125,7 @@ hit rate.
 | `--output-mode summary\|requests\|full` | `summary` | Which artifacts to write. Requires `--output-dir`. |
 | `--runtime-validation true\|false` | `true` | Per-iteration scheduler, KV-accounting, and CPU-ownership invariant checks. Disable for throughput once a configuration is trusted. |
 | `--gpu-kv-occupancy true\|false` | `true` | Whether to record the GPU KV occupancy sample stream. |
+| `--wall-progress-interval-s <seconds>` | unset | Emit `simulation_progress_s=<seconds>` to stderr after each wall-clock interval. |
 | `--simulation-end-time-s <seconds>` | unset | Stop at a bounded observation horizon instead of running to quiescence. |
 
 `--simulation-end-time-s` runs a bounded experiment: only requests that
@@ -132,6 +133,12 @@ reached canonical completion are exported, quiescence validation is skipped,
 and cache/transfer diagnostics are snapshotted at the horizon. The output
 then carries `observation_window_seconds`, and `summary.json` computes rates
 against that window rather than against first-arrival-to-last-completion.
+
+Progress reporting is disabled unless `--wall-progress-interval-s` is set.
+For example, `--wall-progress-interval-s 60` prints the latest processed
+simulation time approximately once per wall-clock minute. Progress goes to
+stderr so stdout remains valid deterministic JSON when `--output-dir` is not
+used.
 
 Read-only normalization:
 
@@ -289,7 +296,8 @@ Co-location has exactly one `monolithic` cluster:
       "moe_routing": {
         "mode": "simulation",
         "distribution": "balanced",
-        "seed": 42
+        "seed": 42,
+        "layer_scope": "shared"
       }
     }
   }
@@ -540,6 +548,9 @@ per implementation family: standard attention, MLA, and KDA each retain one
 representative roofline time and a PP-stage-local layer count. Kimi K2 therefore
 keeps its single MLA representative, while hybrid Kimi K3 stages preserve their
 distinct KDA and MLA totals. Execution-time component totals remain unchanged.
+Because this mode is defined by one representative expert path, it always uses
+one batch-shared routing draw even when `moe_routing.layer_scope` is
+`per_layer`.
 The mode deliberately omits inter-layer synchronization and congestion changes
 after the representative MoE event. A dense prefix is supported, but a dense
 layer after the first MoE layer in the same PP stage is rejected.
@@ -552,6 +563,11 @@ layer-invariant routing (legacy uniform or balanced simulation routing).
 Layer-dependent routing and non-contiguous MoE layouts automatically use the
 detailed per-layer prediction path instead of reusing a mismatched first
 layer. PP stage arrival/end events remain unchanged.
+
+Timing-template reuse is scoped to one immutable batch: equivalent PP stages
+of that batch share one template per timing group. Different batches never
+share templates, even when their token and context shapes match, and all
+templates are released when the batch entity leaves the simulator.
 
 `scheduler.pipeline_event_mode` independently controls the DES pipeline
 calendar. It defaults to `exact`. Setting it to `collapsed` reserves safe
@@ -636,6 +652,27 @@ The contracts use `nlohmann/json` 3.11.3. CMake resolves an installed package,
 `FRONTIER_NLOHMANN_JSON_SOURCE_DIR`, or the pinned upstream archive when
 `FRONTIER_FETCH_DEPENDENCIES=ON`.
 
+## MoE routing across layers
+
+`moe_routing.distribution` shapes a single expert assignment.
+`moe_routing.layer_scope` decides how many assignments a batch draws, and the
+two are independent:
+
+| `layer_scope` | meaning |
+| --- | --- |
+| `shared` | every MoE layer routes the batch to the same experts. Routing and the expert roofline are evaluated once per batch and reused, so the compressed `moe_layer_event_mode` values stay exact. |
+| `per_layer` | each layer re-draws its assignment, seeded by the layer index, so imbalance decorrelates with depth. Forces per-layer routing and per-layer expert predictions in `detailed`; `stage_group_scaled` falls back to that path. `first_layer_scaled` deliberately overrides this scope with one batch-shared representative draw. |
+
+Omitting the field keeps the behavior that the mode and distribution implied
+before it existed: `uniform_legacy` and `simulation`/`balanced` resolve to
+`shared`, everything else to `per_layer`. The normalized config always states
+the resolved value.
+
+`skewed` and `zipf` never consumed the layer seed, so selecting `shared` for
+them changes no number — it only stops the predictor recomputing an assignment
+it already has. That is worth doing: at K3 (93 layers, 896 experts) each
+redundant draw sorts 896 weights.
+
 ## Determinism
 
 One configuration and workload always produce the same output: the same
@@ -648,6 +685,14 @@ in-tree rather than taken from `<random>`'s distributions, whose sequences
 are implementation-defined. Routing golden vectors in
 `tests/execution_time_predictor/` pin that behavior; regenerate them only
 for a deliberate, documented routing change.
+
+`moe_routing.mode="uniform_random"` now draws each input token's `router_topk`
+experts **without replacement**, as a router does, instead of taking
+`input_tokens * router_topk` independent samples. Expert loads for
+`router_topk > 1` therefore differ from revisions before this change and are
+not comparable at the same seed. The golden vectors use `router_topk = 1`,
+where both formulations consume the RNG identically, so they still hold and
+did not need regenerating.
 
 Earlier revisions reproduced NumPy's PCG64 bit stream so results could be
 diffed against the Python simulator. That correspondence is no longer

@@ -421,6 +421,116 @@ The current implementation intentionally does not model:
 These assumptions should be revisited if measured K3 kernels, memory traces,
 or a more detailed recurrent-state recovery policy become available.
 
+### 12.1 Future work: chunked KDA delta-rule execution
+
+`predict_kda_attention_work` charges one full recurrent-state read and write
+per token. That models a strictly sequential scan over the sequence. FlashKDA
+and the comparable open kernels are instead chunked: roughly sixteen tokens are
+processed together against a state held in registers/shared memory, and only
+the per-chunk results are combined sequentially. The state therefore reaches
+HBM once per chunk, not once per token, and the intra-chunk work becomes a
+matmul rather than a stream of rank-one updates.
+
+Measured consequences of the current model, at K3 dimensions on the `rubin`
+preset with TP=4 (`kda_state` FP32):
+
+| prefill tokens | modeled recurrent | compute part | memory part | chunk-64 reference |
+| --- | --- | --- | --- | --- |
+| 512 | 0.118 ms | 0.0002 ms | 0.113 ms | 0.007 ms |
+| 4,096 | 0.906 ms | 0.0013 ms | 0.901 ms | 0.019 ms |
+| 16,384 | 3.610 ms | 0.0054 ms | 3.604 ms | 0.062 ms |
+
+The term is memory bound by roughly 675:1, which no chunked kernel exhibits.
+Because the recurrent term then dominates, a KDA layer is modeled at about
+four times the cost of an MLA layer during prefill, and 69 of K3's 93 layers
+are KDA. Whole-model prefill is correspondingly overstated.
+
+Implementing this requires a chunk-size model input (16 for FlashKDA, 64-128
+for the FLA-style kernels), per-chunk rather than per-token state traffic, and
+the intra-chunk quadratic FLOP term that the chunked form adds. Decode is
+already correct: one token per request touches the state exactly once.
+
+`cpp/tests/analytical_model/k3_feature_fidelity_test.cc` pins the current
+behavior as a KNOWN DEVIATION so the change is visible when it lands.
+
+### 12.2 Future work: DCP during prefill
+
+Decode context parallelism shards the persistent latent cache and the decode
+attention read, but PREFILL attention over already-cached context is computed
+against the whole context on every rank. This is a deliberate choice: the
+all-gather/reduce-scatter pair that a context-parallel prefill would need is
+expensive enough among the DCP peers to outweigh the sharded read, and the
+sequential PDD topology avoids the conflict entirely because its prefill
+cluster runs at DCP=1.
+
+The unmodeled case is co-location with DCP > 1 and chunked prefill over a
+prefix-cache hit. There a rank reads latent entries it does not own, so the
+prefill attention term is overstated by up to the DCP size while the
+`kv_cache_save` and `kv_cache_rank_local_bytes_per_token` accounting stays
+sharded. Revisit this together with a communication model for context-parallel
+prefill; until then, prefer DCP > 1 only on decode-side clusters.
+
+A related loose end sits in `compute_dcp_attention_communication_ms`: the
+reduce-scatter payload is sized with `v_head_dim`, whereas absorbed MLA partial
+outputs carry `kv_lora_rank` channels until the `W_UV` absorb, which the code
+charges once after the combine. That path also derives `local_query_heads` with
+plain integer division instead of the `dense_ceil_div` used everywhere else.
+
+### 12.3 Attention context is read from the batch snapshot
+
+A prefill chunk covering `[start, start + scheduled_tokens)` attends to exactly
+the tokens ahead of its own queries. That offset is fixed for the chunk's whole
+life: no sibling chunk of the same request can move it, because a chunk's
+position in the prompt is decided when the scheduler issues it.
+
+`build_stage_batch_info` originally took the query count from the batch's
+`RequestBatchSnapshot` but the past context from
+`Request::num_processed_tokens()` live, mirroring production Python. That was
+harmless while a request could hold one batch at a time, since the live counter
+then always equalled the snapshot's offset. Once a prefill pipelines its chunks
+(section 12.2), it stops being true: `num_processed_tokens` only advances as
+chunks *retire*, so a chunk issued at offset 8 reads 0, then 4, then 8 as its
+predecessors land -- possibly after it has already left the pipeline. The live
+read therefore understated attention, and it made a stage's predicted work
+depend on when that stage happened to run, which is what made `collapsed` and
+`exact` disagree: collapsed predicts every stage at stage-zero entry, the
+earliest and lowest reading.
+
+The scheduler advances the optimistic frontier (`advance_scheduler_frontier`,
+vLLM V1's `_update_after_schedule`) *before* it snapshots a request, so the
+chunk's offset is recoverable from the snapshot alone:
+
+```
+past_context = snapshot.scheduler_frontier - snapshot.scheduled_tokens
+```
+
+This is the same identity `VllmV1Scheduler::apply_batch_completion` uses to
+match a completion to its chunk. `make_attention_request_slice` now uses it, the
+prefill/decode split is derived from it instead of the live
+`Request::is_prefill_complete()`, and the lm-head test keys off
+`snapshot.scheduler_frontier` rather than the lagging `snapshot.processed_tokens`
+so the chunk that finishes a prompt is still credited with sampling its first
+token.
+
+Nothing mutable is read, so the two pipeline event modes agree by construction.
+Measured on the K3 P24 / D(TP4 DCP4 DP8 EP32) tracelab workload at 0.50
+sessions/s, collapsed versus exact: requests, batches, batch stages, scheduler
+iterations, scheduled prefill tokens, all latency percentiles and
+`prefill_attention_token_pairs` are identical; PREFILL total predicted work
+differs by 4.6e-16 relative (one ulp of summation order); only the event count
+differs, 3,523,848 versus 4,828,827.
+
+Correcting the understatement raises PREFILL predicted work by 1.22% and leaves
+DECODE within 0.08%, as expected -- a decode step never holds more than one
+in-flight batch, so its live counter already equalled its snapshot.
+
+Note that `num_processed_tokens` itself must not be advanced at pipeline entry
+to achieve this. It is the *retired* counter: `is_prefill_complete_` flips off
+it, `apply_batch_completion` filters stale batches with it, preemption rolls it
+back to zero, and the prefill/decode metric split derives from it. vLLM keeps
+two counters for this reason and Frontier already mirrors that split; the
+optimistic one is `scheduler_num_computed_tokens`.
+
 ## 13. Verification requirements
 
 Changes to this design should preserve tests for:

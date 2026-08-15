@@ -1,6 +1,7 @@
 #include "frontier/simulator/simulator.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <memory>
@@ -42,9 +43,10 @@ void validate_inputs(
         throw SimulationError(
             "system architecture has an incompatible runtime config");
     }
-    if (is_pdd && config.pdd()
-                          .clusters.prefill.parallelism
-                          .decode_context_parallel_size != 1) {
+    if (is_pdd &&
+        config.pdd()
+                .clusters.prefill.parallelism.decode_context_parallel_size !=
+            1) {
         throw SimulationError(
             "PDD PREFILL decode_context_parallel_size must be 1");
     }
@@ -70,15 +72,13 @@ void validate_inputs(
             is_pdd ? target_count(config.pdd().clusters.prefill)
                    : target_count(config.cluster());
         const config::ClusterSchedulerType cache_scheduler_type =
-            is_pdd
-                ? config.cluster_scheduler.type_for_cluster(
-                      ClusterType::kPrefill)
-                : config.cluster_scheduler.type;
+            is_pdd ? config.cluster_scheduler.type_for_cluster(
+                         ClusterType::kPrefill)
+                   : config.cluster_scheduler.type;
         if (cache_targets > 1 &&
             cache_scheduler_type !=
                 config::ClusterSchedulerType::kStickyRoundRobin &&
-            cache_scheduler_type !=
-                config::ClusterSchedulerType::kCacheAware) {
+            cache_scheduler_type != config::ClusterSchedulerType::kCacheAware) {
             throw SimulationError(
                 "multi-target session prefix caching requires "
                 "a cache-affine PREFILL cluster scheduler "
@@ -116,7 +116,8 @@ double kv_cache_dtype_size_bytes(const config::ClusterRuntimeConfig &runtime,
         config::SystemArchitecture::kPdDisaggregation) {
         return config.pdd().kv_cache_transfer.kv_cache_dtype_size_bytes;
     }
-    if (runtime.execution_model.type != config::ExecutionModelType::kAnalytical) {
+    if (runtime.execution_model.type !=
+        config::ExecutionModelType::kAnalytical) {
         // Fixed-latency configs do not carry a precision declaration.  The
         // historical simulator contract uses BF16-sized KV by default.
         return 2.0;
@@ -130,21 +131,20 @@ struct GpuKvPhysicalBlockLayout {
     std::uint64_t pipeline_bytes = 0;
 };
 
-GpuKvPhysicalBlockLayout gpu_kv_physical_block_layout(
-    const config::ClusterRuntimeConfig &runtime,
-    const config::SimulationConfig &config) {
+GpuKvPhysicalBlockLayout
+gpu_kv_physical_block_layout(const config::ClusterRuntimeConfig &runtime,
+                             const config::SimulationConfig &config) {
     const double dtype_bytes = kv_cache_dtype_size_bytes(runtime, config);
     GpuKvPhysicalBlockLayout result{};
-    const std::uint64_t dcp =
-        runtime.parallelism.decode_context_parallel_size;
+    const std::uint64_t dcp = runtime.parallelism.decode_context_parallel_size;
     const std::uint64_t tp = runtime.parallelism.tensor_parallel_size;
     if (dcp == 0 || tp == 0 || tp % dcp != 0) {
         throw SimulationError("invalid GPU KV physical parallelism layout");
     }
     const std::uint64_t mla_copies = tp / dcp;
     const auto add_pipeline_bytes = [&](std::uint64_t stage_bytes) {
-        if (stage_bytes > std::numeric_limits<std::uint64_t>::max() -
-                              result.pipeline_bytes) {
+        if (stage_bytes >
+            std::numeric_limits<std::uint64_t>::max() - result.pipeline_bytes) {
             throw SimulationError("GPU KV pipeline byte layout overflows");
         }
         result.pipeline_bytes += stage_bytes;
@@ -158,10 +158,9 @@ GpuKvPhysicalBlockLayout gpu_kv_physical_block_layout(
                  profile.kv_bytes_per_block_by_rank) {
                 result.max_rank_bytes =
                     std::max(result.max_rank_bytes, rank_bytes);
-                if (rank_bytes > std::numeric_limits<std::uint64_t>::max() -
-                                     stage_bytes) {
-                    throw SimulationError(
-                        "GPU KV stage byte layout overflows");
+                if (rank_bytes >
+                    std::numeric_limits<std::uint64_t>::max() - stage_bytes) {
+                    throw SimulationError("GPU KV stage byte layout overflows");
                 }
                 stage_bytes += rank_bytes;
             }
@@ -363,8 +362,7 @@ void Simulator::record_gpu_kv_occupancy_for_event(const Event &event) {
             gpu_kv_physical_block_layout(runtime, config_);
         metrics_.record_gpu_kv_cache_occupancy(
             event.time, replica_scheduler, bytes.max_rank_bytes,
-            bytes.pipeline_bytes,
-            total_hbm_bytes_per_gpu(runtime));
+            bytes.pipeline_bytes, total_hbm_bytes_per_gpu(runtime));
     };
 
     std::visit(
@@ -374,8 +372,7 @@ void Simulator::record_gpu_kv_occupancy_for_event(const Event &event) {
             if constexpr (std::is_same_v<Payload, ReplicaSchedulePayload> ||
                           std::is_same_v<Payload, ClusterBatchEndPayload> ||
                           std::is_same_v<Payload, GlobalBatchEndPayload>) {
-                sample(payload.cluster_type, payload.replica_id,
-                       payload.dp_id);
+                sample(payload.cluster_type, payload.replica_id, payload.dp_id);
             } else if constexpr (std::is_same_v<Payload,
                                                 KVCacheTransferEndPayload>) {
                 // The event payload addresses the decode target.  Source KV
@@ -383,18 +380,17 @@ void Simulator::record_gpu_kv_occupancy_for_event(const Event &event) {
                 // PREFILL owner from the transfer record.
                 const entities::KVCacheTransferInfo &transfer =
                     kv_cache_transfer(payload.transfer_id);
-                sample(ClusterType::kPrefill,
-                       transfer.source_replica_id(),
+                sample(ClusterType::kPrefill, transfer.source_replica_id(),
                        transfer.source_dp_id());
-            } else if constexpr (
-                std::is_same_v<Payload, CpuKVCacheOffloadEndPayload> ||
-                std::is_same_v<Payload, CpuKVCacheRestoreEndPayload>) {
+            } else if constexpr (std::is_same_v<Payload,
+                                                CpuKVCacheOffloadEndPayload> ||
+                                 std::is_same_v<Payload,
+                                                CpuKVCacheRestoreEndPayload>) {
                 // Offload completion can release the PREFILL source
                 // allocation without scheduling another event on an otherwise
                 // idle target.  Restore completion is sampled as well so the
                 // same-time restore/schedule transition remains explicit.
-                sample(payload.cluster_type, payload.replica_id,
-                       payload.dp_id);
+                sample(payload.cluster_type, payload.replica_id, payload.dp_id);
             }
         },
         event.payload);
@@ -516,7 +512,17 @@ double Simulator::predicted_batch_ms(BatchId batch_id) const {
 }
 
 void Simulator::release_batch(BatchId batch_id) {
+    const ClusterType cluster_type = batch(batch_id).cluster_type();
+    predictors_.at(cluster_type)->release_batch_timing_cache(batch_id);
     entities_.release_batch(batch_id);
+}
+
+void Simulator::set_detailed_traces_enabled(bool enabled) {
+    metrics_.set_detailed_traces_enabled(enabled);
+    for (const auto &[cluster_type, predictor] : predictors_) {
+        static_cast<void>(cluster_type);
+        predictor->set_detailed_diagnostics_enabled(enabled);
+    }
 }
 
 void Simulator::assign_request_target(RequestId request_id,
@@ -663,8 +669,7 @@ void Simulator::finalize() {
                 gpu_kv_physical_block_layout(runtime, config_);
             metrics_.record_gpu_kv_cache_occupancy(
                 last_event_time_, replica_scheduler, bytes.max_rank_bytes,
-                bytes.pipeline_bytes,
-                total_hbm_bytes_per_gpu(runtime), true);
+                bytes.pipeline_bytes, total_hbm_bytes_per_gpu(runtime), true);
             if (config_.prefix_cache.enabled &&
                 cluster_type != ClusterType::kDecode) {
                 metrics_.record_prefix_cache_target(
@@ -757,8 +762,55 @@ metrics::SimulationOutput Simulator::take_output() {
     return metrics_.take_output();
 }
 
+void Simulator::set_wall_clock_progress_callback(
+    double interval_seconds, WallClockProgressCallback callback) {
+    if (!std::isfinite(interval_seconds) || interval_seconds <= 0.0) {
+        throw SimulationError(
+            "wall-clock progress interval must be finite and positive");
+    }
+    if (!callback) {
+        throw SimulationError("wall-clock progress callback must be set");
+    }
+    const auto interval = std::chrono::duration_cast<
+        std::chrono::steady_clock::duration>(
+        std::chrono::duration<double>{interval_seconds});
+    if (interval <= std::chrono::steady_clock::duration::zero()) {
+        throw SimulationError(
+            "wall-clock progress interval is below clock resolution");
+    }
+    wall_clock_progress_interval_ = interval;
+    wall_clock_progress_callback_ = std::move(callback);
+}
+
+void Simulator::start_wall_clock_progress() {
+    if (!wall_clock_progress_callback_) {
+        return;
+    }
+    wall_clock_progress_started_at_ = std::chrono::steady_clock::now();
+    wall_clock_progress_next_at_ =
+        wall_clock_progress_started_at_ + wall_clock_progress_interval_;
+}
+
+void Simulator::maybe_report_wall_clock_progress(SimTime simulation_time) {
+    if (!wall_clock_progress_callback_) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now < wall_clock_progress_next_at_) {
+        return;
+    }
+    const double elapsed_seconds =
+        std::chrono::duration<double>(now - wall_clock_progress_started_at_)
+            .count();
+    wall_clock_progress_callback_(simulation_time, elapsed_seconds);
+    do {
+        wall_clock_progress_next_at_ += wall_clock_progress_interval_;
+    } while (wall_clock_progress_next_at_ <= now);
+}
+
 metrics::SimulationOutput Simulator::run() {
     const events::EventDispatcher dispatcher;
+    start_wall_clock_progress();
     while (!event_queue_.empty()) {
         Event event = event_queue_.pop();
         last_event_time_ = event.time;
@@ -769,6 +821,7 @@ metrics::SimulationOutput Simulator::run() {
         // keeps the occupancy stream event-driven and coalesces same-time
         // transitions in MetricsStore.
         record_gpu_kv_occupancy_for_event(event);
+        maybe_report_wall_clock_progress(event.time);
         peak_event_queue_size_ =
             std::max(peak_event_queue_size_, event_queue_.size());
     }
@@ -778,15 +831,18 @@ metrics::SimulationOutput Simulator::run() {
 
 metrics::SimulationOutput Simulator::run_until(SimTime end_time) {
     if (!end_time.valid() || end_time.seconds() <= 0.0) {
-        throw SimulationError("simulation end time must be finite and positive");
+        throw SimulationError(
+            "simulation end time must be finite and positive");
     }
     const events::EventDispatcher dispatcher;
+    start_wall_clock_progress();
     while (!event_queue_.empty() && event_queue_.top().time <= end_time) {
         Event event = event_queue_.pop();
         last_event_time_ = event.time;
         metrics_.record_event(event);
         dispatcher.dispatch(event, *this);
         record_gpu_kv_occupancy_for_event(event);
+        maybe_report_wall_clock_progress(event.time);
         peak_event_queue_size_ =
             std::max(peak_event_queue_size_, event_queue_.size());
     }
@@ -821,10 +877,10 @@ void Simulator::record_bounded_run_cache_diagnostics(SimTime observation_time) {
                     replica_scheduler.prefix_cache_stats(),
                     replica_scheduler.prefix_cache_diagnostics(),
                     scheduler::ReplicaTarget{replica_id, dp_id}, cluster_type,
-                    runtime.scheduler.block_size, config_.prefix_cache.key_mode);
+                    runtime.scheduler.block_size,
+                    config_.prefix_cache.key_mode);
             }
-            const auto *cpu_manager =
-                replica_scheduler.cpu_kv_cache_manager();
+            const auto *cpu_manager = replica_scheduler.cpu_kv_cache_manager();
             if (cpu_manager == nullptr) {
                 continue;
             }

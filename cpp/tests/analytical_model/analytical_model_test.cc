@@ -436,8 +436,7 @@ void test_router_storage_and_compute_precisions_are_independent() {
     model.intermediate_size = 14'336;
     model.model_num_experts = 256;
     model.moe_tensor_parallel_size = 1;
-    const std::vector<std::uint64_t> expert_tokens(model.model_num_experts,
-                                                    1);
+    const std::vector<std::uint64_t> expert_tokens(model.model_num_experts, 1);
 
     analytical::MoEOperatorPrecisions bf16_storage{};
     bf16_storage.expert = analytical::Precision::kFp16;
@@ -608,16 +607,17 @@ void test_mla_kv_layout_splits_latent_and_rope() {
     const auto k3 = frontier::config::load_model_config("moonshotai/Kimi-K3");
     expect(kv_transfer::model_kv_cache_size_bytes(10, k3, 1.0) == 153'600,
            "K3 token-proportional KV must count only 24 MLA layers");
-    expect(kv_transfer::model_kda_state_snapshot_size_bytes(k3, 4.0) ==
-                   464'633'856ULL &&
-               kv_transfer::model_kda_state_snapshot_size_bytes_rank_local(
-                   k3, 4.0, 8) == 58'079'232ULL,
-           "K3 must expose an explicitly requested FP32 snapshot sharded over TP");
+    expect(
+        kv_transfer::model_kda_state_snapshot_size_bytes(k3, 4.0) ==
+                464'633'856ULL &&
+            kv_transfer::model_kda_state_snapshot_size_bytes_rank_local(
+                k3, 4.0, 8) == 58'079'232ULL,
+        "K3 must expose an explicitly requested FP32 snapshot sharded over TP");
     expect(predictor->predict(16, k3).size_bytes == 232'562'688ULL,
            "PDD K3 transfer must include MLA KV plus one atomic KDA snapshot");
     const auto fp32_snapshot_predictor =
         kv_transfer::make_kv_cache_transfer_predictor(transfer_config, 4, 4,
-                                                       4.0);
+                                                      4.0);
     expect(fp32_snapshot_predictor->predict(16, k3).size_bytes ==
                464'879'616ULL,
            "PDD K3 transfer must honor an explicit FP32 KDA snapshot dtype");
@@ -741,8 +741,7 @@ void test_mla_output_gate_and_nope_costs() {
     model.mla_use_output_gate = false;
     model.mla_use_nope = true;
     const auto nope = predict(model);
-    expect(nope.rope_ms == 0.0,
-           "NoPE MLA must omit rotary transform compute");
+    expect(nope.rope_ms == 0.0, "NoPE MLA must omit rotary transform compute");
     // NoPE only removes the rotary transform.  qk_rope channels remain in
     // attention and in the persistent decoupled RoPE cache.
     expect_approximately_equal(nope.decode_attention_ms,
@@ -1133,8 +1132,7 @@ void test_kimi_k2_dcp_adds_decode_collectives() {
                dcp_stage.execution_time.tp_communication_ms >
                    replicated_stage.execution_time.tp_communication_ms,
            "MLA DCP decode must add all-gather/reduce-scatter communication");
-    expect(routing_tp_total(dcp_stage) >
-               routing_tp_total(replicated_stage) &&
+    expect(routing_tp_total(dcp_stage) > routing_tp_total(replicated_stage) &&
                std::abs(routing_tp_total(dcp_stage) -
                         dcp_stage.execution_time.tp_communication_ms) < 1e-12,
            "MLA DCP communication must be attached to the per-MoE-layer "
@@ -1203,11 +1201,11 @@ void test_kimi_k3_tp8_dcp8_hybrid_decode() {
         batch, requests, frontier::StageId{0});
     const auto routing_for_layer = [](const auto &prediction,
                                       std::uint64_t model_layer) {
-        return std::find_if(
-            prediction.moe_routing.begin(), prediction.moe_routing.end(),
-            [model_layer](const auto &record) {
-                return record.model_layer_id == model_layer;
-            });
+        return std::find_if(prediction.moe_routing.begin(),
+                            prediction.moe_routing.end(),
+                            [model_layer](const auto &record) {
+                                return record.model_layer_id == model_layer;
+                            });
     };
     const auto replicated_kda = routing_for_layer(replicated_stage, 1);
     const auto dcp_kda = routing_for_layer(detailed_stage, 1);
@@ -1229,14 +1227,13 @@ void test_kimi_k3_tp8_dcp8_hybrid_decode() {
                dcp_mla->pre_moe_tp_communication_ms >
                    replicated_mla->pre_moe_tp_communication_ms,
            "K3 MLA decode must shard context work and add DCP collectives");
-    expect(diagnostic_value(detailed_stage,
-                            "dcp_attention_communication_ms") > 0.0,
+    expect(diagnostic_value(detailed_stage, "dcp_attention_communication_ms") >
+               0.0,
            "K3 TP8/DCP8 decode must expose MLA DCP communication");
     expect_approximately_equal(
         diagnostic_value(detailed_stage,
                          "kv_cache_rank_local_bytes_per_token_per_layer"),
-        diagnostic_value(detailed_stage,
-                         "kv_cache_bytes_per_token_per_layer") /
+        diagnostic_value(detailed_stage, "kv_cache_bytes_per_token_per_layer") /
             8.0,
         "K3 TP8/DCP8 MLA KV cache must be sequence-sharded eight ways");
     expect(detailed_stage.execution_time == scaled_stage.execution_time,
@@ -1357,8 +1354,7 @@ void test_kimi_k3_attention_family_scaled_prediction() {
     }
     expect(model_config.num_layers == 93 && model_config.num_kda_layers == 69 &&
                model_config.num_mla_layers == 24 && kda_layers == 69 &&
-               mla_layers == 24 && moe_kda_layers == 68 &&
-               moe_mla_layers == 24,
+               mla_layers == 24 && moe_kda_layers == 68 && moe_mla_layers == 24,
            "Kimi K3 must expose 69 KDA/24 MLA layers and 68/24 MoE layers "
            "after the first dense layer");
 
@@ -1424,14 +1420,12 @@ void test_kimi_k3_attention_family_scaled_prediction() {
         diagnostic_value(scaled_stage, "dense_weight_element_bytes"), 2.0,
         "Kimi K3 native BF16 dense MLP weight");
     expect_approximately_equal(
-        diagnostic_value(scaled_stage,
-                         "routed_expert_weight_element_bytes"),
+        diagnostic_value(scaled_stage, "routed_expert_weight_element_bytes"),
         0.5 + 1.0 / 32.0, "Kimi K3 native MXFP4 routed-expert weight");
     expect_approximately_equal(
         diagnostic_value(scaled_stage,
                          "routed_expert_activation_element_bytes"),
-        1.0 + 1.0 / 32.0,
-        "Kimi K3 native MXFP8 routed-expert activation");
+        1.0 + 1.0 / 32.0, "Kimi K3 native MXFP8 routed-expert activation");
     expect_approximately_equal(
         diagnostic_value(scaled_stage,
                          "latent_moe_projection_weight_element_bytes"),
@@ -1441,8 +1435,7 @@ void test_kimi_k3_attention_family_scaled_prediction() {
                          "latent_moe_projection_activation_element_bytes"),
         2.0, "Kimi K3 native BF16 Stable LatentMoE projection activation");
     expect_approximately_equal(
-        diagnostic_value(scaled_stage,
-                         "shared_expert_weight_element_bytes"),
+        diagnostic_value(scaled_stage, "shared_expert_weight_element_bytes"),
         2.0, "Kimi K3 native BF16 shared-expert weight");
     expect_approximately_equal(
         diagnostic_value(scaled_stage, "router_compute_element_bytes"), 4.0,
@@ -1458,16 +1451,15 @@ void test_kimi_k3_attention_family_scaled_prediction() {
     const auto kda_group = std::find_if(
         attention_groups.begin(), attention_groups.end(),
         [](const auto &group) {
-            return group.family ==
-                   predictor::ScaledMoEAttentionFamily::kKda;
+            return group.family == predictor::ScaledMoEAttentionFamily::kKda;
         });
     const auto mla_group = std::find_if(
         attention_groups.begin(), attention_groups.end(),
         [](const auto &group) {
-            return group.family ==
-                   predictor::ScaledMoEAttentionFamily::kMla;
+            return group.family == predictor::ScaledMoEAttentionFamily::kMla;
         });
-    expect(attention_groups.size() == 2 && kda_group != attention_groups.end() &&
+    expect(attention_groups.size() == 2 &&
+               kda_group != attention_groups.end() &&
                mla_group != attention_groups.end() &&
                kda_group->layer_count == 67 && mla_group->layer_count == 24 &&
                kda_group->pre_moe_compute_ms_per_layer > 0.0 &&
@@ -1475,14 +1467,14 @@ void test_kimi_k3_attention_family_scaled_prediction() {
            "Kimi K3 scaling must expose 67 repeated KDA and 24 repeated MLA "
            "attention layers");
 
-    const auto detailed_for_model_layer = [&detailed_stage](
-                                              std::uint64_t model_layer) {
-        return std::find_if(
-            detailed_stage.moe_routing.begin(), detailed_stage.moe_routing.end(),
-            [model_layer](const auto &record) {
-                return record.model_layer_id == model_layer;
-            });
-    };
+    const auto detailed_for_model_layer =
+        [&detailed_stage](std::uint64_t model_layer) {
+            return std::find_if(detailed_stage.moe_routing.begin(),
+                                detailed_stage.moe_routing.end(),
+                                [model_layer](const auto &record) {
+                                    return record.model_layer_id == model_layer;
+                                });
+        };
     const auto scaled_first = scaled_stage.moe_routing.begin();
     const auto detailed_kda = detailed_for_model_layer(1);
     const auto detailed_kda_repeat = detailed_for_model_layer(2);
@@ -1498,14 +1490,12 @@ void test_kimi_k3_attention_family_scaled_prediction() {
                detailed_kda->model_layer_id != detailed_mla->model_layer_id,
            "Kimi K3 scaled routing must retain the first detailed MoE layer "
            "while attention-family groups carry the remaining timing");
-    expect_approximately_equal(
-        kda_group->pre_moe_compute_ms_per_layer,
-        detailed_kda_repeat->pre_moe_compute_ms,
-        "Kimi K3 repeated KDA attention pre-compute");
-    expect_approximately_equal(
-        mla_group->pre_moe_compute_ms_per_layer,
-        detailed_mla->pre_moe_compute_ms,
-        "Kimi K3 repeated MLA attention pre-compute");
+    expect_approximately_equal(kda_group->pre_moe_compute_ms_per_layer,
+                               detailed_kda_repeat->pre_moe_compute_ms,
+                               "Kimi K3 repeated KDA attention pre-compute");
+    expect_approximately_equal(mla_group->pre_moe_compute_ms_per_layer,
+                               detailed_mla->pre_moe_compute_ms,
+                               "Kimi K3 repeated MLA attention pre-compute");
 
     // Exercise the ModelConfig -> DenseModel plumbing used by the stage
     // predictor, rather than only the detail-model helper above.  Disabling
@@ -1554,7 +1544,8 @@ void test_stage_group_scaled_pp_signatures_and_routing_guard() {
     const auto model_config =
         frontier::config::load_model_config("moonshotai/Kimi-K2-Instruct");
 
-    const auto make_batch = [](std::uint64_t scheduled_tokens = 128) {
+    const auto make_batch = [](std::uint64_t scheduled_tokens = 128,
+                               BatchId batch_id = BatchId{0}) {
         std::vector<Request> requests;
         requests.emplace_back([&]() {
             WorkloadRequest value{};
@@ -1572,8 +1563,11 @@ void test_stage_group_scaled_pp_signatures_and_routing_guard() {
         snapshot.scheduled_tokens = scheduled_tokens;
         snapshot.processed_tokens = 0;
         snapshot.scheduler_frontier = scheduled_tokens;
-        const Batch batch{BatchId{0}, IterationId{0}, {snapshot},
-                          SimTime::from_seconds(0.0), Generation{0}};
+        const Batch batch{batch_id,
+                          IterationId{0},
+                          {snapshot},
+                          SimTime::from_seconds(0.0),
+                          Generation{0}};
         return std::make_pair(std::move(requests), batch);
     };
 
@@ -1600,16 +1594,15 @@ void test_stage_group_scaled_pp_signatures_and_routing_guard() {
         auto grouped_input = make_batch();
         bool saw_timing_cache_hit = false;
         double prior_cache_misses = 0.0;
-        for (std::uint64_t stage = 0; stage < pipeline_parallel_size;
-             ++stage) {
+        for (std::uint64_t stage = 0; stage < pipeline_parallel_size; ++stage) {
             const auto detailed_prediction =
-                detailed.predict_stage_execution_time(
-                    detailed_input.second, detailed_input.first,
-                    frontier::StageId{stage});
+                detailed.predict_stage_execution_time(detailed_input.second,
+                                                      detailed_input.first,
+                                                      frontier::StageId{stage});
             const auto grouped_prediction =
-                grouped.predict_stage_execution_time(
-                    grouped_input.second, grouped_input.first,
-                    frontier::StageId{stage});
+                grouped.predict_stage_execution_time(grouped_input.second,
+                                                     grouped_input.first,
+                                                     frontier::StageId{stage});
             expect(detailed_prediction.execution_time ==
                        grouped_prediction.execution_time,
                    "stage_group_scaled must match detailed K2 timing");
@@ -1617,19 +1610,18 @@ void test_stage_group_scaled_pp_signatures_and_routing_guard() {
                    "balanced stage_group_scaled K2 must use compressed MoE "
                    "events");
             expect(diagnostic_value(grouped_prediction, "timing_group_id") >=
-                       0.0 &&
+                           0.0 &&
                        diagnostic_value(grouped_prediction,
                                         "timing_group_multiplicity") >= 1.0,
                    "PP stage timing diagnostics must expose deterministic "
                    "group IDs");
             const bool final_stage = stage + 1 == pipeline_parallel_size;
             expect((grouped_prediction.execution_time.pp_communication_ms >
-                        0.0) == !final_stage,
+                    0.0) == !final_stage,
                    "stage_group_scaled must preserve PP boundary sends");
             saw_timing_cache_hit =
                 saw_timing_cache_hit ||
-                diagnostic_value(grouped_prediction, "timing_cache_hit") ==
-                    1.0;
+                diagnostic_value(grouped_prediction, "timing_cache_hit") == 1.0;
             const double cache_misses = diagnostic_value(
                 grouped_prediction, "timing_cache_misses_total");
             expect(cache_misses >= prior_cache_misses,
@@ -1641,18 +1633,31 @@ void test_stage_group_scaled_pp_signatures_and_routing_guard() {
                    "equivalent PP stages must reuse a timing template");
         }
 
-        // Dynamic attention features are part of the cache key.  A changed
-        // batch shape must not reuse the 128-token template from the loop.
+        // Reuse is batch-scoped even when another batch has exactly the same
+        // attention shape. Releasing the cache must also make a repeated
+        // direct predictor call miss again.
         if (pipeline_parallel_size > 1) {
-            auto changed_input = make_batch(256);
-            const auto changed_prediction =
-                grouped.predict_stage_execution_time(
-                    changed_input.second, changed_input.first,
-                    frontier::StageId{1});
-            expect(diagnostic_value(changed_prediction, "timing_cache_hit") ==
+            auto independent_input = make_batch(128, BatchId{1});
+            const auto independent_prediction =
+                grouped.predict_stage_execution_time(independent_input.second,
+                                                     independent_input.first,
+                                                     frontier::StageId{1});
+            expect(diagnostic_value(independent_prediction,
+                                    "timing_cache_hit") == 0.0,
+                   "identical shapes from different batches must not share "
+                   "a timing template");
+
+            grouped.release_batch_timing_cache(BatchId{1});
+            const auto released_prediction =
+                grouped.predict_stage_execution_time(independent_input.second,
+                                                     independent_input.first,
+                                                     frontier::StageId{1});
+            expect(diagnostic_value(released_prediction, "timing_cache_hit") ==
                        0.0,
-                   "changed batch features must miss the timing cache");
+                   "released batch timing templates must not remain cached");
+            grouped.release_batch_timing_cache(BatchId{1});
         }
+        grouped.release_batch_timing_cache(BatchId{0});
     }
 
     // Randomized and weighted routing include the logical layer in their
@@ -1669,6 +1674,8 @@ void test_stage_group_scaled_pp_signatures_and_routing_guard() {
     frontier::config::MoeRoutingConfig random_routing{};
     random_routing.distribution =
         frontier::config::MoeRoutingDistribution::kRandom;
+    random_routing.layer_scope =
+        frontier::config::MoeRoutingLayerScope::kPerLayer;
     const predictor::AnalyticalRooflineExecutionTimePredictor guarded{
         grouped_config, parallelism, model_config, random_routing};
     auto guarded_input = make_batch();
@@ -1709,7 +1716,8 @@ void test_stage_group_scaled_pp_signatures_and_routing_guard() {
         });
     expect(k3_prediction.scaled_moe_layer_prediction &&
                k3_prediction.moe_routing.size() == 1 &&
-               k3_kda_group != k3_prediction.scaled_moe_attention_groups.end() &&
+               k3_kda_group !=
+                   k3_prediction.scaled_moe_attention_groups.end() &&
                k3_mla_group != k3_prediction.scaled_moe_attention_groups.end(),
            "stage_group_scaled K3 must keep one lane representative and "
            "separate KDA/MLA attention groups");
@@ -1735,8 +1743,11 @@ void test_kimi_k3_stage_group_scaled_all_pp_stages() {
         snapshot.request_id = RequestId{0};
         snapshot.scheduled_tokens = 128;
         snapshot.scheduler_frontier = 128;
-        const Batch batch{BatchId{0}, IterationId{0}, {snapshot},
-                          SimTime::from_seconds(0.0), Generation{0}};
+        const Batch batch{BatchId{0},
+                          IterationId{0},
+                          {snapshot},
+                          SimTime::from_seconds(0.0),
+                          Generation{0}};
         return std::make_pair(std::move(requests), batch);
     };
 
@@ -1796,12 +1807,13 @@ void test_kimi_k3_stage_group_scaled_all_pp_stages() {
             total_moe += expected_moe;
 
             const auto detailed_prediction =
-                detailed.predict_stage_execution_time(
-                    detailed_input.second, detailed_input.first,
-                    frontier::StageId{stage});
-            const auto grouped_prediction = grouped.predict_stage_execution_time(
-                grouped_input.second, grouped_input.first,
-                frontier::StageId{stage});
+                detailed.predict_stage_execution_time(detailed_input.second,
+                                                      detailed_input.first,
+                                                      frontier::StageId{stage});
+            const auto grouped_prediction =
+                grouped.predict_stage_execution_time(grouped_input.second,
+                                                     grouped_input.first,
+                                                     frontier::StageId{stage});
             expect(detailed_prediction.execution_time ==
                        grouped_prediction.execution_time,
                    "K3 detailed and grouped PP stage times must match");
@@ -1813,19 +1825,18 @@ void test_kimi_k3_stage_group_scaled_all_pp_stages() {
                        grouped_prediction.moe_routing.size() == 1 &&
                        grouped_prediction.scaled_moe_layer_prediction,
                    "K3 grouped PP stage must preserve its exact MoE count");
-            expect(diagnostic_value(grouped_prediction, "kda_layer_count") ==
-                           static_cast<double>(expected_kda) &&
-                       diagnostic_value(grouped_prediction,
-                                        "mla_layer_count") ==
-                           static_cast<double>(expected_mla),
-                   "K3 grouped PP stage must preserve KDA/MLA counts");
+            expect(
+                diagnostic_value(grouped_prediction, "kda_layer_count") ==
+                        static_cast<double>(expected_kda) &&
+                    diagnostic_value(grouped_prediction, "mla_layer_count") ==
+                        static_cast<double>(expected_mla),
+                "K3 grouped PP stage must preserve KDA/MLA counts");
 
             std::uint64_t actual_repeated_kda = 0;
             std::uint64_t actual_repeated_mla = 0;
             for (const auto &group :
                  grouped_prediction.scaled_moe_attention_groups) {
-                if (group.family ==
-                    predictor::ScaledMoEAttentionFamily::kKda) {
+                if (group.family == predictor::ScaledMoEAttentionFamily::kKda) {
                     actual_repeated_kda += group.layer_count;
                 } else if (group.family ==
                            predictor::ScaledMoEAttentionFamily::kMla) {
@@ -1843,14 +1854,26 @@ void test_kimi_k3_stage_group_scaled_all_pp_stages() {
             const auto timing_group = static_cast<std::uint64_t>(
                 diagnostic_value(grouped_prediction, "timing_group_id"));
             const bool repeated_group =
-                std::find(seen_timing_groups.begin(),
-                          seen_timing_groups.end(), timing_group) !=
-                seen_timing_groups.end();
-            expect(diagnostic_value(
-                       grouped_prediction,
-                       repeated_group ? "timing_cache_hit"
-                                      : "timing_cache_miss") == 1.0,
-                   "K3 timing groups must miss once and then reuse cache");
+                std::find(seen_timing_groups.begin(), seen_timing_groups.end(),
+                          timing_group) != seen_timing_groups.end();
+            const bool reusable_group =
+                diagnostic_value(grouped_prediction,
+                                 "timing_group_multiplicity") > 1.0;
+            if (reusable_group) {
+                expect(diagnostic_value(grouped_prediction,
+                                        repeated_group
+                                            ? "timing_cache_hit"
+                                            : "timing_cache_miss") == 1.0,
+                       "reusable K3 timing groups must miss once and then hit");
+            } else {
+                expect(diagnostic_value(grouped_prediction,
+                                        "timing_cache_enabled") == 0.0 &&
+                           diagnostic_value(grouped_prediction,
+                                            "timing_cache_hit") == 0.0 &&
+                           diagnostic_value(grouped_prediction,
+                                            "timing_cache_miss") == 0.0,
+                       "singleton K3 timing groups must bypass the cache");
+            }
             if (!repeated_group) {
                 seen_timing_groups.push_back(timing_group);
             }
@@ -1961,12 +1984,12 @@ void test_kda_roofline_components_and_fixed_context_cost() {
         tp8_kda, long_decode, analytical::Precision::kFp16);
     expect_approximately_equal(tp8_dcp8_times.total_ms(), tp8_times.total_ms(),
                                "KDA TP8 total time must ignore DCP8");
-    expect_approximately_equal(
-        tp8_dcp8_times.kda_projection_ms, tp8_times.kda_projection_ms,
-        "KDA TP8 projection time must ignore DCP8");
-    expect_approximately_equal(
-        tp8_dcp8_times.kda_recurrent_ms, tp8_times.kda_recurrent_ms,
-        "KDA TP8 recurrent time must ignore DCP8");
+    expect_approximately_equal(tp8_dcp8_times.kda_projection_ms,
+                               tp8_times.kda_projection_ms,
+                               "KDA TP8 projection time must ignore DCP8");
+    expect_approximately_equal(tp8_dcp8_times.kda_recurrent_ms,
+                               tp8_times.kda_recurrent_ms,
+                               "KDA TP8 recurrent time must ignore DCP8");
 
     auto asymmetric_heads = kda;
     asymmetric_heads.kda_num_k_heads = 48;
@@ -1985,8 +2008,8 @@ void test_kda_roofline_components_and_fixed_context_cost() {
         [&asymmetric_dimensions, &prefill] {
             static_cast<void>(analytical::predict_dense_layer(
                 analytical::DeviceCeilings::rubin(),
-                analytical::AnalyticalConfig{}, asymmetric_dimensions,
-                prefill, analytical::Precision::kFp16));
+                analytical::AnalyticalConfig{}, asymmetric_dimensions, prefill,
+                analytical::Precision::kFp16));
         },
         "KDA roofline must reject asymmetric Q/K/V head dimensions");
 }
@@ -2039,15 +2062,15 @@ int main() {
                                     test_kimi_k3_tp8_dcp8_hybrid_decode);
     failures += frontier::test::run("Kimi K2 first-layer-scaled prediction",
                                     test_kimi_k2_first_layer_scaled_prediction);
-    failures += frontier::test::run(
-        "Kimi K3 attention-family-scaled prediction",
-        test_kimi_k3_attention_family_scaled_prediction);
+    failures +=
+        frontier::test::run("Kimi K3 attention-family-scaled prediction",
+                            test_kimi_k3_attention_family_scaled_prediction);
     failures += frontier::test::run(
         "stage-group scaled PP signatures and routing guard",
         test_stage_group_scaled_pp_signatures_and_routing_guard);
-    failures += frontier::test::run(
-        "Kimi K3 stage-group scaled all PP stages",
-        test_kimi_k3_stage_group_scaled_all_pp_stages);
+    failures +=
+        frontier::test::run("Kimi K3 stage-group scaled all PP stages",
+                            test_kimi_k3_stage_group_scaled_all_pp_stages);
     failures +=
         frontier::test::run("invalid analytical inputs are rejected",
                             test_invalid_analytical_inputs_are_rejected);

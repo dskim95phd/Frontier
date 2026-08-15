@@ -105,6 +105,7 @@ OrderedJson serialize_moe_routing(const MoeRoutingConfig &routing) {
         {"mode", to_string(routing.mode)},
         {"distribution", to_string(routing.distribution)},
         {"seed", routing.seed},
+        {"layer_scope", to_string(routing.layer_scope)},
     });
 }
 

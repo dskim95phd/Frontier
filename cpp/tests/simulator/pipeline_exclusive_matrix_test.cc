@@ -280,6 +280,21 @@ const std::string kStaggered =
     "0,0,32,3\n"
     "0.0001,0,12,5\n"
     "0.0002,0,8,4\n";
+// Enough staggered arrivals, and enough spread in prefill length, that the
+// pipeline holds three or more batches with visibly different stage durations
+// at the same time.  That combination is what lets a stage's reservation list
+// develop an interior hole, so it is the workload the collapsed calendar has
+// to be checked against; the smaller fixtures above never produce one.
+const std::string kPipelined =
+    "session_start_at,think_time,num_prefill_tokens,num_decode_tokens\n"
+    "0,0,32,8\n"
+    "0.002,0,64,16\n"
+    "0.003,0,48,12\n"
+    "0.006,0,96,8\n"
+    "0.008,0,40,20\n"
+    "0.011,0,80,12\n"
+    "0.014,0,24,8\n"
+    "0.018,0,128,16\n";
 
 void test_k3_pipeline_exclusive_topology_matrix() {
     // Keep this a release smoke matrix rather than a Cartesian explosion.
@@ -332,14 +347,33 @@ void test_k3_exact_collapsed_parity_and_event_reduction() {
     // PP3/PP8/PP24 cover exact uneven partitions and the DCP-sharded endpoint.
     // Analytical stage_group_scaled is the path that benefits from collapsed
     // event reduction; fixed timing is covered by the exact workload matrix.
-    const std::vector<Topology> topologies{{2, 3, 1}, {4, 8, 4}, {8, 24, 8}};
-    for (const Topology topology : topologies) {
+    //
+    // The batch size cap is varied deliberately.  A cap of one keeps a single
+    // batch in the pipeline, where the collapsed calendar holds at most one
+    // reservation per stage and can never disagree with the exact chain.  The
+    // larger caps put three or more batches in flight simultaneously, which is
+    // the only regime that exercises how the calendar orders competing batches
+    // on one stage; parity there is the property that actually needs guarding.
+    struct Case {
+        Topology topology;
+        std::uint64_t batch_size_cap;
+        const std::string &csv;
+    };
+    const std::vector<Case> cases{
+        {{2, 3, 1}, 1, kConcurrent},
+        {{4, 8, 4}, 1, kConcurrent},
+        {{8, 24, 8}, 1, kConcurrent},
+        {{2, 3, 1}, 4, kPipelined},
+        {{4, 8, 4}, 4, kPipelined},
+        {{4, 8, 4}, 16, kPipelined},
+        {{8, 24, 8}, 8, kPipelined},
+    };
+    for (const auto &[topology, batch_size_cap, csv] : cases) {
         const auto exact_config = make_k3_config(
-            ExecutionFlavor::kAnalytical, topology, "exact",
-            /*batch_size_cap=*/1);
+            ExecutionFlavor::kAnalytical, topology, "exact", batch_size_cap);
         auto collapsed_config = exact_config;
         collapsed_config.cluster().scheduler.pipeline_event_mode = "collapsed";
-        const auto requests = workload(kConcurrent);
+        const auto requests = workload(csv);
         const SimulationOutput exact = run_simulation(exact_config, requests);
         const SimulationOutput collapsed =
             run_simulation(collapsed_config, requests);

@@ -14,8 +14,8 @@ Implemented:
   K3 PP1 and PP4; and
 - `stage_group_scaled`, including KDA/MLA family separation and safe detailed
   fallback for layer-dependent routing or a non-contiguous MoE suffix;
-- a bounded, thread-safe cross-stage prediction cache keyed by timing group and
-  exact dynamic prefill/decode attention slices;
+- a thread-safe, batch-scoped cross-stage prediction cache keyed by timing
+  group and released with the batch entity;
 - mandatory positive per-GPU HBM capacity for manual and automatic configs;
 - exact physical validation of manually configured logical block counts; and
 - an opt-in PP collapsed calendar that preserves stage-local reservations and
@@ -409,31 +409,26 @@ The new approximation has two distinct levels:
 1. **within a stage signature:** reuse representative operator-family costs
    across compatible repeated local layers;
 2. **across stages:** reuse the same stage timing template only for stages with
-   an equal `StageTimingSignature` and an equal dynamic timing key.
+   an equal `StageTimingSignature` while the same immutable batch traverses PP.
 
 There is no rule that stage 0 represents every later stage.
 
-### Dynamic timing key
+### Batch-scoped timing key
 
-Cross-stage timing reuse for a batch must include all dynamic inputs that can
-change predicted cost, for example:
+All dynamic predictor inputs are fixed in the batch's request snapshots, so
+cross-stage reuse needs only the batch identity and static timing group:
 
 ```cpp
 struct StageTimingCacheKey {
+    BatchId batch_id;
     std::uint32_t timing_group_id;
-    ClusterType cluster_type;
-    std::uint64_t total_tokens;
-    std::uint64_t scheduled_tokens;
-    std::uint64_t context_tokens;
-    // Include any existing predictor inputs not derivable from these fields.
 };
 ```
 
-The final key must be derived from the actual predictor feature contract rather
-than assuming the abbreviated example is exhaustive.
-
-Cache lifetime should be batch-local or bounded. An unbounded global cache keyed
-by arbitrary batch shapes is not acceptable.
+Different batches do not share templates even when their request shapes happen
+to match. The predictor retains one small timing-group map per in-flight batch,
+and `Simulator::release_batch()` removes that map together with the batch
+entity.
 
 ### Within-group analytical time
 
@@ -640,7 +635,8 @@ Tasks:
 
 - `stage_group_scaled` and `detailed` agree for a synthetic uniform,
   layer-invariant-routing model;
-- stages with equal signatures and batch features reuse one timing template;
+- stages with equal signatures in the same batch reuse one timing template;
+- different batches never share timing templates, even for equal shapes;
 - stages with different boundary state or ordered layer sequence do not reuse;
 - K3 PP4 and PP24 retain separate KDA/MLA contributions;
 - random/skewed/Zipf routing recomputes per-layer routing or explicitly falls

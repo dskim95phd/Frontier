@@ -102,23 +102,32 @@ class BaseExecutionTimePredictor {
                                  const std::vector<entities::Request> &requests,
                                  StageId stage_id) const = 0;
 
-    [[nodiscard]] virtual MoEGroupLayerPrediction predict_moe_group_layer(
-        const MoEGroupLayerInput &input) const = 0;
+    [[nodiscard]] virtual MoEGroupLayerPrediction
+    predict_moe_group_layer(const MoEGroupLayerInput &input) const = 0;
+
+    // Predictors with batch-scoped memoization release it alongside the batch
+    // entity. Predictors without such state intentionally keep this a no-op.
+    virtual void release_batch_timing_cache(BatchId) const {}
+
+    // Output modes that omit detailed traces can disable diagnostic payload
+    // construction at the source. Runtime routing data remains unaffected.
+    virtual void set_detailed_diagnostics_enabled(bool) const noexcept {}
 
     [[nodiscard]] virtual bool supports_lazy_moe_prediction() const noexcept {
         return false;
     }
 
-    [[nodiscard]] virtual ExecutionTimePrediction prepare_moe_stage_execution(
-        const entities::Batch &batch,
-        const std::vector<entities::Request> &requests,
-        StageId stage_id) const {
+    [[nodiscard]] virtual ExecutionTimePrediction
+    prepare_moe_stage_execution(const entities::Batch &batch,
+                                const std::vector<entities::Request> &requests,
+                                StageId stage_id) const {
         return predict_stage_execution_time(batch, requests, stage_id);
     }
 
-    [[nodiscard]] virtual ExecutionTimePrediction predict_moe_layer_execution(
-        const entities::Batch &, const std::vector<entities::Request> &,
-        StageId, std::uint64_t) const {
+    [[nodiscard]] virtual ExecutionTimePrediction
+    predict_moe_layer_execution(const entities::Batch &,
+                                const std::vector<entities::Request> &, StageId,
+                                std::uint64_t) const {
         throw ExecutionTimePredictorError(
             "execution predictor does not support lazy MoE layers");
     }

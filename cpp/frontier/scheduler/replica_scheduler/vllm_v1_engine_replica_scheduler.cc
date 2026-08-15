@@ -1010,13 +1010,29 @@ ScheduleResult VllmV1Scheduler::schedule_requests(SimTime time) {
             ++running_index;
             continue;
         }
-        // A request must have at most one in-flight scheduler batch.  In
-        // particular, chunked PREFILL batches can have different PP pipeline
-        // durations and may otherwise complete out of order.  Advancing the
-        // scheduler frontier for a second chunk before the first completes
-        // can strand the request with no schedulable tokens while its
-        // processed frontier is still behind.
-        if (request_is_active(request_id)) {
+        // A decode step consumes the token sampled by the previous one, so a
+        // request in its decode phase may hold only one in-flight batch.  With
+        // PP that spaces a request's decodes pipeline_parallel_size steps
+        // apart, which is what vLLM V1 enforces through
+        // Request.next_decode_eligible_step.
+        //
+        // A prefill chunk carries no such dependency across the whole model:
+        // chunk N+1 reads chunk N's KV only for the layers of the stage it is
+        // entering, and chunk N has already written those by the time it left
+        // that stage.  Consecutive chunks of one request therefore pipeline one
+        // stage apart, and both production engines schedule them that way --
+        // vLLM V1 lets a prefill request occupy several in-flight microbatches
+        // and stops only when next_num_tokens() reaches zero, and SGLang calls
+        // the same thing chunked pipeline parallelism.  Skipping an active
+        // prefill here instead would leave PP - 1 stages idle whenever one
+        // request's chunks are the only schedulable work.
+        //
+        // Multiple in-flight chunks are already representable: mark_batch_started
+        // exempts PREFILL from the single-batch check, kv_accounted_tokens
+        // reserves blocks against the optimistic scheduler frontier, and
+        // apply_batch_completion reconstructs a chunk's expected processed
+        // tokens from its own snapshot rather than the current frontier.
+        if (value.is_prefill_complete() && request_is_active(request_id)) {
             ++running_index;
             continue;
         }
@@ -1033,10 +1049,23 @@ ScheduleResult VllmV1Scheduler::schedule_requests(SimTime time) {
         }
 
         const std::size_t preempted_before = preempted_requests.size();
-        const bool reserved = try_reserve_with_preemption(
-            request_id, num_tokens, time, preempted_requests, running_scheduled,
-            token_budget, result);
-        if (!reserved) {
+        if (request_is_active(request_id)) {
+            // An extra chunk for a request that already holds a batch exists to
+            // occupy a pipeline stage that would otherwise idle, so it takes
+            // free blocks only.  Evicting another request to run ahead would
+            // trade committed work for a slot that is a bonus rather than a
+            // requirement, and it would fire preemption an iteration earlier
+            // than the sequential order of the same chunks ever does.  Skip to
+            // the next request instead of breaking: a later one may still fit.
+            const std::uint64_t accounted = kv_accounted_tokens(value);
+            if (!kv_blocks_.can_reserve(request_id, accounted, num_tokens)) {
+                ++running_index;
+                continue;
+            }
+            kv_blocks_.reserve(request_id, accounted, num_tokens);
+        } else if (!try_reserve_with_preemption(
+                       request_id, num_tokens, time, preempted_requests,
+                       running_scheduled, token_budget, result)) {
             break;
         }
 
@@ -1343,8 +1372,16 @@ bool VllmV1Scheduler::apply_batch_completion(entities::Batch &batch,
         const std::uint64_t expected_processed_tokens =
             std::max(snapshot.processed_tokens,
                      snapshot.scheduler_frontier - snapshot.scheduled_tokens);
+        // A prefill whose later chunks were already scheduled has a frontier
+        // ahead of this chunk's snapshot, so match on what the snapshot itself
+        // implies: every token before this chunk must be processed, and the
+        // frontier must be at least where it stood when the chunk was issued.
+        // Stages run batches in global creation order, so a request's chunks
+        // land in the order they were issued and expected_processed_tokens is
+        // reached exactly once.  Decode keeps the strict equality -- its
+        // frontier never runs ahead of an in-flight batch.
         const bool frontier_matches =
-            cluster_type() == ClusterType::kPrefill
+            !value.is_prefill_complete()
                 ? value.num_processed_tokens() == expected_processed_tokens &&
                       value.scheduler_num_computed_tokens() >=
                           snapshot.scheduler_frontier

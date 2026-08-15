@@ -460,17 +460,53 @@ enum class MoeRoutingDistribution {
     kZipf,
 };
 
+// Whether every MoE layer routes the batch's tokens to the same experts, or
+// each layer draws its own assignment. This is orthogonal to `distribution`,
+// which decides the shape of one assignment rather than how many are drawn.
+//
+// "shared" routes once per batch and charges every layer the same per-expert
+// token counts, matching a model whose routers agree. It also lets the
+// predictor evaluate routing and the expert roofline a single time and reuse
+// the result for the remaining layers, which is what makes the compressed
+// `moe_layer_event_mode` values exact rather than approximate.
+//
+// "per_layer" re-draws the assignment for each layer, seeded by that layer's
+// index, so imbalance decorrelates across depth. It forces per-layer routing
+// and per-layer expert predictions in detailed mode; first_layer_scaled
+// deliberately overrides it with one batch-shared representative draw.
+enum class MoeRoutingLayerScope {
+    kShared,
+    kPerLayer,
+};
+
 struct MoeRoutingConfig {
     MoeRoutingMode mode = MoeRoutingMode::kSimulation;
     MoeRoutingDistribution distribution = MoeRoutingDistribution::kBalanced;
     std::uint64_t seed = 42;
+    // Defaults to the scope that matches this struct's own default mode and
+    // distribution, so a default-constructed value stays self-consistent.
+    // Code that selects a layer-dependent distribution in C++ must set this
+    // as well; JSON configs that omit the key get
+    // default_moe_routing_layer_scope() applied during parsing.
+    MoeRoutingLayerScope layer_scope = MoeRoutingLayerScope::kShared;
 
     friend bool operator==(const MoeRoutingConfig &lhs,
                            const MoeRoutingConfig &rhs) {
-        return std::tie(lhs.mode, lhs.distribution, lhs.seed) ==
-               std::tie(rhs.mode, rhs.distribution, rhs.seed);
+        return std::tie(lhs.mode, lhs.distribution, lhs.seed,
+                        lhs.layer_scope) ==
+               std::tie(rhs.mode, rhs.distribution, rhs.seed, rhs.layer_scope);
     }
 };
+
+// Layer scope predates its config field: a distribution that ignores the
+// per-layer seed produced one shared assignment, and every other combination
+// re-drew per layer. Configs that omit `layer_scope` keep exactly that
+// behavior. Note that "skewed" and "zipf" are also seed-independent, so
+// selecting "shared" for them changes no number -- it only lets the predictor
+// stop recomputing an assignment it already has.
+[[nodiscard]] MoeRoutingLayerScope
+default_moe_routing_layer_scope(MoeRoutingMode mode,
+                                MoeRoutingDistribution distribution) noexcept;
 
 struct ParallelismConfig {
     std::uint64_t num_replicas = 1;
@@ -564,6 +600,14 @@ struct SchedulerConfig {
     // "collapsed" fuses safe pipeline transitions while preserving the
     // stage-local resource calendar. Unsupported synchronized paths fall
     // back to the exact chain.
+    //
+    // The two modes produce identical timings and identical request and batch
+    // records; only the event count differs. That holds because the analytical
+    // model derives a batch's attention inputs entirely from the batch's own
+    // RequestBatchSnapshot, so a stage's predicted work does not depend on when
+    // the stage runs. Collapsed mode predicts every stage at stage-zero entry
+    // and therefore relies on exactly that property; see
+    // docs/design/kimi-k3-support.md 12.3 for the divergence this replaced.
     std::string pipeline_event_mode = "exact";
     // Derived per-session KDA recurrent-state footprint, expressed in GPU
     // scheduler blocks.  It is populated by memory resolution and omitted
@@ -736,8 +780,10 @@ struct AnalyticalExecutionModelConfig {
     OperatorPrecisionConfig operator_precisions;
     // "detailed" predicts and emits synchronization events one MoE layer at a
     // time.
-    // "first_layer_scaled" emits the first MoE layer normally, reuses its
-    // expert path, and accumulates attention delays by implementation family.
+    // "first_layer_scaled" emits the first MoE layer normally, uses one
+    // batch-shared routing draw regardless of moe_routing.layer_scope, reuses
+    // its expert path, and accumulates attention delays by implementation
+    // family.
     // "stage_group_scaled" additionally exposes canonical PP stage groups,
     // uses the same family-aware compression only for layer-invariant routing,
     // and otherwise falls back to exact per-layer prediction.
@@ -1161,6 +1207,8 @@ to_string(PrefixCachingKeyMode key_mode) noexcept;
 [[nodiscard]] std::string_view to_string(ClusterSchedulerType type) noexcept;
 [[nodiscard]] std::string_view to_string(ModelKind kind) noexcept;
 [[nodiscard]] std::string_view to_string(MoeRoutingMode mode) noexcept;
+[[nodiscard]] std::string_view
+to_string(MoeRoutingLayerScope layer_scope) noexcept;
 [[nodiscard]] std::string_view
 to_string(MoeRoutingDistribution distribution) noexcept;
 [[nodiscard]] std::string_view to_string(ExecutionModelType type) noexcept;

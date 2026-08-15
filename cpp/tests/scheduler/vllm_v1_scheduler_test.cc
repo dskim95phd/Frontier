@@ -172,7 +172,14 @@ void test_chunked_prefill_runs_before_new_waiting_work() {
            "remaining budget must mix waiting and running prefill work");
 }
 
-void test_chunked_prefill_does_not_overlap_same_request_across_pp_batches() {
+// Chunk N+1 of a prefill reads chunk N's KV only for the layers of the stage
+// it is entering, and chunk N wrote those before leaving that stage, so a
+// prefill request may hold several in-flight PP batches at once.  vLLM V1
+// schedules prefill chunks exactly this way and stops only when the request's
+// scheduler frontier reaches the prompt length; SGLang calls the same thing
+// chunked pipeline parallelism.  Refusing to overlap instead would idle
+// PP - 1 stages whenever one request's chunks are the only schedulable work.
+void test_chunked_prefill_overlaps_same_request_across_pp_batches() {
     auto requests = make_requests({{12, 1}});
     SchedulerConfig config = scheduler_config();
     config.max_tokens_in_batch = 4;
@@ -196,42 +203,89 @@ void test_chunked_prefill_does_not_overlap_same_request_across_pp_batches() {
                               frontier::ClusterType::kPrefill};
     arrive_all(scheduler, requests);
 
+    const Request &request = requests.front();
+    // Snapshot the request as the simulator does when a scheduled batch starts,
+    // capturing the frontier the chunk was issued against.
+    const auto start_batch = [&](std::uint64_t batch_index,
+                                 const ScheduleResult &result) {
+        std::vector<RequestBatchSnapshot> snapshots{[&]() {
+            RequestBatchSnapshot value{};
+            value.request_id = request.id();
+            value.scheduled_tokens = result.scheduled_requests.front().num_tokens;
+            value.runtime_epoch = request.runtime_epoch();
+            value.execution_epoch = request.execution_epoch();
+            value.processed_tokens = request.num_processed_tokens();
+            value.scheduler_frontier = request.scheduler_num_computed_tokens();
+            return value;
+        }()};
+        Batch value{BatchId{batch_index}, result.iteration_id,
+                    std::move(snapshots), result.simulation_time,
+                    Generation{1}};
+        scheduler.mark_batch_started(value);
+        return value;
+    };
+
     const ScheduleResult first = scheduler.schedule(SimTime::from_seconds(0));
     expect(first.scheduled_requests.size() == 1 &&
                first.scheduled_requests.front().num_tokens == 4,
            "first PP PREFILL batch must schedule one prompt chunk");
-    const Request &request = requests.front();
-    std::vector<RequestBatchSnapshot> snapshots{[&]() {
-        RequestBatchSnapshot value{};
-        value.request_id = request.id();
-        value.scheduled_tokens = first.scheduled_requests.front().num_tokens;
-        value.runtime_epoch = request.runtime_epoch();
-        value.execution_epoch = request.execution_epoch();
-        value.processed_tokens = request.num_processed_tokens();
-        value.scheduler_frontier = request.scheduler_num_computed_tokens();
-        return value;
-    }()};
-    Batch first_batch{BatchId{0}, first.iteration_id, std::move(snapshots),
-                      first.simulation_time, Generation{1}};
-    scheduler.mark_batch_started(first_batch);
+    Batch first_batch = start_batch(0, first);
 
+    // The pipeline still has a free slot, so the next chunk enters behind the
+    // first instead of waiting for it.
     const ScheduleResult overlapping =
         scheduler.schedule(SimTime::from_seconds(0.0005));
-    expect(overlapping.scheduled_requests.empty() &&
-               requests.front().scheduler_num_computed_tokens() == 4,
-           "an active chunked PREFILL request must not enter a second PP "
-           "batch before its first chunk completes");
+    expect(overlapping.scheduled_requests.size() == 1 &&
+               overlapping.scheduled_requests.front().request_id ==
+                   RequestId{0} &&
+               overlapping.scheduled_requests.front().num_tokens == 4 &&
+               requests.front().scheduler_num_computed_tokens() == 8,
+           "a chunked PREFILL request must enter a second PP batch while its "
+           "first chunk is still in flight");
+    Batch second_batch = start_batch(1, overlapping);
 
+    // Both PP slots are occupied; the replica cannot issue a third batch.
+    expect_throws<frontier::scheduler::SchedulerError>(
+        [&]() {
+            static_cast<void>(scheduler.schedule(SimTime::from_seconds(0.0006)));
+        },
+        "a full PP pipeline must refuse a further scheduler batch");
+
+    // Stages run batches in global creation order, so the chunks retire in the
+    // order they were issued and each one applies against its own snapshot.
     expect(scheduler.on_batch_completed(first_batch,
                                         SimTime::from_seconds(0.001)),
            "first PP PREFILL chunk must complete normally");
+    expect(requests.front().num_processed_tokens() == 4,
+           "completing the first chunk must advance processed tokens to 4");
+
     const ScheduleResult continuation =
         scheduler.schedule(SimTime::from_seconds(0.001));
     expect(continuation.scheduled_requests.size() == 1 &&
-               continuation.scheduled_requests.front().request_id ==
-                   RequestId{0} &&
-               continuation.scheduled_requests.front().num_tokens == 4,
-           "chunked PREFILL must resume after its active PP batch completes");
+               continuation.scheduled_requests.front().num_tokens == 4 &&
+               requests.front().scheduler_num_computed_tokens() == 12,
+           "the freed PP slot must take the request's last chunk");
+    Batch third_batch = start_batch(2, continuation);
+
+    expect(scheduler.on_batch_completed(second_batch,
+                                        SimTime::from_seconds(0.0015)),
+           "second PP PREFILL chunk must complete normally");
+    expect(requests.front().num_processed_tokens() == 8,
+           "completing the second chunk must advance processed tokens to 8");
+
+    // The frontier now covers the whole prompt, so nothing more is schedulable
+    // even though a PP slot is free.
+    const ScheduleResult exhausted =
+        scheduler.schedule(SimTime::from_seconds(0.0016));
+    expect(exhausted.scheduled_requests.empty(),
+           "an exhausted prefill frontier must schedule no further chunk");
+
+    expect(scheduler.on_batch_completed(third_batch,
+                                        SimTime::from_seconds(0.002)),
+           "last PP PREFILL chunk must complete normally");
+    expect(requests.front().is_prefill_complete() &&
+               requests.front().num_processed_tokens() == 12,
+           "overlapped chunks must still finish the prefill exactly once");
 }
 
 void test_pdd_chunked_prefill_commits_full_isl_without_self_preemption() {
@@ -2095,8 +2149,8 @@ int main() {
         frontier::test::run("chunked prefill runs before waiting work",
                             test_chunked_prefill_runs_before_new_waiting_work);
     failures += frontier::test::run(
-        "chunked PREFILL excludes same-request PP overlap",
-        test_chunked_prefill_does_not_overlap_same_request_across_pp_batches);
+        "chunked PREFILL overlaps same-request PP batches",
+        test_chunked_prefill_overlaps_same_request_across_pp_batches);
     failures += frontier::test::run(
         "PDD chunked PREFILL commits full ISL without self-preemption",
         test_pdd_chunked_prefill_commits_full_isl_without_self_preemption);

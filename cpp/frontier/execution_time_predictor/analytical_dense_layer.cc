@@ -923,6 +923,12 @@ predict_mla_attention_work(const DenseLayerContext &context) {
                 context.attention_element_bytes +
             rank_local_cache_tokens * mla_cache_bytes_per_token,
     };
+    // DCP deliberately applies to decode only: a context-parallel prefill would
+    // pay an all-gather/reduce-scatter pair among the DCP peers that outweighs
+    // the sharded read, and sequential PDD runs its prefill cluster at DCP=1.
+    // The unmodeled case is co-location with DCP > 1 over a prefix-cache hit,
+    // where this term reads latent entries the rank does not own while
+    // kv_cache_save below stays sharded.  See kimi-k3-support.md 12.2.
     work.prefill_attention = mla_unabsorbed_attention_work(
         context.batch.prefill_requests, context.local_query_heads,
         model.qk_nope_head_dim, model.qk_rope_head_dim, model.v_head_dim,
@@ -1127,6 +1133,14 @@ predict_kda_attention_work(const DenseLayerContext &context) {
     // touched once per token in this conservative roofline model.  It keeps
     // decode work O(1) in context length while retaining the quadratic head
     // dimension dependence of the state matrix.
+    //
+    // FUTURE WORK (docs/design/kimi-k3-support.md 12.1): this models a strictly
+    // sequential scan.  FlashKDA-style kernels process a chunk of tokens
+    // against a state held in registers and only combine chunk results
+    // sequentially, so the state reaches HBM once per chunk.  Per-token traffic
+    // makes prefill memory bound by roughly 675:1 and overstates a KDA layer by
+    // about an order of magnitude; decode, which touches the state once per
+    // request either way, is unaffected.
     const auto recurrent_work =
         [&](const std::vector<AttentionRequestSlice> &requests) {
             const double request_tokens =

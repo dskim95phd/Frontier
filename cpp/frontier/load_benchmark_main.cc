@@ -196,7 +196,7 @@ int main(int argc, char *argv[]) {
 
         const auto started_at = std::chrono::steady_clock::now();
         frontier::simulator::Simulator simulator{config, workload};
-        simulator.metrics().set_detailed_traces_enabled(false);
+        simulator.set_detailed_traces_enabled(false);
         simulator.set_runtime_validation_enabled(false);
         const frontier::metrics::SimulationOutput output = simulator.run();
         const double wall_clock_seconds =

@@ -960,7 +960,7 @@ def _html_report(document: Mapping[str, Any]) -> str:
     )
     return f"""<!doctype html>
 <html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
-<title>{rate_tag} P8/D16 CPU-DRAM capacity sweep</title>
+<title>{rate_tag} Kimi K3 P24/D64 CPU-DRAM capacity sweep</title>
 <style>
 :root {{ color-scheme:light dark; --bg:#f7f8fb; --panel:#fff; --fg:#172033; --muted:#5b6475; --border:#d8dde8; --grid:#e7eaf0; }}
 @media (prefers-color-scheme:dark) {{ :root {{ --bg:#0f1219; --panel:#171b24; --fg:#edf1f7; --muted:#a6afbf; --border:#31394a; --grid:#252c39; }} }}
@@ -971,7 +971,7 @@ h1 {{ margin:0 0 6px; }} h2 {{ margin:28px 0 12px; }} h3 {{ margin:0 0 8px; font
 details {{ margin-top:14px; }} summary {{ cursor:pointer; font-weight:600; }} .notes {{ padding:14px 16px; background:var(--panel); border-left:4px solid #2563eb; border-radius:4px; }} code {{ font-family:ui-monospace,Consolas,monospace; }}
 @media (max-width:900px) {{ main{{padding:16px}} .charts{{grid-template-columns:1fr}} }}
 </style></head><body><main>
-<h1>{rate_tag} P8/D16 CPU-DRAM capacity sweep</h1>
+<h1>{rate_tag} Kimi K3 P24/D64 CPU-per-PREFILL-GPU capacity sweep</h1>
 <p class='muted'>Five-minute source-derived metrics; simulation rate {simulation_rate:g} sessions/s. Output root: <code>{html.escape(str(document.get('output_root')))}</code></p>
 <div class='notes'><strong>Recommendations</strong><p>Minimum clearly stable: <code>{_fmt(recommendations.get('minimum_clearly_stable_capacity_gb'))} GB</code>. Minimum operationally acceptable: <code>{_fmt(recommendations.get('minimum_operationally_acceptable_capacity_gb'))} GB</code>.</p>
 <p><code>underloaded-stable</code> is below the {thresholds.get('busy_saturation_pct')}% time-weighted PREFILL busy line with non-material reconstructed-backlog and TTFT trends. <code>saturated-stable</code> is at/over that line but remains flat on those primary signals. <code>overloaded</code> requires a material backlog or TTFT trend. Queue and active-session trends are secondary/right-censored diagnostics and cannot trigger overload alone. Stability requires exact 12-bin final-hour and 24-bin final-2-hour windows plus observed backlog and TTFT.</p>
@@ -1118,15 +1118,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_final_hour_queue_count=args.max_final_hour_queue_count,
         max_final_hour_backlog_requests=args.max_final_hour_backlog_requests,
     )
+    nominal_horizon_s = max(float(case.get("horizon_s", 0) or 0) for case in cases)
     document: dict[str, Any] = {
         "schema_version": 1,
-        "analysis": f"{_rate_tag(args.simulation_rate)}_p8_d16_cpu_capacity_sweep_10h",
+        "analysis": f"{_rate_tag(args.simulation_rate)}_k3_p24_d64_cpu_capacity_sweep",
         "output_root": str(root),
         "workload_dir": str(workload_dir),
         "workload_path": str(workload_path),
         "metadata_path": str(metadata_path),
         "simulation_rate_per_s": args.simulation_rate,
-        "nominal_horizon_s": 36000.0,
+        "nominal_horizon_s": nominal_horizon_s,
         "bucket_seconds": args.bucket_seconds,
         "prefill_lanes": args.prefill_lanes,
         "requested_capacities_gb": requested,

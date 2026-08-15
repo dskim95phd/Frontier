@@ -2,6 +2,7 @@
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <optional>
 #include <sstream>
@@ -36,6 +37,7 @@ struct RunOptions {
     bool runtime_validation = true;
     bool gpu_kv_occupancy = true;
     std::optional<double> simulation_end_time_s;
+    std::optional<double> wall_progress_interval_s;
 };
 
 void print_usage(std::ostream &stream) {
@@ -52,6 +54,7 @@ void print_usage(std::ostream &stream) {
            "[--output-mode summary|requests|full] "
            "[--runtime-validation true|false] "
            "[--gpu-kv-occupancy true|false] "
+           "[--wall-progress-interval-s <seconds>] "
            "[--simulation-end-time-s <seconds>]\n\n"
         << "Without --output-dir, the complete deterministic JSON trace is "
            "written to stdout.\n"
@@ -114,6 +117,7 @@ std::optional<RunOptions> parse_run_options(int argc, char *argv[]) {
     std::optional<bool> runtime_validation;
     std::optional<bool> gpu_kv_occupancy;
     std::optional<double> simulation_end_time_s;
+    std::optional<double> wall_progress_interval_s;
     for (int index = 1; index < argc; index += 2) {
         const std::string_view option{argv[index]};
         const std::string_view value{argv[index + 1]};
@@ -159,6 +163,19 @@ std::optional<RunOptions> parse_run_options(int argc, char *argv[]) {
             } catch (const std::exception &) {
                 return std::nullopt;
             }
+        } else if (option == "--wall-progress-interval-s" &&
+                   !wall_progress_interval_s.has_value()) {
+            try {
+                std::size_t consumed = 0;
+                const double parsed = std::stod(std::string{value}, &consumed);
+                if (consumed != value.size() || !std::isfinite(parsed) ||
+                    parsed <= 0.0) {
+                    return std::nullopt;
+                }
+                wall_progress_interval_s = parsed;
+            } catch (const std::exception &) {
+                return std::nullopt;
+            }
         } else {
             return std::nullopt;
         }
@@ -176,6 +193,7 @@ std::optional<RunOptions> parse_run_options(int argc, char *argv[]) {
     result.runtime_validation = runtime_validation.value_or(true);
     result.gpu_kv_occupancy = gpu_kv_occupancy.value_or(true);
     result.simulation_end_time_s = simulation_end_time_s;
+    result.wall_progress_interval_s = wall_progress_interval_s;
     return result;
 }
 
@@ -213,10 +231,9 @@ void write_artifacts(
     }
     // Occupancy samples are compact change events and are retained for every
     // output mode, including summary mode where detailed traces are disabled.
-    write_text_file(
-        directory / "gpu_kv_occupancy.csv",
-        frontier::metrics::serialize_gpu_kv_occupancy_csv(
-            output.gpu_kv_occupancy));
+    write_text_file(directory / "gpu_kv_occupancy.csv",
+                    frontier::metrics::serialize_gpu_kv_occupancy_csv(
+                        output.gpu_kv_occupancy));
     if (options.output_mode == OutputMode::kFull) {
         write_text_file(
             directory / "trace.json",
@@ -268,13 +285,22 @@ int main(int argc, char *argv[]) {
 
         const auto started_at = std::chrono::steady_clock::now();
         frontier::simulator::Simulator simulator{config, workload};
-        simulator.set_runtime_validation_enabled(
-            options->runtime_validation);
+        simulator.set_runtime_validation_enabled(options->runtime_validation);
         simulator.metrics().set_gpu_kv_occupancy_enabled(
             options->gpu_kv_occupancy);
+        if (options->wall_progress_interval_s.has_value()) {
+            simulator.set_wall_clock_progress_callback(
+                options->wall_progress_interval_s.value(),
+                [](frontier::SimTime simulation_time,
+                   double /*wall_clock_elapsed_seconds*/) {
+                    std::cerr << "simulation_progress_s=" << std::setprecision(17)
+                              << simulation_time.seconds() << '\n'
+                              << std::flush;
+                });
+        }
         if (options->output_dir.has_value() &&
             options->output_mode != OutputMode::kFull) {
-            simulator.metrics().set_detailed_traces_enabled(false);
+            simulator.set_detailed_traces_enabled(false);
         }
         const frontier::metrics::SimulationOutput output =
             options->simulation_end_time_s.has_value()

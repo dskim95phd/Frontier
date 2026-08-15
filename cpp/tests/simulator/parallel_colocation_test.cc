@@ -152,15 +152,67 @@ void test_collapsed_pp_calendar_matches_exact_timeline() {
         Json::parse(serialize_simulation_output_json(exact));
     const Json collapsed_json =
         Json::parse(serialize_simulation_output_json(collapsed));
-    expect(exact_json.at("requests") == collapsed_json.at("requests") &&
-               exact_json.at("batches") == collapsed_json.at("batches"),
-           "collapsed PP must preserve request and batch completion output");
+    auto by_request = [](Json value) {
+        std::sort(value.begin(), value.end(),
+                  [](const Json &lhs, const Json &rhs) {
+                      return lhs.at("request_id") < rhs.at("request_id");
+                  });
+        return value;
+    };
+    expect(by_request(exact_json.at("requests")) ==
+               by_request(collapsed_json.at("requests")),
+           "collapsed PP must preserve every request record");
+
+    // The two DP lanes are independent, so when both create a batch at the
+    // same instant the batch-ID counter hands out its two values in whichever
+    // order the modes happen to visit the lanes.  That numbering is internal;
+    // the contract is that each lane runs the same batches over the same
+    // interval.  Compare lane-local identity (dp_id, iteration_id) instead,
+    // and check separately that the two runs issue the same set of IDs.
+    auto batch_ids = [](const Json &value) {
+        std::vector<std::uint64_t> ids;
+        for (const Json &entry : value) {
+            ids.push_back(entry.at("batch_id").get<std::uint64_t>());
+        }
+        std::sort(ids.begin(), ids.end());
+        return ids;
+    };
+    auto by_lane_iteration = [](Json value) {
+        for (Json &entry : value) {
+            entry.erase("batch_id");
+        }
+        std::sort(value.begin(), value.end(),
+                  [](const Json &lhs, const Json &rhs) {
+                      if (lhs.at("dp_id") != rhs.at("dp_id")) {
+                          return lhs.at("dp_id") < rhs.at("dp_id");
+                      }
+                      if (lhs.at("replica_id") != rhs.at("replica_id")) {
+                          return lhs.at("replica_id") < rhs.at("replica_id");
+                      }
+                      return lhs.at("iteration_id") < rhs.at("iteration_id");
+                  });
+        return value;
+    };
+    expect(batch_ids(exact_json.at("batches")) ==
+                   batch_ids(collapsed_json.at("batches")) &&
+               by_lane_iteration(exact_json.at("batches")) ==
+                   by_lane_iteration(collapsed_json.at("batches")),
+           "collapsed PP must preserve every batch record");
 
     auto sort_stages = [](Json value) {
+        for (Json &entry : value) {
+            entry.erase("batch_id");
+        }
         std::sort(value.begin(), value.end(), [](const Json &lhs,
                                                  const Json &rhs) {
-            if (lhs.at("batch_id") != rhs.at("batch_id")) {
-                return lhs.at("batch_id") < rhs.at("batch_id");
+            if (lhs.at("dp_id") != rhs.at("dp_id")) {
+                return lhs.at("dp_id") < rhs.at("dp_id");
+            }
+            if (lhs.at("replica_id") != rhs.at("replica_id")) {
+                return lhs.at("replica_id") < rhs.at("replica_id");
+            }
+            if (lhs.at("started_at_s") != rhs.at("started_at_s")) {
+                return lhs.at("started_at_s") < rhs.at("started_at_s");
             }
             return lhs.at("stage_id") < rhs.at("stage_id");
         });

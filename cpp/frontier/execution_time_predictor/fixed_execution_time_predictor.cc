@@ -102,15 +102,24 @@ FixedExecutionTimePredictor::predict_stage_execution_time(
         }
         routing_diagnostics.reserve(static_cast<std::size_t>(moe_layer_count));
         std::uint64_t local_moe_layer = 0;
+        // Shared routing assigns every layer the same experts, so the
+        // allocation is computed once and reported for each layer.
+        const bool layer_shared =
+            routing_.layer_scope == config::MoeRoutingLayerScope::kShared;
+        std::optional<detail::RoutingAllocation> shared_allocation;
         for (std::uint64_t model_layer = stage_layers.begin;
              model_layer < stage_layers.end; ++model_layer) {
             if (!model_.is_moe_layer(model_layer)) {
                 continue;
             }
-            const detail::RoutingAllocation allocation = detail::route_tokens(
-                batch.total_scheduled_tokens(), model_.router_topk,
-                model_.total_expert_num, parallelism_.moe_expert_parallel_size,
-                routing_, model_layer);
+            if (!layer_shared || !shared_allocation.has_value()) {
+                shared_allocation = detail::route_tokens(
+                    batch.total_scheduled_tokens(), model_.router_topk,
+                    model_.total_expert_num,
+                    parallelism_.moe_expert_parallel_size, routing_,
+                    layer_shared ? 0 : model_layer);
+            }
+            const detail::RoutingAllocation &allocation = *shared_allocation;
             routing_diagnostics.push_back([&]() {
                 MoERoutingDiagnostic value{};
                 value.layer_id = LayerId{local_moe_layer};
@@ -139,10 +148,12 @@ FixedExecutionTimePredictor::predict_stage_execution_time(
         ExecutionTimePrediction value{};
         value.duration_ms = execution_time.total_ms();
         value.execution_time = execution_time;
-        value.diagnostics = {
-            {"fixed_stage_latency_ms", latency},
-            {"stage_duration_ms", execution_time.total_ms()},
-        };
+        if (detailed_diagnostics_enabled_) {
+            value.diagnostics = {
+                {"fixed_stage_latency_ms", latency},
+                {"stage_duration_ms", execution_time.total_ms()},
+            };
+        }
         value.moe_routing = std::move(routing_diagnostics);
         return value;
     }();

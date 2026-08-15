@@ -161,6 +161,42 @@ void test_routing_reproducibility_golden_vectors() {
     }
 }
 
+void test_uniform_random_topk_is_distinct_per_input_token() {
+    frontier::config::MoeRoutingConfig routing{};
+    routing.mode = frontier::config::MoeRoutingMode::kUniformRandom;
+    routing.seed = 42;
+
+    constexpr std::uint64_t kInputTokens = 31;
+    constexpr std::uint64_t kTopK = 8;
+    const auto allocation =
+        frontier::execution_time_predictor::detail::route_tokens(
+            kInputTokens, kTopK, 16, 4, routing, 0);
+
+    require(std::accumulate(allocation.global_expert_tokens.begin(),
+                            allocation.global_expert_tokens.end(),
+                            std::uint64_t{0}) == kInputTokens * kTopK,
+            "uniform top-k routing must conserve all selections");
+    require(std::all_of(allocation.global_expert_tokens.begin(),
+                        allocation.global_expert_tokens.end(),
+                        [](std::uint64_t count) {
+                            return count <= kInputTokens;
+                        }),
+            "one input token must not select the same expert twice");
+
+    // A one-token prefill-sized draw makes the distinctness contract directly
+    // observable from the aggregate histogram: exactly k experts have count 1.
+    const auto one_token =
+        frontier::execution_time_predictor::detail::route_tokens(
+            1, kTopK, 16, 4, routing, 0);
+    require(std::count(one_token.global_expert_tokens.begin(),
+                       one_token.global_expert_tokens.end(),
+                       std::uint64_t{1}) == kTopK &&
+                std::all_of(one_token.global_expert_tokens.begin(),
+                            one_token.global_expert_tokens.end(),
+                            [](std::uint64_t count) { return count <= 1; }),
+            "one input token must route to k distinct experts");
+}
+
 void test_moe_lane_analytical_model() {
     using frontier::config::MoeRoutingConfig;
     using frontier::config::MoeRoutingDistribution;
@@ -411,6 +447,7 @@ int main() {
         test_parallel_domain();
         test_deterministic_distributions();
         test_routing_reproducibility_golden_vectors();
+        test_uniform_random_topk_is_distinct_per_input_token();
         test_moe_lane_analytical_model();
         test_shared_expert_is_replicated_across_ep_and_sharded_by_tp();
         test_latent_moe_projection_precision_is_independent();

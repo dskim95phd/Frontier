@@ -486,6 +486,31 @@ def _filter_and_sample_groups(
     return groups, dropped
 
 
+def count_eligible_source_sessions(
+    db_path: Path,
+    *,
+    providers: Sequence[str] | None = None,
+    models: Sequence[str] | None = None,
+    session_ids: Sequence[str] | None = None,
+) -> int:
+    """Count positive-token source sessions before optional sampling."""
+
+    records = _query_rounds(
+        Path(db_path),
+        providers=_flatten_filters(providers),
+        models=_flatten_filters(models),
+        session_ids=_flatten_filters(session_ids),
+    )
+    if not records:
+        raise ValueError("no TraceLab rounds matched the requested filters")
+    groups, _ = _filter_and_sample_groups(records, sample_sessions=None, seed=0)
+    if not groups:
+        raise ValueError(
+            "all TraceLab rounds matched the filters but had nonpositive token counts"
+        )
+    return len(groups)
+
+
 def _build_output_rows(
     groups: Mapping[tuple[str, str, str, str], Sequence[_Round]],
     *,
