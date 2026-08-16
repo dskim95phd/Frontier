@@ -4,7 +4,7 @@
 #include <cmath>
 #include <utility>
 
-#include "frontier/execution_time_predictor/analytical_roofline_execution_time_predictor.h"
+#include "frontier/execution_time_predictor/analytical_moe_model.h"
 
 namespace frontier::execution_time_predictor {
 
@@ -54,10 +54,8 @@ FixedExecutionTimePredictor::predict_stage_execution_time(
     }();
     if (model_.is_moe()) {
         const std::uint64_t layers_per_stage =
-            config::pipeline_stage_layer_range(
-                model_.num_layers,
-                std::max<std::uint64_t>(1, parallelism_.pipeline_parallel_size),
-                stage_id.index())
+            config::pipeline_stage_layer_range(model_.num_layers, parallelism_,
+                                               stage_id.index())
                 .size();
         const double component =
             latency * static_cast<double>(layers_per_stage);
@@ -92,9 +90,8 @@ FixedExecutionTimePredictor::predict_stage_execution_time(
     std::vector<MoERoutingDiagnostic> routing_diagnostics;
     if (model_.is_moe()) {
         const config::PipelineStageLayerRange stage_layers =
-            config::pipeline_stage_layer_range(
-                model_.num_layers, parallelism_.pipeline_parallel_size,
-                stage_id.index());
+            config::pipeline_stage_layer_range(model_.num_layers, parallelism_,
+                                               stage_id.index());
         std::uint64_t moe_layer_count = 0;
         for (std::uint64_t layer = stage_layers.begin; layer < stage_layers.end;
              ++layer) {

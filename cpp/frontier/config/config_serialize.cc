@@ -79,7 +79,7 @@ OrderedJson serialize_scheduler(const SchedulerConfig &scheduler) {
 }
 
 OrderedJson serialize_parallelism(const ParallelismConfig &parallelism) {
-    return OrderedJson::object({
+    OrderedJson serialized = OrderedJson::object({
         {"num_replicas", parallelism.num_replicas},
         {"tensor_parallel_size", parallelism.tensor_parallel_size},
         {
@@ -98,6 +98,11 @@ OrderedJson serialize_parallelism(const ParallelismConfig &parallelism) {
         },
         {"pipeline_exclusive", parallelism.pipeline_exclusive},
     });
+    if (!parallelism.pipeline_stage_layer_counts.empty()) {
+        serialized["pipeline_stage_layer_counts"] =
+            parallelism.pipeline_stage_layer_counts;
+    }
+    return serialized;
 }
 
 OrderedJson serialize_moe_routing(const MoeRoutingConfig &routing) {

@@ -1,9 +1,9 @@
 // Expert-parallel lane domain: ownership, ranges, and token partitioning.
 //
-// Split out of analytical_roofline_execution_time_predictor.cc; the shared
-// declarations live in that translation unit's header.
+// Expert-parallel domain implementation. Public internal contracts live in
+// analytical_moe_model.h.
 
-#include "frontier/execution_time_predictor/analytical_roofline_execution_time_predictor.h"
+#include "frontier/execution_time_predictor/analytical_moe_model.h"
 
 #include <cstddef>
 #include <cstdint>

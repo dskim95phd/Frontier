@@ -83,6 +83,13 @@ DEFAULT_OUTPUT_ROOT = (
 )
 DECIMAL_GB = 1_000_000_000
 
+# Performance experiment contract.  Full runtime validation walks all
+# materialized CPU KV blocks repeatedly and becomes prohibitively expensive
+# as an offload run warms up.  Keep both diagnostic streams off for benchmark
+# runs unless the caller explicitly acknowledges the cost.
+PERFORMANCE_RUNTIME_VALIDATION = False
+PERFORMANCE_GPU_KV_OCCUPANCY = False
+
 
 @dataclass(frozen=True)
 class MatrixCase:
@@ -400,6 +407,21 @@ def _simulator_command(args: argparse.Namespace, case: MatrixCase) -> list[str]:
     return command
 
 
+def _require_expensive_diagnostics_opt_in(args: argparse.Namespace) -> None:
+    enabled = []
+    if args.runtime_validation:
+        enabled.append("--runtime-validation")
+    if args.gpu_kv_occupancy:
+        enabled.append("--gpu-kv-occupancy")
+    if enabled and not args.allow_expensive_diagnostics:
+        options = ", ".join(enabled)
+        raise SystemExit(
+            f"{options} is disabled for Kimi K3 performance runs; "
+            "pass --allow-expensive-diagnostics only for an intentional "
+            "diagnostic run"
+        )
+
+
 def _case_start_message(
     case: MatrixCase,
     *,
@@ -464,6 +486,8 @@ def run_case(
         "workload_metadata": str(case.metadata.resolve()),
         "config_input": str(case.config_path.resolve()),
         "binary": str(args.binary.resolve()),
+        "runtime_validation": bool(args.runtime_validation),
+        "gpu_kv_occupancy": bool(args.gpu_kv_occupancy),
         "command": command,
         "started_at_unix_s": time.time(),
     }
@@ -576,8 +600,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-generate-workloads", action="store_true")
     parser.add_argument("--regenerate-workloads", action="store_true")
     parser.add_argument("--generate-reports", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--runtime-validation", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--gpu-kv-occupancy", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--runtime-validation",
+        action=argparse.BooleanOptionalAction,
+        default=PERFORMANCE_RUNTIME_VALIDATION,
+        help="enable expensive full-state validation (off for performance runs)",
+    )
+    parser.add_argument(
+        "--gpu-kv-occupancy",
+        action=argparse.BooleanOptionalAction,
+        default=PERFORMANCE_GPU_KV_OCCUPANCY,
+        help="record the GPU KV occupancy stream (off for performance runs)",
+    )
+    parser.add_argument(
+        "--allow-expensive-diagnostics",
+        action="store_true",
+        help="acknowledge the cost when enabling validation or occupancy diagnostics",
+    )
     parser.add_argument(
         "--wall-progress-interval-s",
         type=float,
@@ -590,6 +629,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     global SIMULATION_END_TIME_S
     args = build_parser().parse_args(argv)
+    _require_expensive_diagnostics_opt_in(args)
     if args.jobs <= 0:
         raise SystemExit("--jobs must be positive")
     if not math.isfinite(args.simulation_hours) or args.simulation_hours <= 0:
@@ -666,6 +706,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"{float(injection_duration_s):.1f}s at max rate {highest_rate}/s",
         flush=True,
     )
+    print(
+        "[simulator options] "
+        f"runtime_validation={'on' if args.runtime_validation else 'off'} "
+        f"gpu_kv_occupancy={'on' if args.gpu_kv_occupancy else 'off'}",
+        flush=True,
+    )
     ensure_workloads(
         args,
         cases,
@@ -696,6 +742,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             "seed": SEED,
             "jobs": args.jobs,
             "wall_progress_interval_s": args.wall_progress_interval_s,
+            "simulator_options": {
+                "runtime_validation": bool(args.runtime_validation),
+                "gpu_kv_occupancy": bool(args.gpu_kv_occupancy),
+            },
             "config": str(args.config.resolve()),
             "config_sha256": _sha256(args.config.resolve()),
             "binary": str(args.binary.resolve()),

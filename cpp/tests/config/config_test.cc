@@ -1685,6 +1685,80 @@ void test_pipeline_stage_profile_pp1_compatibility_and_uneven_ranges() {
            "uneven Kimi K2 PP4 partition must preserve 16/15 stage sizes");
 }
 
+void test_explicit_pipeline_stage_layer_counts() {
+    auto config = load("analytical_moe_ep4_colocation.json");
+    config.cluster().parallelism.pipeline_stage_layer_counts = {5, 27};
+    const auto round_trip = parse_simulation_config_json(
+        serialize_simulation_config_json(config));
+    expect(round_trip.cluster()
+                   .parallelism.pipeline_stage_layer_counts ==
+               std::vector<std::uint64_t>({5, 27}),
+           "explicit pipeline layer counts must parse and round-trip");
+    const auto first = frontier::config::pipeline_stage_layer_range(
+        round_trip.cluster().model.num_layers,
+        round_trip.cluster().parallelism, 0);
+    const auto second = frontier::config::pipeline_stage_layer_range(
+        round_trip.cluster().model.num_layers,
+        round_trip.cluster().parallelism, 1);
+    expect(first == frontier::config::PipelineStageLayerRange{0, 5} &&
+               second == frontier::config::PipelineStageLayerRange{5, 32},
+           "explicit pipeline layer counts must define contiguous ranges");
+
+    auto invalid = config;
+    invalid.cluster().parallelism.pipeline_stage_layer_counts = {32};
+    expect_throws<ConfigError>(
+        [&invalid] {
+            static_cast<void>(parse_simulation_config_json(
+                serialize_simulation_config_json(invalid)));
+        },
+        "explicit pipeline partition length must equal PP size");
+    invalid.cluster().parallelism.pipeline_stage_layer_counts = {0, 32};
+    expect_throws<ConfigError>(
+        [&invalid] {
+            static_cast<void>(parse_simulation_config_json(
+                serialize_simulation_config_json(invalid)));
+        },
+        "explicit pipeline partition stages must be nonempty");
+    invalid.cluster().parallelism.pipeline_stage_layer_counts = {5, 26};
+    expect_throws<ConfigError>(
+        [&invalid] {
+            static_cast<void>(parse_simulation_config_json(
+                serialize_simulation_config_json(invalid)));
+        },
+        "explicit pipeline partition must cover every model layer");
+
+    auto cluster = load("analytical_parallel_colocation.json").cluster();
+    cluster.model =
+        frontier::config::load_model_config("moonshotai/Kimi-K3");
+    cluster.parallelism.pipeline_parallel_size = 24;
+    cluster.parallelism.pipeline_stage_layer_counts =
+        std::vector<std::uint64_t>(24, 4);
+    cluster.parallelism.pipeline_stage_layer_counts.back() = 1;
+    cluster.gpu_memory.capacity_bytes_per_gpu =
+        10'000'000'000'000'000ULL;
+    const auto profiles =
+        frontier::config::build_pipeline_stage_memory_profiles(cluster);
+    expect(profiles.at(0).layers ==
+                   frontier::config::PipelineStageLayerRange{0, 4} &&
+               profiles.at(1).layers ==
+                   frontier::config::PipelineStageLayerRange{4, 8} &&
+               profiles.at(22).layers ==
+                   frontier::config::PipelineStageLayerRange{88, 92} &&
+               profiles.at(23).layers ==
+                   frontier::config::PipelineStageLayerRange{92, 93},
+           "K3 PP24 must support 4, 22x4, 1 layer placement");
+    const auto groups = frontier::config::build_pipeline_stage_group_catalogue(
+        cluster, profiles);
+    expect(groups.timing_groups.size() == 3 &&
+               groups.timing_group_multiplicity ==
+                   std::vector<std::uint64_t>({1, 22, 1}) &&
+               groups.stage_to_timing_group.front() == 0 &&
+               groups.stage_to_timing_group.at(1) == 1 &&
+               groups.stage_to_timing_group.at(22) == 1 &&
+               groups.stage_to_timing_group.back() == 2,
+           "K3 explicit PP24 placement must collapse to three timing types");
+}
+
 } // namespace
 
 int main() {
@@ -1764,5 +1838,8 @@ int main() {
     failures += frontier::test::run(
         "PP stage profile PP1 compatibility and uneven ranges",
         test_pipeline_stage_profile_pp1_compatibility_and_uneven_ranges);
+    failures += frontier::test::run(
+        "explicit PP stage layer counts",
+        test_explicit_pipeline_stage_layer_counts);
     return failures == 0 ? 0 : 1;
 }

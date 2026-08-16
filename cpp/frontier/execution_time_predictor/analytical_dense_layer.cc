@@ -1,9 +1,9 @@
 // Dense, MLA, MFA, and KDA per-layer roofline models.
 //
-// Split out of analytical_roofline_execution_time_predictor.cc; the shared
-// declarations live in that translation unit's header.
+// Dense and attention roofline implementation. Public internal contracts live
+// in analytical_attention_model.h.
 
-#include "frontier/execution_time_predictor/analytical_roofline_execution_time_predictor.h"
+#include "frontier/execution_time_predictor/analytical_attention_model.h"
 
 #include <algorithm>
 #include <cmath>
@@ -472,7 +472,10 @@ struct DenseLayerContext {
     std::uint64_t prefill_past_context;
 };
 
-struct AttentionLayerWork {
+// MHA/GQA/MQA, MLA, and MFA all execute sequence-attention kernels and share
+// this normalized intermediate. KDA has a recurrent-state pipeline instead
+// and deliberately uses its own family-local work type below.
+struct SequenceAttentionWork {
     double pre_projection_ms = 0.0;
     double post_projection_ms = 0.0;
     double inter_norm_ms = 0.0;
@@ -481,12 +484,27 @@ struct AttentionLayerWork {
     KernelWork kv_cache_save{0.0, 0.0};
     KernelWork prefill_attention{0.0, 0.0};
     KernelWork decode_attention{0.0, 0.0};
-    KernelWork kda_projection{0.0, 0.0};
-    KernelWork kda_short_conv{0.0, 0.0};
-    KernelWork kda_recurrent_prefill{0.0, 0.0};
-    KernelWork kda_recurrent_decode{0.0, 0.0};
-    KernelWork kda_gate_norm{0.0, 0.0};
 };
+
+AttentionKind attention_kind(const DenseModel &model) {
+    const std::uint64_t selected = static_cast<std::uint64_t>(model.use_mla) +
+                                   static_cast<std::uint64_t>(model.use_mfa) +
+                                   static_cast<std::uint64_t>(model.use_kda);
+    if (selected > 1) {
+        throw AnalyticalModelError(
+            "MLA, MFA, and KDA attention modes are mutually exclusive");
+    }
+    if (model.use_kda) {
+        return AttentionKind::kKda;
+    }
+    if (model.use_mla) {
+        return AttentionKind::kMla;
+    }
+    if (model.use_mfa) {
+        return AttentionKind::kMfa;
+    }
+    return AttentionKind::kStandard;
+}
 
 KernelWork add_kernel_work(const KernelWork &lhs, const KernelWork &rhs) {
     return KernelWork{lhs.flops + rhs.flops, lhs.hbm_bytes + rhs.hbm_bytes};
@@ -528,9 +546,7 @@ void validate_dense_layer_inputs(const AnalyticalConfig &config,
         throw AnalyticalModelError(
             "dense batch total_tokens does not match request slices");
     }
-    if (model.use_mla && model.use_mfa) {
-        throw AnalyticalModelError("MLA and MFA are mutually exclusive");
-    }
+    const AttentionKind kind = attention_kind(model);
     if (model.decode_context_parallel_size == 0 ||
         model.tensor_parallel_size % model.decode_context_parallel_size != 0) {
         throw AnalyticalModelError(
@@ -541,8 +557,8 @@ void validate_dense_layer_inputs(const AnalyticalConfig &config,
     // A KDA layer still carries the replica-level DCP size in DenseModel, but
     // its recurrent state and projections remain sharded solely by TP and do
     // not issue DCP collectives.
-    if (model.decode_context_parallel_size > 1 && !model.use_mla &&
-        !model.use_kda) {
+    if (model.decode_context_parallel_size > 1 && kind != AttentionKind::kMla &&
+        kind != AttentionKind::kKda) {
         throw AnalyticalModelError(
             "decode context parallelism is currently supported only for "
             "MLA or TP-only KDA layers");
@@ -570,11 +586,10 @@ void validate_dense_layer_inputs(const AnalyticalConfig &config,
             "KDA requires positive heads, head dimension, short-conv kernel, "
             "and convolution state dimensions");
     }
-    if (model.use_kda &&
-        (model.kda_num_heads != model.kda_num_k_heads ||
-         model.kda_num_heads != model.kda_num_v_heads ||
-         model.kda_head_dim != model.kda_key_head_dim ||
-         model.kda_head_dim != model.kda_value_head_dim)) {
+    if (model.use_kda && (model.kda_num_heads != model.kda_num_k_heads ||
+                          model.kda_num_heads != model.kda_num_v_heads ||
+                          model.kda_head_dim != model.kda_key_head_dim ||
+                          model.kda_head_dim != model.kda_value_head_dim)) {
         throw AnalyticalModelError(
             "KDA currently supports only symmetric Q/K/V head counts and "
             "dimensions");
@@ -735,7 +750,7 @@ mla_dcp_busiest_new_token_count(const DenseBatch &batch,
     return *std::max_element(tokens_by_rank.begin(), tokens_by_rank.end());
 }
 
-AttentionLayerWork
+SequenceAttentionWork
 predict_mla_attention_work(const DenseLayerContext &context) {
     constexpr double kMlaRopeCacheElementBytes = 2.0;
     const DenseModel &model = context.model;
@@ -746,7 +761,7 @@ predict_mla_attention_work(const DenseLayerContext &context) {
     const std::uint64_t prefill_visible_tokens =
         context.prefill_tokens + context.prefill_past_context;
     const double tokens = static_cast<double>(context.batch.total_tokens);
-    AttentionLayerWork work{};
+    SequenceAttentionWork work{};
 
     if (model.q_lora_rank == 0) {
         work.pre_projection_ms = predict_attention_work_ms(
@@ -887,7 +902,7 @@ predict_mla_attention_work(const DenseLayerContext &context) {
     return work;
 }
 
-AttentionLayerWork
+SequenceAttentionWork
 predict_mfa_attention_work(const DenseLayerContext &context) {
     const DenseModel &model = context.model;
     const double tokens = static_cast<double>(context.batch.total_tokens);
@@ -896,7 +911,7 @@ predict_mfa_attention_work(const DenseLayerContext &context) {
     const double head_dim = static_cast<double>(model.head_dim);
     const std::uint64_t replicated_qkv_dim =
         model.share_q_dim + 2 * context.local_kv_heads * model.head_dim;
-    AttentionLayerWork work{};
+    SequenceAttentionWork work{};
     work.pre_projection_ms = predict_attention_work_ms(
         context,
         attention_gemm_work(context, context.batch.total_tokens,
@@ -939,7 +954,7 @@ predict_mfa_attention_work(const DenseLayerContext &context) {
     return work;
 }
 
-AttentionLayerWork
+SequenceAttentionWork
 predict_mha_attention_work(const DenseLayerContext &context) {
     const DenseModel &model = context.model;
     const double tokens = static_cast<double>(context.batch.total_tokens);
@@ -949,7 +964,7 @@ predict_mha_attention_work(const DenseLayerContext &context) {
     const std::uint64_t local_qkv_dim =
         (context.local_query_heads + 2 * context.local_kv_heads) *
         model.head_dim;
-    AttentionLayerWork work{};
+    SequenceAttentionWork work{};
     work.pre_projection_ms = predict_attention_work_ms(
         context,
         attention_gemm_work(context, context.batch.total_tokens,
@@ -988,8 +1003,14 @@ predict_mha_attention_work(const DenseLayerContext &context) {
 // output gate/norm.  It is not intended to reproduce a particular CUDA kernel
 // schedule; it provides a stable analytical contract that scales with batch
 // tokens, KDA dimensions, and the configured short-convolution width.
-AttentionLayerWork
-predict_kda_attention_work(const DenseLayerContext &context) {
+DenseLayerTimes predict_kda_attention_times(const DenseLayerContext &context) {
+    struct KdaAttentionWork {
+        KernelWork projection{0.0, 0.0};
+        KernelWork short_conv{0.0, 0.0};
+        KernelWork recurrent_prefill{0.0, 0.0};
+        KernelWork recurrent_decode{0.0, 0.0};
+        KernelWork gate_norm{0.0, 0.0};
+    };
     const DenseModel &model = context.model;
     if (!model.use_kda) {
         throw AnalyticalModelError("KDA work requested for a non-KDA layer");
@@ -1019,7 +1040,7 @@ predict_kda_attention_work(const DenseLayerContext &context) {
     const double key_dim = static_cast<double>(local_key_dim);
     const double value_dim = static_cast<double>(local_value_dim);
 
-    AttentionLayerWork work{};
+    KdaAttentionWork work{};
 
     // q/k use key heads while v and the output gate use value heads.  K3's
     // released dimensions happen to match; keeping them separate also makes
@@ -1046,7 +1067,7 @@ predict_kda_attention_work(const DenseLayerContext &context) {
     const KernelWork beta = gemm_work(tokens, model.hidden_size, local_v_heads,
                                       context.attention_weight_element_bytes,
                                       context.attention_element_bytes, 1);
-    work.kda_projection = add_kernel_work(
+    work.projection = add_kernel_work(
         add_kernel_work(add_kernel_work(qk, v), add_kernel_work(f_a, f_b)),
         add_kernel_work(full_rank_gate, beta));
 
@@ -1062,7 +1083,7 @@ predict_kda_attention_work(const DenseLayerContext &context) {
         conv_history_elements * context.kda_state_element_bytes +
             conv_output_elements * context.attention_element_bytes,
     };
-    work.kda_short_conv = short_conv;
+    work.short_conv = short_conv;
 
     // The delta-rule update performs a query/state product and a key/value
     // outer-product update for each head.  The fixed recurrent state is
@@ -1092,75 +1113,57 @@ predict_kda_attention_work(const DenseLayerContext &context) {
                  (qk_channels + v_channels) * context.attention_element_bytes);
             return KernelWork{flops, hbm};
         };
-    work.kda_recurrent_prefill = recurrent_work(context.batch.prefill_requests);
-    work.kda_recurrent_decode = recurrent_work(context.batch.decode_requests);
+    work.recurrent_prefill = recurrent_work(context.batch.prefill_requests);
+    work.recurrent_decode = recurrent_work(context.batch.decode_requests);
 
     // Fused RMSNorm + sigmoid gate: one read/write pass over the projected
     // output with a small constant amount of scalar work per element.
-    work.kda_gate_norm = streaming_work(
+    work.gate_norm = streaming_work(
         token_count * v_channels, token_count * v_channels,
         8.0 * token_count * v_channels, context.attention_element_bytes);
 
-    return work;
+    DenseLayerTimes times{};
+    // Keep the historical attention buckets populated while exposing the KDA
+    // sub-components for diagnostics and focused tests.
+    times.kda_projection_ms = predict_attention_work_ms(
+        context, work.projection,
+        gemm_efficiency_for(context, context.batch.total_tokens));
+    times.kda_short_conv_ms = predict_attention_work_ms(
+        context, work.short_conv, context.config.streaming);
+    times.kda_recurrent_ms =
+        predict_attention_work_ms(context, work.recurrent_prefill,
+                                  context.config.prefill_attention) +
+        predict_attention_work_ms(context, work.recurrent_decode,
+                                  context.config.decode_attention);
+    times.kda_gate_norm_ms = predict_attention_work_ms(
+        context, work.gate_norm, context.config.streaming);
+    times.attention_pre_projection_ms =
+        times.kda_projection_ms + times.kda_short_conv_ms;
+    times.attention_post_projection_ms = predict_attention_work_ms(
+        context,
+        attention_gemm_work(context, context.batch.total_tokens,
+                            dense_ceil_div(context.model.kda_num_v_heads,
+                                           context.model.tensor_parallel_size) *
+                                context.model.kda_value_head_dim,
+                            context.model.hidden_size),
+        gemm_efficiency_for(context, context.batch.total_tokens));
+    times.attention_inter_norm_ms = times.kda_gate_norm_ms;
+    times.prefill_attention_ms = predict_attention_work_ms(
+        context, work.recurrent_prefill, context.config.prefill_attention);
+    times.decode_attention_ms = predict_attention_work_ms(
+        context, work.recurrent_decode, context.config.decode_attention);
+    // KDA does not use RoPE or a sequence-growing KV cache.
+    times.rope_ms = 0.0;
+    times.kv_cache_save_ms = 0.0;
+    times.attention_norm_ms = 0.0;
+    times.attention_wq_projection_ms = 0.0;
+    return times;
 }
 
-AttentionLayerWork predict_attention_work(const DenseLayerContext &context) {
-    if (context.model.use_kda) {
-        return predict_kda_attention_work(context);
-    }
-    if (context.model.use_mla) {
-        return predict_mla_attention_work(context);
-    }
-    if (context.model.use_mfa) {
-        return predict_mfa_attention_work(context);
-    }
-    return predict_mha_attention_work(context);
-}
-
-void populate_attention_times(const DenseLayerContext &context,
-                              const AttentionLayerWork &work,
-                              DenseLayerTimes &times) {
-    if (context.model.use_kda) {
-        // Keep the historical attention buckets populated while exposing the
-        // KDA sub-components for diagnostics and focused tests.
-        times.kda_projection_ms = predict_attention_work_ms(
-            context, work.kda_projection,
-            gemm_efficiency_for(context, context.batch.total_tokens));
-        times.kda_short_conv_ms = predict_attention_work_ms(
-            context, work.kda_short_conv, context.config.streaming);
-        times.kda_recurrent_ms =
-            predict_attention_work_ms(context, work.kda_recurrent_prefill,
-                                      context.config.prefill_attention) +
-            predict_attention_work_ms(context, work.kda_recurrent_decode,
-                                      context.config.decode_attention);
-        times.kda_gate_norm_ms = predict_attention_work_ms(
-            context, work.kda_gate_norm, context.config.streaming);
-
-        times.attention_pre_projection_ms =
-            times.kda_projection_ms + times.kda_short_conv_ms;
-        times.attention_post_projection_ms = predict_attention_work_ms(
-            context,
-            attention_gemm_work(
-                context, context.batch.total_tokens,
-                dense_ceil_div(context.model.kda_num_v_heads,
-                               context.model.tensor_parallel_size) *
-                    context.model.kda_value_head_dim,
-                context.model.hidden_size),
-            gemm_efficiency_for(context, context.batch.total_tokens));
-        times.attention_inter_norm_ms = times.kda_gate_norm_ms;
-        times.prefill_attention_ms =
-            predict_attention_work_ms(context, work.kda_recurrent_prefill,
-                                      context.config.prefill_attention);
-        times.decode_attention_ms =
-            predict_attention_work_ms(context, work.kda_recurrent_decode,
-                                      context.config.decode_attention);
-        // KDA does not use RoPE or a sequence-growing KV cache.
-        times.rope_ms = 0.0;
-        times.kv_cache_save_ms = 0.0;
-        times.attention_norm_ms = 0.0;
-        times.attention_wq_projection_ms = 0.0;
-        return;
-    }
+DenseLayerTimes
+predict_sequence_attention_times(const DenseLayerContext &context,
+                                 const SequenceAttentionWork &work) {
+    DenseLayerTimes times{};
     const double tokens = static_cast<double>(context.batch.total_tokens);
     const double hidden = static_cast<double>(context.model.hidden_size);
     const double norm_factor = context.model.fused_add_norm ? 3.0 : 2.0;
@@ -1185,6 +1188,24 @@ void populate_attention_times(const DenseLayerContext &context,
         context, work.prefill_attention, context.config.prefill_attention);
     times.decode_attention_ms = predict_attention_work_ms(
         context, work.decode_attention, context.config.decode_attention);
+    return times;
+}
+
+DenseLayerTimes predict_attention_times(const DenseLayerContext &context) {
+    switch (attention_kind(context.model)) {
+    case AttentionKind::kStandard:
+        return predict_sequence_attention_times(
+            context, predict_mha_attention_work(context));
+    case AttentionKind::kMla:
+        return predict_sequence_attention_times(
+            context, predict_mla_attention_work(context));
+    case AttentionKind::kMfa:
+        return predict_sequence_attention_times(
+            context, predict_mfa_attention_work(context));
+    case AttentionKind::kKda:
+        return predict_kda_attention_times(context);
+    }
+    throw AnalyticalModelError("unknown analytical attention kind");
 }
 
 void populate_dense_mlp_and_norm_times(const DenseLayerContext &context,
@@ -1244,9 +1265,7 @@ DenseLayerTimes predict_dense_layer(const DeviceCeilings &device,
     validate_dense_layer_inputs(config, model, batch);
     const DenseLayerContext context =
         make_dense_layer_context(device, config, model, batch, precisions);
-    const AttentionLayerWork attention = predict_attention_work(context);
-    DenseLayerTimes times{};
-    populate_attention_times(context, attention, times);
+    DenseLayerTimes times = predict_attention_times(context);
     populate_dense_mlp_and_norm_times(context, times);
     return times;
 }
@@ -1256,9 +1275,11 @@ DenseLayerTimes predict_dense_layer(const DeviceCeilings &device,
                                     const DenseModel &model,
                                     const DenseBatch &batch,
                                     Precision precision) {
-    return predict_dense_layer(
-        device, config, model, batch,
-        DenseOperatorPrecisions{precision, precision, precision});
+    DenseOperatorPrecisions precisions{};
+    precisions.attention = precision;
+    precisions.dense = precision;
+    precisions.kv_cache = precision;
+    return predict_dense_layer(device, config, model, batch, precisions);
 }
 
 } // namespace frontier::execution_time_predictor::detail

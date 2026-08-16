@@ -530,7 +530,11 @@ The analytical predictor derives the model and layer count from the cluster's
 `model_name`; they are not repeated in `execution_model`. TP comes from the
 cluster's `parallelism` object. The current model validates TP 1/2/4/8 and
 allows uneven contiguous PP partitions (for example, 61 layers over PP4 become
-16/15/15/15). MoE assets may configure a dense prefix and shared experts;
+16/15/15/15). To override that near-even partition, set the optional
+`parallelism.pipeline_stage_layer_counts` array. It must contain exactly one
+positive layer count per PP stage and sum to the model layer count; for
+example, Kimi K3 over PP24 can use 23 four-layer stages followed by one
+one-layer stage. MoE assets may configure a dense prefix and shared experts;
 shared experts are replicated across EP lanes and sharded only by MoE TP. The
 last PP stage also models the vocabulary-parallel LM-head projection. Supported
 attention families include dense-KV MHA/GQA/MQA, Step3Text MFA's shared-Q path,

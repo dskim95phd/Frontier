@@ -102,7 +102,7 @@ PipelineMemoryDiagnostics make_pipeline_memory_diagnostics(
         stage_diagnostic.stage_id = StageId{stage};
         const config::PipelineStageLayerRange layers =
             config::pipeline_stage_layer_range(
-            runtime.model.num_layers, pipeline_size, stage);
+                runtime.model.num_layers, runtime.parallelism, stage);
         stage_diagnostic.layer_begin = layers.begin;
         stage_diagnostic.layer_end = layers.end;
         stage_diagnostic.layer_count = layers.size();

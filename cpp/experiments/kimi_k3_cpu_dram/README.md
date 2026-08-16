@@ -31,6 +31,26 @@ The runner enables wall-clock progress output every 60 seconds by default;
 pass `--wall-progress-interval-s 0` to disable it or another positive value to
 change the interval.
 
+### Performance-run safety contract
+
+Kimi K3 CPU-offload performance runs must disable full runtime validation and
+the GPU KV occupancy stream.  In the P24/D32 exact workload, runtime validation
+made a 180-second probe about 26 times slower because it repeatedly scanned a
+CPU KV cache containing hundreds of thousands of materialized blocks.  The
+Python runner therefore always emits the following explicit simulator options,
+prints their state at startup, and records them in both `sweep_plan.json` and
+each case's `run.json`:
+
+```text
+--runtime-validation false --gpu-kv-occupancy false
+```
+
+Enabling either diagnostic option through the runner additionally requires
+`--allow-expensive-diagnostics`, so an accidental flag cannot silently turn a
+benchmark into a validation run.  When invoking `frontier_sim` directly for a
+performance comparison, include both explicit `false` options; do not rely on
+the simulator CLI defaults.
+
 ```powershell
 # Inspect the eight commands without running them.
 python .\cpp\experiments\kimi_k3_cpu_dram\run_dense_cpu_capacity_rate_sweep.py `

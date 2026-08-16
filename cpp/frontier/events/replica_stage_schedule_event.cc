@@ -54,8 +54,7 @@ void handle_event(const ReplicaStageSchedulePayload &payload, SimTime time,
     }
     const config::PipelineStageLayerRange stage_layers =
         config::pipeline_stage_layer_range(
-            runtime.model.num_layers,
-            runtime.parallelism.pipeline_parallel_size,
+            runtime.model.num_layers, runtime.parallelism,
             payload.stage_id.index());
     bool stage_has_moe = false;
     if (runtime.model.is_moe()) {
@@ -81,8 +80,8 @@ void handle_event(const ReplicaStageSchedulePayload &payload, SimTime time,
              ++stage_index) {
             const config::PipelineStageLayerRange candidate_layers =
                 config::pipeline_stage_layer_range(
-                    runtime.model.num_layers,
-                    runtime.parallelism.pipeline_parallel_size, stage_index);
+                    runtime.model.num_layers, runtime.parallelism,
+                    stage_index);
             bool candidate_has_moe = false;
             if (runtime.model.is_moe()) {
                 for (std::uint64_t model_layer = candidate_layers.begin;

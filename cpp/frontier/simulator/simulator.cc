@@ -166,8 +166,7 @@ gpu_kv_physical_block_layout(const config::ClusterRuntimeConfig &runtime,
              stage < runtime.parallelism.pipeline_parallel_size; ++stage) {
             const config::PipelineStageLayerRange layers =
                 config::pipeline_stage_layer_range(
-                    runtime.model.num_layers,
-                    runtime.parallelism.pipeline_parallel_size, stage);
+                    runtime.model.num_layers, runtime.parallelism, stage);
             for (std::uint64_t rank = 0; rank < dcp; ++rank) {
                 result.max_rank_bytes = std::max(
                     result.max_rank_bytes,

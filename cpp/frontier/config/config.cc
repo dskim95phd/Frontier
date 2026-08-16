@@ -170,8 +170,8 @@ std::uint64_t stage_model_weight_bytes_per_gpu(
         throw ConfigError("pipeline stage id is out of range");
     }
     long double total = 0.0L;
-    const PipelineStageLayerRange layers = pipeline_stage_layer_range(
-        model.num_layers, parallelism.pipeline_parallel_size, stage);
+    const PipelineStageLayerRange layers =
+        pipeline_stage_layer_range(model.num_layers, parallelism, stage);
     if (stage == 0) {
         add_weight_bytes(
             total,
@@ -271,7 +271,8 @@ StageTimingSignature build_pipeline_stage_timing_signature(
     const ModelConfig &model, const ParallelismConfig &parallelism,
     std::uint64_t stage) {
     const auto pp = parallelism.pipeline_parallel_size;
-    const auto layers = pipeline_stage_layer_range(model.num_layers, pp, stage);
+    const auto layers =
+        pipeline_stage_layer_range(model.num_layers, parallelism, stage);
     StageTimingSignature signature{};
     signature.owns_input_embedding = stage == 0;
     signature.owns_final_norm = stage + 1 == pp;
@@ -468,8 +469,8 @@ build_pipeline_stage_memory_profiles(const ClusterRuntimeConfig &cluster) {
     for (std::uint64_t stage = 0; stage < pp; ++stage) {
         PipelineStageMemoryProfile profile{};
         profile.stage_id = StageId{stage};
-        profile.layers =
-            pipeline_stage_layer_range(cluster.model.num_layers, pp, stage);
+        profile.layers = pipeline_stage_layer_range(
+            cluster.model.num_layers, cluster.parallelism, stage);
         profile.resident_weight_bytes =
             cluster.execution_model.type == ExecutionModelType::kAnalytical
                 ? stage_model_weight_bytes_per_gpu(

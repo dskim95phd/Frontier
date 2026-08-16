@@ -114,6 +114,8 @@ add_library(
   frontier/execution_time_predictor/analytical_expert_parallel.cc
   frontier/execution_time_predictor/analytical_moe_layer.cc
   frontier/execution_time_predictor/analytical_moe_routing.cc
+  frontier/execution_time_predictor/analytical_moe_stage.cc
+  frontier/execution_time_predictor/analytical_stage_diagnostics.cc
   frontier/kv_cache_transfer/analytical_transfer.cc
   frontier/cpu_kv_cache_transfer/analytical_transfer.cc
   frontier/metrics/output_contract.cc

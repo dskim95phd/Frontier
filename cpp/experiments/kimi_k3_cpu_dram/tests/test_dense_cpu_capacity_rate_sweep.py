@@ -95,6 +95,35 @@ def test_simulator_command_enables_one_minute_wall_progress_by_default(
     assert command[option_index + 1] == "60"
 
 
+def test_simulator_command_uses_performance_safe_diagnostic_options_by_default(
+    tmp_path: Path,
+) -> None:
+    args = runner.build_parser().parse_args([])
+    case = runner.build_matrix(
+        {1000: ("0.50", "0.50")},
+        step="0.01",
+        workload_root=tmp_path / "workloads",
+        output_root=tmp_path / "runs",
+        seed=7,
+    )[0]
+
+    command = runner._simulator_command(args, case)
+
+    assert command[command.index("--runtime-validation") + 1] == "false"
+    assert command[command.index("--gpu-kv-occupancy") + 1] == "false"
+
+
+def test_expensive_diagnostics_require_explicit_acknowledgement() -> None:
+    args = runner.build_parser().parse_args(["--runtime-validation"])
+    with pytest.raises(SystemExit, match="--allow-expensive-diagnostics"):
+        runner._require_expensive_diagnostics_opt_in(args)
+
+    acknowledged = runner.build_parser().parse_args(
+        ["--runtime-validation", "--allow-expensive-diagnostics"]
+    )
+    runner._require_expensive_diagnostics_opt_in(acknowledged)
+
+
 def test_simulator_command_can_disable_wall_progress(tmp_path: Path) -> None:
     args = runner.build_parser().parse_args(["--wall-progress-interval-s", "0"])
     case = runner.build_matrix(
@@ -226,6 +255,7 @@ def test_k3_config_uses_static_per_gpu_capacity_and_off_baseline() -> None:
         "tensor_parallel_size": 1,
         "decode_context_parallel_size": 1,
         "pipeline_parallel_size": 24,
+        "pipeline_stage_layer_counts": [4] * 23 + [1],
         "data_parallel_size": 1,
         "moe_tensor_parallel_size": 1,
         "moe_expert_parallel_size": 1,

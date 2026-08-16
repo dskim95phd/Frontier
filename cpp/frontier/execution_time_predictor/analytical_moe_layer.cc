@@ -1,9 +1,9 @@
 // MoE expert-lane roofline model and collective communication costs.
 //
-// Split out of analytical_roofline_execution_time_predictor.cc; the shared
-// declarations live in that translation unit's header.
+// MoE operator roofline implementation. Public internal contracts live in
+// analytical_moe_model.h.
 
-#include "frontier/execution_time_predictor/analytical_roofline_execution_time_predictor.h"
+#include "frontier/execution_time_predictor/analytical_moe_model.h"
 
 #include <cmath>
 #include <cstddef>
@@ -28,6 +28,15 @@ double predict_ms(const DeviceCeilings &device, Precision precision,
     return predict_roofline(device, precision, work, efficiency,
                             launch_latency_us)
         .predicted_time_ms;
+}
+
+MoEOperatorPrecisions uniform_operator_precisions(Precision precision) {
+    MoEOperatorPrecisions result{};
+    result.expert = precision;
+    result.router = precision;
+    result.dense = precision;
+    result.shared_expert = precision;
+    return result;
 }
 
 std::uint64_t payload_bytes(std::uint64_t tokens, std::uint64_t hidden_size,
@@ -148,9 +157,9 @@ double predict_expert_work_ms(const MoELayerContext &context,
                       efficiency, context.config.kernel_launch_latency_us);
 }
 
-double predict_latent_moe_projection_work_ms(
-    const MoELayerContext &context, const KernelWork &work,
-    const Efficiency &efficiency) {
+double predict_latent_moe_projection_work_ms(const MoELayerContext &context,
+                                             const KernelWork &work,
+                                             const Efficiency &efficiency) {
     return predict_ms(context.device,
                       context.latent_moe_projection_weight_precision, work,
                       efficiency, context.config.kernel_launch_latency_us);
@@ -206,17 +215,16 @@ void add_expert_gemm_work(ExpertGemmWork &work, const MoELayerContext &context,
     const double weight_bytes =
         count_as_routed ? context.expert_weight_element_bytes
                         : context.shared_expert_weight_element_bytes;
-    const double activation_bytes =
-        count_as_routed ? context.expert_element_bytes
-                        : context.shared_expert_element_bytes;
+    const double activation_bytes = count_as_routed
+                                        ? context.expert_element_bytes
+                                        : context.shared_expert_element_bytes;
     add_kernel_work(up, gemm_work(tokens, expert_input_size,
                                   context.local_intermediate, weight_bytes,
                                   activation_bytes,
                                   context.model.gated_mlp ? 2 : 1));
-    add_kernel_work(down,
-                    gemm_work(tokens, context.local_intermediate,
-                              expert_input_size, weight_bytes,
-                              activation_bytes, 1));
+    add_kernel_work(down, gemm_work(tokens, context.local_intermediate,
+                                    expert_input_size, weight_bytes,
+                                    activation_bytes, 1));
 }
 
 ExpertGemmWork
@@ -304,10 +312,10 @@ predict_moe_layer(const DeviceCeilings &device, const AnalyticalConfig &config,
         KernelWork combined_down = expert_work.routed_down;
         add_kernel_work(combined_up, expert_work.shared_up);
         add_kernel_work(combined_down, expert_work.shared_down);
-        result.grouped_up_projection_ms = predict_expert_work_ms(
-            context, combined_up, context.config.moe);
-        result.grouped_down_projection_ms = predict_expert_work_ms(
-            context, combined_down, context.config.moe);
+        result.grouped_up_projection_ms =
+            predict_expert_work_ms(context, combined_up, context.config.moe);
+        result.grouped_down_projection_ms =
+            predict_expert_work_ms(context, combined_down, context.config.moe);
     } else {
         result.grouped_up_projection_ms =
             predict_expert_work_ms(context, expert_work.routed_up,
@@ -363,9 +371,9 @@ predict_moe_layer(const DeviceCeilings &device, const AnalyticalConfig &config,
                   std::uint64_t router_topk,
                   const std::vector<std::uint64_t> &local_expert_tokens,
                   Precision precision) {
-    return predict_moe_layer(
-        device, config, model, input_tokens, router_topk, local_expert_tokens,
-        MoEOperatorPrecisions{precision, precision, precision, precision});
+    return predict_moe_layer(device, config, model, input_tokens, router_topk,
+                             local_expert_tokens,
+                             uniform_operator_precisions(precision));
 }
 
 MoELanePrediction predict_moe_lanes(const DeviceCeilings &device,
@@ -399,9 +407,8 @@ MoELanePrediction
 predict_moe_lanes(const DeviceCeilings &device, const AnalyticalConfig &config,
                   const MoEModel &model, const RoutingAllocation &routing,
                   std::uint64_t router_topk, Precision precision) {
-    return predict_moe_lanes(
-        device, config, model, routing, router_topk,
-        MoEOperatorPrecisions{precision, precision, precision, precision});
+    return predict_moe_lanes(device, config, model, routing, router_topk,
+                             uniform_operator_precisions(precision));
 }
 
 double predict_output_projection_ms(

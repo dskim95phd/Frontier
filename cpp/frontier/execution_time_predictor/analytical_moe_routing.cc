@@ -1,9 +1,9 @@
 // Deterministic MoE token routing and its reproducible RNG.
 //
-// Split out of analytical_roofline_execution_time_predictor.cc; the shared
-// declarations live in that translation unit's header.
+// MoE routing implementation. Public internal contracts live in
+// analytical_moe_model.h.
 
-#include "frontier/execution_time_predictor/analytical_roofline_execution_time_predictor.h"
+#include "frontier/execution_time_predictor/analytical_moe_model.h"
 
 #include <algorithm>
 #include <cmath>
@@ -85,10 +85,11 @@ distribution_weights(std::uint64_t experts,
     return weights;
 }
 
-void accumulate_uniform_topk_counts(
-    std::uint64_t input_tokens, std::uint64_t router_topk,
-    std::uint64_t total_experts, RoutingRng &generator,
-    std::vector<std::uint64_t> &counts) {
+void accumulate_uniform_topk_counts(std::uint64_t input_tokens,
+                                    std::uint64_t router_topk,
+                                    std::uint64_t total_experts,
+                                    RoutingRng &generator,
+                                    std::vector<std::uint64_t> &counts) {
     // A router selects a set of k distinct experts for each input token. Keep
     // only the aggregate expert loads needed by the timing model, but obtain
     // them from a real without-replacement top-k draw. The partial
@@ -200,8 +201,8 @@ route_tokens(std::uint64_t input_tokens, std::uint64_t router_topk,
         }
     } else if (config.mode == config::MoeRoutingMode::kUniformRandom) {
         RoutingRng generator(config.seed + layer_id);
-        accumulate_uniform_topk_counts(input_tokens, router_topk,
-                                       total_experts, generator, counts);
+        accumulate_uniform_topk_counts(input_tokens, router_topk, total_experts,
+                                       generator, counts);
     } else {
         counts = discretize_expert_weights(
             routed_tokens,

@@ -524,6 +524,11 @@ struct ParallelismConfig {
     // exclusively. This is an opt-in topology contract; the default keeps
     // legacy parallelism behavior unchanged.
     bool pipeline_exclusive = false;
+    // Optional exact number of transformer layers assigned to each physical
+    // pipeline stage. An empty vector keeps the legacy near-even contiguous
+    // partition. When set, it must contain pipeline_parallel_size positive
+    // entries whose sum equals the model layer count.
+    std::vector<std::uint64_t> pipeline_stage_layer_counts;
 
     [[nodiscard]] std::uint64_t attention_parallel_size() const noexcept {
         return tensor_parallel_size * data_parallel_size;
@@ -539,15 +544,50 @@ struct ParallelismConfig {
                         lhs.moe_tensor_parallel_size,
                         lhs.moe_expert_parallel_size,
                         lhs.decode_context_parallel_size,
-                        lhs.pipeline_exclusive) ==
+                        lhs.pipeline_exclusive,
+                        lhs.pipeline_stage_layer_counts) ==
                std::tie(rhs.num_replicas, rhs.tensor_parallel_size,
                         rhs.pipeline_parallel_size, rhs.data_parallel_size,
                         rhs.moe_tensor_parallel_size,
                         rhs.moe_expert_parallel_size,
                         rhs.decode_context_parallel_size,
-                        rhs.pipeline_exclusive);
+                        rhs.pipeline_exclusive,
+                        rhs.pipeline_stage_layer_counts);
     }
 };
+
+[[nodiscard]] inline PipelineStageLayerRange pipeline_stage_layer_range(
+    std::uint64_t num_layers, const ParallelismConfig &parallelism,
+    std::uint64_t stage) {
+    if (parallelism.pipeline_stage_layer_counts.empty()) {
+        return pipeline_stage_layer_range(
+            num_layers, parallelism.pipeline_parallel_size, stage);
+    }
+    if (parallelism.pipeline_parallel_size == 0 ||
+        parallelism.pipeline_stage_layer_counts.size() !=
+            parallelism.pipeline_parallel_size ||
+        stage >= parallelism.pipeline_parallel_size) {
+        throw std::invalid_argument("invalid explicit pipeline layer partition");
+    }
+    std::uint64_t assigned_layers = 0;
+    for (const std::uint64_t count :
+         parallelism.pipeline_stage_layer_counts) {
+        if (count == 0 || count > num_layers - assigned_layers) {
+            throw std::invalid_argument(
+                "invalid explicit pipeline layer partition");
+        }
+        assigned_layers += count;
+    }
+    if (assigned_layers != num_layers) {
+        throw std::invalid_argument("invalid explicit pipeline layer partition");
+    }
+    std::uint64_t begin = 0;
+    for (std::uint64_t index = 0; index < stage; ++index) {
+        begin += parallelism.pipeline_stage_layer_counts[index];
+    }
+    return PipelineStageLayerRange{
+        begin, begin + parallelism.pipeline_stage_layer_counts[stage]};
+}
 
 struct ClusterSchedulerConfig {
     ClusterSchedulerType type = ClusterSchedulerType::kRoundRobin;

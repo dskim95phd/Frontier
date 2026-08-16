@@ -153,6 +153,45 @@ std::uint64_t require_uint64(const Json &object, std::string_view field,
     }
 }
 
+std::vector<std::uint64_t> require_uint64_array(
+    const Json &object, std::string_view field, std::string_view context) {
+    const Json &value = object.at(field);
+    if (!value.is_array()) {
+        throw ConfigError(std::string{context} + "." + std::string{field} +
+                          " must be an array");
+    }
+    std::vector<std::uint64_t> result;
+    result.reserve(value.size());
+    for (std::size_t index = 0; index < value.size(); ++index) {
+        const Json &element = value[index];
+        const std::string element_context =
+            std::string{context} + "." + std::string{field} + "[" +
+            std::to_string(index) + "]";
+        if (!element.is_number_integer() || element.is_number_float()) {
+            throw ConfigError(element_context +
+                              " must be a nonnegative integer");
+        }
+        try {
+            if (element.is_number_unsigned()) {
+                result.push_back(element.get<std::uint64_t>());
+            } else {
+                const std::int64_t parsed = element.get<std::int64_t>();
+                if (parsed < 0) {
+                    throw ConfigError(element_context +
+                                      " must be nonnegative");
+                }
+                result.push_back(static_cast<std::uint64_t>(parsed));
+            }
+        } catch (const ConfigError &) {
+            throw;
+        } catch (const Json::exception &) {
+            throw ConfigError(element_context +
+                              " is outside the supported integer range");
+        }
+    }
+    return result;
+}
+
 double require_finite_number(const Json &object, std::string_view field,
                              std::string_view context) {
     const Json &value = object.at(field);
@@ -609,7 +648,8 @@ ParallelismConfig parse_parallelism(const Json &root,
                      "moe_tensor_parallel_size",
                      "moe_expert_parallel_size",
                  },
-                 {"decode_context_parallel_size", "pipeline_exclusive"},
+                 {"decode_context_parallel_size", "pipeline_exclusive",
+                  "pipeline_stage_layer_counts"},
                  "config.parallelism");
     ParallelismConfig parsed = [&]() {
         ParallelismConfig value{};
@@ -629,6 +669,11 @@ ParallelismConfig parse_parallelism(const Json &root,
         }
         value.pipeline_parallel_size = require_uint64(
             parallelism, "pipeline_parallel_size", "config.parallelism");
+        if (parallelism.contains("pipeline_stage_layer_counts")) {
+            value.pipeline_stage_layer_counts = require_uint64_array(
+                parallelism, "pipeline_stage_layer_counts",
+                "config.parallelism");
+        }
         value.data_parallel_size = require_uint64(
             parallelism, "data_parallel_size", "config.parallelism");
         value.moe_tensor_parallel_size = require_uint64(
@@ -685,6 +730,36 @@ ParallelismConfig parse_parallelism(const Json &root,
     if (parsed.pipeline_parallel_size > model.num_layers) {
         throw ConfigError("config.parallelism.pipeline_parallel_size must not "
                           "exceed model num_layers");
+    }
+    if (parallelism.contains("pipeline_stage_layer_counts")) {
+        if (parsed.pipeline_stage_layer_counts.size() !=
+            parsed.pipeline_parallel_size) {
+            throw ConfigError(
+                "config.parallelism.pipeline_stage_layer_counts must contain "
+                "exactly pipeline_parallel_size entries");
+        }
+        std::uint64_t assigned_layers = 0;
+        for (std::size_t stage = 0;
+             stage < parsed.pipeline_stage_layer_counts.size(); ++stage) {
+            const std::uint64_t count =
+                parsed.pipeline_stage_layer_counts[stage];
+            if (count == 0) {
+                throw ConfigError(
+                    "config.parallelism.pipeline_stage_layer_counts[" +
+                    std::to_string(stage) + "] must be positive");
+            }
+            if (count > model.num_layers - assigned_layers) {
+                throw ConfigError(
+                    "config.parallelism.pipeline_stage_layer_counts must sum "
+                    "to model num_layers");
+            }
+            assigned_layers += count;
+        }
+        if (assigned_layers != model.num_layers) {
+            throw ConfigError(
+                "config.parallelism.pipeline_stage_layer_counts must sum to "
+                "model num_layers");
+        }
     }
     if (model.hidden_size % parsed.tensor_parallel_size != 0 ||
         model.num_query_heads % parsed.tensor_parallel_size != 0) {
