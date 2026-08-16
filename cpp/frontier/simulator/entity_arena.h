@@ -2,12 +2,14 @@
 
 #include <cstddef>
 #include <map>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <unordered_map>
 #include <vector>
 
 #include "frontier/config/config.h"
+#include "frontier/core/id_generator.h"
 #include "frontier/entities/batch.h"
 #include "frontier/entities/batch_stage.h"
 #include "frontier/entities/kv_cache_transfer_info.h"
@@ -104,10 +106,12 @@ class EntityArena {
 
     std::vector<entities::Request> requests_;
     std::unordered_map<BatchId::ValueType, BatchRuntimeState> batches_;
-    BatchId::ValueType next_batch_id_ = 0;
+    CheckedIdGenerator<BatchId> batch_ids_{
+        0, std::numeric_limits<BatchId::ValueType>::max() - 1};
     std::map<ClusterType, std::vector<scheduler::ReplicaTarget>>
         request_targets_;
     std::vector<entities::KVCacheTransferInfo> kv_cache_transfers_;
+    CheckedIdGenerator<TransferId> transfer_ids_;
     std::vector<TransferId> request_transfer_ids_;
     std::vector<bool> completion_recorded_;
     std::vector<RequestId> completion_order_;

@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "frontier/attention/mla.h"
+#include "frontier/core/checked_math.h"
 
 namespace frontier::execution_time_predictor::detail {
 
@@ -88,11 +89,8 @@ void validate_efficiency(const Efficiency &efficiency) {
 
 std::uint64_t dense_ceil_div(std::uint64_t numerator,
                              std::uint64_t denominator) {
-    if (denominator == 0) {
-        throw AnalyticalModelError("division denominator must be positive");
-    }
-    return numerator / denominator +
-           static_cast<std::uint64_t>(numerator % denominator != 0);
+    return checked_math::ceil_div<AnalyticalModelError>(
+        numerator, denominator, "division denominator must be positive");
 }
 
 double predict_dense_kernel_ms(const DeviceCeilings &device,
@@ -116,58 +114,16 @@ double DenseLayerTimes::total_ms() const noexcept {
 }
 
 Precision precision_from_string(std::string_view precision) {
-    if (precision == "fp32") {
-        return Precision::kFp32;
-    }
-    if (precision == "fp16") {
-        return Precision::kFp16;
-    }
-    if (precision == "bf16") {
-        return Precision::kBf16;
-    }
-    if (precision == "fp8") {
-        return Precision::kFp8;
-    }
-    if (precision == "mxfp8") {
-        return Precision::kMxFp8;
-    }
-    if (precision == "int8") {
-        return Precision::kInt8;
-    }
-    if (precision == "fp4") {
-        return Precision::kFp4;
-    }
-    if (precision == "mxfp4") {
-        return Precision::kMxFp4;
-    }
-    if (precision == "int4") {
-        return Precision::kInt4;
+    const std::optional<Precision> parsed = parse_precision(precision);
+    if (parsed.has_value()) {
+        return *parsed;
     }
     throw AnalyticalModelError("unsupported analytical precision: " +
                                std::string{precision});
 }
 
 double bytes_per_element(Precision precision) noexcept {
-    switch (precision) {
-    case Precision::kFp32:
-        return 4.0;
-    case Precision::kFp16:
-    case Precision::kBf16:
-        return 2.0;
-    case Precision::kFp8:
-    case Precision::kInt8:
-        return 1.0;
-    case Precision::kMxFp8:
-        // One byte per value plus one E8M0 scale byte per 32-value block.
-        return 1.0 + 1.0 / 32.0;
-    case Precision::kFp4:
-    case Precision::kInt4:
-        return 0.5;
-    case Precision::kMxFp4:
-        // Two packed values per byte plus one E8M0 scale byte per 32 values.
-        return 0.5 + 1.0 / 32.0;
-    }
-    return 0.0;
+    return storage_bytes_per_element(precision);
 }
 
 double peak_tflops(const DeviceCeilings &device, Precision precision) {
@@ -326,35 +282,15 @@ KernelWork streaming_work(double elements_read, double elements_written,
 
 std::uint64_t prefill_attention_token_pairs(
     const std::vector<AttentionRequestSlice> &requests) {
-    const auto checked_add = [](std::uint64_t lhs, std::uint64_t rhs) {
-        if (lhs > std::numeric_limits<std::uint64_t>::max() - rhs) {
-            throw AnalyticalModelError(
-                "PREFILL attention token-pair count overflows uint64");
-        }
-        return lhs + rhs;
-    };
-    const auto checked_mul = [](std::uint64_t lhs, std::uint64_t rhs) {
-        if (lhs != 0 && rhs > std::numeric_limits<std::uint64_t>::max() / lhs) {
-            throw AnalyticalModelError(
-                "PREFILL attention token-pair count overflows uint64");
-        }
-        return lhs * rhs;
-    };
-
     std::uint64_t total = 0;
     for (const AttentionRequestSlice &request : requests) {
-        // q * (q + 1) / 2 is integral for every integer q.  Divide one
-        // factor before multiplying so this remains exact and cannot
-        // overflow merely while forming q + 1 for an odd uint64 maximum.
-        const std::uint64_t triangular =
-            request.query_tokens % 2 == 0
-                ? checked_mul(request.query_tokens / 2,
-                              request.query_tokens + 1)
-                : checked_mul(request.query_tokens,
-                              request.query_tokens / 2 + 1);
-        const std::uint64_t cached_pairs =
-            checked_mul(request.query_tokens, request.past_context);
-        total = checked_add(total, checked_add(cached_pairs, triangular));
+        const std::string_view message =
+            "PREFILL attention token-pair count overflows uint64";
+        total = checked_math::add<AnalyticalModelError>(
+            total,
+            checked_math::prefill_attention_token_pairs<AnalyticalModelError>(
+                request.query_tokens, request.past_context, message),
+            message);
     }
     return total;
 }

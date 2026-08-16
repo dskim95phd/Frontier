@@ -94,10 +94,10 @@ class MetricsStore {
         std::size_t pending_restores, std::size_t staged_restores);
     void record_cpu_kv_cache_offload(
         const entities::CpuKVCacheOffloadInfo &operation,
-        ClusterType cluster_type, std::uint64_t bytes_per_block);
+        ClusterType cluster_type);
     void record_cpu_kv_cache_restore(
         const entities::CpuKVCacheRestoreInfo &operation,
-        ClusterType cluster_type, std::uint64_t bytes_per_block);
+        ClusterType cluster_type);
     void record_gpu_kv_cache_occupancy(
         SimTime time, const scheduler::BaseReplicaScheduler &scheduler,
         std::uint64_t max_rank_bytes_per_block,

@@ -12,16 +12,14 @@
 #include <vector>
 
 #include "frontier/cc_backend/analytical_model.h"
+#include "frontier/core/checked_math.h"
 
 namespace frontier::execution_time_predictor::detail {
 namespace {
 
 std::uint64_t ceil_div(std::uint64_t numerator, std::uint64_t denominator) {
-    if (denominator == 0) {
-        throw AnalyticalModelError("MoE TP size must be positive");
-    }
-    return numerator / denominator +
-           static_cast<std::uint64_t>(numerator % denominator != 0);
+    return checked_math::ceil_div<AnalyticalModelError>(
+        numerator, denominator, "MoE TP size must be positive");
 }
 
 double predict_ms(const DeviceCeilings &device, Precision precision,

@@ -1,6 +1,5 @@
 #include "frontier/core/event_queue.h"
 
-#include <limits>
 #include <stdexcept>
 #include <utility>
 
@@ -11,12 +10,7 @@ EventSequence EventQueue::push_payload(SimTime time, EventPayload payload) {
         throw std::invalid_argument(
             "event time must be finite and nonnegative");
     }
-    if (next_sequence_ == std::numeric_limits<std::uint64_t>::max()) {
-        throw std::overflow_error("event sequence exhausted");
-    }
-
-    const EventSequence sequence{next_sequence_};
-    ++next_sequence_;
+    const EventSequence sequence = sequences_.next("event sequence exhausted");
     events_.push(Event{
         time,
         sequence,

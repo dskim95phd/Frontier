@@ -4,6 +4,7 @@
 #include <cmath>
 #include <limits>
 
+#include "frontier/core/checked_math.h"
 #include "frontier/entities/request.h"
 
 namespace frontier::kv_cache {
@@ -593,11 +594,8 @@ void ReplicaKVCacheManager::release_commitment(RequestId request_id) {
 
 std::uint64_t ReplicaKVCacheManager::ceil_div(std::uint64_t numerator,
                                               std::uint64_t denominator) {
-    if (denominator == 0) {
-        throw ReplicaKVCacheError("KV division denominator is zero");
-    }
-    return numerator / denominator +
-           static_cast<std::uint64_t>(numerator % denominator != 0);
+    return checked_math::ceil_div<ReplicaKVCacheError>(
+        numerator, denominator, "KV division denominator is zero");
 }
 
 std::uint64_t ReplicaKVCacheManager::full_sequence_blocks(

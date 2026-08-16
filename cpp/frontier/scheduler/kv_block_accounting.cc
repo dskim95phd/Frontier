@@ -4,6 +4,8 @@
 #include <limits>
 #include <string>
 
+#include "frontier/core/checked_math.h"
+
 namespace frontier::scheduler {
 
 KvBlockAccounting::KvBlockAccounting(const config::SchedulerConfig &config)
@@ -25,11 +27,8 @@ KvBlockAccounting::KvBlockAccounting(const config::SchedulerConfig &config)
 
 std::uint64_t KvBlockAccounting::ceil_div(std::uint64_t numerator,
                                           std::uint64_t denominator) {
-    if (denominator == 0) {
-        throw KvBlockAccountingError("KV division denominator is zero");
-    }
-    return numerator / denominator +
-           static_cast<std::uint64_t>(numerator % denominator != 0);
+    return checked_math::ceil_div<KvBlockAccountingError>(
+        numerator, denominator, "KV division denominator is zero");
 }
 
 std::uint64_t KvBlockAccounting::additional_blocks_required(

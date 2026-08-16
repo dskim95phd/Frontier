@@ -1,4 +1,5 @@
 #include "frontier/core/event_queue.h"
+#include "frontier/core/id_generator.h"
 #include "tests/test_support.h"
 
 #include <cmath>
@@ -10,6 +11,7 @@ namespace {
 
 using frontier::BatchId;
 using frontier::ClusterBatchEndPayload;
+using frontier::CheckedIdGenerator;
 using frontier::ClusterType;
 using frontier::DataParallelId;
 using frontier::Event;
@@ -46,6 +48,29 @@ void test_default_ids_and_times_are_invalid() {
             }());
         },
         "invalid sentinel time must not enter the event queue");
+}
+
+void test_strong_id_range_and_generator_exhaustion() {
+    expect_throws<std::out_of_range>(
+        [] { static_cast<void>(RequestId{std::uint64_t{1} << 63}); },
+        "strong IDs must reject unsigned values outside int64");
+    expect_throws<std::out_of_range>(
+        [] { static_cast<void>(RequestId{-2}); },
+        "strong IDs must reserve negative values other than -1");
+
+    CheckedIdGenerator<RequestId> ids{0, 1};
+    expect(ids.next("test ID space exhausted") == RequestId{0} &&
+               ids.next("test ID space exhausted") == RequestId{1},
+           "checked ID generator must issue its inclusive range");
+    expect_throws<std::overflow_error>(
+        [&ids] { static_cast<void>(ids.next("test ID space exhausted")); },
+        "checked ID generator must fail before signed wraparound");
+    expect(ids.was_issued(RequestId{0}) && ids.was_issued(RequestId{1}) &&
+               !ids.was_issued(RequestId{2}),
+           "checked ID generator must distinguish issued IDs without a set");
+    CheckedIdGenerator<EventSequence> one_based_ids{1, 2};
+    expect(!one_based_ids.was_issued(EventSequence{0}),
+           "issued-range checks must honor a nonzero first ID");
 }
 
 void test_earlier_time_precedes_later_time() {
@@ -195,6 +220,9 @@ int main() {
     int failures = 0;
     failures += frontier::test::run("default IDs and times are invalid",
                                     test_default_ids_and_times_are_invalid);
+    failures += frontier::test::run(
+        "strong ID range and generator exhaustion",
+        test_strong_id_range_and_generator_exhaustion);
     failures += frontier::test::run("earlier time precedes later time",
                                     test_earlier_time_precedes_later_time);
     failures +=

@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "frontier/core/event.h"
+#include "frontier/core/id_generator.h"
 
 namespace frontier {
 
@@ -33,7 +34,7 @@ class EventQueue {
     };
 
     std::priority_queue<Event, std::vector<Event>, LaterEvent> events_;
-    std::uint64_t next_sequence_ = 1;
+    CheckedIdGenerator<EventSequence> sequences_{1};
 };
 
 } // namespace frontier

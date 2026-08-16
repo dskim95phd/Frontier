@@ -91,7 +91,7 @@ BatchId EntityArena::create_batch(const scheduler::ScheduleResult &schedule,
                                   ClusterType cluster_type,
                                   std::uint64_t pipeline_parallel_size,
                                   config::ModelKind model_kind) {
-    const BatchId batch_id{next_batch_id_++};
+    const BatchId batch_id = batch_ids_.next("batch ID space exhausted");
     const Generation generation{
         static_cast<Generation::ValueType>(batch_id.value() + 1)};
     BatchRuntimeState state;
@@ -125,7 +125,7 @@ BatchId EntityArena::create_moe_idle_batch(MoESyncGroupId sync_group_id,
         throw std::invalid_argument(
             "idle MoE batch requires valid synchronization ownership");
     }
-    const BatchId batch_id{next_batch_id_++};
+    const BatchId batch_id = batch_ids_.next("batch ID space exhausted");
     BatchRuntimeState state;
     state.batch = std::make_unique<entities::Batch>(
         batch_id, IterationId{sync_group_id.value()},
@@ -237,8 +237,8 @@ TransferId EntityArena::create_kv_cache_transfer(
     if (request_transfer_ids_.at(request_index).valid()) {
         throw std::logic_error("request already owns a KV transfer");
     }
-    const TransferId transfer_id{
-        static_cast<TransferId::ValueType>(kv_cache_transfers_.size())};
+    const TransferId transfer_id =
+        transfer_ids_.next("KV transfer ID space exhausted");
     kv_cache_transfers_.emplace_back(
         transfer_id, request_id, source_batch_id, source_target.replica_id,
         source_target.dp_id, size_bytes, predicted_time_ms,

@@ -5,6 +5,7 @@
 #include <utility>
 
 #include "frontier/attention/mla.h"
+#include "frontier/core/checked_math.h"
 
 namespace frontier::kv_cache_transfer {
 
@@ -87,11 +88,8 @@ std::uint64_t count_stage_kda_layers(
 
 std::uint64_t checked_ceil_div(std::uint64_t numerator,
                                std::uint64_t denominator) {
-    if (denominator == 0) {
-        throw TransferModelError("division by zero in stage memory layout");
-    }
-    return numerator / denominator +
-           static_cast<std::uint64_t>(numerator % denominator != 0);
+    return checked_math::ceil_div<TransferModelError>(
+        numerator, denominator, "division by zero in stage memory layout");
 }
 
 } // namespace

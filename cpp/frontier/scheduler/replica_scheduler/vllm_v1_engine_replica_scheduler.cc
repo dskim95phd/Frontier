@@ -647,7 +647,8 @@ void VllmV1Scheduler::suspend_for_cpu_restore(
         const auto timing = cpu_transfer_engine_->schedule(
             cpu_kv_cache_transfer::CpuTransferDirection::kH2D, transfer_bytes,
             time);
-        const CpuKvTransferId transfer_id{next_cpu_transfer_id_++};
+        const CpuKvTransferId transfer_id =
+            cpu_transfer_ids_.next("CPU KV transfer ID space exhausted");
         const Generation generation{value.runtime_epoch()};
         cpu_restore_operations_.emplace(
             transfer_id,
@@ -703,6 +704,34 @@ VllmV1Scheduler::cpu_kv_cache_restore_operations() const {
         result.push_back(operation);
     }
     return result;
+}
+
+std::optional<entities::CpuKVCacheOffloadInfo>
+VllmV1Scheduler::take_completed_cpu_kv_cache_offload(
+    CpuKvTransferId transfer_id) {
+    const auto operation = cpu_offload_operations_.find(transfer_id);
+    if (operation == cpu_offload_operations_.end() ||
+        operation->second.state() !=
+            entities::CpuKVCacheTransferState::kCompleted) {
+        return std::nullopt;
+    }
+    entities::CpuKVCacheOffloadInfo completed = std::move(operation->second);
+    cpu_offload_operations_.erase(operation);
+    return completed;
+}
+
+std::optional<entities::CpuKVCacheRestoreInfo>
+VllmV1Scheduler::take_completed_cpu_kv_cache_restore(
+    CpuKvTransferId transfer_id) {
+    const auto operation = cpu_restore_operations_.find(transfer_id);
+    if (operation == cpu_restore_operations_.end() ||
+        operation->second.state() !=
+            entities::CpuKVCacheTransferState::kCompleted) {
+        return std::nullopt;
+    }
+    entities::CpuKVCacheRestoreInfo completed = std::move(operation->second);
+    cpu_restore_operations_.erase(operation);
+    return completed;
 }
 
 void VllmV1Scheduler::on_cpu_kv_cache_restore_start(CpuKvTransferId transfer_id,
@@ -974,7 +1003,8 @@ ScheduleResult VllmV1Scheduler::schedule_requests(SimTime time) {
 
     ScheduleResult result = [&]() {
         ScheduleResult value{};
-        value.iteration_id = IterationId{next_iteration_id_++};
+        value.iteration_id =
+            iteration_ids_.next("scheduler iteration ID space exhausted");
         value.simulation_time = time;
         value.token_budget_before = config_.max_tokens_in_batch;
         value.token_budget_after = config_.max_tokens_in_batch;
@@ -1529,7 +1559,8 @@ bool VllmV1Scheduler::prepare_cpu_kv_cache_offload(RequestId request_id,
         const auto timing = cpu_transfer_engine_->schedule(
             cpu_kv_cache_transfer::CpuTransferDirection::kD2H, transfer_bytes,
             time);
-        const CpuKvTransferId transfer_id{next_cpu_transfer_id_++};
+        const CpuKvTransferId transfer_id =
+            cpu_transfer_ids_.next("CPU KV transfer ID space exhausted");
         cpu_offload_operations_.emplace(
             transfer_id,
             entities::CpuKVCacheOffloadInfo{

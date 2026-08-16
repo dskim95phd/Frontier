@@ -10,6 +10,7 @@
 
 #include "frontier/config/config.h"
 #include "frontier/core/event.h"
+#include "frontier/core/id_generator.h"
 #include "frontier/core/ids.h"
 #include "frontier/cpu_kv_cache_transfer/analytical_transfer.h"
 #include "frontier/entities/batch.h"
@@ -173,6 +174,12 @@ class VllmV1Scheduler final : public BaseReplicaScheduler {
     cpu_kv_cache_offload_operations() const override;
     [[nodiscard]] std::vector<entities::CpuKVCacheRestoreInfo>
     cpu_kv_cache_restore_operations() const override;
+    [[nodiscard]] std::optional<entities::CpuKVCacheOffloadInfo>
+    take_completed_cpu_kv_cache_offload(
+        CpuKvTransferId transfer_id) override;
+    [[nodiscard]] std::optional<entities::CpuKVCacheRestoreInfo>
+    take_completed_cpu_kv_cache_restore(
+        CpuKvTransferId transfer_id) override;
     [[nodiscard]] bool cancel_cpu_kv_cache_restore(RequestId request_id,
                                                    SimTime time);
 
@@ -225,7 +232,7 @@ class VllmV1Scheduler final : public BaseReplicaScheduler {
     // queue preserves restore-completion FIFO order.
     std::deque<RequestId> restored_ready_;
     std::vector<RequestId> running_;
-    std::uint64_t next_iteration_id_ = 0;
+    CheckedIdGenerator<IterationId> iteration_ids_;
     std::unordered_map<RequestId, std::uint64_t, StrongIdHash<RequestId>>
         pending_terminal_release_iterations_;
     std::unordered_set<RequestId, StrongIdHash<RequestId>>
@@ -242,7 +249,7 @@ class VllmV1Scheduler final : public BaseReplicaScheduler {
     std::unique_ptr<kv_cache::CpuKVCacheManager> cpu_kv_cache_;
     std::unique_ptr<cpu_kv_cache_transfer::AnalyticalCpuKVCacheTransferEngine>
         cpu_transfer_engine_;
-    CpuKvTransferId::ValueType next_cpu_transfer_id_ = 0;
+    CheckedIdGenerator<CpuKvTransferId> cpu_transfer_ids_;
     std::unordered_map<CpuKvTransferId, entities::CpuKVCacheRestoreInfo,
                        StrongIdHash<CpuKvTransferId>>
         cpu_restore_operations_;

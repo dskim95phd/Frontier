@@ -3,6 +3,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
+#include <stdexcept>
 #include <type_traits>
 
 namespace frontier {
@@ -15,8 +17,7 @@ template <typename Tag> class StrongId {
     constexpr StrongId() noexcept = default;
     template <typename Integer,
               typename = std::enable_if_t<std::is_integral_v<Integer>>>
-    explicit constexpr StrongId(Integer value) noexcept
-        : value_(static_cast<ValueType>(value)) {}
+    explicit constexpr StrongId(Integer value) : value_(checked_value(value)) {}
 
     [[nodiscard]] constexpr ValueType value() const noexcept { return value_; }
     [[nodiscard]] constexpr bool valid() const noexcept { return value_ >= 0; }
@@ -44,6 +45,22 @@ template <typename Tag> class StrongId {
     }
 
   private:
+    template <typename Integer>
+    [[nodiscard]] static constexpr ValueType checked_value(Integer value) {
+        if constexpr (std::is_signed_v<Integer>) {
+            if (value < static_cast<Integer>(kInvalidValue) ||
+                (sizeof(Integer) > sizeof(ValueType) &&
+                 value > static_cast<Integer>(
+                             std::numeric_limits<ValueType>::max()))) {
+                throw std::out_of_range("strong ID is outside int64 range");
+            }
+        } else if (value > static_cast<std::make_unsigned_t<ValueType>>(
+                               std::numeric_limits<ValueType>::max())) {
+            throw std::out_of_range("strong ID is outside int64 range");
+        }
+        return static_cast<ValueType>(value);
+    }
+
     ValueType value_ = kInvalidValue;
 };
 

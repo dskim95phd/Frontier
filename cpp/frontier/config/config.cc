@@ -7,40 +7,26 @@
 #include <utility>
 
 #include "frontier/kv_cache_transfer/analytical_transfer.h"
+#include "frontier/core/checked_math.h"
+#include "frontier/core/precision.h"
 
 namespace frontier::config {
 
 namespace {
 
 double storage_bytes_per_element(std::string_view precision) {
-    if (precision == "fp32") {
-        return 4.0;
-    }
-    if (precision == "fp16" || precision == "bf16") {
-        return 2.0;
-    }
-    if (precision == "fp8" || precision == "int8") {
-        return 1.0;
-    }
-    if (precision == "mxfp8") {
-        return 1.0 + 1.0 / 32.0;
-    }
-    if (precision == "fp4" || precision == "int4") {
-        return 0.5;
-    }
-    if (precision == "mxfp4") {
-        return 0.5 + 1.0 / 32.0;
+    const std::optional<Precision> parsed = parse_precision(precision);
+    if (parsed.has_value()) {
+        return frontier::storage_bytes_per_element(*parsed);
     }
     throw ConfigError("unsupported storage precision: " +
                       std::string{precision});
 }
 
 std::uint64_t ceil_div(std::uint64_t numerator, std::uint64_t denominator) {
-    if (denominator == 0) {
-        throw ConfigError("GPU memory parallelism divisor must be positive");
-    }
-    return numerator / denominator +
-           static_cast<std::uint64_t>(numerator % denominator != 0);
+    return checked_math::ceil_div<ConfigError>(
+        numerator, denominator,
+        "GPU memory parallelism divisor must be positive");
 }
 
 void add_weight_bytes(long double &total, std::uint64_t rows,

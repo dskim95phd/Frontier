@@ -16,6 +16,7 @@
 #include <variant>
 
 #include "frontier/events/event_dispatcher.h"
+#include "frontier/core/precision.h"
 #include "frontier/execution_time_predictor/execution_time_predictor_factory.h"
 #include "frontier/kv_cache_transfer/analytical_transfer.h"
 #include "frontier/scheduler/global_scheduler/global_scheduler.h"
@@ -89,23 +90,9 @@ void validate_inputs(
 }
 
 double precision_dtype_size_bytes(std::string_view precision) {
-    if (precision == "fp32") {
-        return 4.0;
-    }
-    if (precision == "fp16" || precision == "bf16") {
-        return 2.0;
-    }
-    if (precision == "fp8" || precision == "int8") {
-        return 1.0;
-    }
-    if (precision == "mxfp8") {
-        return 1.0 + 1.0 / 32.0;
-    }
-    if (precision == "fp4" || precision == "int4") {
-        return 0.5;
-    }
-    if (precision == "mxfp4") {
-        return 0.5 + 1.0 / 32.0;
+    const std::optional<Precision> parsed = parse_precision(precision);
+    if (parsed.has_value()) {
+        return storage_bytes_per_element(*parsed);
     }
     throw SimulationError("unsupported precision: " + std::string{precision});
 }
@@ -471,10 +458,10 @@ BatchId Simulator::create_batch(const scheduler::ScheduleResult &schedule,
         entities_.create_batch(schedule, target, cluster_type,
                                parallelism(cluster_type).pipeline_parallel_size,
                                runtime_config(cluster_type).model.kind);
-    const std::uint64_t global_id =
+    const BatchGlobalId global_id =
         cluster(cluster_type)
             .next_batch_global_id(target.replica_id, target.dp_id);
-    batch(batch_id).set_global_id(BatchGlobalId{global_id});
+    batch(batch_id).set_global_id(global_id);
     return batch_id;
 }
 
@@ -716,14 +703,6 @@ void Simulator::finalize() {
                     scheduler::ReplicaTarget{replica_id, dp_id}, cluster_type,
                     replica_scheduler.pending_cpu_restore_count(),
                     replica_scheduler.staged_cpu_restore_count());
-                for (const auto &operation : offloads) {
-                    metrics_.record_cpu_kv_cache_offload(
-                        operation, cluster_type, cpu_config->bytes_per_block);
-                }
-                for (const auto &operation : restores) {
-                    metrics_.record_cpu_kv_cache_restore(
-                        operation, cluster_type, cpu_config->bytes_per_block);
-                }
             }
             for (std::uint64_t stage = 0;
                  stage < replica_scheduler.pipeline_parallel_size(); ++stage) {
@@ -849,8 +828,8 @@ metrics::SimulationOutput Simulator::run_until(SimTime end_time) {
     // A bounded experiment intentionally leaves future session turns and
     // possibly in-flight requests outside the observation horizon.  Export
     // only requests that reached canonical completion, while snapshotting
-    // (without quiescence validation) cache state and completed transfers at
-    // the boundary.
+    // (without quiescence validation) cache state at the boundary. Completed
+    // CPU transfers are streamed into MetricsStore by their end events.
     metrics_.set_observation_window_seconds(end_time.seconds());
     record_bounded_run_cache_diagnostics(end_time);
     metrics_.collect_completed_requests(config_, entities_);
@@ -895,16 +874,6 @@ void Simulator::record_bounded_run_cache_diagnostics(SimTime observation_time) {
                 scheduler::ReplicaTarget{replica_id, dp_id}, cluster_type,
                 replica_scheduler.pending_cpu_restore_count(),
                 replica_scheduler.staged_cpu_restore_count());
-            for (const auto &operation :
-                 replica_scheduler.cpu_kv_cache_offload_operations()) {
-                metrics_.record_cpu_kv_cache_offload(
-                    operation, cluster_type, cpu_config->bytes_per_block);
-            }
-            for (const auto &operation :
-                 replica_scheduler.cpu_kv_cache_restore_operations()) {
-                metrics_.record_cpu_kv_cache_restore(
-                    operation, cluster_type, cpu_config->bytes_per_block);
-            }
         }
     }
 }

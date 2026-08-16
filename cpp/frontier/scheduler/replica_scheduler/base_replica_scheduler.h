@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <deque>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string_view>
 #include <unordered_map>
@@ -235,6 +236,19 @@ class BaseReplicaScheduler {
     [[nodiscard]] virtual std::vector<entities::CpuKVCacheRestoreInfo>
     cpu_kv_cache_restore_operations() const {
         return {};
+    }
+    // Simulator runs stream completed operations into MetricsStore and then
+    // erase them.  The historical vector accessors remain available for
+    // diagnostics and direct scheduler tests that do not have a metrics sink.
+    [[nodiscard]] virtual std::optional<entities::CpuKVCacheOffloadInfo>
+    take_completed_cpu_kv_cache_offload(CpuKvTransferId transfer_id) {
+        static_cast<void>(transfer_id);
+        return std::nullopt;
+    }
+    [[nodiscard]] virtual std::optional<entities::CpuKVCacheRestoreInfo>
+    take_completed_cpu_kv_cache_restore(CpuKvTransferId transfer_id) {
+        static_cast<void>(transfer_id);
+        return std::nullopt;
     }
 
     [[nodiscard]] ReplicaId replica_id() const noexcept {

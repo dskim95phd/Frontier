@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "frontier/core/event.h"
+#include "frontier/core/id_generator.h"
 #include "frontier/core/ids.h"
 #include "frontier/entities/cluster.h"
 #include "frontier/kv_cache_transfer/base_kv_cache_transfer_predictor.h"
@@ -69,7 +70,7 @@ class BaseClusterScheduler {
     [[nodiscard]] const BaseReplicaScheduler &
     get_replica_scheduler(ReplicaId replica_id, DataParallelId dp_id) const;
 
-    [[nodiscard]] std::uint64_t next_batch_global_id(ReplicaId replica_id,
+    [[nodiscard]] BatchGlobalId next_batch_global_id(ReplicaId replica_id,
                                                      DataParallelId dp_id);
     [[nodiscard]] kv_cache_transfer::TransferPrediction
     predict_kv_cache_transfer(std::uint64_t num_tokens) const;
@@ -378,7 +379,8 @@ class BaseClusterScheduler {
     std::map<MoEStageKey, MoEStageState> moe_stage_states_;
     std::map<MoEGroupKey, MoEGroupState> moe_group_states_;
     std::map<MoEDomainKey, MoEDomainReservation> moe_domain_reservations_;
-    std::map<BatchCounterKey, std::uint64_t> batch_counters_;
+    std::map<BatchCounterKey, CheckedIdGenerator<BatchGlobalId>>
+        batch_counters_;
     std::uint64_t next_moe_sync_generation_ = 1;
 };
 

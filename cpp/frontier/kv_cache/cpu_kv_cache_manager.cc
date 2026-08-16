@@ -4,6 +4,8 @@
 #include <limits>
 #include <tuple>
 
+#include "frontier/core/checked_math.h"
+
 namespace frontier::kv_cache {
 
 CpuKVCacheManager::CpuKVCacheManager(
@@ -80,12 +82,7 @@ CpuBlockId CpuKVCacheManager::allocate_block_id() {
         recycled_block_ids_.pop_back();
         return id;
     }
-    if (next_block_id_ >
-        static_cast<std::uint64_t>(
-            std::numeric_limits<CpuBlockId::ValueType>::max())) {
-        throw CpuKVCacheError("CPU block ID space exhausted");
-    }
-    return CpuBlockId{next_block_id_++};
+    return block_ids_.next("CPU block ID space exhausted");
 }
 
 void CpuKVCacheManager::free_block(CpuBlockId block_id) {
@@ -193,23 +190,11 @@ void CpuKVCacheManager::release_kda_snapshot_slot(SessionId session_id) {
         kda_snapshot_reserved_blocks_ == 0) {
         return;
     }
-    bool owns_slot = false;
-    for (auto &[id, reservation] : reservations_) {
-        static_cast<void>(id);
-        if (reservation.session_id == session_id &&
-            reservation.state != CpuOffloadReservationState::kPending &&
-            reservation.snapshot_slot_reserved) {
-            owns_slot = true;
-            // Terminal records retain only compact idempotency metadata.  Mark
-            // the slot as released so explicit discard cannot release it a
-            // second time later.
-            reservation.snapshot_slot_reserved = false;
-            break;
-        }
-    }
-    if (!owns_slot) {
+    const auto owner = kda_snapshot_slot_owners_.find(session_id);
+    if (owner == kda_snapshot_slot_owners_.end()) {
         return;
     }
+    kda_snapshot_slot_owners_.erase(owner);
     if (kda_snapshot_reserved_blocks_ < kda_snapshot_charge_blocks_) {
         throw CpuKVCacheError("KDA snapshot reservation accounting underflow");
     }
@@ -415,11 +400,12 @@ void CpuKVCacheManager::maybe_reap_discarded_session(SessionId session_id) {
     for (const CpuBlockId block_id : discarded_blocks) {
         free_block(block_id);
     }
+    std::vector<CpuOffloadReservationId> terminal_reservations{
+        session.active_reservations.begin(), session.active_reservations.end()};
     for (const CpuOffloadReservationId reservation_id :
-         session.active_reservations) {
-        OffloadReservation &reservation = reservations_.at(reservation_id);
-        reservation.state = CpuOffloadReservationState::kAborted;
-        std::vector<CpuBlockId>{}.swap(reservation.block_ids);
+         terminal_reservations) {
+        reservations_.at(reservation_id).state =
+            CpuOffloadReservationState::kAborted;
     }
     const bool materialized = !session.blocks.empty();
     stats_.evicted_blocks += discarded_resident;
@@ -431,6 +417,10 @@ void CpuKVCacheManager::maybe_reap_discarded_session(SessionId session_id) {
     // release that slot before dropping the session metadata.
     release_kda_snapshot_slot(session_id);
     sessions_.erase(position);
+    for (const CpuOffloadReservationId reservation_id :
+         terminal_reservations) {
+        reservations_.erase(reservation_id);
+    }
 }
 
 void CpuKVCacheManager::record_occupancy_peaks() noexcept {
@@ -487,14 +477,11 @@ CpuOffloadReservationResult CpuKVCacheManager::reserve_offload(
         }
         return result;
     }
-    auto checked_add = [](std::uint64_t left, std::uint64_t right) {
-        if (right > std::numeric_limits<std::uint64_t>::max() - left) {
-            throw CpuKVCacheError("CPU offload capacity requirement overflows");
-        }
-        return left + right;
-    };
-    const std::uint64_t required_capacity = checked_add(
-        missing, snapshot_slot_needed ? kda_snapshot_charge_blocks_ : 0);
+    const std::uint64_t required_capacity =
+        checked_math::add<CpuKVCacheError>(
+            missing,
+            snapshot_slot_needed ? kda_snapshot_charge_blocks_ : 0,
+            "CPU offload capacity requirement overflows");
 
     if (pressure_policy_ ==
         config::CpuKVCacheCapacityPressurePolicy::kSkipOffload) {
@@ -572,7 +559,8 @@ CpuOffloadReservationResult CpuKVCacheManager::reserve_offload(
 
     SessionState &session = sessions_[session_id];
     session.latest_submitted_generation = generation;
-    const CpuOffloadReservationId reservation_id{next_reservation_id_++};
+    const CpuOffloadReservationId reservation_id =
+        reservation_ids_.next("CPU offload reservation ID space exhausted");
     OffloadReservation reservation{};
     reservation.id = reservation_id;
     reservation.session_id = session_id;
@@ -611,6 +599,10 @@ CpuOffloadReservationResult CpuKVCacheManager::reserve_offload(
     if (!reservations_.emplace(reservation_id, std::move(reservation)).second) {
         throw CpuKVCacheError("duplicate CPU offload reservation");
     }
+    if (snapshot_slot_needed &&
+        !kda_snapshot_slot_owners_.emplace(session_id, reservation_id).second) {
+        throw CpuKVCacheError("duplicate CPU KDA snapshot slot owner");
+    }
     result.reservation_id = reservation_id;
     result.admitted_frontier_blocks = base + admitted;
     result.reserved_blocks = admitted;
@@ -631,6 +623,10 @@ bool CpuKVCacheManager::commit_offload(CpuOffloadReservationId reservation_id,
                                        SimTime completed_at) {
     auto position = reservations_.find(reservation_id);
     if (position == reservations_.end()) {
+        if (reservation_ids_.was_issued(reservation_id)) {
+            ++stats_.stale_generation_completions;
+            return false;
+        }
         throw CpuKVCacheError("unknown CPU offload reservation");
     }
     OffloadReservation &reservation = position->second;
@@ -694,20 +690,13 @@ bool CpuKVCacheManager::commit_offload(CpuOffloadReservationId reservation_id,
                     "CPU KDA snapshot commit lost its reserved slot");
             }
             kda_snapshot_reserved_blocks_ -= kda_snapshot_charge_blocks_;
-            bool released_slot_owner = false;
-            for (auto &[candidate_id, candidate] : reservations_) {
-                static_cast<void>(candidate_id);
-                if (candidate.session_id == reservation.session_id &&
-                    candidate.snapshot_slot_reserved) {
-                    candidate.snapshot_slot_reserved = false;
-                    released_slot_owner = true;
-                    break;
-                }
-            }
-            if (!released_slot_owner) {
+            const auto slot_owner =
+                kda_snapshot_slot_owners_.find(reservation.session_id);
+            if (slot_owner == kda_snapshot_slot_owners_.end()) {
                 throw CpuKVCacheError(
                     "CPU KDA snapshot reserved slot has no owner");
             }
+            kda_snapshot_slot_owners_.erase(slot_owner);
             if (kda_snapshot_occupied_blocks_ >
                 std::numeric_limits<std::uint64_t>::max() -
                     kda_snapshot_charge_blocks_) {
@@ -742,12 +731,10 @@ bool CpuKVCacheManager::commit_offload(CpuOffloadReservationId reservation_id,
                                    committed_snapshot->second);
     }
     reservation.state = CpuOffloadReservationState::kCommitted;
-    // Terminal reservations remain as a compact idempotency record, but do
-    // not retain the potentially large block-id allocation.
-    std::vector<CpuBlockId>{}.swap(reservation.block_ids);
     advance_committed_frontier(session);
     ++stats_.committed_offloads;
     record_occupancy_peaks();
+    reservations_.erase(position);
     validate_local_invariants();
     return true;
 }
@@ -755,6 +742,9 @@ bool CpuKVCacheManager::commit_offload(CpuOffloadReservationId reservation_id,
 bool CpuKVCacheManager::abort_offload(CpuOffloadReservationId reservation_id) {
     auto position = reservations_.find(reservation_id);
     if (position == reservations_.end()) {
+        if (reservation_ids_.was_issued(reservation_id)) {
+            return false;
+        }
         throw CpuKVCacheError("unknown CPU offload reservation");
     }
     OffloadReservation &target = position->second;
@@ -767,13 +757,14 @@ bool CpuKVCacheManager::abort_offload(CpuOffloadReservationId reservation_id) {
     }
     SessionState &session = session_position->second;
     const std::uint64_t gap = target.begin_block;
+    std::vector<CpuOffloadReservationId> aborted_reservations;
     for (auto &[id, reservation] : reservations_) {
         if (reservation.session_id == target.session_id &&
             reservation.state == CpuOffloadReservationState::kPending &&
             reservation.begin_block >= gap) {
             reservation.state = CpuOffloadReservationState::kAborted;
-            std::vector<CpuBlockId>{}.swap(reservation.block_ids);
             session.active_reservations.erase(id);
+            aborted_reservations.push_back(id);
             ++stats_.aborted_offloads;
         }
     }
@@ -802,6 +793,9 @@ bool CpuKVCacheManager::abort_offload(CpuOffloadReservationId reservation_id) {
     }
     release_kda_snapshot_slot(session_id);
     erase_session_if_empty(session_id);
+    for (const CpuOffloadReservationId id : aborted_reservations) {
+        reservations_.erase(id);
+    }
     validate_local_invariants();
     return true;
 }
@@ -882,7 +876,7 @@ CpuRestoreLeaseId CpuKVCacheManager::pin_restore(SessionId session_id,
             "CPU restore range has no matching KDA snapshot frontier");
     }
     RestoreLease lease{};
-    lease.id = CpuRestoreLeaseId{next_lease_id_++};
+    lease.id = lease_ids_.next("CPU restore lease ID space exhausted");
     lease.session_id = session_id;
     lease.started_at = started_at;
     lease.includes_kda_snapshot = include_snapshot;
@@ -940,6 +934,9 @@ bool CpuKVCacheManager::release_restore(CpuRestoreLeaseId lease_id, bool used,
                                         SimTime released_at) {
     auto position = leases_.find(lease_id);
     if (position == leases_.end()) {
+        if (lease_ids_.was_issued(lease_id)) {
+            return false;
+        }
         throw CpuKVCacheError("unknown CPU restore lease");
     }
     RestoreLease &lease = position->second;
@@ -988,10 +985,9 @@ bool CpuKVCacheManager::release_restore(CpuRestoreLeaseId lease_id, bool used,
         session.last_access_time = released_at;
     }
     lease.released = true;
-    // Keep only the terminal lease metadata needed for duplicate-release
-    // idempotency; release the vector's backing allocation as well.
-    std::vector<CpuBlockId>{}.swap(lease.block_ids);
-    maybe_reap_discarded_session(lease.session_id);
+    const SessionId session_id = lease.session_id;
+    leases_.erase(position);
+    maybe_reap_discarded_session(session_id);
     validate_local_invariants();
     return true;
 }
@@ -1209,11 +1205,7 @@ void CpuKVCacheManager::validate_invariants() const {
     }
     for (const auto &[id, reservation] : reservations_) {
         if (reservation.state != CpuOffloadReservationState::kPending) {
-            if (!reservation.block_ids.empty()) {
-                throw CpuKVCacheError(
-                    "terminal CPU reservation retained block metadata");
-            }
-            continue;
+            throw CpuKVCacheError("terminal CPU reservation was retained");
         }
         const auto session = sessions_.find(reservation.session_id);
         if (session == sessions_.end() ||
@@ -1274,6 +1266,20 @@ void CpuKVCacheManager::validate_invariants() const {
         if (reservation.state == CpuOffloadReservationState::kPending &&
             reservation.snapshot_slot_reserved) {
             ++observed_snapshot_slots;
+        }
+    }
+    if (kda_snapshot_slot_owners_.size() != observed_snapshot_slots) {
+        throw CpuKVCacheError("CPU KDA snapshot slot ownership diverged");
+    }
+    for (const auto &[session_id, reservation_id] :
+         kda_snapshot_slot_owners_) {
+        const auto reservation = reservations_.find(reservation_id);
+        if (reservation == reservations_.end() ||
+            reservation->second.session_id != session_id ||
+            reservation->second.state !=
+                CpuOffloadReservationState::kPending ||
+            !reservation->second.snapshot_slot_reserved) {
+            throw CpuKVCacheError("CPU KDA snapshot slot owner is invalid");
         }
     }
     // Multiple in-flight replacements share a single first-object slot; only

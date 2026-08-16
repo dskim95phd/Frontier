@@ -11,6 +11,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include "frontier/core/precision.h"
+
 namespace frontier::config {
 namespace {
 
@@ -811,30 +813,13 @@ std::vector<double> require_finite_number_array(const Json &object,
 }
 
 bool is_supported_analytical_precision(std::string_view precision) noexcept {
-    return precision == "fp32" || precision == "fp16" || precision == "bf16" ||
-           precision == "fp8" || precision == "int8" || precision == "fp4" ||
-           precision == "int4" || precision == "mxfp8" ||
-           precision == "mxfp4";
+    return parse_precision(precision).has_value();
 }
 
 double analytical_precision_size_bytes(std::string_view precision) {
-    if (precision == "fp32") {
-        return 4.0;
-    }
-    if (precision == "fp16" || precision == "bf16") {
-        return 2.0;
-    }
-    if (precision == "fp8" || precision == "int8") {
-        return 1.0;
-    }
-    if (precision == "mxfp8") {
-        return 1.0 + 1.0 / 32.0;
-    }
-    if (precision == "fp4" || precision == "int4") {
-        return 0.5;
-    }
-    if (precision == "mxfp4") {
-        return 0.5 + 1.0 / 32.0;
+    const std::optional<Precision> parsed = parse_precision(precision);
+    if (parsed.has_value()) {
+        return storage_bytes_per_element(*parsed);
     }
     throw ConfigError("unsupported analytical precision: " +
                       std::string{precision});

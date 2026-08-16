@@ -7,6 +7,7 @@
 #include <utility>
 #include <variant>
 
+#include "frontier/core/checked_math.h"
 #include "frontier/entities/batch.h"
 #include "frontier/entities/batch_stage.h"
 #include "frontier/entities/cpu_kv_cache_transfer_info.h"
@@ -45,45 +46,26 @@ void accumulate_execution_time(entities::ExecutionTime &total,
         value.synchronization_unattributed_wait_ms;
     total.synchronization_attribution_overlap_ms +=
         value.synchronization_attribution_overlap_ms;
-    if (total.prefill_attention_token_pairs >
-        std::numeric_limits<std::uint64_t>::max() -
-            value.prefill_attention_token_pairs) {
-        throw std::overflow_error(
+    total.prefill_attention_token_pairs =
+        checked_math::add<std::overflow_error>(
+            total.prefill_attention_token_pairs,
+            value.prefill_attention_token_pairs,
             "aggregate PREFILL attention token-pair count overflows uint64");
-    }
-    total.prefill_attention_token_pairs += value.prefill_attention_token_pairs;
 }
 
 std::uint64_t
 prefill_attention_token_pairs_for_request(std::uint64_t query_tokens,
-                                          std::uint64_t past_context) {
-    const auto checked_mul = [](std::uint64_t lhs, std::uint64_t rhs) {
-        if (lhs != 0 && rhs > std::numeric_limits<std::uint64_t>::max() / lhs) {
-            throw std::overflow_error(
-                "PREFILL attention token-pair count overflows uint64");
-        }
-        return lhs * rhs;
-    };
-    const auto checked_add = [](std::uint64_t lhs, std::uint64_t rhs) {
-        if (lhs > std::numeric_limits<std::uint64_t>::max() - rhs) {
-            throw std::overflow_error(
-                "PREFILL attention token-pair count overflows uint64");
-        }
-        return lhs + rhs;
-    };
-    const std::uint64_t triangular =
-        query_tokens % 2 == 0 ? checked_mul(query_tokens / 2, query_tokens + 1)
-                              : checked_mul(query_tokens, query_tokens / 2 + 1);
-    return checked_add(checked_mul(query_tokens, past_context), triangular);
+                                           std::uint64_t past_context) {
+    return checked_math::prefill_attention_token_pairs<std::overflow_error>(
+        query_tokens, past_context,
+        "PREFILL attention token-pair count overflows uint64");
 }
 
 void accumulate_prefill_attention_token_pairs(std::uint64_t &total,
                                               std::uint64_t value) {
-    if (total > std::numeric_limits<std::uint64_t>::max() - value) {
-        throw std::overflow_error(
-            "aggregate PREFILL attention token-pair count overflows uint64");
-    }
-    total += value;
+    total = checked_math::add<std::overflow_error>(
+        total, value,
+        "aggregate PREFILL attention token-pair count overflows uint64");
 }
 
 PipelineMemoryDiagnostics make_pipeline_memory_diagnostics(
@@ -793,9 +775,8 @@ void MetricsStore::record_cpu_kv_cache_target(
 }
 
 void MetricsStore::record_cpu_kv_cache_offload(
-    const entities::CpuKVCacheOffloadInfo &operation, ClusterType cluster_type,
-    std::uint64_t bytes_per_block) {
-    static_cast<void>(bytes_per_block);
+    const entities::CpuKVCacheOffloadInfo &operation,
+    ClusterType cluster_type) {
     if (operation.state() != entities::CpuKVCacheTransferState::kCompleted) {
         return;
     }
@@ -833,9 +814,8 @@ void MetricsStore::record_cpu_kv_cache_offload(
 }
 
 void MetricsStore::record_cpu_kv_cache_restore(
-    const entities::CpuKVCacheRestoreInfo &operation, ClusterType cluster_type,
-    std::uint64_t bytes_per_block) {
-    static_cast<void>(bytes_per_block);
+    const entities::CpuKVCacheRestoreInfo &operation,
+    ClusterType cluster_type) {
     if (operation.state() != entities::CpuKVCacheTransferState::kCompleted) {
         return;
     }

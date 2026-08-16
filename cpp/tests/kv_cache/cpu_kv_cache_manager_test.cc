@@ -90,8 +90,12 @@ void test_lru_suffix_and_restore_pins() {
     expect(manager.release_restore(lease, true, at(4.1)) &&
                !manager.release_restore(lease, true, at(4.2)),
            "restore lease release must be exact once");
+    expect(manager.retained_restore_lease_count() == 0,
+           "released restore leases must not retain tombstones");
     expect(manager.abort_offload(replacement.reservation_id),
            "pending replacement must abort");
+    expect(manager.retained_reservation_count() == 0,
+           "aborted offloads must not retain tombstones");
     manager.validate_invariants();
 }
 
@@ -139,6 +143,8 @@ void test_out_of_order_commit_and_dependent_abort() {
     expect(!manager.commit_offload(second.reservation_id, at(2.2)) &&
                manager.stats().stale_generation_completions == 2,
            "duplicate terminal commit must remain idempotent");
+    expect(manager.retained_reservation_count() == 0,
+           "committed offloads must not retain tombstones");
 
     CpuKVCacheManager aborting{8, CpuKVCacheCapacityPressurePolicy::kPrefixFit};
     const auto base = aborting.reserve_offload(
@@ -153,6 +159,8 @@ void test_out_of_order_commit_and_dependent_abort() {
            "aborting an earlier reservation must reclaim dependent suffixes");
     expect(!aborting.abort_offload(base.reservation_id),
            "duplicate terminal abort must remain idempotent");
+    expect(aborting.retained_reservation_count() == 0,
+           "dependent abort cleanup must erase every terminal reservation");
 }
 
 void test_noop_lru_empty_metadata_and_zero_fit() {
@@ -230,6 +238,8 @@ void test_migration_discard_drains_inflight_transfers() {
     expect(drained.sessions == 0 && drained.materialized_blocks == 0 &&
                drained.active_reservations == 0 &&
                drained.active_restore_leases == 0 &&
+               manager.retained_reservation_count() == 0 &&
+               manager.retained_restore_lease_count() == 0 &&
                !manager.session_discard_pending(SessionId{41}),
            "last retired transfer completion must physically reap the session");
     expect(!manager.commit_offload(suffix.reservation_id, at(2.5)),

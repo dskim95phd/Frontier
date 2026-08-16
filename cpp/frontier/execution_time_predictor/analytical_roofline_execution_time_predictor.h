@@ -15,6 +15,7 @@
 
 #include "frontier/cc_backend/base_cc_backend.h"
 #include "frontier/config/config.h"
+#include "frontier/core/precision.h"
 #include "frontier/entities/batch.h"
 #include "frontier/entities/execution_time.h"
 #include "frontier/entities/request.h"
@@ -27,17 +28,7 @@ namespace frontier::execution_time_predictor {
 // runtime abstraction.
 namespace detail {
 
-enum class Precision {
-    kFp32,
-    kFp16,
-    kBf16,
-    kFp8,
-    kMxFp8,
-    kInt8,
-    kFp4,
-    kMxFp4,
-    kInt4,
-};
+using Precision = frontier::Precision;
 
 [[nodiscard]] Precision precision_from_string(std::string_view precision);
 

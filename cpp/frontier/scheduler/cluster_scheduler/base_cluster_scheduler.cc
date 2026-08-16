@@ -271,20 +271,15 @@ BaseClusterScheduler::get_replica_scheduler(ReplicaId replica_id,
     return *replica_schedulers_.at(target_index(replica_id, dp_id));
 }
 
-std::uint64_t BaseClusterScheduler::next_batch_global_id(ReplicaId replica_id,
-                                                         DataParallelId dp_id) {
+BatchGlobalId BaseClusterScheduler::next_batch_global_id(
+    ReplicaId replica_id, DataParallelId dp_id) {
     const BatchCounterKey key = [&]() {
         BatchCounterKey value{};
         value.replica_id = replica_id;
         value.dp_id = dp_id;
         return value;
     }();
-    std::uint64_t &next = batch_counters_[key];
-    if (next >
-        static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
-        throw std::overflow_error("batch global ID overflows");
-    }
-    return next++;
+    return batch_counters_[key].next("batch global ID space exhausted");
 }
 
 bool BaseClusterScheduler::requires_moe_synchronization(

@@ -3,7 +3,8 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
-#include <limits>
+
+#include "frontier/core/checked_math.h"
 
 namespace frontier::entities {
 namespace {
@@ -134,14 +135,11 @@ void BatchStage::accumulate_execution_time(
         execution_time.synchronization_unattributed_wait_ms;
     execution_time_.synchronization_attribution_overlap_ms +=
         execution_time.synchronization_attribution_overlap_ms;
-    if (execution_time_.prefill_attention_token_pairs >
-        std::numeric_limits<std::uint64_t>::max() -
-            execution_time.prefill_attention_token_pairs) {
-        throw BatchStageError(
+    execution_time_.prefill_attention_token_pairs =
+        checked_math::add<BatchStageError>(
+            execution_time_.prefill_attention_token_pairs,
+            execution_time.prefill_attention_token_pairs,
             "PREFILL attention token-pair count overflows uint64");
-    }
-    execution_time_.prefill_attention_token_pairs +=
-        execution_time.prefill_attention_token_pairs;
 }
 
 } // namespace frontier::entities

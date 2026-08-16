@@ -1499,6 +1499,15 @@ void test_cpu_offload_export_barrier_both_orders() {
             expect(!scheduler.on_cpu_kv_cache_offload_end(
                        end.transfer_id, end.cpu_generation, ends.front().time),
                    "duplicate D2H completion must be stale");
+            const auto completed =
+                scheduler.take_completed_cpu_kv_cache_offload(end.transfer_id);
+            expect(completed.has_value() &&
+                       scheduler.cpu_kv_cache_offload_operations().empty() &&
+                       !scheduler.take_completed_cpu_kv_cache_offload(
+                            end.transfer_id)
+                            .has_value(),
+                   "metrics handoff must consume a completed D2H operation "
+                   "exactly once");
         };
 
         if (decode_first) {
@@ -1611,6 +1620,11 @@ void test_kda_snapshot_only_offload_and_restore() {
                requests[1].cpu_restore_transferred_blocks() == 0 &&
                requests[1].cpu_restore_bytes() == 8'192,
            "snapshot-only H2D must account bytes without transferred KV");
+    const auto completed_restore =
+        scheduler.take_completed_cpu_kv_cache_restore(restore_end.transfer_id);
+    expect(completed_restore.has_value() &&
+               scheduler.cpu_kv_cache_restore_operations().empty(),
+           "metrics handoff must erase a completed H2D operation");
 
     const auto admitted = scheduler.schedule(restore_ends.front().time);
     expect(admitted.scheduled_requests.size() == 1 &&

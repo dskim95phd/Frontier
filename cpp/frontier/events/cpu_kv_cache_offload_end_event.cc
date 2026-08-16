@@ -1,5 +1,7 @@
 #include "frontier/events/event_handlers.h"
 
+#include <stdexcept>
+
 #include "frontier/simulator/simulator.h"
 
 namespace frontier::events {
@@ -14,6 +16,14 @@ void handle_event(const CpuKVCacheOffloadEndPayload &payload, SimTime time,
     if (!completed) {
         return;
     }
+    auto operation = scheduler.take_completed_cpu_kv_cache_offload(
+        payload.transfer_id);
+    if (!operation.has_value()) {
+        throw std::runtime_error(
+            "completed CPU KV-cache offload operation disappeared");
+    }
+    simulator.metrics().record_cpu_kv_cache_offload(*operation,
+                                                     payload.cluster_type);
 
     // Same-session requests can be held above the replica while this D2H
     // export owns the session.  Re-run cluster routing as soon as the export

@@ -10,6 +10,7 @@
 
 #include "frontier/config/config.h"
 #include "frontier/core/event.h"
+#include "frontier/core/id_generator.h"
 #include "frontier/core/ids.h"
 
 namespace frontier::kv_cache {
@@ -148,6 +149,12 @@ class CpuKVCacheManager {
     [[nodiscard]] bool
     reservation_pending(CpuOffloadReservationId reservation_id) const noexcept;
     [[nodiscard]] bool lease_active(CpuRestoreLeaseId lease_id) const noexcept;
+    [[nodiscard]] std::size_t retained_reservation_count() const noexcept {
+        return reservations_.size();
+    }
+    [[nodiscard]] std::size_t retained_restore_lease_count() const noexcept {
+        return leases_.size();
+    }
     [[nodiscard]] const CpuKVCacheStats &stats() const noexcept {
         return stats_;
     }
@@ -198,8 +205,8 @@ class CpuKVCacheManager {
         std::uint64_t desired_frontier_blocks = 0;
         std::uint64_t admitted_frontier_blocks = 0;
         std::uint64_t begin_block = 0;
-        // Populated only while pending; terminal records retain compact
-        // metadata for duplicate-completion idempotency.
+        // Reservations exist only while pending. Checked monotonic IDs make
+        // late duplicate completions identifiable without tombstone records.
         std::vector<CpuBlockId> block_ids;
         SimTime submitted_at;
         bool includes_kda_snapshot = false;
@@ -213,7 +220,7 @@ class CpuKVCacheManager {
     struct RestoreLease {
         CpuRestoreLeaseId id;
         SessionId session_id;
-        // Populated only while active; release drops the backing allocation.
+        // Leases exist only while active; release erases the record.
         std::vector<CpuBlockId> block_ids;
         SimTime started_at;
         bool includes_kda_snapshot = false;
@@ -255,9 +262,9 @@ class CpuKVCacheManager {
     std::uint64_t kda_snapshot_reserved_blocks_ = 0;
     std::uint64_t pinned_blocks_ = 0;
     std::uint64_t pinned_kda_snapshots_ = 0;
-    std::uint64_t next_block_id_ = 0;
-    std::uint64_t next_reservation_id_ = 0;
-    std::uint64_t next_lease_id_ = 0;
+    CheckedIdGenerator<CpuBlockId> block_ids_;
+    CheckedIdGenerator<CpuOffloadReservationId> reservation_ids_;
+    CheckedIdGenerator<CpuRestoreLeaseId> lease_ids_;
     std::vector<CpuBlockId> recycled_block_ids_;
     std::unordered_map<CpuBlockId, CpuBlock, StrongIdHash<CpuBlockId>> blocks_;
     std::unordered_map<SessionId, SessionState, StrongIdHash<SessionId>>
@@ -265,6 +272,9 @@ class CpuKVCacheManager {
     std::list<SessionId> kda_snapshot_lru_;
     std::unordered_map<SessionId, KdaSnapshot, StrongIdHash<SessionId>>
         kda_snapshots_;
+    std::unordered_map<SessionId, CpuOffloadReservationId,
+                       StrongIdHash<SessionId>>
+        kda_snapshot_slot_owners_;
     std::unordered_map<CpuOffloadReservationId, OffloadReservation,
                        StrongIdHash<CpuOffloadReservationId>>
         reservations_;
