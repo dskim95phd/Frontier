@@ -30,6 +30,7 @@ struct MoEStageContext {
     const detail::DenseBatch &dense_batch;
     const config::AnalyticalExecutionModelConfig &config;
     const detail::DeviceCeilings &device;
+    const detail::AnalyticalConfig &analytical;
     const config::ParallelismConfig &parallelism;
     const config::ModelConfig &model;
     const config::MoeRoutingConfig &routing;

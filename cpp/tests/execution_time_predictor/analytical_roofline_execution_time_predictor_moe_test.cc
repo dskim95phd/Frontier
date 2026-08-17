@@ -261,6 +261,10 @@ void test_sm100_megamoe_public_profile_models_overlap_and_layout_transition() {
         frontier::execution_time_predictor::detail::predict_moe_communication(
             communication, 64, 7168, 512, 4, 1, 32, 4, false, 1.0, 2048,
             "sm100_megamoe_public", &duplicate_heavy, 0.04);
+    const auto synchronized =
+        frontier::execution_time_predictor::detail::predict_moe_communication(
+            communication, 64, 7168, 512, 4, 1, 32, 4, false, 1.0, 2048,
+            "sm100_megamoe_public", &balanced, 0.04, 1.0);
 
     require(public_balanced.raw_ep_dispatch_ms > 0.018 &&
                 public_balanced.raw_ep_combine_ms > 0.031,
@@ -281,6 +285,12 @@ void test_sm100_megamoe_public_profile_models_overlap_and_layout_transition() {
                     public_balanced.raw_ep_combine_ms,
             "multiple expert routes to one destination lane must not duplicate "
             "the one-sided communication payload");
+    require(std::abs(synchronized.ep_dispatch_ms +
+                         synchronized.ep_combine_ms -
+                     synchronized.raw_ep_dispatch_ms -
+                         synchronized.raw_ep_combine_ms) <
+                1e-12,
+            "synchronized MegaMoE must expose the full A2A path");
 }
 
 void test_group_moe_communication_aggregates_dp_source_rows() {
@@ -346,6 +356,12 @@ void test_group_moe_communication_aggregates_dp_source_rows() {
             execution, parallelism, model, routing);
     const auto single = predictor.predict_moe_group_layer(make_input(false));
     const auto group = predictor.predict_moe_group_layer(make_input(true));
+    execution.kernel_profile = "k3_deepgemm_megamoe";
+    const frontier::execution_time_predictor::
+        AnalyticalRooflineExecutionTimePredictor synchronized_predictor(
+            execution, parallelism, model, routing);
+    const auto synchronized_group =
+        synchronized_predictor.predict_moe_group_layer(make_input(true));
     require(single.has_source_aware_ep_communication &&
                 group.has_source_aware_ep_communication,
             "GB300 group predictor must expose source-aware EP communication");
@@ -365,6 +381,13 @@ void test_group_moe_communication_aggregates_dp_source_rows() {
                 group.raw_ep_combine_ms >= single.raw_ep_combine_ms,
             "adding an active DP source must not reduce receiver-side A2A "
             "time");
+    require(synchronized_group.critical_lane_time_ms >
+                    group.critical_lane_time_ms &&
+                synchronized_group.ep_dispatch_ms +
+                        synchronized_group.ep_combine_ms >
+                    group.ep_dispatch_ms + group.ep_combine_ms,
+            "wide-EP K3 profile must expose receiver-side kernel and barrier "
+            "costs");
 }
 
 void test_moe_lane_analytical_model() {

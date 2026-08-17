@@ -254,7 +254,8 @@ moe_stage_communication(const MoEStageContext &context,
         context.communication_element_bytes,
         context.model.routed_expert_hidden_size,
         context.config.moe_communication_backend, &allocation,
-        fused_expert_compute_ms);
+        fused_expert_compute_ms,
+        context.analytical.moe_a2a_overlap_residual);
 }
 
 void reset_moe_compute(entities::ExecutionTime &execution_time) noexcept {
@@ -371,7 +372,7 @@ predict_selected_moe_layer_execution(const MoEStageContext &context,
                 context.reusable_moe_lane_prediction;
             if (lane_prediction == nullptr) {
                 owned_lane_prediction.emplace(detail::predict_moe_lanes(
-                    context.device, detail::AnalyticalConfig{}, moe_model,
+                    context.device, context.analytical, moe_model,
                     *allocation, model.router_topk, moe_precisions));
                 lane_prediction = &*owned_lane_prediction;
             }
@@ -514,7 +515,7 @@ MoEStagePrediction predict_moe_stage_execution(const MoEStageContext &context) {
             shared_lane_prediction;
         if (lane_prediction == nullptr || !layer_shared) {
             owned_lane_prediction.emplace(detail::predict_moe_lanes(
-                context.device, detail::AnalyticalConfig{}, moe_model,
+                context.device, context.analytical, moe_model,
                 *allocation, model.router_topk, moe_precisions));
             lane_prediction = &*owned_lane_prediction;
             if (layer_shared) {

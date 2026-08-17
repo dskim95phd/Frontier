@@ -327,7 +327,7 @@ AnalyticalRooflineExecutionTimePredictor::build_stage_layer_times(
                                                        : &standard_layer_times);
         if (!representative->has_value()) {
             *representative = detail::predict_dense_layer(
-                device_, detail::AnalyticalConfig{}, dense_model, dense_batch,
+                device_, analytical_, dense_model, dense_batch,
                 precisions);
         }
         result.push_back(representative->value());
@@ -565,7 +565,7 @@ AnalyticalRooflineExecutionTimePredictor::shared_routing_for_batch(
         parallelism_.moe_expert_parallel_size, routing_, 0,
         static_cast<std::uint64_t>(batch_id.value()));
     value->lane_prediction = detail::predict_moe_lanes(
-        device_, detail::AnalyticalConfig{},
+        device_, analytical_,
         internal::make_moe_model(model_, parallelism_), value->allocation,
         model_.router_topk, internal::make_moe_operator_precisions(config_));
     std::lock_guard<std::mutex> lock(timing_cache_mutex_);
@@ -638,6 +638,8 @@ AnalyticalRooflineExecutionTimePredictor::
         std::shared_ptr<const cc_backend::BaseCCBackend> communication_backend)
     : config_(std::move(config)),
       device_(detail::DeviceCeilings::from_config(config_)),
+      analytical_(detail::analytical_config_from_profile(
+          config_.kernel_profile)),
       parallelism_(parallelism), model_(std::move(model)), routing_(routing),
       communication_backend_(std::move(communication_backend)) {
     config::apply_model_native_precision_defaults(config_, model_);
@@ -749,10 +751,28 @@ AnalyticalRooflineExecutionTimePredictor::predict_moe_group_layer(
             std::count_if(lane.begin(), lane.end(),
                           [](std::uint64_t tokens) { return tokens > 0; })));
     }
-    const detail::MoELanePrediction prediction = detail::predict_moe_lanes(
-        device_, detail::AnalyticalConfig{},
+    detail::MoELanePrediction prediction = detail::predict_moe_lanes(
+        device_, analytical_,
         internal::make_moe_model(model_, parallelism_), allocation,
         model_.router_topk, internal::make_moe_operator_precisions(config_));
+    if (analytical_.group_moe_expert_path_scale != 1.0) {
+        for (detail::MoELayerTime &lane : prediction.lane_times) {
+            lane.grouped_up_projection_ms *=
+                analytical_.group_moe_expert_path_scale;
+            lane.grouped_down_projection_ms *=
+                analytical_.group_moe_expert_path_scale;
+            lane.shuffling_ms *= analytical_.group_moe_expert_path_scale;
+        }
+        const auto critical = std::max_element(
+            prediction.lane_times.begin(), prediction.lane_times.end(),
+            [](const detail::MoELayerTime &lhs,
+               const detail::MoELayerTime &rhs) {
+                return lhs.total_ms() < rhs.total_ms();
+            });
+        prediction.critical_lane = static_cast<std::uint64_t>(
+            std::distance(prediction.lane_times.begin(), critical));
+        prediction.critical_lane_time_ms = critical->total_ms();
+    }
 
     MoEGroupLayerPrediction result{};
     result.lane_times_ms = internal::lane_times_ms(prediction);
@@ -780,7 +800,8 @@ AnalyticalRooflineExecutionTimePredictor::predict_moe_group_layer(
                 detail::bytes_per_element(communication_precision),
                 model_.routed_expert_hidden_size,
                 config_.moe_communication_backend, &allocation,
-                fused_expert_compute_ms);
+                fused_expert_compute_ms,
+                analytical_.moe_a2a_overlap_residual);
         result.has_source_aware_ep_communication = true;
         result.raw_ep_dispatch_ms = communication.raw_ep_dispatch_ms;
         result.raw_ep_combine_ms = communication.raw_ep_combine_ms;
@@ -930,7 +951,7 @@ AnalyticalRooflineExecutionTimePredictor::predict_execution(
     execution_time.pp_communication_ms = pp_communication_ms;
     if (stage_id.index() + 1 == parallelism_.pipeline_parallel_size) {
         execution_time.lm_head_ms = detail::predict_output_projection_ms(
-            device_, detail::AnalyticalConfig{}, batch_info.lm_head_tokens,
+            device_, analytical_, batch_info.lm_head_tokens,
             model_.hidden_size, model_.vocab_size,
             parallelism_.tensor_parallel_size,
             detail::precision_from_string(config_.lm_head_weight_precision()),
@@ -961,6 +982,7 @@ AnalyticalRooflineExecutionTimePredictor::predict_execution(
             dense_batch,
             config_,
             device_,
+            analytical_,
             parallelism_,
             model_,
             routing_,

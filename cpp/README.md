@@ -584,6 +584,25 @@ dispatch/combine are the
 layout transition, so this profile does not add a second DP input/output
 all-reduce. It is a documented prior, not a workload-fitted calibration.
 
+`execution_model.kernel_profile` is also optional and defaults to `generic`,
+which preserves the portable roofline efficiencies. Two Kimi-K3/GB300-only
+profiles make serving-stack assumptions explicit instead of silently changing
+the device ceilings:
+
+- `k3_sglang_mxfp4` models the published Blackwell K3 local-kernel path: W4A8
+  SiTU expert kernels, small-M GEMMs, fused routing/finalize work, and reduced
+  launch overhead. Its batch-1 target is the published non-speculative
+  approximately 113 tok/s endpoint.
+- `k3_deepgemm_megamoe` applies only to the DP-source-composed destination-EP
+  group prediction. It lowers wide-EP receiver-side grouped-expert efficiency
+  and exposes the complete dispatch/GEMM/combine producer-consumer critical
+  path. This efficiency factor is an LMSYS K3 serving-frontier calibration,
+  not an independent hardware measurement; the A2A transport envelope remains
+  the separate public NVIDIA prior described above.
+
+Both profiles require `device="gb300"` and a Kimi K3 model asset. They are
+opt-in so existing analytical configs and numeric baselines remain unchanged.
+
 Timing-template reuse is scoped to one immutable batch: equivalent PP stages
 of that batch share one template per timing group. Different batches never
 share templates, even when their token and context shapes match, and all

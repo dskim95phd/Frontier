@@ -214,6 +214,9 @@ OrderedJson serialize_execution_model(const ExecutionModelConfig &execution) {
         add("kda_snapshot", operators.kda_snapshot);
         result["operator_precisions"] = std::move(values);
     }
+    if (execution.analytical.kernel_profile != "generic") {
+        result["kernel_profile"] = execution.analytical.kernel_profile;
+    }
     return result;
 }
 

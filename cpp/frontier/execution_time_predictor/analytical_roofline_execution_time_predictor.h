@@ -134,6 +134,7 @@ class AnalyticalRooflineExecutionTimePredictor final
 
     config::AnalyticalExecutionModelConfig config_;
     detail::DeviceCeilings device_;
+    detail::AnalyticalConfig analytical_;
     config::ParallelismConfig parallelism_;
     config::ModelConfig model_;
     config::MoeRoutingConfig routing_;

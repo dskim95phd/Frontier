@@ -20,6 +20,39 @@
 
 namespace frontier::execution_time_predictor::detail {
 
+AnalyticalConfig analytical_config_from_profile(std::string_view profile) {
+    AnalyticalConfig result{};
+    if (profile == "generic") {
+        return result;
+    }
+    if (profile == "k3_sglang_mxfp4") {
+        // Blackwell K3 local-MoE profile: official W4A8 SiTU cubins, fused
+        // routing/finalize, small-M GEMMs, and lower launch count.  Keep the
+        // ceilings physical; only achieved efficiencies and launch overhead
+        // differ from the portable generic path.
+        result.large_gemm = Efficiency{0.70, 0.80, 0.075};
+        result.small_gemm = Efficiency{0.315, 0.69, 0.375};
+        result.streaming = Efficiency{0.26, 0.825, 0.0};
+        result.moe = Efficiency{0.525, 0.75, 0.225};
+        result.routing = Efficiency{0.195, 0.625, 0.625};
+        result.kernel_launch_latency_us = 3.75;
+        return result;
+    }
+    if (profile == "k3_deepgemm_megamoe") {
+        // Large DP-attention + EP K3 deployments use a synchronized
+        // MegaMoE/DeepGEMM critical path.  Public communication measurements
+        // include mandatory dispatch-tail and combine-head barriers, so do
+        // not hide the shorter A2A path.  The receiver-side expert path scale
+        // captures the lower achieved efficiency of the rank-major wide-EP
+        // kernel relative to the generic single-lane roofline.
+        result.group_moe_expert_path_scale = 1.75;
+        result.moe_a2a_overlap_residual = 1.0;
+        return result;
+    }
+    throw AnalyticalModelError("unknown analytical kernel profile: " +
+                               std::string{profile});
+}
+
 DeviceCeilings DeviceCeilings::from_config(
     const config::AnalyticalExecutionModelConfig &config) {
     DeviceCeilings result{};

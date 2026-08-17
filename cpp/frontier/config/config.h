@@ -818,6 +818,10 @@ struct AnalyticalExecutionModelConfig {
     AnalyticalDeviceOverrides device_overrides;
     std::string precision = "fp16";
     OperatorPrecisionConfig operator_precisions;
+    // Selects an explicit operator-efficiency/fusion profile.  "generic"
+    // preserves the historical roofline constants.  K3 profiles are opt-in
+    // because they describe backend-specific Blackwell kernel stacks.
+    std::string kernel_profile = "generic";
     // "detailed" predicts and emits synchronization events one MoE layer at a
     // time.
     // "first_layer_scaled" emits the first MoE layer normally, uses one
@@ -839,13 +843,15 @@ struct AnalyticalExecutionModelConfig {
     friend bool operator==(const AnalyticalExecutionModelConfig &lhs,
                            const AnalyticalExecutionModelConfig &rhs) {
         return std::tie(lhs.device, lhs.device_overrides, lhs.precision,
-                        lhs.operator_precisions, lhs.moe_layer_event_mode,
+                        lhs.operator_precisions, lhs.kernel_profile,
+                        lhs.moe_layer_event_mode,
                         lhs.moe_communication_backend,
                         lhs.tensor_parallel_size, lhs.network_bandwidth_gbps,
                         lhs.network_latency_us,
                         lhs.intra_node_bandwidth_gbps) ==
                std::tie(rhs.device, rhs.device_overrides, rhs.precision,
-                        rhs.operator_precisions, rhs.moe_layer_event_mode,
+                        rhs.operator_precisions, rhs.kernel_profile,
+                        rhs.moe_layer_event_mode,
                         rhs.moe_communication_backend,
                         rhs.tensor_parallel_size, rhs.network_bandwidth_gbps,
                         rhs.network_latency_us, rhs.intra_node_bandwidth_gbps);

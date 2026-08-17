@@ -194,6 +194,7 @@ predict_moe_lanes(const DeviceCeilings &device, const AnalyticalConfig &config,
     std::uint64_t routed_hidden_size = 0,
     std::string_view moe_communication_backend = "generic",
     const RoutingAllocation *routing = nullptr,
-    double fused_expert_compute_ms = 0.0);
+    double fused_expert_compute_ms = 0.0,
+    double overlap_residual = 0.35);
 
 } // namespace frontier::execution_time_predictor::detail

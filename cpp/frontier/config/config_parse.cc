@@ -1047,8 +1047,8 @@ ExecutionModelConfig parse_execution_model(const Json &root,
                 "network_latency_us",
                 "intra_node_bandwidth_gbps",
             },
-            {"operator_precisions", "device_overrides", "moe_layer_event_mode",
-             "moe_communication_backend"},
+            {"operator_precisions", "device_overrides", "kernel_profile",
+             "moe_layer_event_mode", "moe_communication_backend"},
             "config.execution_model");
         AnalyticalExecutionModelConfig analytical = [&]() {
             AnalyticalExecutionModelConfig value{};
@@ -1059,6 +1059,10 @@ ExecutionModelConfig parse_execution_model(const Json &root,
             value.precision = require_string(execution, "precision",
                                              "config.execution_model");
             value.operator_precisions = parse_operator_precisions(execution);
+            if (execution.contains("kernel_profile")) {
+                value.kernel_profile = require_string(
+                    execution, "kernel_profile", "config.execution_model");
+            }
             if (execution.contains("moe_layer_event_mode")) {
                 value.moe_layer_event_mode =
                     require_string(execution, "moe_layer_event_mode",
@@ -1102,6 +1106,20 @@ ExecutionModelConfig parse_execution_model(const Json &root,
             throw ConfigError(
                 "config.execution_model.moe_layer_event_mode must be "
                 "'detailed', 'first_layer_scaled', or 'stage_group_scaled'");
+        }
+        if (analytical.kernel_profile != "generic" &&
+            analytical.kernel_profile != "k3_sglang_mxfp4" &&
+            analytical.kernel_profile != "k3_deepgemm_megamoe") {
+            throw ConfigError(
+                "config.execution_model.kernel_profile must be 'generic', "
+                "'k3_sglang_mxfp4', or 'k3_deepgemm_megamoe'");
+        }
+        if (analytical.kernel_profile != "generic" &&
+            (analytical.device != "gb300" ||
+             model.model_type != "kimi_k3")) {
+            throw ConfigError(
+                "K3 analytical kernel profiles require model Kimi-K3 and "
+                "execution device='gb300'");
         }
         if (analytical.moe_communication_backend != "generic" &&
             analytical.moe_communication_backend !=

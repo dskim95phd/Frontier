@@ -441,7 +441,13 @@ MoECommunicationTime predict_moe_communication(
     bool has_pipeline_boundary, double element_bytes,
     std::uint64_t routed_hidden_size,
     std::string_view moe_communication_backend,
-    const RoutingAllocation *routing, double fused_expert_compute_ms) {
+    const RoutingAllocation *routing, double fused_expert_compute_ms,
+    double overlap_residual) {
+    if (!std::isfinite(overlap_residual) || overlap_residual < 0.0 ||
+        overlap_residual > 1.0) {
+        throw AnalyticalModelError(
+            "MoE communication overlap residual must be in [0, 1]");
+    }
     const std::uint64_t activation_bytes =
         payload_bytes(input_tokens, hidden_size, element_bytes);
     const std::uint64_t routed_bytes = payload_bytes(
@@ -509,12 +515,13 @@ MoECommunicationTime predict_moe_communication(
 
             const double raw_total =
                 value.raw_ep_dispatch_ms + value.raw_ep_combine_ms;
-            // Fused dispatch/GEMM/combine overlaps most, but not all, of the
-            // shorter path. A 35% residual is a named public prior, not a
-            // fitted result for the simulator workload.
+            // Fused dispatch/GEMM/combine may overlap the shorter path.  The
+            // portable public prior exposes 35%; synchronized profiles can
+            // explicitly request the full producer/consumer critical path.
             const double fused_total =
                 std::max(fused_expert_compute_ms, raw_total) +
-                0.35 * std::min(fused_expert_compute_ms, raw_total);
+                overlap_residual *
+                    std::min(fused_expert_compute_ms, raw_total);
             const double exposed =
                 std::max(0.0, fused_total - fused_expert_compute_ms);
             value.ep_dispatch_ms =

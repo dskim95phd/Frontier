@@ -72,7 +72,16 @@ struct AnalyticalConfig {
     Efficiency routing{0.15, 0.55, 0.75};
     double kernel_launch_latency_us = 5.0;
     std::uint64_t small_gemm_token_threshold = 128;
+    // Applied only when DP-attention source batches are recomposed into one
+    // destination-EP MegaMoE prediction.
+    double group_moe_expert_path_scale = 1.0;
+    // Fraction of the shorter A2A-vs-expert path left exposed.  The generic
+    // public prior retains 0.35; the synchronized DeepGEMM profile uses 1.0.
+    double moe_a2a_overlap_residual = 0.35;
 };
+
+[[nodiscard]] AnalyticalConfig
+analytical_config_from_profile(std::string_view profile);
 
 class AnalyticalModelError : public std::runtime_error {
   public:

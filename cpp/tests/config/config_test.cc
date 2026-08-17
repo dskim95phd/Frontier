@@ -1688,6 +1688,59 @@ void test_pipeline_stage_profile_pp1_compatibility_and_uneven_ranges() {
            "uneven Kimi K2 PP4 partition must preserve 16/15 stage sizes");
 }
 
+void test_k3_kernel_profile_contract() {
+    auto config = load("analytical_parallel_colocation.json");
+    config.cluster().model =
+        frontier::config::load_model_config("moonshotai/Kimi-K3");
+    config.cluster().parallelism.moe_tensor_parallel_size =
+        config.cluster().parallelism.tensor_parallel_size;
+    config.cluster().parallelism.moe_expert_parallel_size = 1;
+    config.cluster().parallelism.data_parallel_size = 1;
+    auto &analytical = config.cluster().execution_model.analytical;
+    analytical.device = "gb300";
+    analytical.kernel_profile = "k3_sglang_mxfp4";
+    frontier::config::apply_model_native_precision_defaults(
+        analytical, config.cluster().model);
+    const std::string serialized = serialize_simulation_config_json(config);
+    const auto parsed = parse_simulation_config_json(serialized);
+    expect(serialized.find("\"kernel_profile\"") != std::string::npos &&
+               parsed.cluster()
+                       .execution_model.analytical.kernel_profile ==
+                   "k3_sglang_mxfp4" &&
+               parsed.cluster().model.model_type == "kimi_k3",
+           "K3 kernel profiles must parse and round-trip");
+
+    std::string invalid = serialized;
+    const std::string valid_profile = "\"k3_sglang_mxfp4\"";
+    invalid.replace(invalid.find(valid_profile), valid_profile.size(),
+                    "\"unknown\"");
+    expect_throws<ConfigError>(
+        [&invalid] {
+            static_cast<void>(parse_simulation_config_json(invalid));
+        },
+        "unknown analytical kernel profiles must fail fast");
+
+    auto wrong_device = config;
+    wrong_device.cluster().execution_model.analytical.device = "rubin";
+    expect_throws<ConfigError>(
+        [&wrong_device] {
+            static_cast<void>(parse_simulation_config_json(
+                serialize_simulation_config_json(wrong_device)));
+        },
+        "K3 kernel profiles must reject non-GB300 devices");
+
+    auto wrong_model = load("analytical_parallel_colocation.json");
+    wrong_model.cluster().execution_model.analytical.device = "gb300";
+    wrong_model.cluster().execution_model.analytical.kernel_profile =
+        "k3_deepgemm_megamoe";
+    expect_throws<ConfigError>(
+        [&wrong_model] {
+            static_cast<void>(parse_simulation_config_json(
+                serialize_simulation_config_json(wrong_model)));
+        },
+        "K3 kernel profiles must reject other model families");
+}
+
 void test_explicit_pipeline_stage_layer_counts() {
     auto config = load("analytical_moe_ep4_colocation.json");
     config.cluster().parallelism.pipeline_stage_layer_counts = {5, 27};
@@ -1777,6 +1830,8 @@ int main() {
                             test_stage_specific_cluster_scheduler_overrides);
     failures += frontier::test::run("analytical contract round trip",
                                     test_analytical_contract_round_trip);
+    failures += frontier::test::run("K3 kernel profile contract",
+                                    test_k3_kernel_profile_contract);
     failures +=
         frontier::test::run("operator precision contract round trip",
                             test_operator_precision_contract_round_trip);
