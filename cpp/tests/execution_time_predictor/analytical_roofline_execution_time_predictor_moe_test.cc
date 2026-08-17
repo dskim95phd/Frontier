@@ -197,6 +197,176 @@ void test_uniform_random_topk_is_distinct_per_input_token() {
             "one input token must route to k distinct experts");
 }
 
+void test_uniform_routing_varies_by_batch_and_reports_lane_traffic() {
+    frontier::config::MoeRoutingConfig routing{};
+    routing.mode = frontier::config::MoeRoutingMode::kUniformRandom;
+    routing.layer_scope = frontier::config::MoeRoutingLayerScope::kShared;
+    routing.seed = 42;
+
+    const auto first =
+        frontier::execution_time_predictor::detail::route_tokens(
+            64, 8, 256, 32, routing, 7, 1001);
+    const auto repeated =
+        frontier::execution_time_predictor::detail::route_tokens(
+            64, 8, 256, 32, routing, 7, 1001);
+    const auto next_batch =
+        frontier::execution_time_predictor::detail::route_tokens(
+            64, 8, 256, 32, routing, 7, 1002);
+
+    require(first == repeated,
+            "uniform routing must be deterministic for one batch/layer");
+    require(first.global_expert_tokens != next_batch.global_expert_tokens,
+            "different batches must not repeat one routing draw");
+    require(first.lane_routed_tokens.size() == 32 &&
+                first.lane_active_experts.size() == 32 &&
+                first.lane_unique_tokens.size() == 32,
+            "routing must expose one traffic summary per EP lane");
+    require(std::accumulate(first.lane_routed_tokens.begin(),
+                            first.lane_routed_tokens.end(),
+                            std::uint64_t{0}) == first.routed_tokens,
+            "lane routed-token summaries must conserve assignments");
+    require(std::all_of(first.lane_unique_tokens.begin(),
+                        first.lane_unique_tokens.end(),
+                        [](std::uint64_t value) { return value <= 64; }),
+            "one source token must count at most once per destination lane");
+}
+
+void test_sm100_megamoe_public_profile_models_overlap_and_layout_transition() {
+    frontier::cc_backend::AnalyticalCommunicationConfig communication_config{};
+    communication_config.network_bandwidth_gbps = 400.0;
+    communication_config.latency_us = 1.0;
+    communication_config.intra_node_bandwidth_gbps = 14'400.0;
+    const frontier::cc_backend::AnalyticalCommunicationModel communication(
+        communication_config);
+
+    frontier::execution_time_predictor::detail::RoutingAllocation balanced{};
+    balanced.input_tokens = 64;
+    balanced.routed_tokens = 512;
+    balanced.lane_routed_tokens = std::vector<std::uint64_t>(32, 16);
+    balanced.lane_unique_tokens = std::vector<std::uint64_t>(32, 12);
+    auto imbalanced = balanced;
+    imbalanced.lane_unique_tokens.front() = 48;
+    auto duplicate_heavy = balanced;
+    duplicate_heavy.lane_routed_tokens.front() = 64;
+
+    const auto public_balanced =
+        frontier::execution_time_predictor::detail::predict_moe_communication(
+            communication, 64, 7168, 512, 4, 1, 32, 4, false, 1.0, 2048,
+            "sm100_megamoe_public", &balanced, 0.04);
+    const auto public_imbalanced =
+        frontier::execution_time_predictor::detail::predict_moe_communication(
+            communication, 64, 7168, 512, 4, 1, 32, 4, false, 1.0, 2048,
+            "sm100_megamoe_public", &imbalanced, 0.04);
+    const auto public_duplicate_heavy =
+        frontier::execution_time_predictor::detail::predict_moe_communication(
+            communication, 64, 7168, 512, 4, 1, 32, 4, false, 1.0, 2048,
+            "sm100_megamoe_public", &duplicate_heavy, 0.04);
+
+    require(public_balanced.raw_ep_dispatch_ms > 0.018 &&
+                public_balanced.raw_ep_combine_ms > 0.031,
+            "public profile must include measured A2A startup floors");
+    require(public_balanced.ep_dispatch_ms + public_balanced.ep_combine_ms <
+                public_balanced.raw_ep_dispatch_ms +
+                    public_balanced.raw_ep_combine_ms,
+            "MegaMoE profile must expose only the non-overlapped tail");
+    require(public_balanced.dp_input_ms == 0.0 &&
+                public_balanced.dp_output_ms == 0.0,
+            "DP-attention to EP-expert transition must not be double charged");
+    require(public_imbalanced.raw_ep_dispatch_ms >
+                public_balanced.raw_ep_dispatch_ms,
+            "receiver-side unique-token imbalance must lengthen dispatch");
+    require(public_duplicate_heavy.raw_ep_dispatch_ms ==
+                    public_balanced.raw_ep_dispatch_ms &&
+                public_duplicate_heavy.raw_ep_combine_ms ==
+                    public_balanced.raw_ep_combine_ms,
+            "multiple expert routes to one destination lane must not duplicate "
+            "the one-sided communication payload");
+}
+
+void test_group_moe_communication_aggregates_dp_source_rows() {
+    frontier::config::AnalyticalExecutionModelConfig execution{};
+    execution.device = "gb300";
+    execution.precision = "fp8";
+    execution.moe_communication_backend = "sm100_megamoe_public";
+    execution.network_bandwidth_gbps = 28'800.0;
+    execution.intra_node_bandwidth_gbps = 28'800.0;
+
+    frontier::config::ParallelismConfig parallelism{};
+    parallelism.tensor_parallel_size = 8;
+    parallelism.decode_context_parallel_size = 8;
+    parallelism.data_parallel_size = 4;
+    parallelism.moe_tensor_parallel_size = 1;
+    parallelism.moe_expert_parallel_size = 32;
+
+    const auto model =
+        frontier::config::load_model_config("moonshotai/Kimi-K3");
+    frontier::config::MoeRoutingConfig routing{};
+    routing.mode = frontier::config::MoeRoutingMode::kUniformRandom;
+    routing.distribution =
+        frontier::config::MoeRoutingDistribution::kBalanced;
+    routing.layer_scope = frontier::config::MoeRoutingLayerScope::kShared;
+
+    const auto source0 =
+        frontier::execution_time_predictor::detail::route_tokens(
+            64, model.router_topk, model.total_expert_num,
+            parallelism.moe_expert_parallel_size, routing, 0, 1001);
+    const auto source1 =
+        frontier::execution_time_predictor::detail::route_tokens(
+            64, model.router_topk, model.total_expert_num,
+            parallelism.moe_expert_parallel_size, routing, 0, 1002);
+
+    const auto make_input = [&](bool include_second_source) {
+        frontier::execution_time_predictor::MoEGroupLayerInput input{};
+        input.layer_id = frontier::LayerId{0};
+        input.model_layer_id = 0;
+        input.input_tokens = include_second_source ? 128 : 64;
+        input.routed_tokens = input.input_tokens * model.router_topk;
+        input.global_expert_tokens = source0.global_expert_tokens;
+        input.source_lane_routed_tokens = {source0.lane_routed_tokens};
+        input.source_lane_unique_tokens = {source0.lane_unique_tokens};
+        if (include_second_source) {
+            for (std::size_t expert = 0;
+                 expert < input.global_expert_tokens.size(); ++expert) {
+                input.global_expert_tokens.at(expert) +=
+                    source1.global_expert_tokens.at(expert);
+            }
+            input.source_lane_routed_tokens.push_back(
+                source1.lane_routed_tokens);
+            input.source_lane_unique_tokens.push_back(
+                source1.lane_unique_tokens);
+        }
+        input.fallback_lane_times_ms.assign(
+            static_cast<std::size_t>(parallelism.moe_expert_parallel_size),
+            0.0);
+        return input;
+    };
+
+    const frontier::execution_time_predictor::
+        AnalyticalRooflineExecutionTimePredictor predictor(
+            execution, parallelism, model, routing);
+    const auto single = predictor.predict_moe_group_layer(make_input(false));
+    const auto group = predictor.predict_moe_group_layer(make_input(true));
+    require(single.has_source_aware_ep_communication &&
+                group.has_source_aware_ep_communication,
+            "GB300 group predictor must expose source-aware EP communication");
+    for (std::size_t lane = 0;
+         lane < group.destination_lane_routed_tokens.size(); ++lane) {
+        require(group.destination_lane_routed_tokens.at(lane) ==
+                    source0.lane_routed_tokens.at(lane) +
+                        source1.lane_routed_tokens.at(lane),
+                "destination load must equal the DP-source column sum");
+        require(group.destination_lane_unique_tokens.at(lane) ==
+                    source0.lane_unique_tokens.at(lane) +
+                        source1.lane_unique_tokens.at(lane),
+                "destination unique-token load must equal the DP-source "
+                "column sum");
+    }
+    require(group.raw_ep_dispatch_ms >= single.raw_ep_dispatch_ms &&
+                group.raw_ep_combine_ms >= single.raw_ep_combine_ms,
+            "adding an active DP source must not reduce receiver-side A2A "
+            "time");
+}
+
 void test_moe_lane_analytical_model() {
     using frontier::config::MoeRoutingConfig;
     using frontier::config::MoeRoutingDistribution;
@@ -448,6 +618,9 @@ int main() {
         test_deterministic_distributions();
         test_routing_reproducibility_golden_vectors();
         test_uniform_random_topk_is_distinct_per_input_token();
+        test_uniform_routing_varies_by_batch_and_reports_lane_traffic();
+        test_sm100_megamoe_public_profile_models_overlap_and_layout_transition();
+        test_group_moe_communication_aggregates_dp_source_rows();
         test_moe_lane_analytical_model();
         test_shared_expert_is_replicated_across_ep_and_sharded_by_tp();
         test_latent_moe_projection_precision_is_independent();

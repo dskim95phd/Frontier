@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <optional>
 #include <stdexcept>
+#include <string_view>
 #include <tuple>
 #include <vector>
 
@@ -62,13 +63,23 @@ struct RoutingAllocation {
     std::uint64_t routed_tokens = 0;
     std::vector<std::uint64_t> global_expert_tokens;
     std::vector<std::vector<std::uint64_t>> lane_expert_tokens;
+    // Receiver-side load and source-to-destination traffic summaries.  The
+    // latter counts each input token once per destination EP lane, even when
+    // several of its top-k experts live on that same lane.
+    std::vector<std::uint64_t> lane_routed_tokens;
+    std::vector<std::uint64_t> lane_active_experts;
+    std::vector<std::uint64_t> lane_unique_tokens;
 
     friend bool operator==(const RoutingAllocation &lhs,
                            const RoutingAllocation &rhs) {
         return std::tie(lhs.input_tokens, lhs.routed_tokens,
-                        lhs.global_expert_tokens, lhs.lane_expert_tokens) ==
+                        lhs.global_expert_tokens, lhs.lane_expert_tokens,
+                        lhs.lane_routed_tokens, lhs.lane_active_experts,
+                        lhs.lane_unique_tokens) ==
                std::tie(rhs.input_tokens, rhs.routed_tokens,
-                        rhs.global_expert_tokens, rhs.lane_expert_tokens);
+                        rhs.global_expert_tokens, rhs.lane_expert_tokens,
+                        rhs.lane_routed_tokens, rhs.lane_active_experts,
+                        rhs.lane_unique_tokens);
     }
 };
 
@@ -78,7 +89,8 @@ discretize_expert_weights(std::uint64_t total_tokens,
 [[nodiscard]] RoutingAllocation
 route_tokens(std::uint64_t input_tokens, std::uint64_t router_topk,
              std::uint64_t total_experts, std::uint64_t expert_parallel_size,
-             const config::MoeRoutingConfig &config, std::uint64_t layer_id);
+             const config::MoeRoutingConfig &config, std::uint64_t layer_id,
+             std::optional<std::uint64_t> sample_id = std::nullopt);
 
 struct MoEModel {
     std::uint64_t hidden_size = 0;
@@ -112,6 +124,10 @@ struct MoECommunicationTime {
     double moe_tp_ms = 0.0;
     double ep_dispatch_ms = 0.0;
     double ep_combine_ms = 0.0;
+    // Unhidden transport time before MegaMoE overlap is applied. Equal to the
+    // exposed values for the generic backend.
+    double raw_ep_dispatch_ms = 0.0;
+    double raw_ep_combine_ms = 0.0;
     double dp_input_ms = 0.0;
     double dp_output_ms = 0.0;
     double pipeline_parallel_ms = 0.0;
@@ -175,6 +191,9 @@ predict_moe_lanes(const DeviceCeilings &device, const AnalyticalConfig &config,
     std::uint64_t attention_tp_size, std::uint64_t moe_tp_size,
     std::uint64_t expert_parallel_size, std::uint64_t data_parallel_size,
     bool has_pipeline_boundary, double element_bytes,
-    std::uint64_t routed_hidden_size = 0);
+    std::uint64_t routed_hidden_size = 0,
+    std::string_view moe_communication_backend = "generic",
+    const RoutingAllocation *routing = nullptr,
+    double fused_expert_compute_ms = 0.0);
 
 } // namespace frontier::execution_time_predictor::detail

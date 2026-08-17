@@ -681,11 +681,16 @@ void BaseClusterScheduler::begin_moe_stage(
             prediction.moe_routing.size());
         value.pre_moe_tp_communication_ms_by_layer.reserve(
             prediction.moe_routing.size());
+        value.decode_local_ep_communication_ms_by_layer.reserve(
+            prediction.moe_routing.size());
         for (const auto &diagnostic : prediction.moe_routing) {
             value.pre_moe_compute_ms_by_layer.push_back(
                 diagnostic.pre_moe_compute_ms);
             value.pre_moe_tp_communication_ms_by_layer.push_back(
                 diagnostic.pre_moe_tp_communication_ms);
+            value.decode_local_ep_communication_ms_by_layer.push_back(
+                diagnostic.exposed_ep_dispatch_ms +
+                diagnostic.exposed_ep_combine_ms);
         }
         value.prefill_post_attention_ms_by_layer =
             std::move(prefill_post_attention_ms_by_layer);
@@ -969,6 +974,18 @@ void BaseClusterScheduler::continue_moe_stage(
                     group_input.fallback_lane_times_ms.at(lane) +=
                         routing.lane_times_ms.at(lane);
                 }
+                if (routing.lane_routed_tokens.size() !=
+                        aggregate_lane_times_ms.size() ||
+                    routing.lane_unique_tokens.size() !=
+                        aggregate_lane_times_ms.size()) {
+                    throw std::logic_error(
+                        "aligned DECODE MoE source traffic lane domains do "
+                        "not match");
+                }
+                group_input.source_lane_routed_tokens.push_back(
+                    routing.lane_routed_tokens);
+                group_input.source_lane_unique_tokens.push_back(
+                    routing.lane_unique_tokens);
             }
             if (!routing_initialized) {
                 throw std::logic_error(
@@ -985,6 +1002,27 @@ void BaseClusterScheduler::continue_moe_stage(
                     "group MoE prediction changed the EP lane domain");
             }
             aggregate_lane_times_ms = group_prediction.lane_times_ms;
+            if (group_prediction.has_source_aware_ep_communication) {
+                if (group_prediction.destination_lane_routed_tokens.size() !=
+                        aggregate_lane_times_ms.size() ||
+                    group_prediction.destination_lane_unique_tokens.size() !=
+                        aggregate_lane_times_ms.size()) {
+                    throw std::logic_error(
+                        "group MoE source-aware communication changed the EP "
+                        "lane domain");
+                }
+                const double group_ep_communication_ms =
+                    group_prediction.ep_dispatch_ms +
+                    group_prediction.ep_combine_ms;
+                for (const auto &[unused, batch_id] : group.participants) {
+                    static_cast<void>(unused);
+                    if (!simulator.batch(batch_id).is_idle()) {
+                        moe_stage_state(batch_id, key.stage_id)
+                            .decode_ep_communication_ms_per_layer =
+                            group_ep_communication_ms;
+                    }
+                }
+            }
         }
         const double critical_lane_ms = *std::max_element(
             aggregate_lane_times_ms.begin(), aggregate_lane_times_ms.end());
@@ -1063,6 +1101,14 @@ void BaseClusterScheduler::continue_moe_stage(
                                       participant.elapsed_component_ms);
                 synchronization_breakdown.moe_ep_aggregation_extra_ms =
                     std::max(0.0, critical_lane_ms - local_critical_lane_ms);
+                const double local_ep_communication_ms =
+                    state.decode_local_ep_communication_ms_by_layer.at(
+                        layer_index);
+                const double source_aware_ep_extra_ms = std::max(
+                    0.0, state.decode_ep_communication_ms_per_layer -
+                             local_ep_communication_ms);
+                synchronization_breakdown.moe_ep_aggregation_extra_ms +=
+                    source_aware_ep_extra_ms;
                 if (state.remaining_scaled_moe_layers > 0) {
                     for (std::size_t family = 0;
                          family < attention_group_layout.size(); ++family) {
@@ -1083,6 +1129,9 @@ void BaseClusterScheduler::continue_moe_stage(
                         static_cast<double>(state.remaining_scaled_moe_layers) *
                         std::max(0.0,
                                  critical_lane_ms - local_critical_lane_ms);
+                    synchronization_breakdown.moe_ep_aggregation_extra_ms +=
+                        static_cast<double>(state.remaining_scaled_moe_layers) *
+                        source_aware_ep_extra_ms;
                 }
                 simulator.batch_stage(state.batch_id, state.stage_id)
                     .accumulate_execution_time(synchronization_breakdown);
@@ -1243,6 +1292,9 @@ void BaseClusterScheduler::continue_moe_stage(
                     refreshed_pre_moe_tp_communication_ms);
                 state.decode_lane_times_ms.push_back(diagnostic.lane_times_ms);
                 state.moe_routing_by_layer.push_back(diagnostic);
+                state.decode_local_ep_communication_ms_by_layer.push_back(
+                    diagnostic.exposed_ep_dispatch_ms +
+                    diagnostic.exposed_ep_combine_ms);
                 const entities::ExecutionTime &layer_execution =
                     next_prediction.execution_time;
                 const double critical_lane_ms =

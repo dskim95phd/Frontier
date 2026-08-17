@@ -590,10 +590,23 @@ OrderedJson serialize_moe_routing(const MoERoutingMetricsRecord &routing) {
         !routing.layer_id.valid() || routing.input_tokens == 0 ||
         routing.routed_tokens == 0 || routing.global_expert_tokens.empty() ||
         routing.lane_expert_tokens.empty() ||
+        routing.lane_routed_tokens.size() !=
+            routing.lane_expert_tokens.size() ||
+        routing.lane_active_experts.size() !=
+            routing.lane_expert_tokens.size() ||
+        routing.lane_unique_tokens.size() !=
+            routing.lane_expert_tokens.size() ||
         routing.lane_times_ms.size() != routing.lane_expert_tokens.size() ||
         routing.critical_lane >= routing.lane_times_ms.size() ||
         !std::isfinite(routing.critical_lane_time_ms) ||
         routing.critical_lane_time_ms < 0.0 ||
+        !std::isfinite(routing.raw_ep_dispatch_ms) ||
+        !std::isfinite(routing.raw_ep_combine_ms) ||
+        !std::isfinite(routing.exposed_ep_dispatch_ms) ||
+        !std::isfinite(routing.exposed_ep_combine_ms) ||
+        routing.raw_ep_dispatch_ms < 0.0 || routing.raw_ep_combine_ms < 0.0 ||
+        routing.exposed_ep_dispatch_ms < 0.0 ||
+        routing.exposed_ep_combine_ms < 0.0 ||
         std::any_of(
             routing.lane_times_ms.begin(), routing.lane_times_ms.end(),
             [](double value) {
@@ -608,6 +621,18 @@ OrderedJson serialize_moe_routing(const MoERoutingMetricsRecord &routing) {
         throw std::invalid_argument(
             "MoE routing diagnostic does not conserve routed tokens");
     }
+    const std::uint64_t lane_total =
+        std::accumulate(routing.lane_routed_tokens.begin(),
+                        routing.lane_routed_tokens.end(), std::uint64_t{0});
+    if (lane_total != routing.routed_tokens ||
+        std::any_of(routing.lane_unique_tokens.begin(),
+                    routing.lane_unique_tokens.end(),
+                    [&routing](std::uint64_t value) {
+                        return value > routing.input_tokens;
+                    })) {
+        throw std::invalid_argument(
+            "MoE routing lane traffic diagnostic is inconsistent");
+    }
     OrderedJson json = OrderedJson::object({
         {"batch_id", routing.batch_id.value()},
         {"stage_id", routing.stage_id.value()},
@@ -621,9 +646,16 @@ OrderedJson serialize_moe_routing(const MoERoutingMetricsRecord &routing) {
         {"routed_tokens", routing.routed_tokens},
         {"global_expert_tokens", routing.global_expert_tokens},
         {"lane_expert_tokens", routing.lane_expert_tokens},
+        {"lane_routed_tokens", routing.lane_routed_tokens},
+        {"lane_active_experts", routing.lane_active_experts},
+        {"lane_unique_tokens", routing.lane_unique_tokens},
         {"lane_times_ms", routing.lane_times_ms},
         {"critical_lane", routing.critical_lane},
         {"critical_lane_time_ms", routing.critical_lane_time_ms},
+        {"raw_ep_dispatch_ms", routing.raw_ep_dispatch_ms},
+        {"raw_ep_combine_ms", routing.raw_ep_combine_ms},
+        {"exposed_ep_dispatch_ms", routing.exposed_ep_dispatch_ms},
+        {"exposed_ep_combine_ms", routing.exposed_ep_combine_ms},
     });
     if (routing.sync_group_id.valid()) {
         json["sync_group_id"] = routing.sync_group_id.value();

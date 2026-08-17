@@ -143,6 +143,8 @@ OrderedJson serialize_execution_model(const ExecutionModelConfig &execution) {
         {"device", execution.analytical.device},
         {"precision", execution.analytical.precision},
         {"moe_layer_event_mode", execution.analytical.moe_layer_event_mode},
+        {"moe_communication_backend",
+         execution.analytical.moe_communication_backend},
         {
             "network_bandwidth_gbps",
             execution.analytical.network_bandwidth_gbps,

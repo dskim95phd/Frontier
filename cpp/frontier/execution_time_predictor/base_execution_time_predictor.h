@@ -28,9 +28,16 @@ struct MoERoutingDiagnostic {
     std::uint64_t routed_tokens = 0;
     std::vector<std::uint64_t> global_expert_tokens;
     std::vector<std::vector<std::uint64_t>> lane_expert_tokens;
+    std::vector<std::uint64_t> lane_routed_tokens;
+    std::vector<std::uint64_t> lane_active_experts;
+    std::vector<std::uint64_t> lane_unique_tokens;
     std::vector<double> lane_times_ms;
     std::uint64_t critical_lane = 0;
     double critical_lane_time_ms = 0.0;
+    double raw_ep_dispatch_ms = 0.0;
+    double raw_ep_combine_ms = 0.0;
+    double exposed_ep_dispatch_ms = 0.0;
+    double exposed_ep_combine_ms = 0.0;
 };
 
 enum class ScaledMoEAttentionFamily {
@@ -75,6 +82,10 @@ struct MoEGroupLayerInput {
     std::uint64_t input_tokens = 0;
     std::uint64_t routed_tokens = 0;
     std::vector<std::uint64_t> global_expert_tokens;
+    // One row per active attention-DP source and one column per destination
+    // EP lane. Column sums are the receiver-side loads that bound A2A time.
+    std::vector<std::vector<std::uint64_t>> source_lane_routed_tokens;
+    std::vector<std::vector<std::uint64_t>> source_lane_unique_tokens;
     // Predictors without a token-sensitive group model may retain their
     // existing behavior by returning this lane-wise sum.
     std::vector<double> fallback_lane_times_ms;
@@ -84,6 +95,13 @@ struct MoEGroupLayerPrediction {
     std::vector<double> lane_times_ms;
     std::uint64_t critical_lane = 0;
     double critical_lane_time_ms = 0.0;
+    bool has_source_aware_ep_communication = false;
+    std::vector<std::uint64_t> destination_lane_routed_tokens;
+    std::vector<std::uint64_t> destination_lane_unique_tokens;
+    double raw_ep_dispatch_ms = 0.0;
+    double raw_ep_combine_ms = 0.0;
+    double ep_dispatch_ms = 0.0;
+    double ep_combine_ms = 0.0;
 };
 
 class ExecutionTimePredictorError : public std::runtime_error {

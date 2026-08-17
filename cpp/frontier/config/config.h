@@ -828,6 +828,9 @@ struct AnalyticalExecutionModelConfig {
     // uses the same family-aware compression only for layer-invariant routing,
     // and otherwise falls back to exact per-layer prediction.
     std::string moe_layer_event_mode = "detailed";
+    // "generic" uses the configured collective backend. The GB300 profile is
+    // an opt-in public-prior model for fused MegaMoE dispatch/expert/combine.
+    std::string moe_communication_backend = "generic";
     std::uint64_t tensor_parallel_size = 8;
     double network_bandwidth_gbps = 400.0;
     double network_latency_us = 1.0;
@@ -837,11 +840,13 @@ struct AnalyticalExecutionModelConfig {
                            const AnalyticalExecutionModelConfig &rhs) {
         return std::tie(lhs.device, lhs.device_overrides, lhs.precision,
                         lhs.operator_precisions, lhs.moe_layer_event_mode,
+                        lhs.moe_communication_backend,
                         lhs.tensor_parallel_size, lhs.network_bandwidth_gbps,
                         lhs.network_latency_us,
                         lhs.intra_node_bandwidth_gbps) ==
                std::tie(rhs.device, rhs.device_overrides, rhs.precision,
                         rhs.operator_precisions, rhs.moe_layer_event_mode,
+                        rhs.moe_communication_backend,
                         rhs.tensor_parallel_size, rhs.network_bandwidth_gbps,
                         rhs.network_latency_us, rhs.intra_node_bandwidth_gbps);
     }

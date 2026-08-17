@@ -240,9 +240,16 @@ struct MoERoutingMetricsRecord {
     std::uint64_t routed_tokens = 0;
     std::vector<std::uint64_t> global_expert_tokens;
     std::vector<std::vector<std::uint64_t>> lane_expert_tokens;
+    std::vector<std::uint64_t> lane_routed_tokens;
+    std::vector<std::uint64_t> lane_active_experts;
+    std::vector<std::uint64_t> lane_unique_tokens;
     std::vector<double> lane_times_ms;
     std::uint64_t critical_lane = 0;
     double critical_lane_time_ms = 0.0;
+    double raw_ep_dispatch_ms = 0.0;
+    double raw_ep_combine_ms = 0.0;
+    double exposed_ep_dispatch_ms = 0.0;
+    double exposed_ep_combine_ms = 0.0;
 };
 
 struct BatchMetricsAggregate {

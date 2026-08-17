@@ -5,6 +5,7 @@
 
 #include "frontier/execution_time_predictor/analytical_moe_model.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -438,7 +439,9 @@ MoECommunicationTime predict_moe_communication(
     std::uint64_t attention_tp_size, std::uint64_t moe_tp_size,
     std::uint64_t expert_parallel_size, std::uint64_t data_parallel_size,
     bool has_pipeline_boundary, double element_bytes,
-    std::uint64_t routed_hidden_size) {
+    std::uint64_t routed_hidden_size,
+    std::string_view moe_communication_backend,
+    const RoutingAllocation *routing, double fused_expert_compute_ms) {
     const std::uint64_t activation_bytes =
         payload_bytes(input_tokens, hidden_size, element_bytes);
     const std::uint64_t routed_bytes = payload_bytes(
@@ -451,14 +454,91 @@ MoECommunicationTime predict_moe_communication(
             communication.allreduce_ms(activation_bytes, attention_tp_size);
         value.moe_tp_ms =
             communication.allreduce_ms(activation_bytes, moe_tp_size);
-        value.ep_dispatch_ms =
-            communication.all_to_all_ms(routed_bytes, expert_parallel_size);
-        value.ep_combine_ms =
-            communication.all_to_all_ms(routed_bytes, expert_parallel_size);
-        value.dp_input_ms =
-            communication.allreduce_ms(activation_bytes, data_parallel_size);
-        value.dp_output_ms =
-            communication.allreduce_ms(activation_bytes, data_parallel_size);
+        if (moe_communication_backend == "sm100_megamoe_public" &&
+            expert_parallel_size > 1) {
+            // Public-prior GB200/GB300 NVL72 one-sided A2A envelope.  The
+            // startup terms (roughly 18--22 us dispatch and 31--33 us combine)
+            // and effective bandwidth range (about 0.59--0.75 TB/s) follow
+            // published DeepEP/MegaMoE-family measurements rather than peak
+            // NVLink bandwidth. Interpolate conservatively in log2(EP).
+            const double log_ep = std::log2(
+                static_cast<double>(expert_parallel_size));
+            const double ep_position = std::clamp((log_ep - 3.0) / 3.0,
+                                                  0.0, 1.0);
+            const double dispatch_startup_us = 18.0 + 4.0 * ep_position;
+            const double combine_startup_us = 31.0 + 2.0 * ep_position;
+            const double dispatch_gbps = 753.0 - 165.0 * ep_position;
+            const double combine_gbps = 728.0 - 97.0 * ep_position;
+
+            // The rank-major one-sided buffer stores one copy per
+            // (source token, destination EP lane), even when several selected
+            // experts for that token live on the same lane.  Expert-route
+            // counts still drive lane-local GEMM work, but communication must
+            // use the deduplicated token counts.
+            std::uint64_t maximum_lane_unique_tokens =
+                expert_parallel_size == 0
+                    ? 0
+                    : std::min(
+                          input_tokens,
+                          routed_tokens / expert_parallel_size +
+                              static_cast<std::uint64_t>(
+                                  routed_tokens % expert_parallel_size != 0));
+            if (routing != nullptr && !routing->lane_unique_tokens.empty()) {
+                maximum_lane_unique_tokens = *std::max_element(
+                    routing->lane_unique_tokens.begin(),
+                    routing->lane_unique_tokens.end());
+            }
+            const std::uint64_t routed_width =
+                routed_hidden_size == 0 ? hidden_size : routed_hidden_size;
+            const std::uint64_t maximum_dispatch_bytes = payload_bytes(
+                maximum_lane_unique_tokens, routed_width, element_bytes);
+            // MegaMoE combines BF16 expert outputs even when the dispatch
+            // activation is FP8.
+            const std::uint64_t maximum_combine_bytes = payload_bytes(
+                maximum_lane_unique_tokens, routed_width,
+                std::max(2.0, element_bytes));
+            const double remote_fraction =
+                static_cast<double>(expert_parallel_size - 1) /
+                static_cast<double>(expert_parallel_size);
+            value.raw_ep_dispatch_ms = dispatch_startup_us * 1e-3 +
+                remote_fraction * static_cast<double>(maximum_dispatch_bytes) /
+                    (dispatch_gbps * 1e6);
+            value.raw_ep_combine_ms = combine_startup_us * 1e-3 +
+                remote_fraction * static_cast<double>(maximum_combine_bytes) /
+                    (combine_gbps * 1e6);
+
+            const double raw_total =
+                value.raw_ep_dispatch_ms + value.raw_ep_combine_ms;
+            // Fused dispatch/GEMM/combine overlaps most, but not all, of the
+            // shorter path. A 35% residual is a named public prior, not a
+            // fitted result for the simulator workload.
+            const double fused_total =
+                std::max(fused_expert_compute_ms, raw_total) +
+                0.35 * std::min(fused_expert_compute_ms, raw_total);
+            const double exposed =
+                std::max(0.0, fused_total - fused_expert_compute_ms);
+            value.ep_dispatch_ms =
+                raw_total > 0.0
+                    ? exposed * value.raw_ep_dispatch_ms / raw_total
+                    : 0.0;
+            value.ep_combine_ms = exposed - value.ep_dispatch_ms;
+            // With DP attention + EP experts, dispatch/combine are the layout
+            // transition. Charging another DP all-reduce would double-count
+            // it. TP collectives remain separate above.
+            value.dp_input_ms = 0.0;
+            value.dp_output_ms = 0.0;
+        } else {
+            value.ep_dispatch_ms =
+                communication.all_to_all_ms(routed_bytes, expert_parallel_size);
+            value.ep_combine_ms =
+                communication.all_to_all_ms(routed_bytes, expert_parallel_size);
+            value.raw_ep_dispatch_ms = value.ep_dispatch_ms;
+            value.raw_ep_combine_ms = value.ep_combine_ms;
+            value.dp_input_ms = communication.allreduce_ms(
+                activation_bytes, data_parallel_size);
+            value.dp_output_ms = communication.allreduce_ms(
+                activation_bytes, data_parallel_size);
+        }
         value.pipeline_parallel_ms =
             has_pipeline_boundary
                 ? communication.point_to_point_ms(activation_bytes)

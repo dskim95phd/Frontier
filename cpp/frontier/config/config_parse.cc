@@ -1047,7 +1047,8 @@ ExecutionModelConfig parse_execution_model(const Json &root,
                 "network_latency_us",
                 "intra_node_bandwidth_gbps",
             },
-            {"operator_precisions", "device_overrides", "moe_layer_event_mode"},
+            {"operator_precisions", "device_overrides", "moe_layer_event_mode",
+             "moe_communication_backend"},
             "config.execution_model");
         AnalyticalExecutionModelConfig analytical = [&]() {
             AnalyticalExecutionModelConfig value{};
@@ -1062,6 +1063,11 @@ ExecutionModelConfig parse_execution_model(const Json &root,
                 value.moe_layer_event_mode =
                     require_string(execution, "moe_layer_event_mode",
                                    "config.execution_model");
+            }
+            if (execution.contains("moe_communication_backend")) {
+                value.moe_communication_backend = require_string(
+                    execution, "moe_communication_backend",
+                    "config.execution_model");
             }
             value.tensor_parallel_size = parallelism.tensor_parallel_size;
             value.network_bandwidth_gbps = require_finite_number(
@@ -1096,6 +1102,19 @@ ExecutionModelConfig parse_execution_model(const Json &root,
             throw ConfigError(
                 "config.execution_model.moe_layer_event_mode must be "
                 "'detailed', 'first_layer_scaled', or 'stage_group_scaled'");
+        }
+        if (analytical.moe_communication_backend != "generic" &&
+            analytical.moe_communication_backend !=
+                "sm100_megamoe_public") {
+            throw ConfigError(
+                "config.execution_model.moe_communication_backend must be "
+                "'generic' or 'sm100_megamoe_public'");
+        }
+        if (analytical.moe_communication_backend ==
+                "sm100_megamoe_public" &&
+            analytical.device != "gb300") {
+            throw ConfigError(
+                "sm100_megamoe_public requires execution device='gb300'");
         }
         if (!model.attention.execution_enabled ||
             model.attention.memory_layout ==

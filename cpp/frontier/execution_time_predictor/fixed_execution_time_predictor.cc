@@ -114,7 +114,8 @@ FixedExecutionTimePredictor::predict_stage_execution_time(
                     batch.total_scheduled_tokens(), model_.router_topk,
                     model_.total_expert_num,
                     parallelism_.moe_expert_parallel_size, routing_,
-                    layer_shared ? 0 : model_layer);
+                    layer_shared ? 0 : model_layer,
+                    static_cast<std::uint64_t>(batch.id().value()));
             }
             const detail::RoutingAllocation &allocation = *shared_allocation;
             routing_diagnostics.push_back([&]() {
@@ -130,6 +131,9 @@ FixedExecutionTimePredictor::predict_stage_execution_time(
                 value.routed_tokens = allocation.routed_tokens;
                 value.global_expert_tokens = allocation.global_expert_tokens;
                 value.lane_expert_tokens = allocation.lane_expert_tokens;
+                value.lane_routed_tokens = allocation.lane_routed_tokens;
+                value.lane_active_experts = allocation.lane_active_experts;
+                value.lane_unique_tokens = allocation.lane_unique_tokens;
                 value.lane_times_ms = std::vector<double>(
                     static_cast<std::size_t>(
                         parallelism_.moe_expert_parallel_size),

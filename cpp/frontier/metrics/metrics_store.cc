@@ -434,9 +434,16 @@ void MetricsStore::record_moe_routing(
         value.routed_tokens = diagnostic.routed_tokens;
         value.global_expert_tokens = diagnostic.global_expert_tokens;
         value.lane_expert_tokens = diagnostic.lane_expert_tokens;
+        value.lane_routed_tokens = diagnostic.lane_routed_tokens;
+        value.lane_active_experts = diagnostic.lane_active_experts;
+        value.lane_unique_tokens = diagnostic.lane_unique_tokens;
         value.lane_times_ms = diagnostic.lane_times_ms;
         value.critical_lane = diagnostic.critical_lane;
         value.critical_lane_time_ms = diagnostic.critical_lane_time_ms;
+        value.raw_ep_dispatch_ms = diagnostic.raw_ep_dispatch_ms;
+        value.raw_ep_combine_ms = diagnostic.raw_ep_combine_ms;
+        value.exposed_ep_dispatch_ms = diagnostic.exposed_ep_dispatch_ms;
+        value.exposed_ep_combine_ms = diagnostic.exposed_ep_combine_ms;
         return value;
     }());
 }

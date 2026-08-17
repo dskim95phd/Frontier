@@ -44,6 +44,7 @@ struct MoEStageContext {
     const detail::MoECommunicationTime *reusable_moe_communication = nullptr;
     const detail::RoutingAllocation *reusable_routing_allocation = nullptr;
     bool detailed_diagnostics_enabled = true;
+    std::uint64_t routing_sample_id = 0;
 
     [[nodiscard]] const detail::DenseLayerTimes &
     layer_time(std::uint64_t model_layer) const noexcept;

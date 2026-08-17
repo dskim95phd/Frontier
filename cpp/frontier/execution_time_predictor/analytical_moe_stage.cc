@@ -111,6 +111,9 @@ MoERoutingDiagnostic make_moe_routing_diagnostic(
     result.routed_tokens = allocation.routed_tokens;
     result.global_expert_tokens = allocation.global_expert_tokens;
     result.lane_expert_tokens = allocation.lane_expert_tokens;
+    result.lane_routed_tokens = allocation.lane_routed_tokens;
+    result.lane_active_experts = allocation.lane_active_experts;
+    result.lane_unique_tokens = allocation.lane_unique_tokens;
     result.lane_times_ms = lane_times_ms(lane_prediction);
     result.critical_lane = lane_prediction.critical_lane;
     result.critical_lane_time_ms = lane_prediction.critical_lane_time_ms;
@@ -228,11 +231,19 @@ void add_scaled_attention_layer(std::vector<ScaledMoEAttentionGroup> &groups,
 // Both MoE stage assemblers charge the same per-layer collective set; each
 // decides for itself whether to multiply it by the layer count.
 detail::MoECommunicationTime
-moe_stage_communication(const MoEStageContext &context) {
-    if (context.reusable_moe_communication != nullptr) {
+moe_stage_communication(const MoEStageContext &context,
+                        const detail::RoutingAllocation &allocation,
+                        const detail::MoELanePrediction &lane_prediction) {
+    if (context.config.moe_communication_backend == "generic" &&
+        context.reusable_moe_communication != nullptr) {
         return *context.reusable_moe_communication;
     }
     const std::uint64_t input_tokens = context.dense_batch.total_tokens;
+    const detail::MoELayerTime &critical = lane_prediction.lane_times.at(
+        static_cast<std::size_t>(lane_prediction.critical_lane));
+    const double fused_expert_compute_ms =
+        critical.grouped_up_projection_ms +
+        critical.grouped_down_projection_ms + critical.shuffling_ms;
     return detail::predict_moe_communication(
         context.communication_backend, input_tokens, context.model.hidden_size,
         input_tokens * context.model.router_topk,
@@ -241,7 +252,9 @@ moe_stage_communication(const MoEStageContext &context) {
         context.parallelism.moe_expert_parallel_size,
         context.parallelism.data_parallel_size, false,
         context.communication_element_bytes,
-        context.model.routed_expert_hidden_size);
+        context.model.routed_expert_hidden_size,
+        context.config.moe_communication_backend, &allocation,
+        fused_expert_compute_ms);
 }
 
 void reset_moe_compute(entities::ExecutionTime &execution_time) noexcept {
@@ -277,6 +290,22 @@ void record_moe_layer(MoEStagePrediction &result,
     add_critical_moe_layer_time(
         result.execution_time, critical,
         context.layer_time(model_layer).residual_add_ms);
+    const detail::MoECommunicationTime communication =
+        moe_stage_communication(context, allocation, lane_prediction);
+    MoERoutingDiagnostic &diagnostic = result.routing_diagnostics.back();
+    diagnostic.raw_ep_dispatch_ms = communication.raw_ep_dispatch_ms;
+    diagnostic.raw_ep_combine_ms = communication.raw_ep_combine_ms;
+    diagnostic.exposed_ep_dispatch_ms = communication.ep_dispatch_ms;
+    diagnostic.exposed_ep_combine_ms = communication.ep_combine_ms;
+    result.execution_time.moe_tp_communication_ms += communication.moe_tp_ms;
+    result.execution_time.ep_dispatch_ms += communication.ep_dispatch_ms;
+    result.execution_time.ep_combine_ms += communication.ep_combine_ms;
+    if (context.cluster_type == ClusterType::kDecode) {
+        result.execution_time.dp_input_communication_ms +=
+            communication.dp_input_ms;
+        result.execution_time.dp_output_communication_ms +=
+            communication.dp_output_ms;
+    }
     if (!context.detailed_diagnostics_enabled) {
         return;
     }
@@ -286,26 +315,6 @@ void record_moe_layer(MoEStagePrediction &result,
     result.diagnostics.emplace_back("layer_" + std::to_string(model_layer) +
                                         "_critical_lane_ms",
                                     lane_prediction.critical_lane_time_ms);
-}
-
-void apply_moe_communication(MoEStagePrediction &result,
-                             const MoEStageContext &context,
-                             double layer_multiplier) {
-    const detail::MoECommunicationTime communication =
-        moe_stage_communication(context);
-    result.execution_time.moe_tp_communication_ms =
-        layer_multiplier * communication.moe_tp_ms;
-    result.execution_time.ep_dispatch_ms =
-        layer_multiplier * communication.ep_dispatch_ms;
-    result.execution_time.ep_combine_ms =
-        layer_multiplier * communication.ep_combine_ms;
-    if (context.cluster_type != ClusterType::kDecode) {
-        return;
-    }
-    result.execution_time.dp_input_communication_ms =
-        layer_multiplier * communication.dp_input_ms;
-    result.execution_time.dp_output_communication_ms =
-        layer_multiplier * communication.dp_output_ms;
 }
 
 MoEStagePrediction
@@ -353,7 +362,8 @@ predict_selected_moe_layer_execution(const MoEStageContext &context,
                     parallelism.moe_expert_parallel_size, context.routing,
                     routing_seed_layer(routing_is_batch_shared(context.config,
                                                                context.routing),
-                                       model_layer)));
+                                       model_layer),
+                    context.routing_sample_id));
                 allocation = &*owned_allocation;
             }
             std::optional<detail::MoELanePrediction> owned_lane_prediction;
@@ -386,7 +396,6 @@ predict_selected_moe_layer_execution(const MoEStageContext &context,
             pending_tp_communication_ms;
     }
 
-    apply_moe_communication(result, context, 1.0);
     return result;
 }
 
@@ -399,6 +408,7 @@ MoEStagePrediction predict_moe_stage_execution(const MoEStageContext &context) {
     MoEStagePrediction result{};
     result.execution_time = context.base_execution_time;
     reset_moe_compute(result.execution_time);
+    reset_moe_communication(result.execution_time);
     const detail::MoEModel moe_model = make_moe_model(model, parallelism);
     const detail::MoEOperatorPrecisions moe_precisions =
         make_moe_operator_precisions(config);
@@ -406,6 +416,7 @@ MoEStagePrediction predict_moe_stage_execution(const MoEStageContext &context) {
     double pending_pre_moe_tp_communication_ms = 0.0;
     std::uint64_t moe_layer_index = 0;
     const detail::MoELanePrediction *repeated_lane_prediction = nullptr;
+    const detail::RoutingAllocation *repeated_allocation = nullptr;
     const bool first_layer_scaled =
         config.moe_layer_event_mode == "first_layer_scaled";
     const bool stage_group_requested =
@@ -466,6 +477,21 @@ MoEStagePrediction predict_moe_stage_execution(const MoEStageContext &context) {
             add_critical_moe_layer_time(
                 result.execution_time, critical,
                 context.layer_time(model_layer).residual_add_ms);
+            const detail::MoECommunicationTime communication =
+                moe_stage_communication(context, *repeated_allocation,
+                                        *repeated_lane_prediction);
+            result.execution_time.moe_tp_communication_ms +=
+                communication.moe_tp_ms;
+            result.execution_time.ep_dispatch_ms +=
+                communication.ep_dispatch_ms;
+            result.execution_time.ep_combine_ms +=
+                communication.ep_combine_ms;
+            if (context.cluster_type == ClusterType::kDecode) {
+                result.execution_time.dp_input_communication_ms +=
+                    communication.dp_input_ms;
+                result.execution_time.dp_output_communication_ms +=
+                    communication.dp_output_ms;
+            }
             pending_pre_moe_compute_ms = 0.0;
             pending_pre_moe_tp_communication_ms = 0.0;
             ++moe_layer_index;
@@ -477,7 +503,8 @@ MoEStagePrediction predict_moe_stage_execution(const MoEStageContext &context) {
             owned_allocation.emplace(detail::route_tokens(
                 context.dense_batch.total_tokens, model.router_topk,
                 model.total_expert_num, parallelism.moe_expert_parallel_size,
-                routing, routing_seed_layer(layer_shared, model_layer)));
+                routing, routing_seed_layer(layer_shared, model_layer),
+                context.routing_sample_id));
             allocation = &*owned_allocation;
             if (layer_shared) {
                 shared_allocation = allocation;
@@ -504,13 +531,12 @@ MoEStagePrediction predict_moe_stage_execution(const MoEStageContext &context) {
         ++moe_layer_index;
         if (first_layer_scaled || stage_group_scaled) {
             repeated_lane_prediction = lane_prediction;
+            repeated_allocation = allocation;
             result.repeated_moe_layer_pre_compute_ms = attention_compute_ms;
         }
     }
     result.suffix_compute_ms = pending_pre_moe_compute_ms;
     result.suffix_tp_communication_ms = pending_pre_moe_tp_communication_ms;
-    apply_moe_communication(
-        result, context, static_cast<double>(result.logical_moe_layer_count));
     return result;
 }
 

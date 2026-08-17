@@ -177,6 +177,7 @@ void test_moe_routing_layer_scope_contract() {
             static_cast<void>(parse_simulation_config_json(invalid));
         },
         "invalid layer_scope must fail fast");
+
 }
 
 void test_pdd_contract_round_trip() {
@@ -254,6 +255,7 @@ void test_analytical_contract_round_trip() {
     auto &analytical = config.cluster().execution_model.analytical;
     analytical.device = "gb300";
     analytical.moe_layer_event_mode = "first_layer_scaled";
+    analytical.moe_communication_backend = "sm100_megamoe_public";
     analytical.device_overrides.hbm_bandwidth_tbps = 7.5;
     analytical.device_overrides.fp8_tflops = 4'750.0;
     const auto gb300 =
@@ -279,6 +281,7 @@ void test_analytical_contract_round_trip() {
         "unsupported MoE layer event modes must fail fast");
 
     analytical.device = "custom";
+    analytical.moe_communication_backend = "generic";
     const std::string incomplete_custom =
         serialize_simulation_config_json(config);
     expect_throws<ConfigError>(

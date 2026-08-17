@@ -88,8 +88,11 @@ distribution_weights(std::uint64_t experts,
 void accumulate_uniform_topk_counts(std::uint64_t input_tokens,
                                     std::uint64_t router_topk,
                                     std::uint64_t total_experts,
+                                    const ExpertParallelDomain &domain,
                                     RoutingRng &generator,
-                                    std::vector<std::uint64_t> &counts) {
+                                    std::vector<std::uint64_t> &counts,
+                                    std::vector<std::uint64_t>
+                                        &lane_unique_tokens) {
     // A router selects a set of k distinct experts for each input token. Keep
     // only the aggregate expert loads needed by the timing model, but obtain
     // them from a real without-replacement top-k draw. The partial
@@ -101,6 +104,9 @@ void accumulate_uniform_topk_counts(std::uint64_t input_tokens,
     std::iota(expert_pool.begin(), expert_pool.end(), 0);
     std::vector<std::uint64_t> swap_positions(
         static_cast<std::size_t>(router_topk));
+    std::vector<bool> lane_seen(static_cast<std::size_t>(domain.size()), false);
+    std::vector<std::uint64_t> touched_lanes;
+    touched_lanes.reserve(static_cast<std::size_t>(router_topk));
 
     for (std::uint64_t token = 0; token < input_tokens; ++token) {
         for (std::uint64_t pick = 0; pick < router_topk; ++pick) {
@@ -109,8 +115,15 @@ void accumulate_uniform_topk_counts(std::uint64_t input_tokens,
             swap_positions[static_cast<std::size_t>(pick)] = swap_position;
             std::swap(expert_pool[static_cast<std::size_t>(pick)],
                       expert_pool[static_cast<std::size_t>(swap_position)]);
-            ++counts[static_cast<std::size_t>(
-                expert_pool[static_cast<std::size_t>(pick)])];
+            const std::uint64_t expert =
+                expert_pool[static_cast<std::size_t>(pick)];
+            ++counts[static_cast<std::size_t>(expert)];
+            const std::uint64_t lane = domain.owner(expert);
+            if (!lane_seen[static_cast<std::size_t>(lane)]) {
+                lane_seen[static_cast<std::size_t>(lane)] = true;
+                touched_lanes.push_back(lane);
+                ++lane_unique_tokens[static_cast<std::size_t>(lane)];
+            }
         }
         for (std::uint64_t pick = router_topk; pick > 0; --pick) {
             const std::uint64_t index = pick - 1;
@@ -119,7 +132,20 @@ void accumulate_uniform_topk_counts(std::uint64_t input_tokens,
             std::swap(expert_pool[static_cast<std::size_t>(index)],
                       expert_pool[static_cast<std::size_t>(swap_position)]);
         }
+        for (const std::uint64_t lane : touched_lanes) {
+            lane_seen[static_cast<std::size_t>(lane)] = false;
+        }
+        touched_lanes.clear();
     }
+}
+
+// SplitMix64 makes the batch and layer independent seed dimensions instead
+// of aliasing pairs such as (batch=1, layer=2) and (batch=2, layer=1).
+std::uint64_t mix_seed(std::uint64_t value) noexcept {
+    value += 0x9e3779b97f4a7c15ULL;
+    value = (value ^ (value >> 30U)) * 0xbf58476d1ce4e5b9ULL;
+    value = (value ^ (value >> 27U)) * 0x94d049bb133111ebULL;
+    return value ^ (value >> 31U);
 }
 
 } // namespace
@@ -178,7 +204,8 @@ discretize_expert_weights(std::uint64_t total_tokens,
 RoutingAllocation
 route_tokens(std::uint64_t input_tokens, std::uint64_t router_topk,
              std::uint64_t total_experts, std::uint64_t expert_parallel_size,
-             const config::MoeRoutingConfig &config, std::uint64_t layer_id) {
+             const config::MoeRoutingConfig &config, std::uint64_t layer_id,
+             std::optional<std::uint64_t> sample_id) {
     if (router_topk == 0 || router_topk > total_experts) {
         throw RoutingError("router top-k must be in [1, total experts]");
     }
@@ -191,6 +218,8 @@ route_tokens(std::uint64_t input_tokens, std::uint64_t router_topk,
     const std::uint64_t routed_tokens = input_tokens * router_topk;
     std::vector<std::uint64_t> counts(static_cast<std::size_t>(total_experts),
                                       0);
+    std::vector<std::uint64_t> lane_unique_tokens(
+        static_cast<std::size_t>(expert_parallel_size), 0);
 
     if (config.mode == config::MoeRoutingMode::kUniformLegacy) {
         const std::uint64_t base = routed_tokens / total_experts;
@@ -200,9 +229,18 @@ route_tokens(std::uint64_t input_tokens, std::uint64_t router_topk,
                 base + static_cast<std::uint64_t>(expert < remainder);
         }
     } else if (config.mode == config::MoeRoutingMode::kUniformRandom) {
-        RoutingRng generator(config.seed + layer_id);
+        // An omitted sample ID retains the historical explicit helper
+        // contract. Real batches pass an engaged optional, including batch 0,
+        // and therefore use the collision-resistant batch/layer mixer.
+        const std::uint64_t seed =
+            !sample_id.has_value()
+                ? config.seed + layer_id
+                : mix_seed(config.seed) ^ mix_seed(layer_id) ^
+                      mix_seed(*sample_id);
+        RoutingRng generator(seed);
         accumulate_uniform_topk_counts(input_tokens, router_topk, total_experts,
-                                       generator, counts);
+                                       domain, generator, counts,
+                                       lane_unique_tokens);
     } else {
         counts = discretize_expert_weights(
             routed_tokens,
@@ -216,6 +254,24 @@ route_tokens(std::uint64_t input_tokens, std::uint64_t router_topk,
         value.routed_tokens = routed_tokens;
         value.global_expert_tokens = counts;
         value.lane_expert_tokens = domain.partition(counts);
+        value.lane_routed_tokens.reserve(value.lane_expert_tokens.size());
+        value.lane_active_experts.reserve(value.lane_expert_tokens.size());
+        for (const auto &lane : value.lane_expert_tokens) {
+            value.lane_routed_tokens.push_back(
+                std::accumulate(lane.begin(), lane.end(), std::uint64_t{0}));
+            value.lane_active_experts.push_back(static_cast<std::uint64_t>(
+                std::count_if(lane.begin(), lane.end(),
+                              [](std::uint64_t tokens) { return tokens > 0; })));
+        }
+        if (config.mode != config::MoeRoutingMode::kUniformRandom) {
+            // Aggregate-only routing modes do not retain token identities.
+            // This upper bound is exact for top-1 and conservative otherwise.
+            for (std::size_t lane = 0; lane < lane_unique_tokens.size(); ++lane) {
+                lane_unique_tokens[lane] =
+                    std::min(input_tokens, value.lane_routed_tokens[lane]);
+            }
+        }
+        value.lane_unique_tokens = std::move(lane_unique_tokens);
         return value;
     }();
 }

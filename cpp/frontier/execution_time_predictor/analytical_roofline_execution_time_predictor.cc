@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <numeric>
 #include <string>
 #include <utility>
 
@@ -561,7 +562,8 @@ AnalyticalRooflineExecutionTimePredictor::shared_routing_for_batch(
     // which layer or stage happened to ask for it first.
     value->allocation = detail::route_tokens(
         dense_batch.total_tokens, model_.router_topk, model_.total_expert_num,
-        parallelism_.moe_expert_parallel_size, routing_, 0);
+        parallelism_.moe_expert_parallel_size, routing_, 0,
+        static_cast<std::uint64_t>(batch_id.value()));
     value->lane_prediction = detail::predict_moe_lanes(
         device_, detail::AnalyticalConfig{},
         internal::make_moe_model(model_, parallelism_), value->allocation,
@@ -688,6 +690,65 @@ AnalyticalRooflineExecutionTimePredictor::predict_moe_group_layer(
     allocation.global_expert_tokens = input.global_expert_tokens;
     allocation.lane_expert_tokens =
         domain.partition(allocation.global_expert_tokens);
+    const std::size_t ep_size =
+        static_cast<std::size_t>(parallelism_.moe_expert_parallel_size);
+    if (input.source_lane_routed_tokens.empty() ||
+        input.source_lane_routed_tokens.size() !=
+            input.source_lane_unique_tokens.size()) {
+        throw ExecutionTimePredictorError(
+            "analytical group MoE source traffic matrix is missing");
+    }
+    allocation.lane_routed_tokens.assign(ep_size, 0);
+    allocation.lane_unique_tokens.assign(ep_size, 0);
+    for (std::size_t source = 0;
+         source < input.source_lane_routed_tokens.size(); ++source) {
+        const auto &routed_row = input.source_lane_routed_tokens.at(source);
+        const auto &unique_row = input.source_lane_unique_tokens.at(source);
+        if (routed_row.size() != ep_size || unique_row.size() != ep_size) {
+            throw ExecutionTimePredictorError(
+                "analytical group MoE source traffic row has invalid EP "
+                "width");
+        }
+        for (std::size_t lane = 0; lane < ep_size; ++lane) {
+            if (routed_row.at(lane) >
+                    std::numeric_limits<std::uint64_t>::max() -
+                        allocation.lane_routed_tokens.at(lane) ||
+                unique_row.at(lane) >
+                    std::numeric_limits<std::uint64_t>::max() -
+                        allocation.lane_unique_tokens.at(lane)) {
+                throw ExecutionTimePredictorError(
+                    "analytical group MoE source traffic overflows");
+            }
+            allocation.lane_routed_tokens.at(lane) += routed_row.at(lane);
+            allocation.lane_unique_tokens.at(lane) += unique_row.at(lane);
+        }
+    }
+    const std::uint64_t lane_routed_total = std::accumulate(
+        allocation.lane_routed_tokens.begin(),
+        allocation.lane_routed_tokens.end(), std::uint64_t{0});
+    if (lane_routed_total != allocation.routed_tokens) {
+        throw ExecutionTimePredictorError(
+            "analytical group MoE source traffic does not conserve routed "
+            "tokens");
+    }
+    for (std::size_t lane = 0; lane < ep_size; ++lane) {
+        const std::uint64_t expert_lane_total = std::accumulate(
+            allocation.lane_expert_tokens.at(lane).begin(),
+            allocation.lane_expert_tokens.at(lane).end(), std::uint64_t{0});
+        if (expert_lane_total != allocation.lane_routed_tokens.at(lane) ||
+            allocation.lane_unique_tokens.at(lane) >
+                allocation.input_tokens) {
+            throw ExecutionTimePredictorError(
+                "analytical group MoE destination traffic is inconsistent "
+                "with expert routing");
+        }
+    }
+    allocation.lane_active_experts.reserve(ep_size);
+    for (const auto &lane : allocation.lane_expert_tokens) {
+        allocation.lane_active_experts.push_back(static_cast<std::uint64_t>(
+            std::count_if(lane.begin(), lane.end(),
+                          [](std::uint64_t tokens) { return tokens > 0; })));
+    }
     const detail::MoELanePrediction prediction = detail::predict_moe_lanes(
         device_, detail::AnalyticalConfig{},
         internal::make_moe_model(model_, parallelism_), allocation,
@@ -697,6 +758,35 @@ AnalyticalRooflineExecutionTimePredictor::predict_moe_group_layer(
     result.lane_times_ms = internal::lane_times_ms(prediction);
     result.critical_lane = prediction.critical_lane;
     result.critical_lane_time_ms = prediction.critical_lane_time_ms;
+    result.destination_lane_routed_tokens = allocation.lane_routed_tokens;
+    result.destination_lane_unique_tokens = allocation.lane_unique_tokens;
+    if (config_.moe_communication_backend == "sm100_megamoe_public" &&
+        parallelism_.moe_expert_parallel_size > 1) {
+        const detail::MoELayerTime &critical = prediction.lane_times.at(
+            static_cast<std::size_t>(prediction.critical_lane));
+        const double fused_expert_compute_ms =
+            critical.grouped_up_projection_ms +
+            critical.grouped_down_projection_ms + critical.shuffling_ms;
+        const detail::Precision communication_precision =
+            detail::precision_from_string(config_.communication_precision());
+        const detail::MoECommunicationTime communication =
+            detail::predict_moe_communication(
+                *communication_backend_, input.input_tokens,
+                model_.hidden_size, input.routed_tokens,
+                parallelism_.tensor_parallel_size,
+                parallelism_.moe_tensor_parallel_size,
+                parallelism_.moe_expert_parallel_size,
+                parallelism_.data_parallel_size, false,
+                detail::bytes_per_element(communication_precision),
+                model_.routed_expert_hidden_size,
+                config_.moe_communication_backend, &allocation,
+                fused_expert_compute_ms);
+        result.has_source_aware_ep_communication = true;
+        result.raw_ep_dispatch_ms = communication.raw_ep_dispatch_ms;
+        result.raw_ep_combine_ms = communication.raw_ep_combine_ms;
+        result.ep_dispatch_ms = communication.ep_dispatch_ms;
+        result.ep_combine_ms = communication.ep_combine_ms;
+    }
     return result;
 }
 
@@ -888,6 +978,7 @@ AnalyticalRooflineExecutionTimePredictor::predict_execution(
                 : nullptr,
             shared_routing != nullptr ? &shared_routing->allocation : nullptr,
             detailed_diagnostics_enabled_,
+            static_cast<std::uint64_t>(batch.id().value()),
         };
         internal::MoEStagePrediction moe_prediction =
             selected_moe_layer.has_value()

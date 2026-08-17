@@ -568,6 +568,22 @@ Layer-dependent routing and non-contiguous MoE layouts automatically use the
 detailed per-layer prediction path instead of reusing a mismatched first
 layer. PP stage arrival/end events remain unchanged.
 
+`execution_model.moe_communication_backend` is optional and defaults to
+`generic`, which preserves the configured collective model. The opt-in
+`sm100_megamoe_public` profile models the fused MegaMoE
+dispatch → expert GEMMs → combine critical path on a GB200/GB300 NVL72 domain.
+It uses public-prior one-sided A2A startup and effective-bandwidth envelopes,
+charges the receiver-side maximum unique-token load after deduplicating
+multiple expert routes from one token to the same destination lane, and
+overlaps communication with the expert kernels. At an aligned DP barrier, each
+active DP batch contributes one source row of destination-EP routed and
+unique-token counts; column sums form the receiver loads used by the group
+dispatch/combine prediction. Idle DP participants contribute no traffic. For
+DP-attention + EP-expert layouts,
+dispatch/combine are the
+layout transition, so this profile does not add a second DP input/output
+all-reduce. It is a documented prior, not a workload-fitted calibration.
+
 Timing-template reuse is scoped to one immutable batch: equivalent PP stages
 of that batch share one template per timing group. Different batches never
 share templates, even when their token and context shapes match, and all
@@ -676,6 +692,16 @@ the resolved value.
 them changes no number — it only stops the predictor recomputing an assignment
 it already has. That is worth doing: at K3 (93 layers, 896 experts) each
 redundant draw sorts 896 weights.
+
+For Kimi K3, use `mode="uniform_random"`, `distribution="balanced"`, and
+`layer_scope="shared"` to represent no-aux-loss routing as balanced in
+expectation but stochastic for every finite batch. One token-level top-k draw
+includes the batch ID in the deterministic seed and is reused by every MoE
+layer, so two same-sized batches do not repeat the same expert histogram
+without expanding the DES into one routing/barrier sequence per layer. Routing diagnostics
+also expose `lane_routed_tokens`, `lane_active_experts`, and
+`lane_unique_tokens`; the last field counts one source token once per
+destination EP lane and can therefore drive source-aware A2A traffic models.
 
 ## Determinism
 
