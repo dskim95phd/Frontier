@@ -400,29 +400,19 @@ Session snapshot generation may use a dedicated `CpuOffloadGeneration` or a
 clearly documented `Generation` value. Do not use an untyped integer in event
 payloads when a stale operation could mutate newer state.
 
-### Block state
+### Analytical range state
 
-```cpp
-enum class CpuBlockState {
-    kReserved,
-    kCommitted,
-};
-```
+The final C++ representation does not materialize physical CPU block IDs.
+Ordinary KV is stored as one contiguous session prefix plus a small set of
+in-flight or out-of-order ranges. Free capacity remains implicit in
+`capacity_blocks - resident_blocks - reserved_blocks`. Host-memory use is
+therefore proportional to sessions and concurrent transfers, not simulated
+CPU DRAM blocks.
 
-The final C++ representation materializes only owned blocks. Free capacity is
-implicit in `capacity_blocks - resident_blocks - reserved_blocks`, while
-released materialized IDs are recycled through the free-ID queue. Consequently
-there is no live `kFree` block record; this preserves the planned lazy-memory
-contract for very large CPU capacities.
-
-Each materialized CPU block records:
-
-- block ID;
-- state;
-- session ID;
-- logical block index;
-- pin count; and
-- owning reservation ID when reserved.
+An offload reservation owns one half-open suffix range. A restore lease pins
+one half-open committed range. When suffix completions arrive out of order,
+the manager retains only those completed ranges until the missing earlier
+range closes the gap, then coalesces them into the committed frontier.
 
 ### Session state
 
@@ -433,9 +423,10 @@ Each CPU session entry records:
 - last access time;
 - last commit time;
 - latest committed generation;
-- logical-index to CPU-block ownership;
+- committed and reserved aggregate block counts;
+- completed out-of-order suffix ranges;
 - active reservation IDs; and
-- aggregate restore pin count.
+- active restore lease IDs and aggregate/distinct pin counts.
 
 A session is not evictable while it has an active offload reservation or
 restore pin.
@@ -449,7 +440,7 @@ An offload reservation records:
 - generation;
 - desired frontier;
 - admitted frontier;
-- reserved block indices and IDs;
+- reserved half-open block range;
 - submission time;
 - skipped/truncated flags; and
 - terminal state.
@@ -460,19 +451,17 @@ A restore lease records:
 
 - lease ID;
 - session ID;
-- pinned block indices and IDs;
+- pinned half-open block range;
 - start time; and
 - released state.
 
-### Lazy materialization
+### Constant-size capacity accounting
 
-Do not allocate one C++ object per configured CPU block at construction time.
-Large DRAM capacities can represent hundreds of thousands or millions of
-logical blocks. Materialize block records only when reserved, and recycle freed
-IDs through a free-ID queue.
-
-Construction and idle memory usage should be independent of configured
-capacity.
+Do not allocate one C++ object per configured or resident CPU block. Large
+DRAM capacities can represent tens of millions of logical blocks, so both idle
+and fully occupied memory usage must remain independent of block count.
+Reservation, commit, restore, and suffix eviction update range endpoints and
+aggregate counters rather than iterating over logical blocks.
 
 ## CPU Store Operations
 

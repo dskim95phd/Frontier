@@ -1,8 +1,10 @@
 #include "frontier/kv_cache/cpu_kv_cache_manager.h"
 #include "tests/test_support.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <random>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -127,6 +129,43 @@ void test_incremental_occupancy_accounting() {
     manager.validate_invariants();
 }
 
+void test_overlapping_restore_ranges_count_distinct_pins() {
+    CpuKVCacheManager manager{16, CpuKVCacheCapacityPressurePolicy::kPrefixFit};
+    commit(manager, 12, 1, 8, 1.0);
+
+    const auto first = manager.pin_restore(SessionId{12}, 0, 5, at(2.0));
+    const auto second = manager.pin_restore(SessionId{12}, 3, 8, at(2.1));
+    expect(manager.diagnostics().pinned_blocks == 8,
+           "overlapping restore leases must count their block union");
+
+    expect(manager.release_restore(first, true, at(2.2)) &&
+               manager.diagnostics().pinned_blocks == 5,
+           "releasing one overlapping lease must preserve the other range");
+    expect(manager.release_restore(second, true, at(2.3)) &&
+               manager.diagnostics().pinned_blocks == 0,
+           "releasing every overlapping lease must clear distinct pins");
+    manager.validate_invariants();
+}
+
+void test_large_resident_range_has_constant_metadata() {
+    constexpr std::uint64_t capacity = 1'000'000'000ULL;
+    constexpr std::uint64_t frontier = 500'000'000ULL;
+    CpuKVCacheManager manager{capacity,
+                              CpuKVCacheCapacityPressurePolicy::kPrefixFit};
+    const auto reservation = manager.reserve_offload(
+        SessionId{13}, CpuOffloadGeneration{1}, frontier, at(1.0));
+    expect(reservation.reserved_blocks == frontier &&
+               manager.commit_offload(reservation.reservation_id, at(1.1)),
+           "large analytical range must reserve and commit as one record");
+    const auto diagnostics = manager.diagnostics();
+    expect(diagnostics.materialized_blocks == frontier &&
+               diagnostics.resident_blocks == frontier &&
+               diagnostics.sessions == 1 &&
+               diagnostics.active_reservations == 0,
+           "large analytical range must preserve logical block accounting");
+    manager.validate_invariants();
+}
+
 void test_out_of_order_commit_and_dependent_abort() {
     CpuKVCacheManager manager{8, CpuKVCacheCapacityPressurePolicy::kPrefixFit};
     const auto first = manager.reserve_offload(
@@ -167,8 +206,7 @@ void test_noop_lru_empty_metadata_and_zero_fit() {
     CpuKVCacheManager manager{4, CpuKVCacheCapacityPressurePolicy::kPrefixFit};
     commit(manager, 1, 1, 2, 1.0);
     commit(manager, 2, 1, 2, 2.0);
-    const std::uint64_t truncated_before =
-        manager.stats().truncated_offloads;
+    const std::uint64_t truncated_before = manager.stats().truncated_offloads;
     const auto no_op = manager.reserve_offload(
         SessionId{1}, CpuOffloadGeneration{2}, 2, at(3.0));
     expect(!no_op.requires_transfer() && !no_op.skipped && !no_op.truncated &&
@@ -298,6 +336,135 @@ void test_randomized_invariants() {
     }
 }
 
+std::uint64_t pinned_range_union(
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges) {
+    if (ranges.empty()) {
+        return 0;
+    }
+    std::sort(ranges.begin(), ranges.end());
+    std::uint64_t total = 0;
+    std::uint64_t begin = ranges.front().first;
+    std::uint64_t end = ranges.front().second;
+    for (std::size_t index = 1; index < ranges.size(); ++index) {
+        if (ranges[index].first > end) {
+            total += end - begin;
+            begin = ranges[index].first;
+            end = ranges[index].second;
+        } else {
+            end = std::max(end, ranges[index].second);
+        }
+    }
+    return total + end - begin;
+}
+
+void test_randomized_out_of_order_ranges_and_overlapping_leases() {
+    std::mt19937_64 random{0xC0FFEE};
+    for (std::int64_t trial = 0; trial < 200; ++trial) {
+        CpuKVCacheManager manager{1'024,
+                                  CpuKVCacheCapacityPressurePolicy::kPrefixFit};
+        const SessionId session{1 + trial};
+        const std::size_t reservation_count =
+            2 + static_cast<std::size_t>(random() % 15);
+        std::vector<frontier::CpuOffloadReservationId> reservation_ids;
+        std::vector<std::uint64_t> range_lengths;
+        std::vector<bool> committed(reservation_count, false);
+        reservation_ids.reserve(reservation_count);
+        range_lengths.reserve(reservation_count);
+        std::uint64_t frontier = 0;
+        double now = 1.0;
+        for (std::size_t index = 0; index < reservation_count; ++index) {
+            const std::uint64_t length = 1 + random() % 16;
+            frontier += length;
+            const auto reservation = manager.reserve_offload(
+                session,
+                CpuOffloadGeneration{static_cast<std::int64_t>(index + 1)},
+                frontier, at(now));
+            now += 0.001;
+            expect(reservation.reserved_blocks == length,
+                   "random range reservation must append its complete suffix");
+            reservation_ids.push_back(reservation.reservation_id);
+            range_lengths.push_back(length);
+        }
+
+        std::vector<std::size_t> completion_order;
+        completion_order.reserve(reservation_count);
+        for (std::size_t index = 0; index < reservation_count; ++index) {
+            completion_order.push_back(index);
+        }
+        std::shuffle(completion_order.begin(), completion_order.end(), random);
+        for (const std::size_t completed : completion_order) {
+            expect(manager.commit_offload(reservation_ids[completed], at(now)),
+                   "random out-of-order reservation must commit");
+            now += 0.001;
+            committed[completed] = true;
+            std::uint64_t expected_frontier = 0;
+            std::uint64_t expected_resident = 0;
+            std::uint64_t expected_reserved = 0;
+            bool prefix_complete = true;
+            for (std::size_t index = 0; index < reservation_count; ++index) {
+                if (committed[index]) {
+                    expected_resident += range_lengths[index];
+                } else {
+                    expected_reserved += range_lengths[index];
+                }
+                if (prefix_complete && committed[index]) {
+                    expected_frontier += range_lengths[index];
+                } else {
+                    prefix_complete = false;
+                }
+            }
+            const auto diagnostics = manager.diagnostics();
+            expect(manager.committed_frontier_blocks(session) ==
+                           expected_frontier &&
+                       diagnostics.resident_blocks == expected_resident &&
+                       diagnostics.reserved_blocks == expected_reserved,
+                   "random completion order must publish only a contiguous "
+                   "prefix while preserving aggregate range accounting");
+        }
+
+        struct ActiveLease {
+            frontier::CpuRestoreLeaseId id;
+            std::pair<std::uint64_t, std::uint64_t> range;
+        };
+        std::vector<ActiveLease> leases;
+        const std::size_t lease_count =
+            2 + static_cast<std::size_t>(random() % 25);
+        leases.reserve(lease_count);
+        for (std::size_t index = 0; index < lease_count; ++index) {
+            const std::uint64_t begin = random() % frontier;
+            const std::uint64_t end = begin + 1 + random() % (frontier - begin);
+            leases.push_back({manager.pin_restore(session, begin, end, at(now)),
+                              {begin, end}});
+            now += 0.001;
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+            ranges.reserve(leases.size());
+            for (const auto &lease : leases) {
+                ranges.push_back(lease.range);
+            }
+            expect(manager.diagnostics().pinned_blocks ==
+                       pinned_range_union(std::move(ranges)),
+                   "overlapping random leases must count their interval union");
+        }
+        std::shuffle(leases.begin(), leases.end(), random);
+        while (!leases.empty()) {
+            expect(manager.release_restore(leases.back().id, random() % 2 == 0,
+                                           at(now)),
+                   "random overlapping lease must release exactly once");
+            now += 0.001;
+            leases.pop_back();
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+            ranges.reserve(leases.size());
+            for (const auto &lease : leases) {
+                ranges.push_back(lease.range);
+            }
+            expect(manager.diagnostics().pinned_blocks ==
+                       pinned_range_union(std::move(ranges)),
+                   "random lease release must preserve the remaining union");
+        }
+        manager.validate_invariants();
+    }
+}
+
 void test_kda_snapshot_offload_replacement_and_restore_pin() {
     CpuKVCacheManager manager{16, CpuKVCacheCapacityPressurePolicy::kPrefixFit};
     manager.configure_kda_snapshot(2, 8'192);
@@ -335,8 +502,7 @@ void test_kda_snapshot_offload_replacement_and_restore_pin() {
     expect(manager.release_restore(lease, true, at(2.3)),
            "KDA restore lease must release exactly once");
 
-    const std::uint64_t truncated_before =
-        manager.stats().truncated_offloads;
+    const std::uint64_t truncated_before = manager.stats().truncated_offloads;
     const auto no_op = manager.reserve_offload(
         SessionId{71}, CpuOffloadGeneration{3}, 4, at(3.0));
     expect(!no_op.requires_transfer() && !no_op.truncated &&
@@ -489,6 +655,30 @@ void test_kda_snapshot_discard_waits_for_restore_pin() {
     manager.validate_invariants();
 }
 
+void test_kda_snapshot_only_discard_reaps_after_zero_block_update() {
+    CpuKVCacheManager manager{2, CpuKVCacheCapacityPressurePolicy::kPrefixFit};
+    manager.configure_kda_snapshot(2, 4'096);
+    commit(manager, 92, 1, 0, 1.0);
+    const auto update = manager.reserve_offload(
+        SessionId{92}, CpuOffloadGeneration{2}, 2, at(2.0));
+    expect(update.requires_transfer() && update.reserved_blocks == 0 &&
+               update.kda_snapshot_blocks == 2 && update.truncated,
+           "snapshot-frontier update must remain transferable when ordinary "
+           "KV admits zero blocks");
+    expect(manager.discard_session(SessionId{92}) &&
+               manager.commit_offload(update.reservation_id, at(2.1)),
+           "discarded zero-block snapshot update must drain its completion");
+    const auto diagnostics = manager.diagnostics();
+    expect(diagnostics.sessions == 0 &&
+               diagnostics.kda_snapshot_sessions == 0 &&
+               diagnostics.kda_snapshot_occupied_blocks == 0 &&
+               diagnostics.active_reservations == 0 &&
+               manager.stats().discarded_offload_completions == 1,
+           "snapshot-only discard must reap already-erased session metadata "
+           "without reusing its iterator");
+    manager.validate_invariants();
+}
+
 void test_kda_first_snapshot_out_of_order_generation_commit() {
     CpuKVCacheManager manager{20, CpuKVCacheCapacityPressurePolicy::kPrefixFit};
     manager.configure_kda_snapshot(2, 4'096);
@@ -501,6 +691,12 @@ void test_kda_first_snapshot_out_of_order_generation_commit() {
                manager.kda_snapshot_frontier_blocks(SessionId{101}) == 4,
            "newer first-snapshot generation must consume the shared atomic "
            "slot");
+    const auto between = manager.diagnostics();
+    expect(between.active_reservations == 1 &&
+               between.kda_snapshot_reserved_blocks == 0 &&
+               between.kda_snapshot_occupied_blocks == 2,
+           "consuming a shared snapshot slot must clear its original owner's "
+           "reservation flag before the stale completion arrives");
     expect(manager.commit_offload(older.reservation_id, at(1.3)) &&
                manager.lookup(SessionId{101}, 4).hit_blocks == 4 &&
                manager.diagnostics().reserved_blocks == 0 &&
@@ -522,6 +718,12 @@ int main() {
                                     test_lru_suffix_and_restore_pins);
     failures += frontier::test::run("CPU incremental occupancy accounting",
                                     test_incremental_occupancy_accounting);
+    failures += frontier::test::run(
+        "CPU overlapping restore ranges count distinct pins",
+        test_overlapping_restore_ranges_count_distinct_pins);
+    failures +=
+        frontier::test::run("CPU large resident range uses constant metadata",
+                            test_large_resident_range_has_constant_metadata);
     failures +=
         frontier::test::run("CPU out-of-order commit and dependent abort",
                             test_out_of_order_commit_and_dependent_abort);
@@ -533,11 +735,14 @@ int main() {
     failures += frontier::test::run("CPU randomized invariants",
                                     test_randomized_invariants);
     failures += frontier::test::run(
+        "CPU randomized out-of-order ranges and overlapping leases",
+        test_randomized_out_of_order_ranges_and_overlapping_leases);
+    failures += frontier::test::run(
         "CPU KDA snapshot replacement and restore pin",
         test_kda_snapshot_offload_replacement_and_restore_pin);
-    failures += frontier::test::run(
-        "CPU KDA snapshot-only offload and restore pin",
-        test_kda_snapshot_only_offload_and_restore_pin);
+    failures +=
+        frontier::test::run("CPU KDA snapshot-only offload and restore pin",
+                            test_kda_snapshot_only_offload_and_restore_pin);
     failures += frontier::test::run(
         "CPU KDA snapshot atomic eviction after ordinary KV",
         test_kda_snapshot_eviction_is_atomic_after_normal_kv);
@@ -553,6 +758,9 @@ int main() {
     failures +=
         frontier::test::run("CPU KDA snapshot discard waits for restore pin",
                             test_kda_snapshot_discard_waits_for_restore_pin);
+    failures += frontier::test::run(
+        "CPU KDA snapshot-only discard drains zero-block update",
+        test_kda_snapshot_only_discard_reaps_after_zero_block_update);
     failures += frontier::test::run(
         "CPU KDA first snapshot out-of-order generation commit",
         test_kda_first_snapshot_out_of_order_generation_commit);

@@ -2,11 +2,11 @@
 
 #include <cstdint>
 #include <list>
+#include <map>
 #include <optional>
 #include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
-#include <vector>
 
 #include "frontier/config/config.h"
 #include "frontier/core/event.h"
@@ -20,7 +20,6 @@ class CpuKVCacheError : public std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
-enum class CpuBlockState { kReserved, kCommitted };
 enum class CpuOffloadReservationState { kPending, kCommitted, kAborted };
 
 struct CpuPrefixLookupResult {
@@ -162,31 +161,27 @@ class CpuKVCacheManager {
     void validate_invariants() const;
 
   private:
-    struct CpuBlock {
-        CpuBlockId id;
-        CpuBlockState state = CpuBlockState::kReserved;
-        SessionId session_id;
-        std::uint64_t logical_index = 0;
-        std::uint64_t pin_count = 0;
-        CpuOffloadReservationId reservation_id;
-        CpuOffloadGeneration generation;
-    };
-
     struct SessionState {
-        // Materialized session blocks are always a contiguous prefix.  The
-        // committed frontier may lag the reserved frontier when a suffix
-        // reservation completes out of order.
+        // Ordinary CPU KV is an analytical contiguous prefix. Physical block
+        // identity is intentionally absent: in-flight suffix reservations and
+        // completed out-of-order ranges carry the only state that cannot be
+        // represented by the two frontiers and aggregate counts below.
         std::uint64_t committed_frontier_blocks = 0;
         std::uint64_t reserved_frontier_blocks = 0;
+        std::uint64_t committed_blocks = 0;
+        std::uint64_t reserved_blocks = 0;
         SimTime last_access_time;
         SimTime last_commit_time;
         CpuOffloadGeneration latest_submitted_generation;
         CpuOffloadGeneration latest_committed_generation;
-        std::unordered_map<std::uint64_t, CpuBlockId> blocks;
+        std::map<std::uint64_t, std::uint64_t> committed_out_of_order_ranges;
         std::unordered_set<CpuOffloadReservationId,
                            StrongIdHash<CpuOffloadReservationId>>
             active_reservations;
+        std::unordered_set<CpuRestoreLeaseId, StrongIdHash<CpuRestoreLeaseId>>
+            active_restore_leases;
         std::uint64_t aggregate_restore_pins = 0;
+        std::uint64_t distinct_pinned_blocks = 0;
         std::uint64_t aggregate_snapshot_pins = 0;
         bool discard_pending = false;
     };
@@ -205,9 +200,8 @@ class CpuKVCacheManager {
         std::uint64_t desired_frontier_blocks = 0;
         std::uint64_t admitted_frontier_blocks = 0;
         std::uint64_t begin_block = 0;
-        // Reservations exist only while pending. Checked monotonic IDs make
-        // late duplicate completions identifiable without tombstone records.
-        std::vector<CpuBlockId> block_ids;
+        // Reservations exist only while pending. The ordinary KV suffix is
+        // the half-open range [begin_block, admitted_frontier_blocks).
         SimTime submitted_at;
         bool includes_kda_snapshot = false;
         bool snapshot_slot_reserved = false;
@@ -220,8 +214,10 @@ class CpuKVCacheManager {
     struct RestoreLease {
         CpuRestoreLeaseId id;
         SessionId session_id;
-        // Leases exist only while active; release erases the record.
-        std::vector<CpuBlockId> block_ids;
+        // Leases exist only while active; release erases the record. The
+        // pinned ordinary KV is the half-open range [begin_block, end_block).
+        std::uint64_t begin_block = 0;
+        std::uint64_t end_block = 0;
         SimTime started_at;
         bool includes_kda_snapshot = false;
         std::uint64_t kda_snapshot_blocks = 0;
@@ -229,8 +225,6 @@ class CpuKVCacheManager {
         bool released = false;
     };
 
-    [[nodiscard]] CpuBlockId allocate_block_id();
-    void free_block(CpuBlockId block_id);
     [[nodiscard]] std::uint64_t available_blocks() const noexcept;
     [[nodiscard]] std::uint64_t evict_for(std::uint64_t required,
                                           SessionId excluded_session);
@@ -243,7 +237,10 @@ class CpuKVCacheManager {
     void release_kda_snapshot_slot(SessionId session_id);
     [[nodiscard]] bool
     session_has_pending_snapshot(SessionId session_id) const noexcept;
-    void advance_committed_frontier(SessionState &session);
+    void publish_committed_range(SessionState &session,
+                                 std::uint64_t begin_block,
+                                 std::uint64_t end_block);
+    void recompute_distinct_pinned_blocks(SessionState &session);
     void erase_session_if_empty(SessionId session_id);
     void maybe_reap_discarded_session(SessionId session_id);
     void record_occupancy_peaks() noexcept;
@@ -262,11 +259,8 @@ class CpuKVCacheManager {
     std::uint64_t kda_snapshot_reserved_blocks_ = 0;
     std::uint64_t pinned_blocks_ = 0;
     std::uint64_t pinned_kda_snapshots_ = 0;
-    CheckedIdGenerator<CpuBlockId> block_ids_;
     CheckedIdGenerator<CpuOffloadReservationId> reservation_ids_;
     CheckedIdGenerator<CpuRestoreLeaseId> lease_ids_;
-    std::vector<CpuBlockId> recycled_block_ids_;
-    std::unordered_map<CpuBlockId, CpuBlock, StrongIdHash<CpuBlockId>> blocks_;
     std::unordered_map<SessionId, SessionState, StrongIdHash<SessionId>>
         sessions_;
     std::list<SessionId> kda_snapshot_lru_;

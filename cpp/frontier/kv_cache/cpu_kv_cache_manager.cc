@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <limits>
 #include <tuple>
+#include <vector>
 
 #include "frontier/core/checked_math.h"
 
@@ -76,35 +77,6 @@ void CpuKVCacheManager::record_successful_lookup(RequestId request_id,
     }
 }
 
-CpuBlockId CpuKVCacheManager::allocate_block_id() {
-    if (!recycled_block_ids_.empty()) {
-        const CpuBlockId id = recycled_block_ids_.back();
-        recycled_block_ids_.pop_back();
-        return id;
-    }
-    return block_ids_.next("CPU block ID space exhausted");
-}
-
-void CpuKVCacheManager::free_block(CpuBlockId block_id) {
-    const auto position = blocks_.find(block_id);
-    if (position == blocks_.end() || position->second.pin_count != 0) {
-        throw CpuKVCacheError("cannot free missing or pinned CPU block");
-    }
-    if (position->second.state == CpuBlockState::kCommitted) {
-        if (resident_blocks_ == 0) {
-            throw CpuKVCacheError("CPU resident block accounting underflow");
-        }
-        --resident_blocks_;
-    } else {
-        if (reserved_blocks_ == 0) {
-            throw CpuKVCacheError("CPU reserved block accounting underflow");
-        }
-        --reserved_blocks_;
-    }
-    blocks_.erase(position);
-    recycled_block_ids_.push_back(block_id);
-}
-
 std::uint64_t CpuKVCacheManager::available_blocks() const noexcept {
     const std::uint64_t ordinary = resident_blocks_ + reserved_blocks_;
     const std::uint64_t snapshots =
@@ -156,7 +128,8 @@ bool CpuKVCacheManager::can_evict_kda_snapshot(SessionId session_id) const {
     const auto snapshot = kda_snapshots_.find(session_id);
     const auto session = sessions_.find(session_id);
     return snapshot != kda_snapshots_.end() && session != sessions_.end() &&
-           snapshot->second.in_lru && session->second.blocks.empty() &&
+           snapshot->second.in_lru && session->second.committed_blocks == 0 &&
+           session->second.reserved_blocks == 0 &&
            session->second.active_reservations.empty() &&
            session->second.aggregate_restore_pins == 0 &&
            session->second.aggregate_snapshot_pins == 0 &&
@@ -247,7 +220,7 @@ std::uint64_t CpuKVCacheManager::evict_for(std::uint64_t required,
             // chain is consumed in that order below; selecting a victim from
             // the full session set is important because a zero-KV snapshot
             // can be older than a newer session's ordinary suffix.
-            if (candidate.blocks.empty() &&
+            if (candidate.committed_blocks == 0 &&
                 (snapshot == kda_snapshots_.end() ||
                  !can_evict_kda_snapshot(position->first))) {
                 continue;
@@ -268,36 +241,25 @@ std::uint64_t CpuKVCacheManager::evict_for(std::uint64_t required,
         const SessionId victim_id = victim->first;
         SessionState &session = victim->second;
         const std::uint64_t need = required - available_blocks();
-        const std::uint64_t reclaim = std::min<std::uint64_t>(
-            need, static_cast<std::uint64_t>(session.blocks.size()));
-        // Session block logical indices are materialized as a contiguous
-        // prefix and eviction always removes its suffix.  Remove those keys
-        // directly instead of searching the whole unordered map for the
-        // maximum on every iteration (which made this path O(N^2)).
-        const std::uint64_t suffix_end =
-            static_cast<std::uint64_t>(session.blocks.size());
-        for (std::uint64_t count = 0; count < reclaim; ++count) {
-            if (session.blocks.empty() || suffix_end <= count) {
-                throw CpuKVCacheError("CPU session suffix eviction underflow");
-            }
-            const std::uint64_t logical_index = suffix_end - count - 1;
-            auto suffix = session.blocks.find(logical_index);
-            if (suffix == session.blocks.end()) {
-                throw CpuKVCacheError("CPU session suffix eviction gap");
-            }
-            const CpuBlockId block_id = suffix->second;
-            session.blocks.erase(suffix);
-            free_block(block_id);
-            ++stats_.evicted_blocks;
+        if (session.reserved_blocks != 0 ||
+            !session.committed_out_of_order_ranges.empty() ||
+            session.committed_frontier_blocks != session.committed_blocks ||
+            session.reserved_frontier_blocks != session.committed_blocks) {
+            throw CpuKVCacheError(
+                "evictable CPU session is not a settled contiguous prefix");
         }
-        if (suffix_end != 0) {
-            const std::uint64_t remaining =
-                static_cast<std::uint64_t>(session.blocks.size());
-            session.committed_frontier_blocks =
-                std::min(session.committed_frontier_blocks, remaining);
-            session.reserved_frontier_blocks =
-                std::min(session.reserved_frontier_blocks, remaining);
-            if (session.blocks.empty()) {
+        const std::uint64_t reclaim =
+            std::min<std::uint64_t>(need, session.committed_blocks);
+        if (reclaim > resident_blocks_) {
+            throw CpuKVCacheError("CPU resident block accounting underflow");
+        }
+        session.committed_blocks -= reclaim;
+        session.committed_frontier_blocks -= reclaim;
+        session.reserved_frontier_blocks -= reclaim;
+        resident_blocks_ -= reclaim;
+        stats_.evicted_blocks += reclaim;
+        if (reclaim != 0) {
+            if (session.committed_blocks == 0) {
                 const auto snapshot = kda_snapshots_.find(victim_id);
                 if (snapshot != kda_snapshots_.end() &&
                     !snapshot->second.in_lru &&
@@ -321,7 +283,9 @@ std::uint64_t CpuKVCacheManager::evict_for(std::uint64_t required,
         // sessions.
         if (available_blocks() < required) {
             const auto current = sessions_.find(victim_id);
-            if (current != sessions_.end() && current->second.blocks.empty() &&
+            if (current != sessions_.end() &&
+                current->second.committed_blocks == 0 &&
+                current->second.reserved_blocks == 0 &&
                 can_evict_kda_snapshot(victim_id)) {
                 remove_kda_snapshot(victim_id, true);
             }
@@ -330,30 +294,87 @@ std::uint64_t CpuKVCacheManager::evict_for(std::uint64_t required,
     return available_blocks();
 }
 
-void CpuKVCacheManager::advance_committed_frontier(SessionState &session) {
-    // Reservations append a contiguous suffix.  A commit can therefore only
-    // expose new blocks starting at the current committed frontier; an
-    // out-of-order suffix commit stops at the first still-reserved block.
-    while (session.committed_frontier_blocks <
-           session.reserved_frontier_blocks) {
-        const auto owned =
-            session.blocks.find(session.committed_frontier_blocks);
-        if (owned == session.blocks.end()) {
-            break;
-        }
-        const auto block = blocks_.find(owned->second);
-        if (block == blocks_.end() ||
-            block->second.state != CpuBlockState::kCommitted) {
-            break;
-        }
-        ++session.committed_frontier_blocks;
+void CpuKVCacheManager::publish_committed_range(SessionState &session,
+                                                std::uint64_t begin_block,
+                                                std::uint64_t end_block) {
+    if (begin_block > end_block ||
+        end_block > session.reserved_frontier_blocks) {
+        throw CpuKVCacheError("invalid committed CPU range");
     }
+    if (begin_block == end_block) {
+        return;
+    }
+    if (begin_block < session.committed_frontier_blocks) {
+        throw CpuKVCacheError("committed CPU range overlaps published prefix");
+    }
+    if (begin_block != session.committed_frontier_blocks) {
+        if (!session.committed_out_of_order_ranges
+                 .emplace(begin_block, end_block)
+                 .second) {
+            throw CpuKVCacheError("duplicate out-of-order CPU range");
+        }
+        return;
+    }
+    session.committed_frontier_blocks = end_block;
+    while (true) {
+        const auto next = session.committed_out_of_order_ranges.find(
+            session.committed_frontier_blocks);
+        if (next == session.committed_out_of_order_ranges.end()) {
+            break;
+        }
+        session.committed_frontier_blocks = next->second;
+        session.committed_out_of_order_ranges.erase(next);
+    }
+}
+
+void CpuKVCacheManager::recompute_distinct_pinned_blocks(
+    SessionState &session) {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    ranges.reserve(session.active_restore_leases.size());
+    for (const CpuRestoreLeaseId lease_id : session.active_restore_leases) {
+        const auto lease = leases_.find(lease_id);
+        if (lease == leases_.end() || lease->second.released) {
+            throw CpuKVCacheError("CPU session references an inactive lease");
+        }
+        if (lease->second.begin_block != lease->second.end_block) {
+            ranges.emplace_back(lease->second.begin_block,
+                                lease->second.end_block);
+        }
+    }
+    std::sort(ranges.begin(), ranges.end());
+    std::uint64_t distinct = 0;
+    std::uint64_t begin = 0;
+    std::uint64_t end = 0;
+    bool have_range = false;
+    for (const auto &[range_begin, range_end] : ranges) {
+        if (!have_range || range_begin > end) {
+            if (have_range) {
+                distinct += end - begin;
+            }
+            begin = range_begin;
+            end = range_end;
+            have_range = true;
+        } else {
+            end = std::max(end, range_end);
+        }
+    }
+    if (have_range) {
+        distinct += end - begin;
+    }
+    if (session.distinct_pinned_blocks > pinned_blocks_) {
+        throw CpuKVCacheError("CPU pinned block accounting underflow");
+    }
+    pinned_blocks_ -= session.distinct_pinned_blocks;
+    pinned_blocks_ += distinct;
+    session.distinct_pinned_blocks = distinct;
 }
 
 void CpuKVCacheManager::erase_session_if_empty(SessionId session_id) {
     const auto position = sessions_.find(session_id);
-    if (position != sessions_.end() && position->second.blocks.empty() &&
+    if (position != sessions_.end() && position->second.committed_blocks == 0 &&
+        position->second.reserved_blocks == 0 &&
         position->second.active_reservations.empty() &&
+        position->second.active_restore_leases.empty() &&
         position->second.aggregate_restore_pins == 0 &&
         position->second.aggregate_snapshot_pins == 0 &&
         kda_snapshots_.find(session_id) == kda_snapshots_.end() &&
@@ -383,31 +404,21 @@ void CpuKVCacheManager::maybe_reap_discarded_session(SessionId session_id) {
         }
     }
 
-    std::uint64_t discarded_resident = 0;
-    std::vector<CpuBlockId> discarded_blocks;
-    discarded_blocks.reserve(session.blocks.size());
-    for (const auto &[index, block_id] : session.blocks) {
-        static_cast<void>(index);
-        const auto block = blocks_.find(block_id);
-        if (block == blocks_.end() || block->second.pin_count != 0) {
-            throw CpuKVCacheError(
-                "discarded CPU session retained an invalid block");
-        }
-        discarded_resident += static_cast<std::uint64_t>(
-            block->second.state == CpuBlockState::kCommitted);
-        discarded_blocks.push_back(block_id);
+    const std::uint64_t discarded_resident = session.committed_blocks;
+    const std::uint64_t discarded_reserved = session.reserved_blocks;
+    if (discarded_resident > resident_blocks_ ||
+        discarded_reserved > reserved_blocks_) {
+        throw CpuKVCacheError("discarded CPU range accounting underflow");
     }
-    for (const CpuBlockId block_id : discarded_blocks) {
-        free_block(block_id);
-    }
+    resident_blocks_ -= discarded_resident;
+    reserved_blocks_ -= discarded_reserved;
     std::vector<CpuOffloadReservationId> terminal_reservations{
         session.active_reservations.begin(), session.active_reservations.end()};
-    for (const CpuOffloadReservationId reservation_id :
-         terminal_reservations) {
+    for (const CpuOffloadReservationId reservation_id : terminal_reservations) {
         reservations_.at(reservation_id).state =
             CpuOffloadReservationState::kAborted;
     }
-    const bool materialized = !session.blocks.empty();
+    const bool materialized = discarded_resident + discarded_reserved != 0;
     stats_.evicted_blocks += discarded_resident;
     stats_.evicted_sessions += static_cast<std::uint64_t>(materialized);
     session.active_reservations.clear();
@@ -416,9 +427,8 @@ void CpuKVCacheManager::maybe_reap_discarded_session(SessionId session_id) {
     // having published an object yet.  Once all retired completions drain,
     // release that slot before dropping the session metadata.
     release_kda_snapshot_slot(session_id);
-    sessions_.erase(position);
-    for (const CpuOffloadReservationId reservation_id :
-         terminal_reservations) {
+    sessions_.erase(session_id);
+    for (const CpuOffloadReservationId reservation_id : terminal_reservations) {
         reservations_.erase(reservation_id);
     }
 }
@@ -477,11 +487,9 @@ CpuOffloadReservationResult CpuKVCacheManager::reserve_offload(
         }
         return result;
     }
-    const std::uint64_t required_capacity =
-        checked_math::add<CpuKVCacheError>(
-            missing,
-            snapshot_slot_needed ? kda_snapshot_charge_blocks_ : 0,
-            "CPU offload capacity requirement overflows");
+    const std::uint64_t required_capacity = checked_math::add<CpuKVCacheError>(
+        missing, snapshot_slot_needed ? kda_snapshot_charge_blocks_ : 0,
+        "CPU offload capacity requirement overflows");
 
     if (pressure_policy_ ==
         config::CpuKVCacheCapacityPressurePolicy::kSkipOffload) {
@@ -494,7 +502,7 @@ CpuOffloadReservationResult CpuKVCacheManager::reserve_offload(
                 continue;
             }
             const std::uint64_t count =
-                static_cast<std::uint64_t>(candidate.blocks.size());
+                candidate.committed_blocks + candidate.reserved_blocks;
             if (count > std::numeric_limits<std::uint64_t>::max() - evictable) {
                 throw CpuKVCacheError("CPU evictable capacity overflows");
             }
@@ -508,10 +516,9 @@ CpuOffloadReservationResult CpuKVCacheManager::reserve_offload(
             const bool snapshot_reclaimable =
                 snapshot != kda_snapshots_.end() &&
                 candidate.aggregate_snapshot_pins == 0 &&
-                (!candidate.blocks.empty() ||
+                (candidate.committed_blocks != 0 ||
                  can_evict_kda_snapshot(candidate_id));
-            if (kda_snapshot_charge_blocks_ != 0 &&
-                snapshot_reclaimable) {
+            if (kda_snapshot_charge_blocks_ != 0 && snapshot_reclaimable) {
                 if (kda_snapshot_charge_blocks_ >
                     std::numeric_limits<std::uint64_t>::max() - evictable) {
                     throw CpuKVCacheError("CPU evictable capacity overflows");
@@ -573,23 +580,14 @@ CpuOffloadReservationResult CpuKVCacheManager::reserve_offload(
     reservation.snapshot_slot_reserved = snapshot_slot_needed;
     reservation.kda_snapshot_frontier_blocks = desired_frontier_blocks;
     reservation.truncated = admitted < missing;
-    reservation.block_ids.reserve(static_cast<std::size_t>(admitted));
-    for (std::uint64_t offset = 0; offset < admitted; ++offset) {
-        const std::uint64_t logical_index = base + offset;
-        const CpuBlockId block_id = allocate_block_id();
-        CpuBlock block{};
-        block.id = block_id;
-        block.session_id = session_id;
-        block.logical_index = logical_index;
-        block.reservation_id = reservation_id;
-        block.generation = generation;
-        if (!blocks_.emplace(block_id, block).second ||
-            !session.blocks.emplace(logical_index, block_id).second) {
-            throw CpuKVCacheError("duplicate CPU block materialization");
-        }
-        ++reserved_blocks_;
-        reservation.block_ids.push_back(block_id);
+    if (admitted >
+            std::numeric_limits<std::uint64_t>::max() - reserved_blocks_ ||
+        admitted > std::numeric_limits<std::uint64_t>::max() -
+                       session.reserved_blocks) {
+        throw CpuKVCacheError("CPU reserved range accounting overflows");
     }
+    reserved_blocks_ += admitted;
+    session.reserved_blocks += admitted;
     if ((snapshot_update || admitted > 0) && has_snapshot &&
         snapshot_position->second.in_lru) {
         remove_kda_snapshot_from_lru(snapshot_position->second);
@@ -660,21 +658,22 @@ bool CpuKVCacheManager::commit_offload(CpuOffloadReservationId reservation_id,
         stale_snapshot) {
         ++stats_.stale_generation_completions;
     }
-    for (const CpuBlockId block_id : reservation.block_ids) {
-        auto block = blocks_.find(block_id);
-        if (block == blocks_.end() ||
-            block->second.state != CpuBlockState::kReserved ||
-            block->second.reservation_id != reservation_id) {
-            throw CpuKVCacheError("CPU offload reservation blocks diverged");
-        }
-        block->second.state = CpuBlockState::kCommitted;
-        block->second.reservation_id = CpuOffloadReservationId{};
-        if (reserved_blocks_ == 0) {
-            throw CpuKVCacheError("CPU reserved block accounting underflow");
-        }
-        --reserved_blocks_;
-        ++resident_blocks_;
+    if (reservation.admitted_frontier_blocks < reservation.begin_block) {
+        throw CpuKVCacheError("CPU offload reservation range is inverted");
     }
+    const std::uint64_t committed =
+        reservation.admitted_frontier_blocks - reservation.begin_block;
+    if (committed > reserved_blocks_ || committed > session.reserved_blocks ||
+        committed >
+            std::numeric_limits<std::uint64_t>::max() - resident_blocks_ ||
+        committed > std::numeric_limits<std::uint64_t>::max() -
+                        session.committed_blocks) {
+        throw CpuKVCacheError("CPU offload range accounting diverged");
+    }
+    reserved_blocks_ -= committed;
+    session.reserved_blocks -= committed;
+    resident_blocks_ += committed;
+    session.committed_blocks += committed;
     session.active_reservations.erase(reservation_id);
     session.last_commit_time = completed_at;
     session.last_access_time = completed_at;
@@ -689,14 +688,26 @@ bool CpuKVCacheManager::commit_offload(CpuOffloadReservationId reservation_id,
                 throw CpuKVCacheError(
                     "CPU KDA snapshot commit lost its reserved slot");
             }
-            kda_snapshot_reserved_blocks_ -= kda_snapshot_charge_blocks_;
             const auto slot_owner =
                 kda_snapshot_slot_owners_.find(reservation.session_id);
             if (slot_owner == kda_snapshot_slot_owners_.end()) {
                 throw CpuKVCacheError(
                     "CPU KDA snapshot reserved slot has no owner");
             }
+            const auto owner_reservation =
+                reservations_.find(slot_owner->second);
+            if (owner_reservation == reservations_.end() ||
+                owner_reservation->second.session_id !=
+                    reservation.session_id ||
+                owner_reservation->second.state !=
+                    CpuOffloadReservationState::kPending ||
+                !owner_reservation->second.snapshot_slot_reserved) {
+                throw CpuKVCacheError(
+                    "CPU KDA snapshot reserved slot owner is invalid");
+            }
+            owner_reservation->second.snapshot_slot_reserved = false;
             kda_snapshot_slot_owners_.erase(slot_owner);
+            kda_snapshot_reserved_blocks_ -= kda_snapshot_charge_blocks_;
             if (kda_snapshot_occupied_blocks_ >
                 std::numeric_limits<std::uint64_t>::max() -
                     kda_snapshot_charge_blocks_) {
@@ -722,7 +733,8 @@ bool CpuKVCacheManager::commit_offload(CpuOffloadReservationId reservation_id,
         }
     }
     const auto committed_snapshot = kda_snapshots_.find(reservation.session_id);
-    if (committed_snapshot != kda_snapshots_.end() && session.blocks.empty() &&
+    if (committed_snapshot != kda_snapshots_.end() &&
+        session.committed_blocks == 0 && session.reserved_blocks == 0 &&
         session.active_reservations.empty() &&
         session.aggregate_restore_pins == 0 &&
         session.aggregate_snapshot_pins == 0 && !session.discard_pending &&
@@ -731,7 +743,8 @@ bool CpuKVCacheManager::commit_offload(CpuOffloadReservationId reservation_id,
                                    committed_snapshot->second);
     }
     reservation.state = CpuOffloadReservationState::kCommitted;
-    advance_committed_frontier(session);
+    publish_committed_range(session, reservation.begin_block,
+                            reservation.admitted_frontier_blocks);
     ++stats_.committed_offloads;
     record_occupancy_peaks();
     reservations_.erase(position);
@@ -764,19 +777,28 @@ bool CpuKVCacheManager::abort_offload(CpuOffloadReservationId reservation_id) {
             reservation.begin_block >= gap) {
             reservation.state = CpuOffloadReservationState::kAborted;
             session.active_reservations.erase(id);
+            const std::uint64_t length =
+                reservation.admitted_frontier_blocks - reservation.begin_block;
+            if (length > reserved_blocks_ || length > session.reserved_blocks) {
+                throw CpuKVCacheError(
+                    "aborted CPU reservation accounting underflow");
+            }
+            reserved_blocks_ -= length;
+            session.reserved_blocks -= length;
             aborted_reservations.push_back(id);
             ++stats_.aborted_offloads;
         }
     }
-    std::vector<std::pair<std::uint64_t, CpuBlockId>> suffix;
-    for (const auto &[index, block_id] : session.blocks) {
-        if (index >= gap) {
-            suffix.emplace_back(index, block_id);
+    auto committed = session.committed_out_of_order_ranges.lower_bound(gap);
+    while (committed != session.committed_out_of_order_ranges.end()) {
+        const std::uint64_t length = committed->second - committed->first;
+        if (length > resident_blocks_ || length > session.committed_blocks) {
+            throw CpuKVCacheError(
+                "aborted committed CPU suffix accounting underflow");
         }
-    }
-    for (const auto &[index, block_id] : suffix) {
-        session.blocks.erase(index);
-        free_block(block_id);
+        resident_blocks_ -= length;
+        session.committed_blocks -= length;
+        committed = session.committed_out_of_order_ranges.erase(committed);
     }
     session.committed_frontier_blocks =
         std::min(session.committed_frontier_blocks, gap);
@@ -784,8 +806,8 @@ bool CpuKVCacheManager::abort_offload(CpuOffloadReservationId reservation_id) {
         std::min(session.reserved_frontier_blocks, gap);
     const SessionId session_id = target.session_id;
     const auto snapshot = kda_snapshots_.find(session_id);
-    if (snapshot != kda_snapshots_.end() && session.blocks.empty() &&
-        session.active_reservations.empty() &&
+    if (snapshot != kda_snapshots_.end() && session.committed_blocks == 0 &&
+        session.reserved_blocks == 0 && session.active_reservations.empty() &&
         session.aggregate_restore_pins == 0 &&
         session.aggregate_snapshot_pins == 0 && !session.discard_pending &&
         !snapshot->second.in_lru) {
@@ -853,8 +875,7 @@ CpuRestoreLeaseId CpuKVCacheManager::pin_restore(SessionId session_id,
                                                  std::uint64_t begin_block,
                                                  std::uint64_t end_block,
                                                  SimTime started_at) {
-    if (!session_id.valid() || !started_at.valid() ||
-        begin_block > end_block) {
+    if (!session_id.valid() || !started_at.valid() || begin_block > end_block) {
         throw CpuKVCacheError("invalid CPU restore lease range/time");
     }
     auto position = sessions_.find(session_id);
@@ -878,6 +899,8 @@ CpuRestoreLeaseId CpuKVCacheManager::pin_restore(SessionId session_id,
     RestoreLease lease{};
     lease.id = lease_ids_.next("CPU restore lease ID space exhausted");
     lease.session_id = session_id;
+    lease.begin_block = begin_block;
+    lease.end_block = end_block;
     lease.started_at = started_at;
     lease.includes_kda_snapshot = include_snapshot;
     if (include_snapshot) {
@@ -889,43 +912,18 @@ CpuRestoreLeaseId CpuKVCacheManager::pin_restore(SessionId session_id,
         ++session.aggregate_snapshot_pins;
         ++pinned_kda_snapshots_;
     }
-    lease.block_ids.reserve(static_cast<std::size_t>(end_block - begin_block));
-    for (std::uint64_t index = begin_block; index < end_block; ++index) {
-        const auto owned = session.blocks.find(index);
-        if (owned == session.blocks.end()) {
-            for (const CpuBlockId pinned : lease.block_ids) {
-                CpuBlock &block = blocks_.at(pinned);
-                if (block.pin_count == 1) {
-                    if (pinned_blocks_ == 0) {
-                        throw CpuKVCacheError(
-                            "CPU pinned block accounting underflow");
-                    }
-                    --pinned_blocks_;
-                }
-                --block.pin_count;
-                --session.aggregate_restore_pins;
-            }
-            if (lease.includes_kda_snapshot) {
-                if (session.aggregate_snapshot_pins == 0 ||
-                    pinned_kda_snapshots_ == 0) {
-                    throw CpuKVCacheError(
-                        "CPU KDA snapshot pin accounting underflow");
-                }
-                --session.aggregate_snapshot_pins;
-                --pinned_kda_snapshots_;
-            }
-            throw CpuKVCacheError("CPU restore range contains a gap");
-        }
-        CpuBlock &block = blocks_.at(owned->second);
-        if (block.pin_count == 0) {
-            ++pinned_blocks_;
-        }
-        ++block.pin_count;
-        ++session.aggregate_restore_pins;
-        lease.block_ids.push_back(block.id);
+    const std::uint64_t length = end_block - begin_block;
+    if (length > std::numeric_limits<std::uint64_t>::max() -
+                     session.aggregate_restore_pins) {
+        throw CpuKVCacheError("CPU restore pin accounting overflows");
     }
     const CpuRestoreLeaseId lease_id = lease.id;
-    leases_.emplace(lease_id, std::move(lease));
+    if (!leases_.emplace(lease_id, std::move(lease)).second ||
+        !session.active_restore_leases.insert(lease_id).second) {
+        throw CpuKVCacheError("duplicate CPU restore lease");
+    }
+    session.aggregate_restore_pins += length;
+    recompute_distinct_pinned_blocks(session);
     validate_local_invariants();
     return lease_id;
 }
@@ -951,20 +949,13 @@ bool CpuKVCacheManager::release_restore(CpuRestoreLeaseId lease_id, bool used,
         throw CpuKVCacheError("pinned CPU restore session disappeared");
     }
     SessionState &session = session_position->second;
-    for (const CpuBlockId block_id : lease.block_ids) {
-        CpuBlock &block = blocks_.at(block_id);
-        if (block.pin_count == 0 || session.aggregate_restore_pins == 0) {
-            throw CpuKVCacheError("CPU restore pin accounting underflow");
-        }
-        if (block.pin_count == 1) {
-            if (pinned_blocks_ == 0) {
-                throw CpuKVCacheError("CPU pinned block accounting underflow");
-            }
-            --pinned_blocks_;
-        }
-        --block.pin_count;
-        --session.aggregate_restore_pins;
+    const std::uint64_t length = lease.end_block - lease.begin_block;
+    if (length > session.aggregate_restore_pins ||
+        session.active_restore_leases.erase(lease_id) != 1) {
+        throw CpuKVCacheError("CPU restore pin accounting underflow");
     }
+    session.aggregate_restore_pins -= length;
+    recompute_distinct_pinned_blocks(session);
     if (lease.includes_kda_snapshot) {
         if (session.aggregate_snapshot_pins == 0 ||
             pinned_kda_snapshots_ == 0) {
@@ -974,10 +965,10 @@ bool CpuKVCacheManager::release_restore(CpuRestoreLeaseId lease_id, bool used,
         --pinned_kda_snapshots_;
         const auto snapshot = kda_snapshots_.find(lease.session_id);
         if (!session.discard_pending && snapshot != kda_snapshots_.end() &&
-            session.blocks.empty() && session.active_reservations.empty() &&
+            session.committed_blocks == 0 && session.reserved_blocks == 0 &&
+            session.active_reservations.empty() &&
             session.aggregate_restore_pins == 0 &&
-            session.aggregate_snapshot_pins == 0 &&
-            !snapshot->second.in_lru) {
+            session.aggregate_snapshot_pins == 0 && !snapshot->second.in_lru) {
             append_kda_snapshot_to_lru(lease.session_id, snapshot->second);
         }
     }
@@ -1042,12 +1033,9 @@ void CpuKVCacheManager::validate_local_invariants() const {
                                             kda_snapshot_occupied_blocks_) {
         throw CpuKVCacheError("CPU block accounting exceeds capacity");
     }
-    if (resident_blocks_ + reserved_blocks_ != blocks_.size()) {
-        throw CpuKVCacheError("CPU block accounting diverged");
-    }
-    if (pinned_blocks_ > resident_blocks_ + reserved_blocks_) {
+    if (pinned_blocks_ > resident_blocks_) {
         throw CpuKVCacheError(
-            "CPU pinned block accounting exceeds materialized blocks");
+            "CPU pinned block accounting exceeds committed blocks");
     }
     if (kda_snapshot_charge_blocks_ == 0 &&
         (kda_snapshot_occupied_blocks_ != 0 ||
@@ -1088,121 +1076,158 @@ CpuKVCacheDiagnostics CpuKVCacheManager::diagnostics() const {
 
 void CpuKVCacheManager::validate_invariants() const {
     validate_local_invariants();
-    if (blocks_.size() > capacity_blocks_ ||
-        kda_snapshot_charge_blocks_ != 0 &&
-            kda_snapshots_.size() >
-                capacity_blocks_ / kda_snapshot_charge_blocks_) {
+    if (kda_snapshot_charge_blocks_ != 0 &&
+        kda_snapshots_.size() >
+            capacity_blocks_ / kda_snapshot_charge_blocks_) {
         throw CpuKVCacheError("CPU resident plus reserved exceeds capacity");
     }
-    std::uint64_t observed_pins = 0;
-    std::uint64_t session_pins = 0;
-    std::uint64_t observed_snapshot_pins = 0;
     std::uint64_t observed_resident_blocks = 0;
     std::uint64_t observed_reserved_blocks = 0;
     std::uint64_t observed_pinned_blocks = 0;
+    std::uint64_t observed_snapshot_pins = 0;
     for (const auto &[session_id, session] : sessions_) {
-        if (session.blocks.empty() && session.active_reservations.empty() &&
+        if (session.committed_blocks == 0 && session.reserved_blocks == 0 &&
+            session.active_reservations.empty() &&
+            session.active_restore_leases.empty() &&
             session.aggregate_restore_pins == 0 &&
             session.aggregate_snapshot_pins == 0 &&
             kda_snapshots_.find(session_id) == kda_snapshots_.end() &&
             !session.discard_pending) {
             throw CpuKVCacheError("empty CPU session metadata accumulated");
         }
-        std::uint64_t committed = 0;
-        while (true) {
-            const auto owned = session.blocks.find(committed);
-            if (owned == session.blocks.end()) {
-                break;
+        if (session.committed_frontier_blocks >
+                session.reserved_frontier_blocks ||
+            session.committed_blocks > session.reserved_frontier_blocks ||
+            session.reserved_blocks >
+                session.reserved_frontier_blocks - session.committed_blocks ||
+            session.committed_blocks + session.reserved_blocks !=
+                session.reserved_frontier_blocks) {
+            throw CpuKVCacheError(
+                "CPU analytical frontier accounting diverged");
+        }
+
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> suffix_ranges;
+        suffix_ranges.reserve(session.committed_out_of_order_ranges.size() +
+                              session.active_reservations.size());
+        std::uint64_t counted_committed = session.committed_frontier_blocks;
+        for (const auto &[begin, end] : session.committed_out_of_order_ranges) {
+            if (begin <= session.committed_frontier_blocks || begin >= end ||
+                end > session.reserved_frontier_blocks) {
+                throw CpuKVCacheError(
+                    "CPU out-of-order committed range is invalid");
             }
-            const auto block = blocks_.find(owned->second);
-            if (block == blocks_.end() ||
-                block->second.state != CpuBlockState::kCommitted) {
-                break;
+            counted_committed += end - begin;
+            suffix_ranges.emplace_back(begin, end);
+        }
+        if (counted_committed != session.committed_blocks) {
+            throw CpuKVCacheError("CPU committed range count diverged");
+        }
+        std::uint64_t counted_reserved = 0;
+        for (const CpuOffloadReservationId reservation_id :
+             session.active_reservations) {
+            const auto reservation = reservations_.find(reservation_id);
+            if (reservation == reservations_.end() ||
+                reservation->second.session_id != session_id ||
+                reservation->second.state !=
+                    CpuOffloadReservationState::kPending ||
+                reservation->second.begin_block >
+                    reservation->second.admitted_frontier_blocks) {
+                throw CpuKVCacheError(
+                    "CPU session has an invalid active reservation");
             }
-            ++committed;
-        }
-        std::uint64_t reserved = committed;
-        while (session.blocks.find(reserved) != session.blocks.end()) {
-            ++reserved;
-        }
-        if (committed != session.committed_frontier_blocks ||
-            reserved != session.reserved_frontier_blocks) {
-            throw CpuKVCacheError("CPU session frontier contains a gap");
-        }
-        for (const auto &[index, block_id] : session.blocks) {
-            const auto block = blocks_.find(block_id);
-            if (block == blocks_.end() ||
-                block->second.session_id != session_id ||
-                block->second.logical_index != index) {
-                throw CpuKVCacheError("CPU session block ownership diverged");
+            counted_reserved += reservation->second.admitted_frontier_blocks -
+                                reservation->second.begin_block;
+            if (reservation->second.begin_block !=
+                reservation->second.admitted_frontier_blocks) {
+                suffix_ranges.emplace_back(
+                    reservation->second.begin_block,
+                    reservation->second.admitted_frontier_blocks);
             }
-            session_pins += block->second.pin_count;
         }
-        if (session_pins < observed_pins ||
-            session_pins - observed_pins != session.aggregate_restore_pins) {
-            throw CpuKVCacheError("CPU aggregate restore pins diverged");
+        if (counted_reserved != session.reserved_blocks) {
+            throw CpuKVCacheError("CPU reserved range count diverged");
         }
-        observed_snapshot_pins += session.aggregate_snapshot_pins;
-        observed_pins = session_pins;
-    }
-    for (const auto &[block_id, block] : blocks_) {
-        if (block.state == CpuBlockState::kCommitted) {
-            ++observed_resident_blocks;
-        } else {
-            ++observed_reserved_blocks;
+        std::sort(suffix_ranges.begin(), suffix_ranges.end());
+        std::uint64_t cursor = session.committed_frontier_blocks;
+        for (const auto &[begin, end] : suffix_ranges) {
+            if (begin != cursor || end < begin) {
+                throw CpuKVCacheError("CPU session frontier contains a gap");
+            }
+            cursor = end;
         }
-        if (block.pin_count > 0) {
-            ++observed_pinned_blocks;
+        if (cursor != session.reserved_frontier_blocks) {
+            throw CpuKVCacheError("CPU session suffix coverage diverged");
         }
-        const auto session = sessions_.find(block.session_id);
-        if (session == sessions_.end()) {
-            throw CpuKVCacheError("materialized CPU block has no session");
-        }
-        const auto owned = session->second.blocks.find(block.logical_index);
-        if (owned == session->second.blocks.end() ||
-            owned->second != block_id) {
-            throw CpuKVCacheError("materialized CPU block is orphaned");
-        }
-    }
-    if (observed_resident_blocks != resident_blocks_ ||
-        observed_reserved_blocks != reserved_blocks_ ||
-        observed_pinned_blocks != pinned_blocks_) {
-        throw CpuKVCacheError("CPU block state accounting diverged");
-    }
-    std::uint64_t active_leases = 0;
-    std::uint64_t lease_pins = 0;
-    std::uint64_t lease_snapshot_pins = 0;
-    for (const auto &[id, lease] : leases_) {
-        static_cast<void>(id);
-        if (!lease.released) {
-            ++active_leases;
-            lease_pins += static_cast<std::uint64_t>(lease.block_ids.size());
-            lease_snapshot_pins +=
-                static_cast<std::uint64_t>(lease.includes_kda_snapshot);
-            if (lease.includes_kda_snapshot &&
-                (lease.kda_snapshot_blocks != kda_snapshot_charge_blocks_ ||
-                 lease.kda_snapshot_bytes != kda_snapshot_charge_bytes_)) {
+
+        std::uint64_t aggregate_pins = 0;
+        std::uint64_t snapshot_pins = 0;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> pin_ranges;
+        pin_ranges.reserve(session.active_restore_leases.size());
+        for (const CpuRestoreLeaseId lease_id : session.active_restore_leases) {
+            const auto lease = leases_.find(lease_id);
+            if (lease == leases_.end() || lease->second.released ||
+                lease->second.session_id != session_id ||
+                lease->second.begin_block > lease->second.end_block ||
+                lease->second.end_block > session.committed_frontier_blocks) {
+                throw CpuKVCacheError(
+                    "CPU session has an invalid restore lease");
+            }
+            aggregate_pins +=
+                lease->second.end_block - lease->second.begin_block;
+            if (lease->second.begin_block != lease->second.end_block) {
+                pin_ranges.emplace_back(lease->second.begin_block,
+                                        lease->second.end_block);
+            }
+            snapshot_pins +=
+                static_cast<std::uint64_t>(lease->second.includes_kda_snapshot);
+            if (lease->second.includes_kda_snapshot &&
+                (lease->second.kda_snapshot_blocks !=
+                     kda_snapshot_charge_blocks_ ||
+                 lease->second.kda_snapshot_bytes !=
+                     kda_snapshot_charge_bytes_ ||
+                 kda_snapshots_.find(session_id) == kda_snapshots_.end())) {
                 throw CpuKVCacheError(
                     "active CPU restore lease has stale KDA payload");
             }
-            if (lease.includes_kda_snapshot &&
-                kda_snapshots_.find(lease.session_id) == kda_snapshots_.end()) {
-                throw CpuKVCacheError(
-                    "active CPU restore lease lost its KDA snapshot");
-            }
-        } else if (!lease.block_ids.empty()) {
-            throw CpuKVCacheError(
-                "terminal CPU restore lease retained block metadata");
         }
+        std::sort(pin_ranges.begin(), pin_ranges.end());
+        std::uint64_t distinct_pins = 0;
+        std::uint64_t pin_begin = 0;
+        std::uint64_t pin_end = 0;
+        bool have_pin = false;
+        for (const auto &[begin, end] : pin_ranges) {
+            if (!have_pin || begin > pin_end) {
+                if (have_pin) {
+                    distinct_pins += pin_end - pin_begin;
+                }
+                pin_begin = begin;
+                pin_end = end;
+                have_pin = true;
+            } else {
+                pin_end = std::max(pin_end, end);
+            }
+        }
+        if (have_pin) {
+            distinct_pins += pin_end - pin_begin;
+        }
+        if (aggregate_pins != session.aggregate_restore_pins ||
+            distinct_pins != session.distinct_pinned_blocks ||
+            snapshot_pins != session.aggregate_snapshot_pins) {
+            throw CpuKVCacheError("CPU restore range accounting diverged");
+        }
+
+        observed_resident_blocks += session.committed_blocks;
+        observed_reserved_blocks += session.reserved_blocks;
+        observed_pinned_blocks += session.distinct_pinned_blocks;
+        observed_snapshot_pins += session.aggregate_snapshot_pins;
     }
-    static_cast<void>(active_leases);
-    if (lease_pins != observed_pins) {
-        throw CpuKVCacheError("CPU restore leases do not own every pin");
+    if (observed_resident_blocks != resident_blocks_ ||
+        observed_reserved_blocks != reserved_blocks_ ||
+        observed_pinned_blocks != pinned_blocks_ ||
+        observed_snapshot_pins != pinned_kda_snapshots_) {
+        throw CpuKVCacheError("CPU analytical range accounting diverged");
     }
-    if (lease_snapshot_pins != observed_snapshot_pins ||
-        lease_snapshot_pins != pinned_kda_snapshots_) {
-        throw CpuKVCacheError("CPU KDA snapshot pins diverged");
-    }
+
     for (const auto &[id, reservation] : reservations_) {
         if (reservation.state != CpuOffloadReservationState::kPending) {
             throw CpuKVCacheError("terminal CPU reservation was retained");
@@ -1210,21 +1235,27 @@ void CpuKVCacheManager::validate_invariants() const {
         const auto session = sessions_.find(reservation.session_id);
         if (session == sessions_.end() ||
             session->second.active_reservations.find(id) ==
-                session->second.active_reservations.end()) {
-            throw CpuKVCacheError("pending CPU reservation is not active");
-        }
-        for (const CpuBlockId block_id : reservation.block_ids) {
-            const auto block = blocks_.find(block_id);
-            if (block == blocks_.end() ||
-                block->second.state != CpuBlockState::kReserved ||
-                block->second.reservation_id != id) {
-                throw CpuKVCacheError("pending CPU reservation lost a block");
-            }
+                session->second.active_reservations.end() ||
+            reservation.begin_block > reservation.admitted_frontier_blocks ||
+            reservation.admitted_frontier_blocks >
+                session->second.reserved_frontier_blocks) {
+            throw CpuKVCacheError("pending CPU reservation range is invalid");
         }
         if (reservation.includes_kda_snapshot &&
             kda_snapshot_charge_blocks_ == 0) {
             throw CpuKVCacheError(
                 "pending CPU reservation carries disabled KDA snapshot");
+        }
+    }
+    for (const auto &[id, lease] : leases_) {
+        if (lease.released) {
+            throw CpuKVCacheError("terminal CPU restore lease was retained");
+        }
+        const auto session = sessions_.find(lease.session_id);
+        if (session == sessions_.end() ||
+            session->second.active_restore_leases.find(id) ==
+                session->second.active_restore_leases.end()) {
+            throw CpuKVCacheError("active CPU restore lease is not owned");
         }
     }
 
@@ -1237,7 +1268,8 @@ void CpuKVCacheManager::validate_invariants() const {
             throw CpuKVCacheError("CPU KDA snapshot has no session metadata");
         }
         if (snapshot.in_lru) {
-            if (!session->second.blocks.empty() ||
+            if (session->second.committed_blocks != 0 ||
+                session->second.reserved_blocks != 0 ||
                 !session->second.active_reservations.empty() ||
                 session->second.aggregate_restore_pins != 0 ||
                 session->second.aggregate_snapshot_pins != 0 ||
@@ -1271,13 +1303,11 @@ void CpuKVCacheManager::validate_invariants() const {
     if (kda_snapshot_slot_owners_.size() != observed_snapshot_slots) {
         throw CpuKVCacheError("CPU KDA snapshot slot ownership diverged");
     }
-    for (const auto &[session_id, reservation_id] :
-         kda_snapshot_slot_owners_) {
+    for (const auto &[session_id, reservation_id] : kda_snapshot_slot_owners_) {
         const auto reservation = reservations_.find(reservation_id);
         if (reservation == reservations_.end() ||
             reservation->second.session_id != session_id ||
-            reservation->second.state !=
-                CpuOffloadReservationState::kPending ||
+            reservation->second.state != CpuOffloadReservationState::kPending ||
             !reservation->second.snapshot_slot_reserved) {
             throw CpuKVCacheError("CPU KDA snapshot slot owner is invalid");
         }
