@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "run_id": "kimi-k3-tracelab-p24-d32-r0p50-cpu1000gb-exact-benchmark",
+  "run_id": "kimi-k3-tracelab-p24-d32-cpu-sweep-exact-benchmark-template",
   "simulation_mode": "online",
   "system_architecture": "pd-disaggregation",
   "enable_parallel_clusters": false,

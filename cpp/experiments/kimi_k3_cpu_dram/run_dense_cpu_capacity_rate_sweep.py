@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the Kimi K3 P24/D64 CPU-capacity sweep.
+"""Run the Kimi K3 P24/D32 exact CPU-capacity sweep.
 
 Edit ``SESSION_RATE_CAPACITIES_GB`` and ``MAX_CONCURRENT_SIMULATIONS`` below
 for the server.  Each session-injection rate has its own explicit list of CPU
@@ -72,7 +72,7 @@ SEED = 20260803
 
 
 DEFAULT_CONFIG = (
-    HERE / "configs" / "tracelab_k3_p24_d64_cache_aware_cpu_per_gpu.json"
+    HERE / "configs" / "tracelab_k3_p24_d32_cpu_sweep_exact_benchmark.json"
 )
 DEFAULT_TRACELAB_DB = (
     REPO_ROOT / "outputs" / "datasets" / "tracelab" / "v0.0.2" / "syfi_coding_trace.duckdb"
@@ -87,7 +87,7 @@ DEFAULT_WORKLOAD_ROOT = (
     / "all_sessions_continuous_10h"
 )
 DEFAULT_OUTPUT_ROOT = (
-    REPO_ROOT / "outputs" / "tracelab_k3_p24_d64_cpu_per_gpu_capacity_10h"
+    REPO_ROOT / "outputs" / "tracelab_k3_p24_d32_cpu_per_gpu_capacity_10h"
 )
 DECIMAL_GB = 1_000_000_000
 
@@ -426,8 +426,46 @@ def ensure_workloads(
             raise RuntimeError(f"converter did not produce a compatible workload for {case.rate_label}")
 
 
+def _cluster_gpu_count(config: Mapping[str, Any], cluster_type: str) -> int:
+    clusters = config.get("clusters")
+    if not isinstance(clusters, Mapping):
+        raise ValueError("clusters must be a JSON object")
+    cluster = clusters.get(cluster_type)
+    if not isinstance(cluster, Mapping):
+        raise ValueError(f"clusters.{cluster_type} must be a JSON object")
+    parallelism = cluster.get("parallelism")
+    if not isinstance(parallelism, Mapping):
+        raise ValueError(
+            f"clusters.{cluster_type}.parallelism must be a JSON object"
+        )
+    dimensions = (
+        "num_replicas",
+        "tensor_parallel_size",
+        "pipeline_parallel_size",
+        "data_parallel_size",
+    )
+    values = [parallelism.get(dimension, 1) for dimension in dimensions]
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value <= 0
+        for value in values
+    ):
+        raise ValueError(
+            f"clusters.{cluster_type}.parallelism GPU dimensions must be "
+            "positive integers"
+        )
+    return math.prod(values)
+
+
+def _topology_gpu_counts(config: Mapping[str, Any]) -> tuple[int, int]:
+    return (
+        _cluster_gpu_count(config, "prefill"),
+        _cluster_gpu_count(config, "decode"),
+    )
+
+
 def build_config(template: Mapping[str, Any], case: MatrixCase) -> dict[str, Any]:
     config = copy.deepcopy(dict(template))
+    prefill_gpus, decode_gpus = _topology_gpu_counts(config)
     cpu = config.setdefault("cpu_kv_cache", {})
     if not isinstance(cpu, dict):
         raise ValueError("cpu_kv_cache must be a JSON object")
@@ -436,9 +474,10 @@ def build_config(template: Mapping[str, Any], case: MatrixCase) -> dict[str, Any
     cpu["capacity_bytes_per_gpu"] = max(DECIMAL_GB, case.capacity_gb * DECIMAL_GB)
     # This field is ignored in static-slice mode, but keeping the aggregate
     # value makes the input self-describing to readers outside the simulator.
-    cpu["capacity_bytes"] = case.capacity_gb * DECIMAL_GB * 24
+    cpu["capacity_bytes"] = case.capacity_gb * DECIMAL_GB * prefill_gpus
     config["run_id"] = (
-        f"kimi-k3-tracelab-p24-d64-{case.rate_label}-{case.capacity_label}"
+        f"kimi-k3-tracelab-p{prefill_gpus}-d{decode_gpus}-"
+        f"{case.rate_label}-{case.capacity_label}"
     )
     return config
 
@@ -504,13 +543,14 @@ def _require_expensive_diagnostics_opt_in(args: argparse.Namespace) -> None:
 def _case_start_message(
     case: MatrixCase,
     *,
+    prefill_gpus: int = 24,
     source_sessions_per_epoch: int,
     session_repetitions: int,
 ) -> str:
     return (
         f"[running] {case.label} rate={format(case.rate, 'f')}/s "
         f"per_prefill_gpu={case.capacity_gb:g}GB "
-        f"aggregate_cpu={case.capacity_gb * 24:g}GB "
+        f"aggregate_cpu={case.capacity_gb * prefill_gpus:g}GB "
         f"source_sessions={source_sessions_per_epoch} "
         f"epochs={session_repetitions} "
         f"horizon={SIMULATION_END_TIME_S / 3600.0:g}h"
@@ -540,6 +580,7 @@ def run_case(
     source_sessions_per_epoch: int,
     session_repetitions: int,
 ) -> tuple[str, bool]:
+    prefill_gpus, decode_gpus = _topology_gpu_counts(template)
     if args.resume and _run_is_complete(case):
         print(f"[reused] {case.label}", flush=True)
         return case.label, True
@@ -554,7 +595,9 @@ def run_case(
         "status": "running",
         "capacity_gb": case.capacity_gb,
         "cpu_dram_gb_per_prefill_gpu": case.capacity_gb,
-        "aggregate_cpu_dram_gb": case.capacity_gb * 24,
+        "aggregate_cpu_dram_gb": case.capacity_gb * prefill_gpus,
+        "prefill_gpus": prefill_gpus,
+        "decode_gpus": decode_gpus,
         "session_arrival_rate_per_second": float(case.rate),
         "rate_label": case.rate_label,
         "simulation_end_time_s": SIMULATION_END_TIME_S,
@@ -575,6 +618,7 @@ def run_case(
     print(
         _case_start_message(
             case,
+            prefill_gpus=prefill_gpus,
             source_sessions_per_epoch=source_sessions_per_epoch,
             session_repetitions=session_repetitions,
         ),
@@ -809,6 +853,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         session_repetitions=session_repetitions,
     )
     template = _json_read(args.config)
+    prefill_gpus, decode_gpus = _topology_gpu_counts(template)
     if not args.dry_run:
         workload_hashes: dict[str, str] = {}
         for case in cases:
@@ -816,16 +861,22 @@ def main(argv: Sequence[str] | None = None) -> int:
                 workload_hashes[case.rate_label] = _sha256(case.workload.resolve())
         plan = {
             "schema_version": 2,
-            "study": "kimi_k3_p24_d64_cpu_per_gpu_capacity_session_rate",
+            "study": (
+                f"kimi_k3_p{prefill_gpus}_d{decode_gpus}_"
+                "cpu_per_gpu_capacity_session_rate"
+            ),
             "git_revision": _git_revision(),
             "rate_capacities_gb": {
                 format(rate, "f"): list(capacities)
                 for rate, capacities in rate_capacities.items()
             },
             "session_rate_override": args.session_rate,
-            "capacity_mapping": "capacity point is decimal GB per PREFILL GPU; aggregate static CPU capacity is point * 24 PREFILL GPU slices",
-            "prefill_gpus": 24,
-            "decode_gpus": 64,
+            "capacity_mapping": (
+                "capacity point is decimal GB per PREFILL GPU; aggregate static "
+                f"CPU capacity is point * {prefill_gpus} PREFILL GPU slices"
+            ),
+            "prefill_gpus": prefill_gpus,
+            "decode_gpus": decode_gpus,
             "simulation_end_time_s": SIMULATION_END_TIME_S,
             "sample_sessions": SAMPLE_SESSIONS,
             "eligible_source_sessions": eligible_source_sessions,
@@ -853,7 +904,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "rate_label": case.rate_label,
                     "capacity_gb": case.capacity_gb,
                     "cpu_dram_gb_per_prefill_gpu": case.capacity_gb,
-                    "aggregate_cpu_dram_gb": case.capacity_gb * 24,
+                    "aggregate_cpu_dram_gb": case.capacity_gb * prefill_gpus,
                     "output_dir": str(case.output_dir.resolve()),
                     "workload_csv": str(case.workload.resolve()),
                     "workload_metadata": str(case.metadata.resolve()),

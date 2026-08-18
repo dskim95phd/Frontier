@@ -8,10 +8,12 @@ conversion and capacity-report analysis utilities remain in
 ## CPU-per-GPU capacity sweep
 
 `run_dense_cpu_capacity_rate_sweep.py` is the asymmetric PDD capacity runner.
-The intended P24/D64 topology is PREFILL TP1/PP24/DP1 with
-pipeline-exclusive collapsed events and DECODE TP4/PP1/DP16/EP64 with the
-exact event path. Check the selected JSON configuration before each run,
-because diagnostic P24/D32 variants have also been used.
+Its default template is
+`configs/tracelab_k3_p24_d32_cpu_sweep_exact_benchmark.json`: PREFILL
+TP1/PP24/DP1 with pipeline-exclusive exact events and DECODE
+TP4/DCP4/PP1/DP8/EP32 with the exact event path. The runner derives P/D GPU
+counts from the selected JSON and records them in generated run IDs and sweep
+metadata.
 
 The default capacity grid contains eight points:
 
@@ -75,6 +77,7 @@ python .\cpp\experiments\kimi_k3_cpu_dram\run_dense_cpu_capacity_rate_sweep.py `
   --dry-run --no-generate-reports
 
 # Run or resume the matrix declared in SESSION_RATE_CAPACITIES_GB.
+# The P24/D32 exact sweep template is selected by default.
 python .\cpp\experiments\kimi_k3_cpu_dram\run_dense_cpu_capacity_rate_sweep.py `
   --binary .\cpp\build\Release\frontier_sim.exe --jobs 4 --resume
 ```

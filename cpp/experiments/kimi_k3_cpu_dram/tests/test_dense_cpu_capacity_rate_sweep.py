@@ -267,6 +267,9 @@ def test_case_start_message_prints_complete_experiment_condition(tmp_path: Path)
 
 
 def test_k3_config_uses_static_per_gpu_capacity_and_off_baseline() -> None:
+    assert runner.DEFAULT_CONFIG.name == (
+        "tracelab_k3_p24_d32_cpu_sweep_exact_benchmark.json"
+    )
     template = json.loads(runner.DEFAULT_CONFIG.read_text(encoding="utf-8"))
     cases = runner.build_matrix(
         {0: ("0.30", "0.30"), 250: ("0.30", "0.30")},
@@ -286,6 +289,8 @@ def test_k3_config_uses_static_per_gpu_capacity_and_off_baseline() -> None:
         "capacity_bytes_per_gpu": 250_000_000_000,
         "capacity_bytes": 6_000_000_000_000,
     }
+    assert runner._topology_gpu_counts(enabled) == (24, 32)
+    assert enabled["run_id"] == "kimi-k3-tracelab-p24-d32-r0p30-cpu0250gb"
     assert enabled["clusters"]["prefill"]["parallelism"] == {
         "num_replicas": 1,
         "tensor_parallel_size": 1,
