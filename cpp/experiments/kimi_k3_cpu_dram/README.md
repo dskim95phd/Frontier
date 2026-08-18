@@ -71,6 +71,19 @@ python .\cpp\experiments\kimi_k3_cpu_dram\run_dense_cpu_capacity_rate_sweep.py `
   --capacities-gb 250,1000 --jobs 2 --resume
 ```
 
+Report generation discovers completed results from the output directory, not
+only from the most recently written `sweep_plan.json`.  This makes split runs
+additive: invoke the runner several times with the same `--output-root` and
+different `--capacities-gb` subsets, and each regenerated HTML/JSON/CSV report
+will contain every completed `r*/cpu*gb/r1` point already present there.
+Incomplete or failed cases are ignored.  Reports can also be refreshed
+directly:
+
+```powershell
+python .\cpp\experiments\kimi_k3_cpu_dram\generate_dense_cpu_capacity_rate_reports.py `
+  --output-root .\outputs\my-k3-capacity-sweep
+```
+
 ## Fixed 4 TB rate screen
 
 `run_cpu4tb_rate_sweep.py` runs the shorter fixed-capacity arrival-rate screen

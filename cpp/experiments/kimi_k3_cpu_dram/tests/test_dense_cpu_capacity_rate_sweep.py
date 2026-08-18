@@ -317,3 +317,142 @@ def test_report_discovery_includes_only_completed_points(tmp_path: Path) -> None
 
     assert list(grouped) == ["r0p3"]
     assert [case["capacity_gb"] for case in grouped["r0p3"]] == [500]
+
+
+def _write_discoverable_report_case(
+    root: Path,
+    *,
+    rate_label: str,
+    rate: float,
+    capacity_gb: int,
+    metadata: Path,
+    status: str = "completed",
+) -> Path:
+    case_dir = root / rate_label / f"cpu{capacity_gb:04d}gb" / "r1"
+    case_dir.mkdir(parents=True)
+    (case_dir / "summary.json").write_text("{}", encoding="utf-8")
+    (case_dir / "requests.csv").write_text("request_id\n", encoding="utf-8")
+    (case_dir / "run.json").write_text(
+        json.dumps(
+            {
+                "status": status,
+                "session_arrival_rate_per_second": rate,
+                "simulation_end_time_s": 12 * 3600,
+                "workload_metadata": str(metadata),
+            }
+        ),
+        encoding="utf-8",
+    )
+    (case_dir / "config.normalized.json").write_text(
+        json.dumps(
+            {
+                "clusters": {
+                    "prefill": {
+                        "parallelism": {
+                            "num_replicas": 1,
+                            "tensor_parallel_size": 1,
+                            "pipeline_parallel_size": 24,
+                            "data_parallel_size": 1,
+                        }
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    return case_dir
+
+
+def test_report_generation_discovers_split_runs_beyond_latest_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output_root = tmp_path / "split-sweep"
+    metadata = tmp_path / "workloads" / "r0p50" / "seed_7_metadata.json"
+    metadata.parent.mkdir(parents=True)
+    metadata.write_text(json.dumps({"sampling": {}}), encoding="utf-8")
+    first = _write_discoverable_report_case(
+        output_root,
+        rate_label="r0p50",
+        rate=0.5,
+        capacity_gb=500,
+        metadata=metadata,
+    )
+    second = _write_discoverable_report_case(
+        output_root,
+        rate_label="r0p50",
+        rate=0.5,
+        capacity_gb=1000,
+        metadata=metadata,
+    )
+    _write_discoverable_report_case(
+        output_root,
+        rate_label="r0p50",
+        rate=0.5,
+        capacity_gb=750,
+        metadata=metadata,
+        status="failed",
+    )
+    # Simulate a later split invocation replacing the plan with only its own
+    # capacity.  Directory discovery must retain the earlier completed point.
+    (output_root / "sweep_plan.json").write_text(
+        json.dumps(
+            {
+                "prefill_gpus": 24,
+                "cases": [
+                    {
+                        "rate": 0.5,
+                        "rate_label": "r0p50",
+                        "capacity_gb": 1000,
+                        "output_dir": str(second),
+                        "workload_metadata": str(metadata),
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    calls: list[list[str]] = []
+
+    def fake_capacity_report(argv: list[str]) -> int:
+        calls.append(argv)
+        for option in ("--output-csv", "--output-json", "--output-html"):
+            path = Path(argv[argv.index(option) + 1])
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("generated", encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(reports.capacity_report, "main", fake_capacity_report)
+
+    result = reports.generate_reports(output_root)
+
+    assert len(calls) == 1
+    assert calls[0][calls[0].index("--capacities") + 1] == "500,1000"
+    assert calls[0][calls[0].index("--prefill-lanes") + 1] == "24"
+    assert result["planned_cases"] == 1
+    assert result["completed_cases"] == 2
+    assert result["rate_reports"][0]["capacities_gb"] == [500, 1000]
+    assert first.is_dir()
+    index = (output_root / "index.html").read_text(encoding="utf-8")
+    assert "Discovered 2 completed points" in index
+    assert "500, 1000" in index
+
+
+def test_report_directory_discovery_does_not_require_sweep_plan(
+    tmp_path: Path,
+) -> None:
+    metadata = tmp_path / "workloads" / "r0p30" / "seed_7_metadata.json"
+    metadata.parent.mkdir(parents=True)
+    metadata.write_text("{}", encoding="utf-8")
+    _write_discoverable_report_case(
+        tmp_path,
+        rate_label="r0p30",
+        rate=0.3,
+        capacity_gb=250,
+        metadata=metadata,
+    )
+
+    grouped = reports.discover_completed_cases_by_rate(tmp_path)
+
+    assert list(grouped) == ["r0p30"]
+    assert [case["capacity_gb"] for case in grouped["r0p30"]] == [250]

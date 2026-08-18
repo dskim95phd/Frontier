@@ -586,13 +586,17 @@ all-reduce. It is a documented prior, not a workload-fitted calibration.
 The profile may also be selected with the `rubin` device preset as an explicit
 forward projection. In that mode arithmetic and HBM work use Rubin roofline
 ceilings, the expert grid uses 224 rather than 160 SMs, A2A payload time scales
-by the public 3.6/1.8 TB/s NVLink ratio, and the per-cluster residual scales by
-low-precision throughput per SM. Fixed A2A startup and overlap dependency do
-not scale from peak bandwidth. Rubin counted writes and tile-level dependent
-triggering may improve overlap, but there is no K3 MegaMoE measurement to
-quantify it, so both fixed startup and the selected overlap residual remain the
-GB300 priors. Block-M, block-N, two-CTA clustering, and the functional form
-remain public SM100 priors rather than Rubin measurements.
+by the public 3.6/1.8 TB/s NVLink ratio, while the per-cluster residual remains
+the GB300-calibrated 0.06325 us. Like fixed A2A startup, the residual represents
+a latency term for which no public GB300-to-Rubin ratio is available; it does
+not scale from peak arithmetic or memory bandwidth. The former 5/3
+throughput-per-SM reduction to 0.03795 us is retained only as an explicit
+optimistic sensitivity through `mega_moe_cluster_task_latency_us`. Rubin
+counted writes and tile-level dependent triggering may improve overlap, but
+there is no K3 MegaMoE measurement to quantify it, so fixed startup and the
+selected overlap residual also remain the GB300 priors. Block-M, block-N,
+two-CTA clustering, and the functional form remain public SM100 priors rather
+than Rubin measurements.
 The Rubin A2A payload scale belongs to the device plus communication backend,
 not to `kernel_profile`: explicitly selecting `sm100_megamoe_public` with a
 generic kernel profile still uses the Rubin payload bandwidth. The ordinary

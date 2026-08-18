@@ -128,7 +128,7 @@ resource that dominates it:
 | HBM traffic | `22 / 8 = 2.75x` bandwidth | handled once by the ordinary roofline |
 | Wave capacity | `224 / 160 = 1.4x` SMs | set `mega_moe_sm_count=224` |
 | A2A payload | `3.6 / 1.8 = 2x` NVLink bandwidth | double the public effective payload bandwidth |
-| Per-cluster coefficient | `(35/224) / (15/160) = 5/3` throughput per SM | divide `0.06325 us` by `5/3`, yielding `0.03795 us` |
+| Per-cluster coefficient | no public generational latency ratio | retain the GB300-calibrated `0.06325 us` |
 | A2A startup | no public generational latency ratio | retain the GB300 public prior |
 | Communication/compute overlap | producer-consumer dependency | retain the measured wide-EP `1.0` residual; report optimistic overlap only as sensitivity |
 
@@ -138,7 +138,10 @@ inference maximum. Peak NVLink bandwidth scales only the payload term. It does
 not reduce fixed dispatch/combine startup, and it does not change overlap by
 itself. Rubin counted writes and tile-level dependent triggering motivate a
 future sensitivity case but do not provide a numeric K3 MegaMoE overlap value.
-This separation prevents applying the same hardware gain twice.
+The former throughput-per-SM projection, `0.06325 / (5/3) = 0.03795 us`, is an
+optimistic boundary available through the explicit cluster-task-latency
+override, not the Rubin default. This separation prevents applying the same
+hardware gain twice or silently treating throughput as a latency measurement.
 
 The geometry model is enabled only in `predict_moe_group_layer()`, after all
 active DP source rows have been composed into the destination EP lanes. That
@@ -369,10 +372,17 @@ The generated comparison artifact is:
 
 `outputs/k3_lmsys_gb300_serving_frontier_20260816/report_model_v14_factorial_selected.html`
 
-The four equally calibrated GB300 corners remain close after the Rubin
-resource projection: their per-user decode spread is about 0.8% for DP4 and
-2.3% for DP2 at c=256/c=1024. This is the current structural uncertainty of
-the wide-EP Rubin projection; it does not replace a Rubin measurement.
+Under the former throughput-per-SM Rubin sensitivity, the four equally
+calibrated GB300 corners remain close: their per-user decode spread is about
+0.8% for DP4 and 2.3% for DP2 at c=256/c=1024. Those results now define an
+optimistic boundary rather than the default projection. Keeping `c_grid` at
+the GB300 value reduces the wide-EP Rubin median per-user decode speed by
+8.0% relative to that boundary; the reduction is about 10--11% for DP4 and
+14% for DP2 at c=256/c=1024. The conservative full-sweep artifact is:
+
+`outputs/k3_lmsys_rubin_serving_frontier_20260817/report_rubin_frontier_latency_conservative_v15.html`
+
+Neither boundary replaces a Rubin measurement.
 
 ## Compatibility and invariants
 
@@ -380,10 +390,12 @@ the wide-EP Rubin projection; it does not replace a Rubin measurement.
 - The model is opt-in and K3-only. GB300 is the calibrated device; Rubin use
   is an unvalidated projection that maps each term to its dominant resource:
   arithmetic/HBM use Rubin roofline ceilings, A2A payload uses the 2x per-GPU
-  NVLink ratio, and the cluster-task coefficient uses low-precision
-  throughput per SM. Geometry records 224 SMs, but `lambda_wave=0` means that
-  count does not add a separate wave timing multiplier. Fixed startup and
-  wide-EP overlap are not scaled without a Rubin K3 measurement.
+  NVLink ratio, while the latency-like cluster-task coefficient remains the
+  GB300-calibrated `0.06325 us`. Geometry records 224 SMs, but
+  `lambda_wave=0` means that count does not add a separate wave timing
+  multiplier. Fixed startup, cluster-task latency, and wide-EP overlap are not
+  scaled without a Rubin K3 measurement. The former `0.03795 us` coefficient
+  is retained only as an explicit optimistic sensitivity.
 - Routed and source-local timing are emitted in one lane pass; enabling the
   breakdown does not double the number of MoE-layer roofline evaluations.
 - The already-predicted shared-expert path is carried per source into the

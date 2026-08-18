@@ -81,12 +81,11 @@ AnalyticalConfig analytical_config_from_profile(std::string_view profile,
         // ignore it.
         result.mega_moe_sm_count = 224;
         result.mega_moe_a2a_bandwidth_scale = 2.0;
-        if (profile == "k3_deepgemm_megamoe") {
-            // The residual is per cluster task, so scale by low-precision
-            // throughput per SM rather than total device throughput:
-            // (35 PFLOP/s / 224 SM) / (15 PFLOP/s / 160 SM) = 5/3.
-            result.mega_moe_cluster_task_latency_us /= (5.0 / 3.0);
-        }
+        // Keep the GB300-calibrated per-cluster residual unchanged. It
+        // represents small-grid scheduling/pipeline latency, not bulk
+        // arithmetic throughput, and no public Rubin measurement provides a
+        // generational latency ratio. The former 5/3 throughput-per-SM scale
+        // remains available as an explicit optimistic config sensitivity.
     }
     return result;
 }

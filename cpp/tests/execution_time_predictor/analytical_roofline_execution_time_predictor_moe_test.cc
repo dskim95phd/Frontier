@@ -704,10 +704,10 @@ void test_mega_moe_geometry_uses_exact_expert_histogram() {
                 rubin_mega.mega_moe_tail_io_fraction == 1.0 &&
                 rubin_mega.mega_moe_wave_exposure == 0.0 &&
                 std::abs(rubin_mega.mega_moe_cluster_task_latency_us -
-                         0.03795) < 1e-12 &&
+                         0.06325) < 1e-12 &&
                 rubin_mega.moe_a2a_overlap_residual == 1.0,
-            "Rubin MegaMoE projection must scale SM waves, NVLink payload, "
-            "and per-SM cluster residual without changing measured overlap");
+            "Rubin MegaMoE projection must scale SM waves and NVLink payload "
+            "without assuming a lower unmeasured cluster-task latency");
     require(!rubin_generic.mega_moe_geometry_enabled &&
                 rubin_generic.mega_moe_sm_count == 224 &&
                 rubin_generic.mega_moe_a2a_bandwidth_scale == 2.0,
