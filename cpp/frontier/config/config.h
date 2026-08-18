@@ -820,7 +820,8 @@ struct AnalyticalExecutionModelConfig {
     OperatorPrecisionConfig operator_precisions;
     // Selects an explicit operator-efficiency/fusion profile.  "generic"
     // preserves the historical roofline constants.  K3 profiles are opt-in
-    // because they describe backend-specific Blackwell kernel stacks.
+    // because they describe backend-specific Blackwell kernel stacks. Rubin
+    // use is an explicit forward projection of those public priors.
     std::string kernel_profile = "generic";
     // "detailed" predicts and emits synchronization events one MoE layer at a
     // time.
@@ -832,9 +833,15 @@ struct AnalyticalExecutionModelConfig {
     // uses the same family-aware compression only for layer-invariant routing,
     // and otherwise falls back to exact per-layer prediction.
     std::string moe_layer_event_mode = "detailed";
-    // "generic" uses the configured collective backend. The GB300 profile is
-    // an opt-in public-prior model for fused MegaMoE dispatch/expert/combine.
+    // "generic" uses the configured collective backend. The SM100 profile is
+    // an opt-in public-prior model for fused MegaMoE dispatch/expert/combine;
+    // on Rubin it is a forward projection rather than a calibrated profile.
     std::string moe_communication_backend = "generic";
+    // Optional absolute MegaMoE sensitivity/calibration overrides. They are
+    // valid only with k3_deepgemm_megamoe; absent values use profile priors.
+    std::optional<double> mega_moe_tail_io_fraction;
+    std::optional<double> mega_moe_wave_exposure;
+    std::optional<double> mega_moe_cluster_task_latency_us;
     std::uint64_t tensor_parallel_size = 8;
     double network_bandwidth_gbps = 400.0;
     double network_latency_us = 1.0;
@@ -846,6 +853,9 @@ struct AnalyticalExecutionModelConfig {
                         lhs.operator_precisions, lhs.kernel_profile,
                         lhs.moe_layer_event_mode,
                         lhs.moe_communication_backend,
+                        lhs.mega_moe_tail_io_fraction,
+                        lhs.mega_moe_wave_exposure,
+                        lhs.mega_moe_cluster_task_latency_us,
                         lhs.tensor_parallel_size, lhs.network_bandwidth_gbps,
                         lhs.network_latency_us,
                         lhs.intra_node_bandwidth_gbps) ==
@@ -853,6 +863,9 @@ struct AnalyticalExecutionModelConfig {
                         rhs.operator_precisions, rhs.kernel_profile,
                         rhs.moe_layer_event_mode,
                         rhs.moe_communication_backend,
+                        rhs.mega_moe_tail_io_fraction,
+                        rhs.mega_moe_wave_exposure,
+                        rhs.mega_moe_cluster_task_latency_us,
                         rhs.tensor_parallel_size, rhs.network_bandwidth_gbps,
                         rhs.network_latency_us, rhs.intra_node_bandwidth_gbps);
     }

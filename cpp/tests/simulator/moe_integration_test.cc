@@ -127,6 +127,24 @@ void test_colocation_runs_all_sync_event_families() {
            "synchronized MoE must finish each real request and stage");
 }
 
+void test_colocation_dp1_ep4_has_source_local_breakdown() {
+    auto config = load_config("analytical_moe_ep4_colocation.json");
+    auto &runtime = config.cluster();
+    runtime.parallelism.tensor_parallel_size = 4;
+    runtime.parallelism.data_parallel_size = 1;
+    runtime.parallelism.moe_tensor_parallel_size = 1;
+    runtime.parallelism.moe_expert_parallel_size = 4;
+    runtime.execution_model.analytical.tensor_parallel_size = 4;
+    const auto output = run_simulation(
+        config,
+        parse_workload_csv(
+            "session_start_at,think_time,num_prefill_tokens,num_decode_tokens\n"
+            "0,0,8,2\n"));
+    expect(output.requests.size() == 1 &&
+               count_events(output, EventType::kDecodeSyncCollective) > 0,
+           "DP1/EP>1 must retain routed/source-local group composition");
+}
+
 void test_pdd_moe_preserves_phi_kv_contract() {
     const auto workload = load_small_workload();
     const auto output =
@@ -373,10 +391,41 @@ void test_colocation_dp2_ep2_repredicts_aggregated_expert_tokens() {
             analytical::DeviceCeilings::from_config(analytical_config),
             analytical::AnalyticalConfig{}, moe_model, allocation,
             runtime.model.router_topk, precisions);
+    std::vector<double> maximum_source_local_by_lane(lane_count, 0.0);
+    for (const RoutingRecord *record : group->second) {
+        analytical::RoutingAllocation source_allocation{};
+        source_allocation.input_tokens = record->input_tokens;
+        source_allocation.routed_tokens = record->routed_tokens;
+        source_allocation.global_expert_tokens =
+            record->global_expert_tokens;
+        source_allocation.lane_expert_tokens = record->lane_expert_tokens;
+        const analytical::MoELanePrediction source_prediction =
+            analytical::predict_moe_lanes(
+                analytical::DeviceCeilings::from_config(analytical_config),
+                analytical::AnalyticalConfig{}, moe_model,
+                source_allocation, runtime.model.router_topk, precisions);
+        for (std::size_t lane = 0; lane < lane_count; ++lane) {
+            maximum_source_local_by_lane.at(lane) = std::max(
+                maximum_source_local_by_lane.at(lane),
+                source_prediction.source_local_lane_times_ms.at(lane));
+        }
+    }
+    const analytical::MoERoutedLanePrediction aggregate_routed =
+        analytical::predict_routed_moe_lanes(
+            analytical::DeviceCeilings::from_config(analytical_config),
+            analytical::AnalyticalConfig{}, moe_model, allocation,
+            runtime.model.router_topk, precisions);
     const double time_sum_critical_ms =
         *std::max_element(time_sum_by_lane.begin(), time_sum_by_lane.end());
     const double aggregate_critical_ms =
         aggregate_prediction.critical_lane_time_ms;
+    double source_local_composed_critical_ms = 0.0;
+    for (std::size_t lane = 0; lane < lane_count; ++lane) {
+        source_local_composed_critical_ms = std::max(
+            source_local_composed_critical_ms,
+            maximum_source_local_by_lane.at(lane) +
+                aggregate_routed.lane_times_ms.at(lane));
+    }
 
     double pre_collective_ms = -1.0;
     double post_collective_ms = -1.0;
@@ -405,15 +454,18 @@ void test_colocation_dp2_ep2_repredicts_aggregated_expert_tokens() {
     const std::string diagnostic =
         " time_sum_critical_ms=" + std::to_string(time_sum_critical_ms) +
         " aggregate_critical_ms=" + std::to_string(aggregate_critical_ms) +
+        " source_local_composed_critical_ms=" +
+        std::to_string(source_local_composed_critical_ms) +
         " observed_critical_ms=" + std::to_string(observed_critical_ms);
     expect(std::abs(time_sum_critical_ms - aggregate_critical_ms) > 1e-6,
            "regression must distinguish time-sum from token aggregation:" +
                diagnostic);
     expect(std::abs(observed_critical_ms - time_sum_critical_ms) > 1e-6,
            "collective must not use the DP lane-time sum:" + diagnostic);
-    expect(std::abs(observed_critical_ms - aggregate_critical_ms) < 1e-9,
-           "collective must re-predict one aggregated expert allocation:" +
-               diagnostic);
+    expect(std::abs(observed_critical_ms -
+                    source_local_composed_critical_ms) < 1e-9,
+           "collective must retain source-local work and re-predict only "
+           "the aggregated routed allocation:" + diagnostic);
 }
 
 void test_pdd_dp2_ep2_waits_for_slowest_real_attention_lane() {
@@ -1016,6 +1068,9 @@ int main() {
     failures +=
         frontier::test::run("co-location MoE synchronization",
                             test_colocation_runs_all_sync_event_families);
+    failures += frontier::test::run(
+        "co-location DP1/EP4 source-local composition",
+        test_colocation_dp1_ep4_has_source_local_breakdown);
     failures += frontier::test::run("PDD MoE Phi KV contract",
                                     test_pdd_moe_preserves_phi_kv_contract);
     failures += frontier::test::run("co-location DP2/EP2 decode lockstep",

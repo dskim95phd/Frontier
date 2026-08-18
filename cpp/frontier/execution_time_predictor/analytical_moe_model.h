@@ -105,6 +105,21 @@ struct MoEModel {
     bool fused_add_norm = false;
 };
 
+struct MoEGroupedGemmGeometry {
+    bool enabled = false;
+    std::uint64_t block_m = 0;
+    std::uint64_t routed_m_blocks = 0;
+    std::uint64_t shared_m_blocks = 0;
+    std::uint64_t routed_padded_tokens = 0;
+    std::uint64_t shared_padded_tokens = 0;
+    std::uint64_t up_cluster_tasks = 0;
+    std::uint64_t down_cluster_tasks = 0;
+    double up_wave_utilization = 1.0;
+    double down_wave_utilization = 1.0;
+    double up_cluster_task_overhead_ms = 0.0;
+    double down_cluster_task_overhead_ms = 0.0;
+};
+
 struct MoELayerTime {
     double gating_linear_ms = 0.0;
     double gating_routing_topk_ms = 0.0;
@@ -115,6 +130,14 @@ struct MoELayerTime {
     double latent_projection_ms = 0.0;
     double latent_norm_ms = 0.0;
     double attn_res_ms = 0.0;
+    // Explicit decomposition used by DP/EP barrier composition. In the
+    // split routed/shared-kernel path these add back to total_ms(). In the
+    // fused path they are counterfactual standalone timings: the actual
+    // grouped_* fields share one launch and one roofline overlap decision.
+    double routed_path_ms = 0.0;
+    double shared_expert_path_ms = 0.0;
+    double source_local_ms = 0.0;
+    MoEGroupedGemmGeometry grouped_gemm_geometry;
 
     [[nodiscard]] double total_ms() const noexcept;
 };
@@ -139,6 +162,24 @@ struct MoELanePrediction {
     std::vector<MoELayerTime> lane_times;
     std::uint64_t critical_lane = 0;
     double critical_lane_time_ms = 0.0;
+    // Destination-side work that scales with the routed expert histogram.
+    // Source-local router, latent/shared-expert, and finalize work is excluded
+    // so DP-source composition can compare like with like at the EP barrier.
+    std::vector<double> routed_lane_times_ms;
+    std::vector<double> source_local_lane_times_ms;
+    // Source-local shared-expert component. It is lane invariant and is
+    // retained separately so the DP group predictor can form its overlap
+    // window without predicting the full layer again for every source.
+    double shared_expert_path_ms = 0.0;
+    std::uint64_t routed_critical_lane = 0;
+    double routed_critical_lane_time_ms = 0.0;
+};
+
+struct MoERoutedLanePrediction {
+    std::vector<double> lane_times_ms;
+    std::uint64_t critical_lane = 0;
+    double critical_lane_time_ms = 0.0;
+    MoEGroupedGemmGeometry critical_lane_geometry;
 };
 
 struct MoEOperatorPrecisions {
@@ -180,11 +221,18 @@ predict_moe_layer(const DeviceCeilings &device, const AnalyticalConfig &config,
 predict_moe_lanes(const DeviceCeilings &device, const AnalyticalConfig &config,
                   const MoEModel &model, const RoutingAllocation &routing,
                   std::uint64_t router_topk,
-                  const MoEOperatorPrecisions &precisions);
+                  const MoEOperatorPrecisions &precisions,
+                  bool enable_group_mega_moe_geometry = false);
 [[nodiscard]] MoELanePrediction
 predict_moe_lanes(const DeviceCeilings &device, const AnalyticalConfig &config,
                   const MoEModel &model, const RoutingAllocation &routing,
-                  std::uint64_t router_topk, Precision precision);
+                   std::uint64_t router_topk, Precision precision,
+                   bool enable_group_mega_moe_geometry = false);
+[[nodiscard]] MoERoutedLanePrediction predict_routed_moe_lanes(
+    const DeviceCeilings &device, const AnalyticalConfig &config,
+    const MoEModel &model, const RoutingAllocation &routing,
+    std::uint64_t router_topk, const MoEOperatorPrecisions &precisions,
+    bool enable_group_mega_moe_geometry = false);
 [[nodiscard]] MoECommunicationTime predict_moe_communication(
     const cc_backend::BaseCCBackend &communication, std::uint64_t input_tokens,
     std::uint64_t hidden_size, std::uint64_t routed_tokens,
@@ -195,6 +243,8 @@ predict_moe_lanes(const DeviceCeilings &device, const AnalyticalConfig &config,
     std::string_view moe_communication_backend = "generic",
     const RoutingAllocation *routing = nullptr,
     double fused_expert_compute_ms = 0.0,
-    double overlap_residual = 0.35);
+    double overlap_residual = 0.35,
+    double a2a_bandwidth_scale = 1.0,
+    double a2a_startup_scale = 1.0);
 
 } // namespace frontier::execution_time_predictor::detail

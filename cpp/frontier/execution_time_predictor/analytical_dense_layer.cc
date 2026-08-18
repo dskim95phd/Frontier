@@ -20,12 +20,18 @@
 
 namespace frontier::execution_time_predictor::detail {
 
-AnalyticalConfig analytical_config_from_profile(std::string_view profile) {
+AnalyticalConfig analytical_config_from_profile(std::string_view profile,
+                                                std::string_view device) {
     AnalyticalConfig result{};
-    if (profile == "generic") {
-        return result;
+    if (device != "rubin" && device != "gb300" && device != "custom") {
+        throw AnalyticalModelError("unknown analytical profile device: " +
+                                   std::string{device});
     }
-    if (profile == "k3_sglang_mxfp4") {
+    if (profile == "generic") {
+        // Keep portable kernel efficiencies. Device resource scaling below
+        // remains independent because the separately selected MegaMoE
+        // communication backend may be used with this kernel profile.
+    } else if (profile == "k3_sglang_mxfp4") {
         // Blackwell K3 local-MoE profile: official W4A8 SiTU cubins, fused
         // routing/finalize, small-M GEMMs, and lower launch count.  Keep the
         // ceilings physical; only achieved efficiencies and launch overhead
@@ -36,21 +42,53 @@ AnalyticalConfig analytical_config_from_profile(std::string_view profile) {
         result.moe = Efficiency{0.525, 0.75, 0.225};
         result.routing = Efficiency{0.195, 0.625, 0.625};
         result.kernel_launch_latency_us = 3.75;
-        return result;
-    }
-    if (profile == "k3_deepgemm_megamoe") {
+    } else if (profile == "k3_deepgemm_megamoe") {
         // Large DP-attention + EP K3 deployments use a synchronized
         // MegaMoE/DeepGEMM critical path.  Public communication measurements
         // include mandatory dispatch-tail and combine-head barriers, so do
-        // not hide the shorter A2A path.  The receiver-side expert path scale
-        // captures the lower achieved efficiency of the rank-major wide-EP
-        // kernel relative to the generic single-lane roofline.
-        result.group_moe_expert_path_scale = 1.75;
+        // not hide the shorter A2A path.  Expert execution uses the public
+        // SM100 block-M policy and exact destination-lane histogram instead
+        // of a workload-fitted constant slowdown.
+        result.mega_moe_geometry_enabled = true;
+        // RaMP's public H200 wave staircase implies about 0.1--0.2 us per
+        // CTA over this grid range. MegaMoE uses two-CTA clusters and GB300
+        // has higher compute/HBM ceilings, so retain only a conservative
+        // residual after the ordinary roofline contribution. The coefficient
+        // is calibrated on the three LMSYS DP4/EP32 points; DP2/EP16 is kept
+        // as a topology holdout rather than participating in the fit.
+        // A 2x2 factorial refit of tail IO and wave exposure found that the
+        // former wave term was degenerate with this coefficient. Full padded
+        // activation IO plus no separate wave multiplier preserves the DP4
+        // calibration while reducing the DP2 topology holdout error.
+        result.mega_moe_tail_io_fraction = 1.0;
+        result.mega_moe_wave_exposure = 0.0;
+        result.mega_moe_cluster_task_latency_us = 0.06325;
+        // The measured wide-EP path includes a synchronized dispatch-tail /
+        // combine-head barrier. Rubin exposes mechanisms that may improve
+        // this dependency, but no K3 MegaMoE measurement quantifies the
+        // overlap. Keep the measured residual instead of folding an
+        // optimistic software assumption into hardware resource scaling.
         result.moe_a2a_overlap_residual = 1.0;
-        return result;
+    } else {
+        throw AnalyticalModelError("unknown analytical kernel profile: " +
+                                   std::string{profile});
     }
-    throw AnalyticalModelError("unknown analytical kernel profile: " +
-                               std::string{profile});
+
+    if (device == "rubin") {
+        // Device resources are intentionally independent of kernel_profile.
+        // The 2x payload scale is consumed only by the explicitly selected
+        // sm100_megamoe_public communication backend; generic collectives
+        // ignore it.
+        result.mega_moe_sm_count = 224;
+        result.mega_moe_a2a_bandwidth_scale = 2.0;
+        if (profile == "k3_deepgemm_megamoe") {
+            // The residual is per cluster task, so scale by low-precision
+            // throughput per SM rather than total device throughput:
+            // (35 PFLOP/s / 224 SM) / (15 PFLOP/s / 160 SM) = 5/3.
+            result.mega_moe_cluster_task_latency_us /= (5.0 / 3.0);
+        }
+    }
+    return result;
 }
 
 DeviceCeilings DeviceCeilings::from_config(

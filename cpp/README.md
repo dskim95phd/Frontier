@@ -583,25 +583,62 @@ DP-attention + EP-expert layouts,
 dispatch/combine are the
 layout transition, so this profile does not add a second DP input/output
 all-reduce. It is a documented prior, not a workload-fitted calibration.
+The profile may also be selected with the `rubin` device preset as an explicit
+forward projection. In that mode arithmetic and HBM work use Rubin roofline
+ceilings, the expert grid uses 224 rather than 160 SMs, A2A payload time scales
+by the public 3.6/1.8 TB/s NVLink ratio, and the per-cluster residual scales by
+low-precision throughput per SM. Fixed A2A startup and overlap dependency do
+not scale from peak bandwidth. Rubin counted writes and tile-level dependent
+triggering may improve overlap, but there is no K3 MegaMoE measurement to
+quantify it, so both fixed startup and the selected overlap residual remain the
+GB300 priors. Block-M, block-N, two-CTA clustering, and the functional form
+remain public SM100 priors rather than Rubin measurements.
+The Rubin A2A payload scale belongs to the device plus communication backend,
+not to `kernel_profile`: explicitly selecting `sm100_megamoe_public` with a
+generic kernel profile still uses the Rubin payload bandwidth. The ordinary
+`generic` collective backend ignores this MegaMoE-specific scale.
 
 `execution_model.kernel_profile` is also optional and defaults to `generic`,
-which preserves the portable roofline efficiencies. Two Kimi-K3/GB300-only
-profiles make serving-stack assumptions explicit instead of silently changing
-the device ceilings:
+which preserves the portable roofline efficiencies. Two Kimi-K3 profiles for
+GB300, or explicit forward projection onto Rubin, make serving-stack
+assumptions explicit instead of silently changing the device ceilings:
 
 - `k3_sglang_mxfp4` models the published Blackwell K3 local-kernel path: W4A8
   SiTU expert kernels, small-M GEMMs, fused routing/finalize work, and reduced
   launch overhead. Its batch-1 target is the published non-speculative
   approximately 113 tok/s endpoint.
 - `k3_deepgemm_megamoe` applies only to the DP-source-composed destination-EP
-  group prediction. It lowers wide-EP receiver-side grouped-expert efficiency
-  and exposes the complete dispatch/GEMM/combine producer-consumer critical
-  path. This efficiency factor is an LMSYS K3 serving-frontier calibration,
-  not an independent hardware measurement; the A2A transport envelope remains
-  the separate public NVIDIA prior described above.
+  group prediction. It applies the public DeepGEMM SM100 block-M selection
+  policy to the exact destination-lane expert histogram, charges tensor-core
+  work and activation IO for padded M blocks, and adds a grid-size-dependent
+  cluster scheduler/pipeline term. A factorial refit found no independently
+  identifiable final-wave multiplier after the grid coefficient was refit.
+  The latter is the reduced `c*g` term from a RaMP-style wave model after the
+  existing roofline has already charged arithmetic and bulk HBM traffic. Its
+  0.06325 us/routed-two-CTA-cluster coefficient is calibrated on the three
+  LMSYS DP4/EP32 points; the DP2/EP16 points are a topology holdout. The grid
+  term dominates the low-concurrency end of that calibration set and should
+  not be interpreted as a small perturbation there. DP-group
+  recomposition includes routed destination-expert work only: router, latent
+  projection, replicated shared expert, normalization, and finalize work keep
+  each DP source's local token count. The shared-expert overlap component is
+  carried from that first source prediction into the group barrier rather
+  than recomputing a full MoE layer per source. It also exposes the complete
+  dispatch/GEMM/combine producer-consumer critical path. The former
+  workload-fitted constant expert slowdown is not used; the A2A transport
+  envelope remains the separate public NVIDIA prior described above.
 
-Both profiles require `device="gb300"` and a Kimi K3 model asset. They are
-opt-in so existing analytical configs and numeric baselines remain unchanged.
+  For controlled sensitivity or hardware refitting, this profile alone also
+  accepts optional `mega_moe_tail_io_fraction`, `mega_moe_wave_exposure`, and
+  `mega_moe_cluster_task_latency_us` overrides. Omitting them selects the
+  documented device-profile priors.
+
+Both profiles require `device="gb300"` or `device="rubin"` and a Kimi K3 model
+asset. They are opt-in so existing analytical configs and numeric baselines
+remain unchanged.
+The model choice, equations, calibration split, and rejected alternatives are
+recorded in
+[`docs/design/kimi-k3-wide-ep-expert-kernel-model.md`](../docs/design/kimi-k3-wide-ep-expert-kernel-model.md).
 
 Timing-template reuse is scoped to one immutable batch: equivalent PP stages
 of that batch share one template per timing group. Different batches never

@@ -639,9 +639,21 @@ AnalyticalRooflineExecutionTimePredictor::
     : config_(std::move(config)),
       device_(detail::DeviceCeilings::from_config(config_)),
       analytical_(detail::analytical_config_from_profile(
-          config_.kernel_profile)),
+          config_.kernel_profile, config_.device)),
       parallelism_(parallelism), model_(std::move(model)), routing_(routing),
       communication_backend_(std::move(communication_backend)) {
+    if (config_.mega_moe_tail_io_fraction.has_value()) {
+        analytical_.mega_moe_tail_io_fraction =
+            *config_.mega_moe_tail_io_fraction;
+    }
+    if (config_.mega_moe_wave_exposure.has_value()) {
+        analytical_.mega_moe_wave_exposure =
+            *config_.mega_moe_wave_exposure;
+    }
+    if (config_.mega_moe_cluster_task_latency_us.has_value()) {
+        analytical_.mega_moe_cluster_task_latency_us =
+            *config_.mega_moe_cluster_task_latency_us;
+    }
     config::apply_model_native_precision_defaults(config_, model_);
     if (parallelism_.tensor_parallel_size == 0) {
         parallelism_.tensor_parallel_size = config_.tensor_parallel_size;
@@ -696,9 +708,25 @@ AnalyticalRooflineExecutionTimePredictor::predict_moe_group_layer(
         static_cast<std::size_t>(parallelism_.moe_expert_parallel_size);
     if (input.source_lane_routed_tokens.empty() ||
         input.source_lane_routed_tokens.size() !=
-            input.source_lane_unique_tokens.size()) {
+            input.source_lane_unique_tokens.size() ||
+        input.source_lane_routed_tokens.size() !=
+            input.source_input_tokens.size()) {
         throw ExecutionTimePredictorError(
             "analytical group MoE source traffic matrix is missing");
+    }
+    std::uint64_t source_input_total = 0;
+    for (const std::uint64_t tokens : input.source_input_tokens) {
+        if (tokens > std::numeric_limits<std::uint64_t>::max() -
+                         source_input_total) {
+            throw ExecutionTimePredictorError(
+                "analytical group MoE source input token count overflows");
+        }
+        source_input_total += tokens;
+    }
+    if (source_input_total != input.input_tokens) {
+        throw ExecutionTimePredictorError(
+            "analytical group MoE source input tokens do not conserve the "
+            "group total");
     }
     allocation.lane_routed_tokens.assign(ep_size, 0);
     allocation.lane_unique_tokens.assign(ep_size, 0);
@@ -751,42 +779,61 @@ AnalyticalRooflineExecutionTimePredictor::predict_moe_group_layer(
             std::count_if(lane.begin(), lane.end(),
                           [](std::uint64_t tokens) { return tokens > 0; })));
     }
-    detail::MoELanePrediction prediction = detail::predict_moe_lanes(
-        device_, analytical_,
-        internal::make_moe_model(model_, parallelism_), allocation,
-        model_.router_topk, internal::make_moe_operator_precisions(config_));
-    if (analytical_.group_moe_expert_path_scale != 1.0) {
-        for (detail::MoELayerTime &lane : prediction.lane_times) {
-            lane.grouped_up_projection_ms *=
-                analytical_.group_moe_expert_path_scale;
-            lane.grouped_down_projection_ms *=
-                analytical_.group_moe_expert_path_scale;
-            lane.shuffling_ms *= analytical_.group_moe_expert_path_scale;
-        }
-        const auto critical = std::max_element(
-            prediction.lane_times.begin(), prediction.lane_times.end(),
-            [](const detail::MoELayerTime &lhs,
-               const detail::MoELayerTime &rhs) {
-                return lhs.total_ms() < rhs.total_ms();
-            });
-        prediction.critical_lane = static_cast<std::uint64_t>(
-            std::distance(prediction.lane_times.begin(), critical));
-        prediction.critical_lane_time_ms = critical->total_ms();
-    }
+    const detail::MoEModel moe_model =
+        internal::make_moe_model(model_, parallelism_);
+    const detail::MoEOperatorPrecisions moe_precisions =
+        internal::make_moe_operator_precisions(config_);
+    const detail::MoERoutedLanePrediction prediction =
+        detail::predict_routed_moe_lanes(
+            device_, analytical_, moe_model, allocation, model_.router_topk,
+            moe_precisions, true);
 
     MoEGroupLayerPrediction result{};
-    result.lane_times_ms = internal::lane_times_ms(prediction);
+    result.lane_times_ms = prediction.lane_times_ms;
+    result.lane_times_are_routed_only = true;
     result.critical_lane = prediction.critical_lane;
     result.critical_lane_time_ms = prediction.critical_lane_time_ms;
+    const detail::MoEGroupedGemmGeometry &geometry =
+        prediction.critical_lane_geometry;
+    result.grouped_gemm_geometry = {
+        geometry.enabled,
+        geometry.block_m,
+        geometry.routed_m_blocks,
+        geometry.shared_m_blocks,
+        geometry.routed_padded_tokens,
+        geometry.shared_padded_tokens,
+        geometry.up_cluster_tasks,
+        geometry.down_cluster_tasks,
+        geometry.up_wave_utilization,
+        geometry.down_wave_utilization,
+        geometry.up_cluster_task_overhead_ms,
+        geometry.down_cluster_task_overhead_ms,
+    };
     result.destination_lane_routed_tokens = allocation.lane_routed_tokens;
     result.destination_lane_unique_tokens = allocation.lane_unique_tokens;
     if (config_.moe_communication_backend == "sm100_megamoe_public" &&
         parallelism_.moe_expert_parallel_size > 1) {
-        const detail::MoELayerTime &critical = prediction.lane_times.at(
-            static_cast<std::size_t>(prediction.critical_lane));
+        if (input.source_shared_expert_path_ms.size() !=
+            input.source_input_tokens.size()) {
+            throw ExecutionTimePredictorError(
+                "analytical group MoE requires one shared-expert path per "
+                "DP source");
+        }
+        double maximum_shared_expert_ms = 0.0;
+        for (const double source_shared_expert_ms :
+             input.source_shared_expert_path_ms) {
+            if (!std::isfinite(source_shared_expert_ms) ||
+                source_shared_expert_ms < 0.0) {
+                throw ExecutionTimePredictorError(
+                    "analytical group MoE shared-expert path is invalid");
+            }
+            maximum_shared_expert_ms = std::max(
+                maximum_shared_expert_ms, source_shared_expert_ms);
+        }
+        // Preserve the historical overlap window's shared-expert component,
+        // but evaluate it per source instead of on the DP-summed token count.
         const double fused_expert_compute_ms =
-            critical.grouped_up_projection_ms +
-            critical.grouped_down_projection_ms + critical.shuffling_ms;
+            prediction.critical_lane_time_ms + maximum_shared_expert_ms;
         const detail::Precision communication_precision =
             detail::precision_from_string(config_.communication_precision());
         const detail::MoECommunicationTime communication =
@@ -801,7 +848,9 @@ AnalyticalRooflineExecutionTimePredictor::predict_moe_group_layer(
                 model_.routed_expert_hidden_size,
                 config_.moe_communication_backend, &allocation,
                 fused_expert_compute_ms,
-                analytical_.moe_a2a_overlap_residual);
+                analytical_.moe_a2a_overlap_residual,
+                analytical_.mega_moe_a2a_bandwidth_scale,
+                analytical_.mega_moe_a2a_startup_scale);
         result.has_source_aware_ep_communication = true;
         result.raw_ep_dispatch_ms = communication.raw_ep_dispatch_ms;
         result.raw_ep_combine_ms = communication.raw_ep_combine_ms;

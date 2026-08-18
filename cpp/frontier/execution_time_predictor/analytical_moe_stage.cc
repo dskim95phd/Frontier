@@ -115,6 +115,10 @@ MoERoutingDiagnostic make_moe_routing_diagnostic(
     result.lane_active_experts = allocation.lane_active_experts;
     result.lane_unique_tokens = allocation.lane_unique_tokens;
     result.lane_times_ms = lane_times_ms(lane_prediction);
+    result.routed_lane_times_ms = lane_prediction.routed_lane_times_ms;
+    result.source_local_lane_times_ms =
+        lane_prediction.source_local_lane_times_ms;
+    result.shared_expert_path_ms = lane_prediction.shared_expert_path_ms;
     result.critical_lane = lane_prediction.critical_lane;
     result.critical_lane_time_ms = lane_prediction.critical_lane_time_ms;
     return result;
@@ -255,7 +259,9 @@ moe_stage_communication(const MoEStageContext &context,
         context.model.routed_expert_hidden_size,
         context.config.moe_communication_backend, &allocation,
         fused_expert_compute_ms,
-        context.analytical.moe_a2a_overlap_residual);
+        context.analytical.moe_a2a_overlap_residual,
+        context.analytical.mega_moe_a2a_bandwidth_scale,
+        context.analytical.mega_moe_a2a_startup_scale);
 }
 
 void reset_moe_compute(entities::ExecutionTime &execution_time) noexcept {

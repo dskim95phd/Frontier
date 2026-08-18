@@ -1,4 +1,5 @@
 // Internal analytical MoE behavior is tested through the predictor module.
+#include <cmath>
 #include <cstdint>
 #include <iostream>
 #include <limits>
@@ -265,6 +266,10 @@ void test_sm100_megamoe_public_profile_models_overlap_and_layout_transition() {
         frontier::execution_time_predictor::detail::predict_moe_communication(
             communication, 64, 7168, 512, 4, 1, 32, 4, false, 1.0, 2048,
             "sm100_megamoe_public", &balanced, 0.04, 1.0);
+    const auto rubin_bandwidth =
+        frontier::execution_time_predictor::detail::predict_moe_communication(
+            communication, 64, 7168, 512, 4, 1, 32, 4, false, 1.0, 2048,
+            "sm100_megamoe_public", &balanced, 0.04, 0.35, 2.0, 1.0);
 
     require(public_balanced.raw_ep_dispatch_ms > 0.018 &&
                 public_balanced.raw_ep_combine_ms > 0.031,
@@ -291,6 +296,21 @@ void test_sm100_megamoe_public_profile_models_overlap_and_layout_transition() {
                          synchronized.raw_ep_combine_ms) <
                 1e-12,
             "synchronized MegaMoE must expose the full A2A path");
+    const double ep32_position = 2.0 / 3.0;
+    const double dispatch_startup_ms =
+        (18.0 + 4.0 * ep32_position) / 1000.0;
+    const double combine_startup_ms =
+        (31.0 + 2.0 * ep32_position) / 1000.0;
+    require(std::abs(
+                rubin_bandwidth.raw_ep_dispatch_ms - dispatch_startup_ms -
+                0.5 * (public_balanced.raw_ep_dispatch_ms -
+                       dispatch_startup_ms)) < 1e-12 &&
+                std::abs(
+                    rubin_bandwidth.raw_ep_combine_ms - combine_startup_ms -
+                    0.5 * (public_balanced.raw_ep_combine_ms -
+                           combine_startup_ms)) < 1e-12,
+            "Rubin NVLink scaling must halve payload time without scaling "
+            "the fixed A2A startup");
 }
 
 void test_group_moe_communication_aggregates_dp_source_rows() {
@@ -332,6 +352,8 @@ void test_group_moe_communication_aggregates_dp_source_rows() {
         input.input_tokens = include_second_source ? 128 : 64;
         input.routed_tokens = input.input_tokens * model.router_topk;
         input.global_expert_tokens = source0.global_expert_tokens;
+        input.source_input_tokens = {64};
+        input.source_shared_expert_path_ms = {0.0};
         input.source_lane_routed_tokens = {source0.lane_routed_tokens};
         input.source_lane_unique_tokens = {source0.lane_unique_tokens};
         if (include_second_source) {
@@ -344,6 +366,8 @@ void test_group_moe_communication_aggregates_dp_source_rows() {
                 source1.lane_routed_tokens);
             input.source_lane_unique_tokens.push_back(
                 source1.lane_unique_tokens);
+            input.source_input_tokens.push_back(64);
+            input.source_shared_expert_path_ms.push_back(0.0);
         }
         input.fallback_lane_times_ms.assign(
             static_cast<std::size_t>(parallelism.moe_expert_parallel_size),
@@ -362,9 +386,22 @@ void test_group_moe_communication_aggregates_dp_source_rows() {
             execution, parallelism, model, routing);
     const auto synchronized_group =
         synchronized_predictor.predict_moe_group_layer(make_input(true));
+    auto sensitivity_execution = execution;
+    sensitivity_execution.mega_moe_cluster_task_latency_us = 0.0;
+    sensitivity_execution.mega_moe_wave_exposure = 0.0;
+    sensitivity_execution.mega_moe_tail_io_fraction = 1.0;
+    const frontier::execution_time_predictor::
+        AnalyticalRooflineExecutionTimePredictor sensitivity_predictor(
+            sensitivity_execution, parallelism, model, routing);
+    const auto sensitivity_group =
+        sensitivity_predictor.predict_moe_group_layer(make_input(true));
     require(single.has_source_aware_ep_communication &&
                 group.has_source_aware_ep_communication,
             "GB300 group predictor must expose source-aware EP communication");
+    require(single.lane_times_are_routed_only &&
+                group.lane_times_are_routed_only,
+            "analytical DP-group prediction must expose only destination "
+            "routed work");
     for (std::size_t lane = 0;
          lane < group.destination_lane_routed_tokens.size(); ++lane) {
         require(group.destination_lane_routed_tokens.at(lane) ==
@@ -388,6 +425,30 @@ void test_group_moe_communication_aggregates_dp_source_rows() {
                     group.ep_dispatch_ms + group.ep_combine_ms,
             "wide-EP K3 profile must expose receiver-side kernel and barrier "
             "costs");
+    require(sensitivity_group.critical_lane_time_ms !=
+                synchronized_group.critical_lane_time_ms,
+            "MegaMoE rho_tail/lambda_wave/c_grid config overrides must "
+            "change the live routed group prediction");
+    require(synchronized_group.grouped_gemm_geometry.enabled &&
+                synchronized_group.grouped_gemm_geometry.block_m > 0 &&
+                synchronized_group.grouped_gemm_geometry.up_cluster_tasks >
+                    0 &&
+                synchronized_group.grouped_gemm_geometry
+                        .down_cluster_tasks > 0,
+            "production group prediction must retain critical-lane MegaMoE "
+            "geometry");
+
+    auto no_shared_model = model;
+    no_shared_model.num_shared_experts = 0;
+    const frontier::execution_time_predictor::
+        AnalyticalRooflineExecutionTimePredictor no_shared_predictor(
+            execution, parallelism, no_shared_model, routing);
+    const auto no_shared_group =
+        no_shared_predictor.predict_moe_group_layer(make_input(true));
+    require(no_shared_group.lane_times_ms ==
+                synchronized_group.lane_times_ms,
+            "DP-group destination work must not include source-local shared "
+            "experts");
 }
 
 void test_moe_lane_analytical_model() {
@@ -581,6 +642,162 @@ void test_latent_moe_projection_precision_is_independent() {
             "precision overrides");
 }
 
+void test_split_expert_decomposition_is_additive() {
+    using frontier::execution_time_predictor::detail::AnalyticalConfig;
+    using frontier::execution_time_predictor::detail::DeviceCeilings;
+    using frontier::execution_time_predictor::detail::MoEModel;
+    using frontier::execution_time_predictor::detail::MoEOperatorPrecisions;
+    using frontier::execution_time_predictor::detail::Precision;
+
+    MoEModel model{};
+    model.hidden_size = 4096;
+    model.intermediate_size = 2048;
+    model.model_num_experts = 8;
+    model.num_shared_experts = 1;
+    model.moe_tensor_parallel_size = 1;
+    model.gated_mlp = true;
+
+    MoEOperatorPrecisions precisions{};
+    precisions.expert_weight = Precision::kFp4;
+    precisions.expert_activation = Precision::kFp8;
+    precisions.shared_expert_weight = Precision::kFp8;
+    precisions.shared_expert_activation = Precision::kFp8;
+    const auto layer =
+        frontier::execution_time_predictor::detail::predict_moe_layer(
+            DeviceCeilings::gb300(), AnalyticalConfig{}, model, 32, 2,
+            std::vector<std::uint64_t>(8, 8), precisions);
+    require(std::abs(layer.routed_path_ms + layer.source_local_ms -
+                     layer.total_ms()) < 1e-12,
+            "split routed/shared MoE decomposition must add to total_ms");
+}
+
+void test_mega_moe_geometry_uses_exact_expert_histogram() {
+    using frontier::execution_time_predictor::detail::AnalyticalConfig;
+    using frontier::execution_time_predictor::detail::DeviceCeilings;
+    using frontier::execution_time_predictor::detail::MoEModel;
+    using frontier::execution_time_predictor::detail::Precision;
+
+    MoEModel model{};
+    model.hidden_size = 4'096;
+    model.intermediate_size = 2'048;
+    model.model_num_experts = 16;
+    model.moe_tensor_parallel_size = 1;
+    model.gated_mlp = true;
+
+    const std::vector<std::uint64_t> aligned = {
+        16, 16, 16, 16, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    const std::vector<std::uint64_t> fragmented = {
+        31, 16, 16, 16, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    const AnalyticalConfig generic{};
+    const AnalyticalConfig mega =
+        frontier::execution_time_predictor::detail::
+            analytical_config_from_profile("k3_deepgemm_megamoe");
+    const AnalyticalConfig rubin_mega =
+        frontier::execution_time_predictor::detail::
+            analytical_config_from_profile("k3_deepgemm_megamoe", "rubin");
+    const AnalyticalConfig rubin_generic =
+        frontier::execution_time_predictor::detail::
+            analytical_config_from_profile("generic", "rubin");
+    require(rubin_mega.mega_moe_sm_count == 224 &&
+                rubin_mega.mega_moe_a2a_bandwidth_scale == 2.0 &&
+                rubin_mega.mega_moe_a2a_startup_scale == 1.0 &&
+                rubin_mega.mega_moe_tail_io_fraction == 1.0 &&
+                rubin_mega.mega_moe_wave_exposure == 0.0 &&
+                std::abs(rubin_mega.mega_moe_cluster_task_latency_us -
+                         0.03795) < 1e-12 &&
+                rubin_mega.moe_a2a_overlap_residual == 1.0,
+            "Rubin MegaMoE projection must scale SM waves, NVLink payload, "
+            "and per-SM cluster residual without changing measured overlap");
+    require(!rubin_generic.mega_moe_geometry_enabled &&
+                rubin_generic.mega_moe_sm_count == 224 &&
+                rubin_generic.mega_moe_a2a_bandwidth_scale == 2.0,
+            "Rubin device resources must remain independent of the optional "
+            "K3 kernel profile");
+
+    const auto generic_aligned =
+        frontier::execution_time_predictor::detail::predict_moe_layer(
+            DeviceCeilings::gb300(), generic, model, 80, 1, aligned,
+            Precision::kFp8);
+    const auto generic_fragmented =
+        frontier::execution_time_predictor::detail::predict_moe_layer(
+            DeviceCeilings::gb300(), generic, model, 80, 1, fragmented,
+            Precision::kFp8);
+    const auto mega_aligned =
+        frontier::execution_time_predictor::detail::predict_moe_layer(
+            DeviceCeilings::gb300(), mega, model, 80, 1, aligned,
+            Precision::kFp8);
+    const auto mega_fragmented =
+        frontier::execution_time_predictor::detail::predict_moe_layer(
+            DeviceCeilings::gb300(), mega, model, 80, 1, fragmented,
+            Precision::kFp8);
+
+    require(generic_aligned.grouped_up_projection_ms ==
+                    generic_fragmented.grouped_up_projection_ms &&
+                generic_aligned.grouped_down_projection_ms ==
+                    generic_fragmented.grouped_down_projection_ms,
+            "portable roofline must retain aggregate-work behavior");
+    require(mega_fragmented.grouped_up_projection_ms >
+                    mega_aligned.grouped_up_projection_ms &&
+                mega_fragmented.grouped_down_projection_ms >
+                    mega_aligned.grouped_down_projection_ms,
+            "MegaMoE geometry must charge the extra expert M block");
+    require(mega_aligned.grouped_gemm_geometry.enabled &&
+                mega_aligned.grouped_gemm_geometry.block_m == 16 &&
+                mega_aligned.grouped_gemm_geometry.routed_m_blocks == 5 &&
+                mega_fragmented.grouped_gemm_geometry.routed_m_blocks == 6 &&
+                mega_aligned.grouped_gemm_geometry.routed_padded_tokens == 80 &&
+                mega_fragmented.grouped_gemm_geometry.routed_padded_tokens ==
+                    96 &&
+                std::abs(mega_aligned.grouped_gemm_geometry
+                             .up_cluster_task_overhead_ms -
+                         static_cast<double>(mega_aligned
+                                                 .grouped_gemm_geometry
+                                                 .up_cluster_tasks) *
+                             0.06325 / 1000.0) < 1e-12,
+            "MegaMoE diagnostics must expose block-M padding geometry");
+    require(mega_aligned.shuffling_ms == generic_aligned.shuffling_ms,
+            "expert GEMM geometry must not scale shuffling work");
+
+    frontier::execution_time_predictor::detail::RoutingAllocation allocation{};
+    allocation.input_tokens = 80;
+    allocation.routed_tokens = 80;
+    allocation.lane_expert_tokens = {aligned};
+    const auto source_local =
+        frontier::execution_time_predictor::detail::predict_moe_lanes(
+            DeviceCeilings::gb300(), mega, model, allocation, 1,
+            Precision::kFp8);
+    const auto group_composed =
+        frontier::execution_time_predictor::detail::predict_routed_moe_lanes(
+            DeviceCeilings::gb300(), mega, model, allocation, 1,
+            frontier::execution_time_predictor::detail::
+                MoEOperatorPrecisions{},
+            true);
+    require(!source_local.lane_times.front().grouped_gemm_geometry.enabled &&
+                group_composed.critical_lane_geometry.enabled &&
+                group_composed.critical_lane_geometry.block_m == 16 &&
+                group_composed.critical_lane_geometry.up_cluster_tasks > 0,
+            "live routed-only group prediction must retain its critical "
+            "MegaMoE geometry");
+
+    auto threshold_model = model;
+    threshold_model.model_num_experts = 8;
+    const std::vector<std::uint64_t> threshold_low = {68, 0, 0, 0, 0, 0, 0, 0};
+    const std::vector<std::uint64_t> threshold_high = {69, 0, 0, 0, 0, 0, 0, 0};
+    const auto low =
+        frontier::execution_time_predictor::detail::predict_moe_layer(
+            DeviceCeilings::gb300(), mega, threshold_model, 68, 1,
+            threshold_low,
+            Precision::kFp8);
+    const auto high =
+        frontier::execution_time_predictor::detail::predict_moe_layer(
+            DeviceCeilings::gb300(), mega, threshold_model, 69, 1,
+            threshold_high,
+            Precision::kFp8);
+    require(low.grouped_gemm_geometry.block_m == 16 &&
+                high.grouped_gemm_geometry.block_m == 32,
+            "MegaMoE block-M policy must switch above 8.5 tokens/expert");
+}
+
 void test_moe_overflow_and_nonfinite_inputs_fail_fast() {
     using frontier::config::MoeRoutingConfig;
     bool routing_overflow_rejected = false;
@@ -645,8 +862,10 @@ int main() {
         test_sm100_megamoe_public_profile_models_overlap_and_layout_transition();
         test_group_moe_communication_aggregates_dp_source_rows();
         test_moe_lane_analytical_model();
+        test_split_expert_decomposition_is_additive();
         test_shared_expert_is_replicated_across_ep_and_sharded_by_tp();
         test_latent_moe_projection_precision_is_independent();
+        test_mega_moe_geometry_uses_exact_expert_histogram();
         test_moe_overflow_and_nonfinite_inputs_fail_fast();
     } catch (const std::exception &error) {
         std::cerr << error.what() << '\n';

@@ -586,6 +586,21 @@ OrderedJson serialize_diagnostic(const AnalyticalDiagnostic &diagnostic) {
 }
 
 OrderedJson serialize_moe_routing(const MoERoutingMetricsRecord &routing) {
+    const auto &geometry = routing.grouped_gemm_geometry;
+    const bool invalid_geometry =
+        !std::isfinite(geometry.up_wave_utilization) ||
+        !std::isfinite(geometry.down_wave_utilization) ||
+        !std::isfinite(geometry.up_cluster_task_overhead_ms) ||
+        !std::isfinite(geometry.down_cluster_task_overhead_ms) ||
+        geometry.up_wave_utilization <= 0.0 ||
+        geometry.up_wave_utilization > 1.0 ||
+        geometry.down_wave_utilization <= 0.0 ||
+        geometry.down_wave_utilization > 1.0 ||
+        geometry.up_cluster_task_overhead_ms < 0.0 ||
+        geometry.down_cluster_task_overhead_ms < 0.0 ||
+        (geometry.enabled &&
+         (geometry.block_m == 0 || geometry.routed_m_blocks == 0 ||
+          geometry.up_cluster_tasks == 0 || geometry.down_cluster_tasks == 0));
     if (!routing.batch_id.valid() || !routing.stage_id.valid() ||
         !routing.layer_id.valid() || routing.input_tokens == 0 ||
         routing.routed_tokens == 0 || routing.global_expert_tokens.empty() ||
@@ -597,7 +612,13 @@ OrderedJson serialize_moe_routing(const MoERoutingMetricsRecord &routing) {
         routing.lane_unique_tokens.size() !=
             routing.lane_expert_tokens.size() ||
         routing.lane_times_ms.size() != routing.lane_expert_tokens.size() ||
+        routing.routed_lane_times_ms.size() !=
+            routing.lane_expert_tokens.size() ||
+        routing.source_local_lane_times_ms.size() !=
+            routing.lane_expert_tokens.size() ||
         routing.critical_lane >= routing.lane_times_ms.size() ||
+        !std::isfinite(routing.shared_expert_path_ms) ||
+        routing.shared_expert_path_ms < 0.0 ||
         !std::isfinite(routing.critical_lane_time_ms) ||
         routing.critical_lane_time_ms < 0.0 ||
         !std::isfinite(routing.raw_ep_dispatch_ms) ||
@@ -606,12 +627,21 @@ OrderedJson serialize_moe_routing(const MoERoutingMetricsRecord &routing) {
         !std::isfinite(routing.exposed_ep_combine_ms) ||
         routing.raw_ep_dispatch_ms < 0.0 || routing.raw_ep_combine_ms < 0.0 ||
         routing.exposed_ep_dispatch_ms < 0.0 ||
-        routing.exposed_ep_combine_ms < 0.0 ||
+        routing.exposed_ep_combine_ms < 0.0 || invalid_geometry ||
         std::any_of(
             routing.lane_times_ms.begin(), routing.lane_times_ms.end(),
             [](double value) {
                 return !std::isfinite(value) || value < 0.0;
-            })) {
+            }) ||
+        std::any_of(routing.routed_lane_times_ms.begin(),
+                    routing.routed_lane_times_ms.end(), [](double value) {
+                        return !std::isfinite(value) || value < 0.0;
+                    }) ||
+        std::any_of(routing.source_local_lane_times_ms.begin(),
+                    routing.source_local_lane_times_ms.end(),
+                    [](double value) {
+                        return !std::isfinite(value) || value < 0.0;
+                    })) {
         throw std::invalid_argument("MoE routing diagnostic is invalid");
     }
     const std::uint64_t global_total =
@@ -650,12 +680,32 @@ OrderedJson serialize_moe_routing(const MoERoutingMetricsRecord &routing) {
         {"lane_active_experts", routing.lane_active_experts},
         {"lane_unique_tokens", routing.lane_unique_tokens},
         {"lane_times_ms", routing.lane_times_ms},
+        {"routed_lane_times_ms", routing.routed_lane_times_ms},
+        {"source_local_lane_times_ms", routing.source_local_lane_times_ms},
+        {"shared_expert_path_ms", routing.shared_expert_path_ms},
         {"critical_lane", routing.critical_lane},
         {"critical_lane_time_ms", routing.critical_lane_time_ms},
         {"raw_ep_dispatch_ms", routing.raw_ep_dispatch_ms},
         {"raw_ep_combine_ms", routing.raw_ep_combine_ms},
         {"exposed_ep_dispatch_ms", routing.exposed_ep_dispatch_ms},
         {"exposed_ep_combine_ms", routing.exposed_ep_combine_ms},
+        {"grouped_gemm_geometry",
+         OrderedJson::object({
+             {"enabled", geometry.enabled},
+             {"block_m", geometry.block_m},
+             {"routed_m_blocks", geometry.routed_m_blocks},
+             {"shared_m_blocks", geometry.shared_m_blocks},
+             {"routed_padded_tokens", geometry.routed_padded_tokens},
+             {"shared_padded_tokens", geometry.shared_padded_tokens},
+             {"up_cluster_tasks", geometry.up_cluster_tasks},
+             {"down_cluster_tasks", geometry.down_cluster_tasks},
+             {"up_wave_utilization", geometry.up_wave_utilization},
+             {"down_wave_utilization", geometry.down_wave_utilization},
+             {"up_cluster_task_overhead_ms",
+              geometry.up_cluster_task_overhead_ms},
+             {"down_cluster_task_overhead_ms",
+              geometry.down_cluster_task_overhead_ms},
+         })},
     });
     if (routing.sync_group_id.valid()) {
         json["sync_group_id"] = routing.sync_group_id.value();

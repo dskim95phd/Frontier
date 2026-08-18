@@ -14,6 +14,21 @@
 
 namespace frontier::execution_time_predictor {
 
+struct MoEGroupedGemmGeometryDiagnostic {
+    bool enabled = false;
+    std::uint64_t block_m = 0;
+    std::uint64_t routed_m_blocks = 0;
+    std::uint64_t shared_m_blocks = 0;
+    std::uint64_t routed_padded_tokens = 0;
+    std::uint64_t shared_padded_tokens = 0;
+    std::uint64_t up_cluster_tasks = 0;
+    std::uint64_t down_cluster_tasks = 0;
+    double up_wave_utilization = 1.0;
+    double down_wave_utilization = 1.0;
+    double up_cluster_task_overhead_ms = 0.0;
+    double down_cluster_task_overhead_ms = 0.0;
+};
+
 struct MoERoutingDiagnostic {
     LayerId layer_id;
     std::uint64_t model_layer_id = 0;
@@ -32,12 +47,23 @@ struct MoERoutingDiagnostic {
     std::vector<std::uint64_t> lane_active_experts;
     std::vector<std::uint64_t> lane_unique_tokens;
     std::vector<double> lane_times_ms;
+    // Routed-expert/shuffle-only lane time. Source-local router, latent,
+    // shared-expert, and finalize work remains in lane_times_ms.
+    std::vector<double> routed_lane_times_ms;
+    // Lane-aligned non-routed contribution emitted directly by the predictor.
+    // Preserving lane identity avoids max(full)-max(routed) subtraction.
+    std::vector<double> source_local_lane_times_ms;
+    // Lane-invariant portion of source_local_lane_times_ms used by the
+    // fused dispatch/expert/combine overlap model.
+    double shared_expert_path_ms = 0.0;
     std::uint64_t critical_lane = 0;
     double critical_lane_time_ms = 0.0;
     double raw_ep_dispatch_ms = 0.0;
     double raw_ep_combine_ms = 0.0;
     double exposed_ep_dispatch_ms = 0.0;
     double exposed_ep_combine_ms = 0.0;
+    // Destination-group critical routed lane. Disabled for local-only paths.
+    MoEGroupedGemmGeometryDiagnostic grouped_gemm_geometry;
 };
 
 enum class ScaledMoEAttentionFamily {
@@ -82,6 +108,13 @@ struct MoEGroupLayerInput {
     std::uint64_t input_tokens = 0;
     std::uint64_t routed_tokens = 0;
     std::vector<std::uint64_t> global_expert_tokens;
+    // Exact local token count for every active attention-DP source. The sum is
+    // input_tokens, but source-local operators must never consume that sum.
+    std::vector<std::uint64_t> source_input_tokens;
+    // One already-predicted shared-expert path per active DP source. This is
+    // carried with source_input_tokens to avoid recomputing full MoE layers
+    // at every destination-group barrier.
+    std::vector<double> source_shared_expert_path_ms;
     // One row per active attention-DP source and one column per destination
     // EP lane. Column sums are the receiver-side loads that bound A2A time.
     std::vector<std::vector<std::uint64_t>> source_lane_routed_tokens;
@@ -93,6 +126,10 @@ struct MoEGroupLayerInput {
 
 struct MoEGroupLayerPrediction {
     std::vector<double> lane_times_ms;
+    // Analytical group predictions contain destination routed work only.
+    // The scheduler composes this with the slowest source-local path. Fixed
+    // predictors retain their historical full-lane fallback and leave false.
+    bool lane_times_are_routed_only = false;
     std::uint64_t critical_lane = 0;
     double critical_lane_time_ms = 0.0;
     bool has_source_aware_ep_communication = false;
@@ -102,6 +139,7 @@ struct MoEGroupLayerPrediction {
     double raw_ep_combine_ms = 0.0;
     double ep_dispatch_ms = 0.0;
     double ep_combine_ms = 0.0;
+    MoEGroupedGemmGeometryDiagnostic grouped_gemm_geometry;
 };
 
 class ExecutionTimePredictorError : public std::runtime_error {

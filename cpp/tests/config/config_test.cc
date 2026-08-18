@@ -1698,7 +1698,10 @@ void test_k3_kernel_profile_contract() {
     config.cluster().parallelism.data_parallel_size = 1;
     auto &analytical = config.cluster().execution_model.analytical;
     analytical.device = "gb300";
-    analytical.kernel_profile = "k3_sglang_mxfp4";
+    analytical.kernel_profile = "k3_deepgemm_megamoe";
+    analytical.mega_moe_tail_io_fraction = 0.25;
+    analytical.mega_moe_wave_exposure = 0.75;
+    analytical.mega_moe_cluster_task_latency_us = 0.068;
     frontier::config::apply_model_native_precision_defaults(
         analytical, config.cluster().model);
     const std::string serialized = serialize_simulation_config_json(config);
@@ -1706,12 +1709,24 @@ void test_k3_kernel_profile_contract() {
     expect(serialized.find("\"kernel_profile\"") != std::string::npos &&
                parsed.cluster()
                        .execution_model.analytical.kernel_profile ==
-                   "k3_sglang_mxfp4" &&
+                   "k3_deepgemm_megamoe" &&
+               parsed.cluster()
+                       .execution_model.analytical
+                       .mega_moe_tail_io_fraction ==
+                   std::optional<double>{0.25} &&
+               parsed.cluster()
+                       .execution_model.analytical
+                       .mega_moe_wave_exposure ==
+                   std::optional<double>{0.75} &&
+               parsed.cluster()
+                       .execution_model.analytical
+                       .mega_moe_cluster_task_latency_us ==
+                   std::optional<double>{0.068} &&
                parsed.cluster().model.model_type == "kimi_k3",
-           "K3 kernel profiles must parse and round-trip");
+           "K3 kernel profiles and sensitivity overrides must round-trip");
 
     std::string invalid = serialized;
-    const std::string valid_profile = "\"k3_sglang_mxfp4\"";
+    const std::string valid_profile = "\"k3_deepgemm_megamoe\"";
     invalid.replace(invalid.find(valid_profile), valid_profile.size(),
                     "\"unknown\"");
     expect_throws<ConfigError>(
@@ -1720,14 +1735,54 @@ void test_k3_kernel_profile_contract() {
         },
         "unknown analytical kernel profiles must fail fast");
 
+    auto invalid_override = config;
+    invalid_override.cluster()
+        .execution_model.analytical.mega_moe_wave_exposure = 1.1;
+    expect_throws<ConfigError>(
+        [&invalid_override] {
+            static_cast<void>(parse_simulation_config_json(
+                serialize_simulation_config_json(invalid_override)));
+        },
+        "MegaMoE sensitivity fractions must reject values outside [0, 1]");
+
+    auto wrong_override_profile = config;
+    wrong_override_profile.cluster()
+        .execution_model.analytical.kernel_profile = "k3_sglang_mxfp4";
+    expect_throws<ConfigError>(
+        [&wrong_override_profile] {
+            static_cast<void>(parse_simulation_config_json(
+                serialize_simulation_config_json(wrong_override_profile)));
+        },
+        "MegaMoE sensitivity overrides must reject unrelated profiles");
+
+    auto rubin = config;
+    rubin.cluster().execution_model.analytical.device = "rubin";
+    rubin.cluster().execution_model.analytical.moe_communication_backend =
+        "sm100_megamoe_public";
+    const auto parsed_rubin = parse_simulation_config_json(
+        serialize_simulation_config_json(rubin));
+    expect(parsed_rubin.cluster().execution_model.analytical.device ==
+                   "rubin" &&
+               parsed_rubin.cluster()
+                       .execution_model.analytical.moe_communication_backend ==
+                   "sm100_megamoe_public",
+           "K3 MegaMoE public priors must support explicit Rubin projection");
+
     auto wrong_device = config;
-    wrong_device.cluster().execution_model.analytical.device = "rubin";
+    auto &wrong_analytical =
+        wrong_device.cluster().execution_model.analytical;
+    wrong_analytical.device = "custom";
+    wrong_analytical.device_overrides.hbm_bandwidth_tbps = 22.0;
+    wrong_analytical.device_overrides.fp32_tflops = 130.0;
+    wrong_analytical.device_overrides.fp16_tflops = 4'000.0;
+    wrong_analytical.device_overrides.fp8_tflops = 17'500.0;
+    wrong_analytical.device_overrides.fp4_tflops = 35'000.0;
     expect_throws<ConfigError>(
         [&wrong_device] {
             static_cast<void>(parse_simulation_config_json(
                 serialize_simulation_config_json(wrong_device)));
         },
-        "K3 kernel profiles must reject non-GB300 devices");
+        "K3 kernel profiles must reject custom devices");
 
     auto wrong_model = load("analytical_parallel_colocation.json");
     wrong_model.cluster().execution_model.analytical.device = "gb300";

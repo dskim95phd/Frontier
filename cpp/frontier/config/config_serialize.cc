@@ -217,6 +217,18 @@ OrderedJson serialize_execution_model(const ExecutionModelConfig &execution) {
     if (execution.analytical.kernel_profile != "generic") {
         result["kernel_profile"] = execution.analytical.kernel_profile;
     }
+    if (execution.analytical.mega_moe_tail_io_fraction.has_value()) {
+        result["mega_moe_tail_io_fraction"] =
+            *execution.analytical.mega_moe_tail_io_fraction;
+    }
+    if (execution.analytical.mega_moe_wave_exposure.has_value()) {
+        result["mega_moe_wave_exposure"] =
+            *execution.analytical.mega_moe_wave_exposure;
+    }
+    if (execution.analytical.mega_moe_cluster_task_latency_us.has_value()) {
+        result["mega_moe_cluster_task_latency_us"] =
+            *execution.analytical.mega_moe_cluster_task_latency_us;
+    }
     return result;
 }
 

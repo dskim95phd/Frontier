@@ -1,5 +1,6 @@
 #include "frontier/metrics/metrics_store.h"
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
@@ -438,14 +439,38 @@ void MetricsStore::record_moe_routing(
         value.lane_active_experts = diagnostic.lane_active_experts;
         value.lane_unique_tokens = diagnostic.lane_unique_tokens;
         value.lane_times_ms = diagnostic.lane_times_ms;
+        value.routed_lane_times_ms = diagnostic.routed_lane_times_ms;
+        value.source_local_lane_times_ms =
+            diagnostic.source_local_lane_times_ms;
+        value.shared_expert_path_ms = diagnostic.shared_expert_path_ms;
         value.critical_lane = diagnostic.critical_lane;
         value.critical_lane_time_ms = diagnostic.critical_lane_time_ms;
         value.raw_ep_dispatch_ms = diagnostic.raw_ep_dispatch_ms;
         value.raw_ep_combine_ms = diagnostic.raw_ep_combine_ms;
         value.exposed_ep_dispatch_ms = diagnostic.exposed_ep_dispatch_ms;
         value.exposed_ep_combine_ms = diagnostic.exposed_ep_combine_ms;
+        value.grouped_gemm_geometry = diagnostic.grouped_gemm_geometry;
         return value;
     }());
+    const MoERoutingMetricsRecord &record = output_.moe_routing.back();
+    moe_routing_positions_.insert_or_assign(
+        MoERoutingKey{record.batch_id, record.stage_id, record.layer_id},
+        output_.moe_routing.size() - 1);
+}
+
+void MetricsStore::update_moe_grouped_gemm_geometry(
+    BatchId batch_id, StageId stage_id, LayerId layer_id,
+    const execution_time_predictor::MoEGroupedGemmGeometryDiagnostic
+        &geometry) {
+    if (!detailed_traces_enabled_) {
+        return;
+    }
+    const auto position = moe_routing_positions_.find(
+        MoERoutingKey{batch_id, stage_id, layer_id});
+    if (position != moe_routing_positions_.end()) {
+        output_.moe_routing.at(position->second).grouped_gemm_geometry =
+            geometry;
+    }
 }
 
 void MetricsStore::collect_completed_requests(

@@ -11,6 +11,7 @@
 #include "frontier/core/event.h"
 #include "frontier/core/ids.h"
 #include "frontier/entities/execution_time.h"
+#include "frontier/execution_time_predictor/base_execution_time_predictor.h"
 
 namespace frontier::metrics {
 
@@ -244,12 +245,17 @@ struct MoERoutingMetricsRecord {
     std::vector<std::uint64_t> lane_active_experts;
     std::vector<std::uint64_t> lane_unique_tokens;
     std::vector<double> lane_times_ms;
+    std::vector<double> routed_lane_times_ms;
+    std::vector<double> source_local_lane_times_ms;
+    double shared_expert_path_ms = 0.0;
     std::uint64_t critical_lane = 0;
     double critical_lane_time_ms = 0.0;
     double raw_ep_dispatch_ms = 0.0;
     double raw_ep_combine_ms = 0.0;
     double exposed_ep_dispatch_ms = 0.0;
     double exposed_ep_combine_ms = 0.0;
+    execution_time_predictor::MoEGroupedGemmGeometryDiagnostic
+        grouped_gemm_geometry;
 };
 
 struct BatchMetricsAggregate {

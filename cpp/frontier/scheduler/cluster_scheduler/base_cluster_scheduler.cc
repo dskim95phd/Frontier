@@ -921,6 +921,9 @@ void BaseClusterScheduler::continue_moe_stage(
             group_input.fallback_lane_times_ms.assign(
                 aggregate_lane_times_ms.size(), 0.0);
             bool routing_initialized = false;
+            std::size_t source_local_breakdown_sources = 0;
+            std::vector<double> maximum_source_local_by_lane(
+                aggregate_lane_times_ms.size(), 0.0);
             const auto add_checked = [](std::uint64_t &target,
                                         std::uint64_t value) {
                 if (value >
@@ -964,6 +967,10 @@ void BaseClusterScheduler::continue_moe_stage(
                 }
                 add_checked(group_input.input_tokens, routing.input_tokens);
                 add_checked(group_input.routed_tokens, routing.routed_tokens);
+                group_input.source_input_tokens.push_back(
+                    routing.input_tokens);
+                group_input.source_shared_expert_path_ms.push_back(
+                    routing.shared_expert_path_ms);
                 for (std::size_t expert = 0;
                      expert < routing.global_expert_tokens.size(); ++expert) {
                     add_checked(group_input.global_expert_tokens.at(expert),
@@ -973,6 +980,22 @@ void BaseClusterScheduler::continue_moe_stage(
                      lane < aggregate_lane_times_ms.size(); ++lane) {
                     group_input.fallback_lane_times_ms.at(lane) +=
                         routing.lane_times_ms.at(lane);
+                }
+                if (!routing.source_local_lane_times_ms.empty()) {
+                    if (routing.source_local_lane_times_ms.size() !=
+                        aggregate_lane_times_ms.size()) {
+                        throw std::logic_error(
+                            "aligned DECODE MoE source-local lane domain "
+                            "does not "
+                            "match");
+                    }
+                    for (std::size_t lane = 0;
+                         lane < aggregate_lane_times_ms.size(); ++lane) {
+                        maximum_source_local_by_lane.at(lane) = std::max(
+                            maximum_source_local_by_lane.at(lane),
+                            routing.source_local_lane_times_ms.at(lane));
+                    }
+                    ++source_local_breakdown_sources;
                 }
                 if (routing.lane_routed_tokens.size() !=
                         aggregate_lane_times_ms.size() ||
@@ -1002,6 +1025,40 @@ void BaseClusterScheduler::continue_moe_stage(
                     "group MoE prediction changed the EP lane domain");
             }
             aggregate_lane_times_ms = group_prediction.lane_times_ms;
+            for (const auto &[unused, batch_id] : group.participants) {
+                static_cast<void>(unused);
+                if (!simulator.batch(batch_id).is_idle()) {
+                    MoEStageState &state =
+                        moe_stage_state(batch_id, key.stage_id);
+                    if (layer_index >= state.moe_routing_by_layer.size()) {
+                        throw std::logic_error(
+                            "group MoE geometry layer is out of range");
+                    }
+                    auto &diagnostic =
+                        state.moe_routing_by_layer.at(layer_index);
+                    diagnostic.grouped_gemm_geometry =
+                        group_prediction.grouped_gemm_geometry;
+                    simulator.metrics().update_moe_grouped_gemm_geometry(
+                        batch_id, key.stage_id, diagnostic.layer_id,
+                        group_prediction.grouped_gemm_geometry);
+                }
+            }
+            if (group_prediction.lane_times_are_routed_only) {
+                if (source_local_breakdown_sources !=
+                    group_input.source_input_tokens.size()) {
+                    throw std::logic_error(
+                        "routed-only MoE group prediction requires a local "
+                        "source-local lane breakdown for every source");
+                }
+                for (std::size_t lane = 0;
+                     lane < aggregate_lane_times_ms.size(); ++lane) {
+                    // Preserve lane pairing before the final max reduction.
+                    // max_l(R_l + max_s NR_s,l) is tighter than the former
+                    // max_l(R_l) + max_s,l(NR_s,l) upper bound.
+                    aggregate_lane_times_ms.at(lane) +=
+                        maximum_source_local_by_lane.at(lane);
+                }
+            }
             if (group_prediction.has_source_aware_ep_communication) {
                 if (group_prediction.destination_lane_routed_tokens.size() !=
                         aggregate_lane_times_ms.size() ||

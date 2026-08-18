@@ -5,6 +5,7 @@
 #include <optional>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -77,6 +78,10 @@ class MetricsStore {
         const entities::Batch &batch, StageId stage_id,
         const execution_time_predictor::MoERoutingDiagnostic &diagnostic,
         const config::ClusterRuntimeConfig &runtime);
+    void update_moe_grouped_gemm_geometry(
+        BatchId batch_id, StageId stage_id, LayerId layer_id,
+        const execution_time_predictor::MoEGroupedGemmGeometryDiagnostic
+            &geometry);
 
     void collect_completed_requests(const config::SimulationConfig &config,
                                     const simulator::EntityArena &entities);
@@ -111,8 +116,36 @@ class MetricsStore {
     using OccupancyTarget =
         std::tuple<ClusterType, ReplicaId, DataParallelId>;
 
+    struct MoERoutingKey {
+        BatchId batch_id;
+        StageId stage_id;
+        LayerId layer_id;
+
+        friend bool operator==(const MoERoutingKey &lhs,
+                               const MoERoutingKey &rhs) noexcept {
+            return lhs.batch_id == rhs.batch_id &&
+                   lhs.stage_id == rhs.stage_id &&
+                   lhs.layer_id == rhs.layer_id;
+        }
+    };
+
+    struct MoERoutingKeyHash {
+        [[nodiscard]] std::size_t
+        operator()(const MoERoutingKey &key) const noexcept {
+            std::size_t seed = StrongIdHash<BatchId>{}(key.batch_id);
+            const auto combine = [&seed](std::size_t value) {
+                seed ^= value + 0x9e3779b9U + (seed << 6U) + (seed >> 2U);
+            };
+            combine(StrongIdHash<StageId>{}(key.stage_id));
+            combine(StrongIdHash<LayerId>{}(key.layer_id));
+            return seed;
+        }
+    };
+
     void record_request(RequestMetricsRecord record);
     SimulationOutput output_;
+    std::unordered_map<MoERoutingKey, std::size_t, MoERoutingKeyHash>
+        moe_routing_positions_;
     bool detailed_traces_enabled_ = true;
     bool gpu_kv_occupancy_enabled_ = true;
     bool arrival_demand_collected_ = false;

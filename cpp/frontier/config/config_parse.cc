@@ -1048,7 +1048,9 @@ ExecutionModelConfig parse_execution_model(const Json &root,
                 "intra_node_bandwidth_gbps",
             },
             {"operator_precisions", "device_overrides", "kernel_profile",
-             "moe_layer_event_mode", "moe_communication_backend"},
+             "moe_layer_event_mode", "moe_communication_backend",
+             "mega_moe_tail_io_fraction", "mega_moe_wave_exposure",
+             "mega_moe_cluster_task_latency_us"},
             "config.execution_model");
         AnalyticalExecutionModelConfig analytical = [&]() {
             AnalyticalExecutionModelConfig value{};
@@ -1072,6 +1074,22 @@ ExecutionModelConfig parse_execution_model(const Json &root,
                 value.moe_communication_backend = require_string(
                     execution, "moe_communication_backend",
                     "config.execution_model");
+            }
+            if (execution.contains("mega_moe_tail_io_fraction")) {
+                value.mega_moe_tail_io_fraction = require_finite_number(
+                    execution, "mega_moe_tail_io_fraction",
+                    "config.execution_model");
+            }
+            if (execution.contains("mega_moe_wave_exposure")) {
+                value.mega_moe_wave_exposure = require_finite_number(
+                    execution, "mega_moe_wave_exposure",
+                    "config.execution_model");
+            }
+            if (execution.contains("mega_moe_cluster_task_latency_us")) {
+                value.mega_moe_cluster_task_latency_us =
+                    require_finite_number(
+                        execution, "mega_moe_cluster_task_latency_us",
+                        "config.execution_model");
             }
             value.tensor_parallel_size = parallelism.tensor_parallel_size;
             value.network_bandwidth_gbps = require_finite_number(
@@ -1115,11 +1133,33 @@ ExecutionModelConfig parse_execution_model(const Json &root,
                 "'k3_sglang_mxfp4', or 'k3_deepgemm_megamoe'");
         }
         if (analytical.kernel_profile != "generic" &&
-            (analytical.device != "gb300" ||
+            ((analytical.device != "gb300" &&
+              analytical.device != "rubin") ||
              model.model_type != "kimi_k3")) {
             throw ConfigError(
                 "K3 analytical kernel profiles require model Kimi-K3 and "
-                "execution device='gb300'");
+                "execution device='gb300' or 'rubin'");
+        }
+        const bool has_mega_moe_override =
+            analytical.mega_moe_tail_io_fraction.has_value() ||
+            analytical.mega_moe_wave_exposure.has_value() ||
+            analytical.mega_moe_cluster_task_latency_us.has_value();
+        if (has_mega_moe_override &&
+            analytical.kernel_profile != "k3_deepgemm_megamoe") {
+            throw ConfigError(
+                "MegaMoE timing overrides require "
+                "kernel_profile='k3_deepgemm_megamoe'");
+        }
+        const auto valid_fraction = [](const std::optional<double> &value) {
+            return !value.has_value() || (*value >= 0.0 && *value <= 1.0);
+        };
+        if (!valid_fraction(analytical.mega_moe_tail_io_fraction) ||
+            !valid_fraction(analytical.mega_moe_wave_exposure) ||
+            (analytical.mega_moe_cluster_task_latency_us.has_value() &&
+             *analytical.mega_moe_cluster_task_latency_us < 0.0)) {
+            throw ConfigError(
+                "MegaMoE tail IO/wave overrides must be in [0, 1] and "
+                "cluster-task latency must be non-negative");
         }
         if (analytical.moe_communication_backend != "generic" &&
             analytical.moe_communication_backend !=
@@ -1130,9 +1170,10 @@ ExecutionModelConfig parse_execution_model(const Json &root,
         }
         if (analytical.moe_communication_backend ==
                 "sm100_megamoe_public" &&
-            analytical.device != "gb300") {
+            analytical.device != "gb300" && analytical.device != "rubin") {
             throw ConfigError(
-                "sm100_megamoe_public requires execution device='gb300'");
+                "sm100_megamoe_public requires execution device='gb300' or "
+                "'rubin'");
         }
         if (!model.attention.execution_enabled ||
             model.attention.memory_layout ==
