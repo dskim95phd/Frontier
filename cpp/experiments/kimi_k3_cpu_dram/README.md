@@ -25,8 +25,26 @@ With 24 PREFILL GPU slices, the enabled points resolve to 6, 9, 12, 15, 18,
 `cpu0250gb` retain analyzer compatibility; the number means capacity per
 PREFILL GPU, not a shared two-GPU CPU pool.
 
-The checked-in `PILOT_SESSION_RATE=0.30` is a runnable starting point and must
-be calibrated before interpreting a long K3 run as a capacity-knee result.
+The checked-in `SESSION_RATE_CAPACITIES_GB` is a runnable starting point and
+must be calibrated before interpreting a long K3 run as a capacity-knee
+result.  It is an explicit rate-to-capacities matrix, so each injection rate
+can use a different set of CPU DRAM points.  For example, edit the settings
+block near the top of the runner to:
+
+```python
+SESSION_RATE_CAPACITIES_GB = {
+    "0.50": (250, 500, 750, 1000),
+    "0.70": (500, 750, 875, 1000),
+    "0.90": (875, 1000),
+}
+```
+
+Then run the script without `--session-rate`; only those exact combinations
+are launched.  `--session-rate 0.5` is retained as a convenient one-rate
+override and applies that rate to the union of all capacities declared in the
+mapping.  `--capacities-gb` can still restrict the selected matrix globally
+for split server runs.
+
 The runner enables wall-clock progress output every 60 seconds by default;
 pass `--wall-progress-interval-s 0` to disable it or another positive value to
 change the interval.
@@ -56,10 +74,9 @@ the simulator CLI defaults.
 python .\cpp\experiments\kimi_k3_cpu_dram\run_dense_cpu_capacity_rate_sweep.py `
   --dry-run --no-generate-reports
 
-# Run or resume the complete eight-point pilot.
+# Run or resume the matrix declared in SESSION_RATE_CAPACITIES_GB.
 python .\cpp\experiments\kimi_k3_cpu_dram\run_dense_cpu_capacity_rate_sweep.py `
-  --binary .\cpp\build\Release\frontier_sim.exe --session-rate 0.30 `
-  --jobs 4 --resume
+  --binary .\cpp\build\Release\frontier_sim.exe --jobs 4 --resume
 ```
 
 For a 12-hour endpoint comparison at 0.5 sessions/s:

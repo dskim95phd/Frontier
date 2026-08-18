@@ -33,9 +33,8 @@ def test_decimal_matrix_is_inclusive_and_exact(tmp_path: Path) -> None:
 def test_default_k3_matrix_has_off_plus_seven_per_gpu_capacity_points(
     tmp_path: Path,
 ) -> None:
-    cases = runner.build_matrix(
-        runner.CPU_CAPACITY_RATE_RANGES,
-        step=runner.RATE_STEP,
+    cases = runner.build_rate_capacity_matrix(
+        runner.SESSION_RATE_CAPACITIES_GB,
         workload_root=tmp_path / "workloads",
         output_root=tmp_path / "runs",
         seed=7,
@@ -48,16 +47,53 @@ def test_default_k3_matrix_has_off_plus_seven_per_gpu_capacity_points(
     assert cases[0].capacity_label == "cpu0000gb"
 
 
-def test_session_rate_is_one_shared_cli_axis_for_all_capacity_points() -> None:
+def test_configured_matrix_can_select_capacities_per_session_rate(
+    tmp_path: Path,
+) -> None:
+    cases = runner.build_rate_capacity_matrix(
+        {
+            "0.50": (250, 500, 1000),
+            "0.70": (500, 1000),
+            "0.90": (1000,),
+        },
+        workload_root=tmp_path / "workloads",
+        output_root=tmp_path / "runs",
+        seed=7,
+    )
+
+    assert [(str(case.rate), case.capacity_gb) for case in cases] == [
+        ("0.50", 250),
+        ("0.50", 500),
+        ("0.50", 1000),
+        ("0.70", 500),
+        ("0.70", 1000),
+        ("0.90", 1000),
+    ]
+
+
+def test_session_rate_cli_is_a_uniform_override_for_all_declared_capacities() -> None:
     args = runner.build_parser().parse_args(["--session-rate", "0.42"])
-    rate = runner._decimal(args.session_rate, name="session rate")
-    ranges = {
-        capacity_gb: (format(rate, "f"), format(rate, "f"))
-        for capacity_gb in runner.CPU_CAPACITY_RATE_RANGES
+    rate_capacities = runner.resolve_rate_capacities(
+        args.session_rate,
+        {"0.30": (0, 250, 500), "0.50": (500, 750, 1000)},
+    )
+
+    assert rate_capacities == {
+        runner.Decimal("0.42"): (0, 250, 500, 750, 1000)
     }
 
-    assert len(ranges) == 8
-    assert set(ranges.values()) == {("0.42", "0.42")}
+
+def test_omitting_session_rate_uses_configured_rate_matrix() -> None:
+    args = runner.build_parser().parse_args([])
+
+    assert args.session_rate is None
+    assert runner.resolve_rate_capacities(
+        args.session_rate,
+        {"0.50": (250, 500), "0.70": (750, 1000)},
+    ) == {
+        runner.Decimal("0.50"): (250, 500),
+        runner.Decimal("0.70"): (750, 1000),
+    }
 
 
 def test_twelve_hour_endpoint_cli_contract() -> None:

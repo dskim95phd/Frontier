@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Run the Kimi K3 P24/D64 CPU-capacity sweep.
 
-Edit ``CPU_CAPACITY_RATE_RANGES`` and ``MAX_CONCURRENT_SIMULATIONS`` below for
-the server.  Every inclusive rate range is expanded at ``RATE_STEP``.  The
-runner generates one deterministic TraceLab workload per distinct rate, runs
-all requested capacity/rate pairs, supports ``--resume``, and generates one
-HTML capacity report per completed session-injection rate.
+Edit ``SESSION_RATE_CAPACITIES_GB`` and ``MAX_CONCURRENT_SIMULATIONS`` below
+for the server.  Each session-injection rate has its own explicit list of CPU
+DRAM capacities.  The runner generates one deterministic TraceLab workload
+per distinct rate, runs all requested capacity/rate pairs, supports
+``--resume``, and generates one HTML capacity report per completed rate.
 
 Capacity labels are decimal GB of CPU DRAM per PREFILL GPU.  The default
 topology has 24 PREFILL GPU slices, so a 250 GB point resolves to 6 TB of
@@ -42,14 +42,22 @@ from convert_tracelab_workload import (  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Server experiment settings: edit this block before launching the sweep.
-# The default is exactly eight capacity points at one pilot session rate.  The
-# rate must be recalibrated before treating a long K3 run as a capacity-knee
-# result; it is deliberately kept as an editable constant here.
+# The default is exactly eight capacity points at one pilot session rate.  Add
+# more entries, or give each rate a different tuple, to select an arbitrary
+# matrix.  For example:
+#
+# SESSION_RATE_CAPACITIES_GB = {
+#     "0.50": (250, 500, 750, 1000),
+#     "0.70": (500, 750, 875, 1000),
+#     "0.90": (875, 1000),
+# }
+#
+# The rate must be calibrated before treating a long K3 run as a capacity-knee
+# result.  ``--session-rate`` remains available as a one-rate override.
 # ---------------------------------------------------------------------------
 PILOT_SESSION_RATE = "0.30"
-CPU_CAPACITY_RATE_RANGES: dict[int, tuple[str, str]] = {
-    capacity_gb: (PILOT_SESSION_RATE, PILOT_SESSION_RATE)
-    for capacity_gb in (0, 250, 375, 500, 625, 750, 875, 1000)
+SESSION_RATE_CAPACITIES_GB: dict[str, tuple[int, ...]] = {
+    PILOT_SESSION_RATE: (0, 250, 375, 500, 625, 750, 875, 1000),
 }
 RATE_STEP = "0.01"
 MAX_CONCURRENT_SIMULATIONS = 4
@@ -200,6 +208,77 @@ def build_matrix(
     return sorted(cases, key=lambda case: (case.rate, case.capacity_gb))
 
 
+def normalize_rate_capacities(
+    rate_capacities: Mapping[str | float | Decimal, Sequence[int]],
+) -> dict[Decimal, tuple[int, ...]]:
+    """Validate and canonicalize an explicit rate -> capacities matrix."""
+
+    normalized: dict[Decimal, tuple[int, ...]] = {}
+    for raw_rate, raw_capacities in rate_capacities.items():
+        rate = _decimal(raw_rate, name="session rate")
+        if rate in normalized:
+            raise ValueError(f"duplicate session rate after normalization: {raw_rate!r}")
+        capacities = tuple(raw_capacities)
+        if not capacities:
+            raise ValueError(f"session rate {rate} has no CPU capacities")
+        if any(
+            isinstance(capacity, bool)
+            or not isinstance(capacity, int)
+            or capacity < 0
+            for capacity in capacities
+        ):
+            raise ValueError(
+                f"session rate {rate} capacities must be nonnegative integer GB values"
+            )
+        if len(set(capacities)) != len(capacities):
+            raise ValueError(f"session rate {rate} contains duplicate CPU capacities")
+        normalized[rate] = tuple(sorted(capacities))
+    if not normalized:
+        raise ValueError("SESSION_RATE_CAPACITIES_GB must not be empty")
+    return dict(sorted(normalized.items()))
+
+
+def resolve_rate_capacities(
+    session_rate: str | float | Decimal | None,
+    configured: Mapping[
+        str | float | Decimal, Sequence[int]
+    ] = SESSION_RATE_CAPACITIES_GB,
+) -> dict[Decimal, tuple[int, ...]]:
+    """Use the configured matrix, or apply the legacy one-rate CLI override."""
+
+    normalized = normalize_rate_capacities(configured)
+    if session_rate is None:
+        return normalized
+    override = _decimal(session_rate, name="session rate")
+    all_capacities = tuple(
+        sorted({capacity for capacities in normalized.values() for capacity in capacities})
+    )
+    return {override: all_capacities}
+
+
+def build_rate_capacity_matrix(
+    rate_capacities: Mapping[str | float | Decimal, Sequence[int]],
+    *,
+    workload_root: Path,
+    output_root: Path,
+    seed: int,
+) -> list[MatrixCase]:
+    """Build cases from an explicit session-rate -> CPU-capacities mapping."""
+
+    cases: list[MatrixCase] = []
+    for rate, capacities in normalize_rate_capacities(rate_capacities).items():
+        cases.extend(
+            build_matrix(
+                {capacity: (rate, rate) for capacity in capacities},
+                step=RATE_STEP,
+                workload_root=workload_root,
+                output_root=output_root,
+                seed=seed,
+            )
+        )
+    return sorted(cases, key=lambda case: (case.rate, case.capacity_gb))
+
+
 def _json_read(path: Path) -> dict[str, Any]:
     value = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict):
@@ -240,7 +319,7 @@ def resolve_session_repetitions(
     configured_repetitions: int | None = SESSION_REPETITIONS,
 ) -> int:
     if not cases:
-        raise ValueError("CPU_CAPACITY_RATE_RANGES produced no cases")
+        raise ValueError("SESSION_RATE_CAPACITIES_GB produced no cases")
     if source_sessions_per_epoch <= 0:
         raise ValueError("source_sessions_per_epoch must be positive")
     highest_rate = max(case.rate for case in cases)
@@ -572,10 +651,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--python", type=Path, default=Path(sys.executable))
     parser.add_argument(
         "--session-rate",
-        default=PILOT_SESSION_RATE,
+        default=None,
         help=(
-            "source sessions/second used for all eight capacity points "
-            f"(default pilot: {PILOT_SESSION_RATE})"
+            "optional source-sessions/second override applied to every declared "
+            "capacity; omit to use SESSION_RATE_CAPACITIES_GB"
         ),
     )
     parser.add_argument(
@@ -643,29 +722,41 @@ def main(argv: Sequence[str] | None = None) -> int:
     if SIMULATION_END_TIME_S <= 0:
         raise SystemExit("--simulation-hours rounds to an empty horizon")
     try:
-        session_rate = _decimal(args.session_rate, name="session rate")
+        rate_capacities = resolve_rate_capacities(args.session_rate)
     except ValueError as error:
         raise SystemExit(str(error)) from error
-    declared_ranges = {
-        capacity_gb: (format(session_rate, "f"), format(session_rate, "f"))
-        for capacity_gb in CPU_CAPACITY_RATE_RANGES
-    }
-    full_matrix = build_matrix(
-        declared_ranges,
-        step=RATE_STEP,
+    full_matrix = build_rate_capacity_matrix(
+        rate_capacities,
         workload_root=args.workload_root.resolve(),
         output_root=args.output_root.resolve(),
         seed=SEED,
     )
-    ranges = declared_ranges
     if args.capacities_gb is not None:
-        unknown = sorted(args.capacities_gb - set(ranges))
+        declared_capacities = {
+            capacity
+            for capacities in rate_capacities.values()
+            for capacity in capacities
+        }
+        unknown = sorted(args.capacities_gb - declared_capacities)
         if unknown:
-            raise SystemExit(f"capacities not declared in CPU_CAPACITY_RATE_RANGES: {unknown}")
-        ranges = {capacity: bounds for capacity, bounds in ranges.items() if capacity in args.capacities_gb}
-    cases = build_matrix(
-        ranges,
-        step=RATE_STEP,
+            raise SystemExit(
+                f"capacities not declared in SESSION_RATE_CAPACITIES_GB: {unknown}"
+            )
+        rate_capacities = {
+            rate: tuple(
+                capacity
+                for capacity in capacities
+                if capacity in args.capacities_gb
+            )
+            for rate, capacities in rate_capacities.items()
+        }
+        rate_capacities = {
+            rate: capacities
+            for rate, capacities in rate_capacities.items()
+            if capacities
+        }
+    cases = build_rate_capacity_matrix(
+        rate_capacities,
         workload_root=args.workload_root.resolve(),
         output_root=args.output_root.resolve(),
         seed=SEED,
@@ -724,11 +815,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             if case.rate_label not in workload_hashes:
                 workload_hashes[case.rate_label] = _sha256(case.workload.resolve())
         plan = {
-            "schema_version": 1,
+            "schema_version": 2,
             "study": "kimi_k3_p24_d64_cpu_per_gpu_capacity_session_rate",
             "git_revision": _git_revision(),
-            "rate_step_per_second": RATE_STEP,
-            "capacity_rate_ranges": {str(key): list(value) for key, value in ranges.items()},
+            "rate_capacities_gb": {
+                format(rate, "f"): list(capacities)
+                for rate, capacities in rate_capacities.items()
+            },
+            "session_rate_override": args.session_rate,
             "capacity_mapping": "capacity point is decimal GB per PREFILL GPU; aggregate static CPU capacity is point * 24 PREFILL GPU slices",
             "prefill_gpus": 24,
             "decode_gpus": 64,
