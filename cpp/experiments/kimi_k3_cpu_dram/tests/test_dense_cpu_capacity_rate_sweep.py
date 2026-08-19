@@ -291,6 +291,12 @@ def test_k3_config_uses_static_per_gpu_capacity_and_off_baseline() -> None:
     }
     assert runner._topology_gpu_counts(enabled) == (24, 32)
     assert enabled["run_id"] == "kimi-k3-tracelab-p24-d32-r0p30-cpu0250gb"
+    prefill_scheduler = enabled["clusters"]["prefill"]["scheduler"]
+    assert prefill_scheduler["max_tokens_in_batch"] == 16_384
+    assert prefill_scheduler["enable_chunked_prefill"] is True
+    assert (
+        prefill_scheduler["long_prefill_token_threshold"] == 512
+    )
     assert enabled["clusters"]["prefill"]["parallelism"] == {
         "num_replicas": 1,
         "tensor_parallel_size": 1,
@@ -470,6 +476,7 @@ def test_report_generation_discovers_split_runs_beyond_latest_plan(
     assert len(calls) == 1
     assert calls[0][calls[0].index("--capacities") + 1] == "500,1000"
     assert calls[0][calls[0].index("--prefill-lanes") + 1] == "24"
+    assert "--include-final-hour-details" in calls[0]
     assert result["planned_cases"] == 1
     assert result["completed_cases"] == 2
     assert result["rate_reports"][0]["capacities_gb"] == [500, 1000]

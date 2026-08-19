@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import re
 
+import pytest
+
 from cpp.experiments.kimi_k2_cpu_dram import analyze_r0p4_capacity_sweep_10h as report
 
 
@@ -90,3 +92,121 @@ def test_stacked_context_chart_uses_counts_and_all_six_ranges() -> None:
     assert "160–200K" in rendered
     assert "&gt;200K" in rendered
     assert rendered.count("<path d=") == 6
+
+
+def test_final_hour_statistics_use_source_counts_and_exact_window() -> None:
+    rows = [
+        {
+            "start_time_s": 3_000.0,
+            "end_time_s": 3_300.0,
+            "duration_s": 300.0,
+            "pool_busy_pct": 50.0,
+            "active_sessions_time_weighted": 24.0,
+            "prefill_waiting_queue_count_time_weighted": 12.0,
+            "request_arrivals": 60,
+            "request_completions": 48,
+            "backlog_delta_requests": 12,
+            "cumulative_backlog_requests": 12,
+            "ttft_count": 2,
+            "ttft_mean_ms": 100.0,
+            "ttft_p90_ms": 200.0,
+            "tpot_count": 2,
+            "tpot_mean_ms": 10.0,
+            "tpot_p90_ms": 12.0,
+            "prefix_cache_query_blocks": 100,
+            "gpu_prefix_hit_blocks": 40,
+            "cpu_prefix_query_blocks": 60,
+            "cpu_prefix_hit_blocks": 30,
+            "prefix_cache_hit_blocks": 70,
+            "transfer_bytes": 300_000_000_000,
+        },
+        {
+            "start_time_s": 3_300.0,
+            "end_time_s": 3_600.0,
+            "duration_s": 300.0,
+            "pool_busy_pct": 100.0,
+            "active_sessions_time_weighted": 48.0,
+            "prefill_waiting_queue_count_time_weighted": 24.0,
+            "request_arrivals": 40,
+            "request_completions": 52,
+            "backlog_delta_requests": -12,
+            "cumulative_backlog_requests": 0,
+            "ttft_count": 1,
+            "ttft_mean_ms": 400.0,
+            "ttft_p90_ms": 500.0,
+            "tpot_count": 1,
+            "tpot_mean_ms": 40.0,
+            "tpot_p90_ms": 50.0,
+            "prefix_cache_query_blocks": 200,
+            "gpu_prefix_hit_blocks": 80,
+            "cpu_prefix_query_blocks": 120,
+            "cpu_prefix_hit_blocks": 60,
+            "prefix_cache_hit_blocks": 140,
+            "transfer_bytes": 600_000_000_000,
+        },
+    ]
+
+    stats = report._window_statistics(rows, 1.0, prefill_lanes=24)
+
+    assert stats["window_start_s"] == 3_000.0
+    assert stats["window_end_s"] == 3_600.0
+    assert stats["request_arrivals"] == 100
+    assert stats["request_completions"] == 100
+    assert stats["completion_to_arrival_pct"] == 100.0
+    assert stats["completion_requests_per_s_per_prefill_gpu"] == pytest.approx(
+        100 / 600 / 24
+    )
+    assert stats["prefill_busy_pct_time_weighted"] == 75.0
+    assert stats["active_sessions_per_prefill_gpu"] == 1.5
+    assert stats["waiting_queue_count_per_prefill_gpu"] == 0.75
+    assert stats["cumulative_backlog_start_requests"] == 0
+    assert stats["cumulative_backlog_end_requests"] == 0
+    assert stats["cumulative_backlog_max_requests"] == 12
+    assert stats["ttft_mean_ms"] == 200.0
+    assert stats["ttft_p90_max_ms"] == 500.0
+    assert stats["tpot_mean_ms"] == 20.0
+    assert stats["tpot_p90_max_ms"] == 50.0
+    assert stats["gpu_hit_pct"] == 40.0
+    assert stats["cpu_conditional_hit_pct"] == 50.0
+    assert stats["combined_hit_pct"] == 70.0
+    assert stats["cpu_transfer_gbps"] == 1.5
+
+
+def test_html_can_render_final_hour_detailed_statistics() -> None:
+    rendered = report._html_report(
+        {
+            "simulation_rate_per_s": 0.5,
+            "report_options": {"include_final_hour_details": True},
+            "cases": [
+                {
+                    "capacity_label": "cpu0500gb",
+                    "overall": {},
+                    "bins": [],
+                    "stability": {
+                        "final_hour": {
+                            "classification": "underloaded-stable",
+                            "expected_bin_count": 12,
+                            "statistics": {
+                                "window_start_s": 32_400.0,
+                                "window_end_s": 36_000.0,
+                                "observed_bin_count": 12,
+                                "request_arrivals": 100,
+                                "request_completions": 99,
+                                "completion_to_arrival_pct": 99.0,
+                            },
+                        },
+                        "last_2_hours": {},
+                    },
+                }
+            ],
+            "heuristic_thresholds": {},
+            "recommendations": {},
+        }
+    )
+
+    assert "Final-hour detailed statistics" in rendered
+    assert "9.00–10.00 h" in rendered
+    assert "12/12" in rendered
+    assert "completed req/s/GPU" in rendered
+    assert "TTFT p90 max" in rendered
+    assert "underloaded-stable" in rendered

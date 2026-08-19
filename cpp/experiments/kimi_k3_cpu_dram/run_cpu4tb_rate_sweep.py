@@ -113,6 +113,10 @@ def build_k3_config(template: dict[str, Any], rate: float) -> dict[str, Any]:
         scheduler = cluster.get("scheduler")
         if not isinstance(scheduler, dict):
             raise ValueError(f"template {role}.scheduler must be an object")
+        if role == "prefill":
+            scheduler["max_tokens_in_batch"] = 16_384
+            scheduler["enable_chunked_prefill"] = True
+            scheduler["long_prefill_token_threshold"] = 512
         # K2's fixed block counts encode its all-MLA FP8 byte size. Preserve
         # the 288 GB hardware and let the K3-aware planner derive new blocks.
         scheduler.pop("num_blocks", None)

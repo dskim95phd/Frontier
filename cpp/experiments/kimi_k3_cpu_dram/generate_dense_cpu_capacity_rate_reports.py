@@ -280,6 +280,7 @@ def generate_reports(
                 ",".join(str(value) for value in capacities),
                 "--prefill-lanes",
                 str(prefill_lanes),
+                "--include-final-hour-details",
                 "--max-final-hour-ttft-p90-ms",
                 format(max_final_hour_ttft_p90_ms, "g"),
                 "--max-final-hour-queue-count",

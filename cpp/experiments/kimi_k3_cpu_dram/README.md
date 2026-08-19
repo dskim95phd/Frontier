@@ -5,6 +5,11 @@ K3-specific configuration, reporting wrapper, and tests. Shared TraceLab
 conversion and capacity-report analysis utilities remain in
 `../kimi_k2_cpu_dram/`.
 
+All Kimi K3 experiment paths use the same PREFILL batching contract:
+chunked PREFILL is enabled, each request contributes at most 512 tokens per
+scheduler iteration, and the aggregate batch token budget is 16,384. DECODE
+retains its independent 8,192-token budget and does not use chunked PREFILL.
+
 ## CPU-per-GPU capacity sweep
 
 `run_dense_cpu_capacity_rate_sweep.py` is the asymmetric PDD capacity runner.
@@ -98,6 +103,12 @@ different `--capacities-gb` subsets, and each regenerated HTML/JSON/CSV report
 will contain every completed `r*/cpu*gb/r1` point already present there.
 Incomplete or failed cases are ignored.  Reports can also be refreshed
 directly:
+
+Each per-rate HTML report includes an exact trailing-one-hour table with
+arrivals, completions, throughput per PREFILL GPU, utilization, active and
+waiting sessions, backlog, TTFT/TPOT, cache-hit rates, and CPU transfer rate.
+Latency p90 columns are the maximum retained five-minute p90 in that hour,
+not a reconstructed pooled percentile.
 
 ```powershell
 python .\cpp\experiments\kimi_k3_cpu_dram\generate_dense_cpu_capacity_rate_reports.py `

@@ -347,6 +347,155 @@ def _window_qos(rows: Sequence[Mapping[str, Any]], hours: float) -> dict[str, An
     }
 
 
+def _window_statistics(
+    rows: Sequence[Mapping[str, Any]],
+    hours: float,
+    *,
+    prefill_lanes: int,
+) -> dict[str, Any]:
+    """Aggregate auditable measurements for one trailing report window.
+
+    Means for latency are weighted by their source sample counts. Utilization,
+    active-session, and waiting-queue means are weighted by bucket duration.
+    Percentiles cannot be pooled from the retained five-minute summaries, so
+    the report exposes the maximum source-bin p90 and labels it accordingly.
+    """
+
+    selected = [rows[index] for index in _window_indices(rows, hours)]
+
+    def duration(row: Mapping[str, Any]) -> float:
+        value = _finite_float(row.get("duration_s"))
+        if value is not None and value > 0:
+            return value
+        start = _finite_float(row.get("start_time_s"))
+        end = _finite_float(row.get("end_time_s"))
+        return max(0.0, end - start) if start is not None and end is not None else 0.0
+
+    def total(key: str) -> float | None:
+        values = [_finite_float(row.get(key)) for row in selected]
+        observed = [value for value in values if value is not None]
+        return sum(observed) if observed else None
+
+    def maximum(key: str) -> float | None:
+        values = [_finite_float(row.get(key)) for row in selected]
+        observed = [value for value in values if value is not None]
+        return max(observed) if observed else None
+
+    def duration_weighted_mean(key: str) -> float | None:
+        numerator = 0.0
+        denominator = 0.0
+        for row in selected:
+            value = _finite_float(row.get(key))
+            weight = duration(row)
+            if value is None or weight <= 0:
+                continue
+            numerator += value * weight
+            denominator += weight
+        return numerator / denominator if denominator > 0 else None
+
+    def sample_weighted_mean(value_key: str, count_key: str) -> float | None:
+        numerator = 0.0
+        denominator = 0.0
+        for row in selected:
+            value = _finite_float(row.get(value_key))
+            count = _finite_float(row.get(count_key))
+            if value is None or count is None or count <= 0:
+                continue
+            numerator += value * count
+            denominator += count
+        return numerator / denominator if denominator > 0 else None
+
+    def ratio_percent(numerator: float | None, denominator: float | None) -> float | None:
+        return 100.0 * numerator / denominator if numerator is not None and denominator else None
+
+    window_duration_s = sum(duration(row) for row in selected)
+    arrivals = total("request_arrivals")
+    completions = total("request_completions")
+    query_blocks = total("prefix_cache_query_blocks")
+    gpu_hit_blocks = total("gpu_prefix_hit_blocks")
+    cpu_query_blocks = total("cpu_prefix_query_blocks")
+    cpu_hit_blocks = total("cpu_prefix_hit_blocks")
+    combined_hit_blocks = total("prefix_cache_hit_blocks")
+    transfer_bytes = total("transfer_bytes")
+
+    backlog_start: float | None = None
+    backlog_end: float | None = None
+    if selected:
+        first_backlog_end = _finite_float(selected[0].get("cumulative_backlog_requests"))
+        first_delta = _finite_float(selected[0].get("backlog_delta_requests"))
+        if first_delta is None:
+            first_arrivals = _finite_float(selected[0].get("request_arrivals"))
+            first_completions = _finite_float(selected[0].get("request_completions"))
+            if first_arrivals is not None and first_completions is not None:
+                first_delta = first_arrivals - first_completions
+        if first_backlog_end is not None and first_delta is not None:
+            backlog_start = first_backlog_end - first_delta
+        backlog_end = _finite_float(selected[-1].get("cumulative_backlog_requests"))
+
+    active_sessions = duration_weighted_mean("active_sessions_time_weighted")
+    waiting_queue = duration_weighted_mean(
+        "prefill_waiting_queue_count_time_weighted"
+    )
+    per_lane = float(prefill_lanes) if prefill_lanes > 0 else None
+    return {
+        "window_hours": hours,
+        "window_start_s": (
+            _finite_float(selected[0].get("start_time_s")) if selected else None
+        ),
+        "window_end_s": (
+            _finite_float(selected[-1].get("end_time_s")) if selected else None
+        ),
+        "window_duration_s": window_duration_s,
+        "observed_bin_count": len(selected),
+        "request_arrivals": arrivals,
+        "request_completions": completions,
+        "completion_to_arrival_pct": ratio_percent(completions, arrivals),
+        "completion_requests_per_s": (
+            completions / window_duration_s
+            if completions is not None and window_duration_s > 0
+            else None
+        ),
+        "completion_requests_per_s_per_prefill_gpu": (
+            completions / window_duration_s / per_lane
+            if completions is not None and window_duration_s > 0 and per_lane
+            else None
+        ),
+        "prefill_busy_pct_time_weighted": duration_weighted_mean("pool_busy_pct"),
+        "active_sessions_time_weighted": active_sessions,
+        "active_sessions_per_prefill_gpu": (
+            active_sessions / per_lane
+            if active_sessions is not None and per_lane
+            else None
+        ),
+        "waiting_queue_count_time_weighted": waiting_queue,
+        "waiting_queue_count_per_prefill_gpu": (
+            waiting_queue / per_lane if waiting_queue is not None and per_lane else None
+        ),
+        "waiting_queue_count_max": maximum(
+            "prefill_waiting_queue_count_time_weighted"
+        ),
+        "cumulative_backlog_start_requests": backlog_start,
+        "cumulative_backlog_end_requests": backlog_end,
+        "cumulative_backlog_max_requests": maximum("cumulative_backlog_requests"),
+        "ttft_mean_ms": sample_weighted_mean("ttft_mean_ms", "ttft_count"),
+        "ttft_p90_max_ms": maximum("ttft_p90_ms"),
+        "tpot_mean_ms": sample_weighted_mean("tpot_mean_ms", "tpot_count"),
+        "tpot_p90_max_ms": maximum("tpot_p90_ms"),
+        "gpu_hit_pct": ratio_percent(gpu_hit_blocks, query_blocks),
+        "cpu_conditional_hit_pct": ratio_percent(cpu_hit_blocks, cpu_query_blocks),
+        "combined_hit_pct": ratio_percent(combined_hit_blocks, query_blocks),
+        "cpu_transfer_gbps": (
+            transfer_bytes / window_duration_s / 1e9
+            if transfer_bytes is not None and window_duration_s > 0
+            else None
+        ),
+        "scope": (
+            "exact trailing window; means are duration- or sample-count-weighted; "
+            "p90 values are maxima of source five-minute p90 values"
+        ),
+    }
+
+
 def _primary_metrics_complete(stability: Mapping[str, Any], expected_bins: int) -> bool:
     """Require backlog and TTFT observations before recommending a capacity."""
 
@@ -451,6 +600,9 @@ def _analyze_capacity_case(
         bucket_seconds,
     )
     final_hour["qos"] = _window_qos(rows, 1.0)
+    final_hour["statistics"] = _window_statistics(
+        rows, 1.0, prefill_lanes=prefill_lanes
+    )
     last_two_hours["qos"] = _window_qos(rows, DEFAULT_TREND_WINDOW_HOURS)
     final_qos = final_hour["qos"]
     final_qos["thresholds"] = {
@@ -906,6 +1058,72 @@ def _html_report(document: Mapping[str, Any]) -> str:
             f"<td>{_fmt(overall.get('final_cumulative_backlog_requests'))}</td>"
             "</tr>"
         )
+    final_hour_details = ""
+    if bool(document.get("report_options", {}).get("include_final_hour_details")):
+        detail_rows: list[str] = []
+        for case in cases:
+            final = case.get("stability", {}).get("final_hour", {})
+            stats = final.get("statistics", {})
+            start_s = _finite_float(stats.get("window_start_s"))
+            end_s = _finite_float(stats.get("window_end_s"))
+            window = (
+                f"{start_s / 3600.0:.2f}–{end_s / 3600.0:.2f} h"
+                if start_s is not None and end_s is not None
+                else "—"
+            )
+            observed_bins = stats.get("observed_bin_count")
+            expected_bins = final.get("expected_bin_count")
+            bins = (
+                f"{observed_bins}/{expected_bins}"
+                if observed_bins is not None and expected_bins is not None
+                else "—"
+            )
+            detail_rows.append(
+                "<tr>"
+                f"<td>{html.escape(str(case.get('capacity_label')))}</td>"
+                f"<td>{window}</td>"
+                f"<td>{bins}</td>"
+                f"<td>{_fmt(stats.get('request_arrivals'))}</td>"
+                f"<td>{_fmt(stats.get('request_completions'))}</td>"
+                f"<td>{_fmt(stats.get('completion_to_arrival_pct'))}%</td>"
+                f"<td>{_fmt(stats.get('completion_requests_per_s_per_prefill_gpu'))}</td>"
+                f"<td>{_fmt(stats.get('prefill_busy_pct_time_weighted'))}%</td>"
+                f"<td>{_fmt(stats.get('active_sessions_per_prefill_gpu'))}</td>"
+                f"<td>{_fmt(stats.get('waiting_queue_count_per_prefill_gpu'))}</td>"
+                f"<td>{_fmt(stats.get('waiting_queue_count_max'))}</td>"
+                f"<td>{_fmt(stats.get('cumulative_backlog_start_requests'))}</td>"
+                f"<td>{_fmt(stats.get('cumulative_backlog_end_requests'))}</td>"
+                f"<td>{_fmt(stats.get('cumulative_backlog_max_requests'))}</td>"
+                f"<td>{_fmt(stats.get('ttft_mean_ms'))} ms</td>"
+                f"<td>{_fmt(stats.get('ttft_p90_max_ms'))} ms</td>"
+                f"<td>{_fmt(stats.get('tpot_mean_ms'))} ms</td>"
+                f"<td>{_fmt(stats.get('tpot_p90_max_ms'))} ms</td>"
+                f"<td>{_fmt(stats.get('gpu_hit_pct'))}%</td>"
+                f"<td>{_fmt(stats.get('cpu_conditional_hit_pct'))}%</td>"
+                f"<td>{_fmt(stats.get('combined_hit_pct'))}%</td>"
+                f"<td>{_fmt(stats.get('cpu_transfer_gbps'))} GB/s</td>"
+                f"<td>{_fmt(final.get('classification'))}</td>"
+                "</tr>"
+            )
+        final_hour_details = (
+            "<h2>Final-hour detailed statistics</h2>"
+            "<p class='muted'>All values use the exact trailing one-hour window. "
+            "Rates and per-GPU counts use the configured PREFILL GPU count. "
+            "Latency means are request-sample weighted; p90 max is the maximum "
+            "of the retained five-minute p90 values, not a pooled percentile. "
+            "Cache-hit percentages are block weighted.</p>"
+            "<div class='table-wrap'><table><thead><tr>"
+            "<th>capacity / PREFILL GPU</th><th>window</th><th>bins</th>"
+            "<th>arrivals</th><th>completions</th><th>completion / arrival</th>"
+            "<th>completed req/s/GPU</th><th>PREFILL busy</th>"
+            "<th>active sessions/GPU</th><th>waiting/GPU</th><th>waiting max</th>"
+            "<th>backlog start</th><th>backlog end</th><th>backlog max</th>"
+            "<th>TTFT mean</th><th>TTFT p90 max</th>"
+            "<th>TPOT mean</th><th>TPOT p90 max</th>"
+            "<th>GPU hit</th><th>CPU hit</th><th>combined hit</th>"
+            "<th>CPU transfer</th><th>final 1h class</th>"
+            f"</tr></thead><tbody>{''.join(detail_rows)}</tbody></table></div>"
+        )
     context_chart = _stacked_context_chart(
         document.get("arrival_context_distribution_4tb")
     )
@@ -977,6 +1195,7 @@ details {{ margin-top:14px; }} summary {{ cursor:pointer; font-weight:600; }} .n
 <p><code>underloaded-stable</code> is below the {thresholds.get('busy_saturation_pct')}% time-weighted PREFILL busy line with non-material reconstructed-backlog and TTFT trends. <code>saturated-stable</code> is at/over that line but remains flat on those primary signals. <code>overloaded</code> requires a material backlog or TTFT trend. Queue and active-session trends are secondary/right-censored diagnostics and cannot trigger overload alone. Stability requires exact 12-bin final-hour and 24-bin final-2-hour windows plus observed backlog and TTFT.</p>
 <p>Backlog growth thresholds: both {thresholds.get('backlog_relative_growth')} of window arrivals and {thresholds.get('backlog_growth_rate_per_s')} requests/s, with at least {thresholds.get('positive_bin_fraction')} positive steps. TTFT trend thresholds: {thresholds.get('ttft_slope_ms_per_hour')} ms/hour and {thresholds.get('ttft_relative_growth')} relative growth. Operational QoS gates are final-hour max source-bin TTFT p90 ≤ {thresholds.get('max_final_hour_ttft_p90_ms')} ms, max time-weighted waiting queue ≤ {thresholds.get('max_final_hour_waiting_queue_count')}, and max cumulative backlog ≤ {thresholds.get('max_final_hour_cumulative_backlog_requests')}. CPU bandwidth is arrival-binned restore+offload. Waiting context is sum(context&nbsp;×&nbsp;queue-duration)/sum(queue-duration), not aggregate context load.</p>{missing_html}</div>
 <h2>Capacity summary</h2><div class='table-wrap'><table><thead><tr><th>capacity</th><th>final 1h class</th><th>last 2h class</th><th>final busy</th><th>backlog Δ</th><th>TTFT slope</th><th>TTFT mean</th><th>TPOT mean</th><th>combined hit</th><th>final backlog</th></tr></thead><tbody>{''.join(rows)}</tbody></table></div>
+{final_hour_details}
 <h2>Five-minute comparison</h2><div class='charts'>{charts}</div>
 <h2>Raw five-minute tables</h2>{''.join(details)}
 <p class='muted'>Generated by <code>analyze_r0p4_capacity_sweep_10h.py</code>. JSON and CSV beside this report contain complete machine-readable output.</p>
@@ -1029,6 +1248,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-final-hour-ttft-p90-ms", type=float, default=DEFAULT_MAX_FINAL_HOUR_TTFT_P90_MS, help="operational QoS gate; max source-bin TTFT p90 in final hour")
     parser.add_argument("--max-final-hour-queue-count", type=float, default=DEFAULT_MAX_FINAL_HOUR_QUEUE_COUNT, help="operational QoS gate; max time-weighted PREFILL waiting queue count")
     parser.add_argument("--max-final-hour-backlog-requests", type=float, default=DEFAULT_MAX_FINAL_HOUR_BACKLOG_REQUESTS, help="operational QoS gate; max cumulative outstanding backlog in final hour")
+    parser.add_argument(
+        "--include-final-hour-details",
+        action="store_true",
+        help="include an exact trailing-one-hour statistics table in the HTML report",
+    )
     parser.add_argument("--output-csv", type=Path)
     parser.add_argument("--output-json", type=Path)
     parser.add_argument("--output-html", type=Path)
@@ -1130,6 +1354,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         "nominal_horizon_s": nominal_horizon_s,
         "bucket_seconds": args.bucket_seconds,
         "prefill_lanes": args.prefill_lanes,
+        "report_options": {
+            "include_final_hour_details": args.include_final_hour_details,
+        },
         "requested_capacities_gb": requested,
         "analyzed_capacities_gb": [int(case["capacity_gb"]) for case in sorted(cases, key=lambda item: item["capacity_gb"])],
         "missing_cases": missing,
