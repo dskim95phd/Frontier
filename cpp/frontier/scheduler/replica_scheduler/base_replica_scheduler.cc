@@ -21,7 +21,7 @@ std::string_view to_string(SchedulerDecisionType decision) noexcept {
 }
 
 BaseReplicaScheduler::BaseReplicaScheduler(
-    config::SchedulerConfig config, std::vector<entities::Request> &requests,
+    config::SchedulerConfig config, entities::RequestCollection &requests,
     const entities::Replica &replica, DataParallelId dp_id,
     execution_time_predictor::ExecutionTimePredictorPtr predictor,
     ClusterType cluster_type, config::PrefixCacheConfig prefix_cache_config)
@@ -54,7 +54,7 @@ BaseReplicaScheduler::BaseReplicaScheduler(
 }
 
 entities::Request &BaseReplicaScheduler::request(RequestId request_id) {
-    if (!request_id.valid() || request_id.index() >= requests_->size()) {
+    if (!requests_->contains(request_id)) {
         throw SchedulerError("scheduler references an unknown request ID");
     }
     entities::Request &value = requests_->at(request_id.index());
@@ -66,7 +66,7 @@ entities::Request &BaseReplicaScheduler::request(RequestId request_id) {
 
 const entities::Request &
 BaseReplicaScheduler::request(RequestId request_id) const {
-    if (!request_id.valid() || request_id.index() >= requests_->size()) {
+    if (!requests_->contains(request_id)) {
         throw SchedulerError("scheduler references an unknown request ID");
     }
     const entities::Request &value = requests_->at(request_id.index());

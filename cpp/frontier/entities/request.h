@@ -1,8 +1,11 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <stdexcept>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "frontier/core/cluster_type.h"
@@ -100,7 +103,9 @@ class Request {
     }
     [[nodiscard]] const std::vector<std::uint64_t> &
     tokens_at_preemption() const noexcept {
-        return tokens_at_preemption_;
+        static const std::vector<std::uint64_t> empty;
+        return tokens_at_preemption_ == nullptr ? empty
+                                                : *tokens_at_preemption_;
     }
 
     [[nodiscard]] SimTime first_scheduled_at() const noexcept {
@@ -202,10 +207,11 @@ class Request {
                                      std::uint64_t bytes,
                                      double queue_time_ms,
                                      double service_time_ms);
-    void record_cpu_prefix_admission(std::uint64_t gpu_hit_blocks,
-                                     std::uint64_t cpu_query_blocks,
-                                     std::uint64_t cpu_consumed_blocks,
-                                     std::uint64_t cpu_restored_tokens);
+    [[nodiscard]] bool
+    record_cpu_prefix_admission(std::uint64_t gpu_hit_blocks,
+                                std::uint64_t cpu_query_blocks,
+                                std::uint64_t cpu_consumed_blocks,
+                                std::uint64_t cpu_restored_tokens);
     void record_cpu_offload_transfer(std::uint64_t bytes,
                                      double queue_time_ms,
                                      double service_time_ms);
@@ -247,7 +253,7 @@ class Request {
     std::uint64_t scheduled_prefill_tokens_ = 0;
     std::uint64_t preemption_recomputed_prefill_tokens_ = 0;
     bool prefill_recompute_pending_ = false;
-    std::vector<std::uint64_t> tokens_at_preemption_;
+    std::unique_ptr<std::vector<std::uint64_t>> tokens_at_preemption_;
 
     SimTime first_scheduled_at_;
     SimTime prefill_completed_at_;
@@ -279,6 +285,102 @@ class Request {
     config::PrefixCachingKeyMode prefix_cache_key_mode_ =
         config::PrefixCachingKeyMode::kSession;
     bool prefix_cache_lookup_recorded_ = false;
+};
+
+// Stores requests densely while allowing their externally visible RequestId
+// values to remain sparse. Bounded online runs can therefore omit sessions
+// that cannot arrive before the observation horizon without renumbering any
+// retained request or weakening the event/output identity contract.
+class RequestCollection {
+  public:
+    using iterator = std::vector<Request>::iterator;
+    using const_iterator = std::vector<Request>::const_iterator;
+
+    RequestCollection() = default;
+
+    void reserve(std::size_t count) { requests_.reserve(count); }
+
+    template <typename... Args> Request &emplace_back(Args &&...args) {
+        requests_.emplace_back(std::forward<Args>(args)...);
+        const std::size_t position = requests_.size() - 1;
+        const RequestId request_id = requests_.back().id();
+        if (!request_id.valid()) {
+            requests_.pop_back();
+            throw std::invalid_argument("request collection requires valid IDs");
+        }
+        if (identity_indexed_ && request_id.index() != position) {
+            identity_indexed_ = false;
+            positions_.reserve(requests_.size());
+            for (std::size_t index = 0; index < position; ++index) {
+                positions_.emplace(requests_[index].id().value(), index);
+            }
+        }
+        if (!identity_indexed_ &&
+            !positions_.emplace(request_id.value(), position).second) {
+            requests_.pop_back();
+            throw std::invalid_argument("duplicate request ID");
+        }
+        return requests_.back();
+    }
+
+    [[nodiscard]] bool contains(RequestId request_id) const noexcept {
+        if (!request_id.valid()) {
+            return false;
+        }
+        if (identity_indexed_) {
+            return request_id.index() < requests_.size() &&
+                   requests_[request_id.index()].id() == request_id;
+        }
+        return positions_.find(request_id.value()) != positions_.end();
+    }
+
+    [[nodiscard]] std::size_t position(RequestId request_id) const {
+        if (!request_id.valid()) {
+            throw std::out_of_range("invalid request ID");
+        }
+        if (identity_indexed_) {
+            if (request_id.index() >= requests_.size() ||
+                requests_[request_id.index()].id() != request_id) {
+                throw std::out_of_range("unknown request ID");
+            }
+            return request_id.index();
+        }
+        const auto found = positions_.find(request_id.value());
+        if (found == positions_.end()) {
+            throw std::out_of_range("unknown request ID");
+        }
+        return found->second;
+    }
+
+    Request &at(std::size_t request_id_index) {
+        return requests_.at(position(RequestId{request_id_index}));
+    }
+    const Request &at(std::size_t request_id_index) const {
+        return requests_.at(position(RequestId{request_id_index}));
+    }
+    Request &operator[](std::size_t request_id_index) {
+        return at(request_id_index);
+    }
+    const Request &operator[](std::size_t request_id_index) const {
+        return at(request_id_index);
+    }
+    Request &front() { return requests_.front(); }
+    const Request &front() const { return requests_.front(); }
+    Request &back() { return requests_.back(); }
+    const Request &back() const { return requests_.back(); }
+    [[nodiscard]] std::size_t size() const noexcept { return requests_.size(); }
+    [[nodiscard]] bool empty() const noexcept { return requests_.empty(); }
+    iterator begin() noexcept { return requests_.begin(); }
+    const_iterator begin() const noexcept { return requests_.begin(); }
+    const_iterator cbegin() const noexcept { return requests_.cbegin(); }
+    iterator end() noexcept { return requests_.end(); }
+    const_iterator end() const noexcept { return requests_.end(); }
+    const_iterator cend() const noexcept { return requests_.cend(); }
+
+  private:
+    std::vector<Request> requests_;
+    std::unordered_map<RequestId::ValueType, std::size_t> positions_;
+    bool identity_indexed_ = true;
 };
 
 } // namespace frontier::entities

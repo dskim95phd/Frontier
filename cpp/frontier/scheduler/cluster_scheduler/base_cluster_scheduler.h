@@ -110,7 +110,7 @@ class BaseClusterScheduler {
 
     BaseClusterScheduler(
         const entities::Cluster &cluster,
-        std::vector<entities::Request> &requests,
+        entities::RequestCollection &requests,
         execution_time_predictor::ExecutionTimePredictorPtr predictor,
         std::shared_ptr<const kv_cache_transfer::BaseKVCacheTransferPredictor>
             kv_cache_transfer_predictor,
@@ -373,7 +373,7 @@ class BaseClusterScheduler {
 
     std::vector<std::unique_ptr<BaseReplicaScheduler>> replica_schedulers_;
     const entities::Cluster *cluster_;
-    const std::vector<entities::Request> *requests_;
+    const entities::RequestCollection *requests_;
     std::shared_ptr<const kv_cache_transfer::BaseKVCacheTransferPredictor>
         kv_cache_transfer_predictor_;
     MoEBarrierCoordinator moe_barrier_;

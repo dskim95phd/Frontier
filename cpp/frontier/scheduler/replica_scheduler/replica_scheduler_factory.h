@@ -18,7 +18,7 @@ class BaseReplicaScheduler;
 
 [[nodiscard]] std::unique_ptr<BaseReplicaScheduler> make_replica_scheduler(
     const config::SchedulerConfig &config,
-    std::vector<entities::Request> &requests,
+    entities::RequestCollection &requests,
     execution_time_predictor::ExecutionTimePredictorPtr predictor,
     const entities::Replica &replica, DataParallelId dp_id,
     ClusterType cluster_type,

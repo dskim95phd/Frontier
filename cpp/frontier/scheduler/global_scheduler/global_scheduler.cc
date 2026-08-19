@@ -12,7 +12,7 @@ namespace frontier::scheduler {
 
 GlobalScheduler::GlobalScheduler(
     const std::map<ClusterType, entities::Cluster> &clusters,
-    std::vector<entities::Request> &requests, const PredictorMap &predictors,
+    entities::RequestCollection &requests, const PredictorMap &predictors,
     std::shared_ptr<const kv_cache_transfer::BaseKVCacheTransferPredictor>
         kv_cache_transfer_predictor,
     const config::ClusterSchedulerConfig &scheduler_config,

@@ -54,22 +54,22 @@ class ReplicaStageScheduler {
     [[nodiscard]]
     execution_time_predictor::ExecutionTimePrediction
     predict(const entities::Batch &batch,
-            const std::vector<entities::Request> &requests) const;
+            const entities::RequestCollection &requests) const;
     // Collapsed PP calendars predict a stage before claiming a stage-local
     // active ticket.  Exact mode never calls this method.
     [[nodiscard]]
     execution_time_predictor::ExecutionTimePrediction
     predict_collapsed(const entities::Batch &batch,
-                      const std::vector<entities::Request> &requests) const;
+                      const entities::RequestCollection &requests) const;
     [[nodiscard]] bool supports_lazy_moe_prediction() const noexcept;
     [[nodiscard]] execution_time_predictor::ExecutionTimePrediction
     prepare_moe_stage(
         const entities::Batch &batch,
-        const std::vector<entities::Request> &requests) const;
+        const entities::RequestCollection &requests) const;
     [[nodiscard]] execution_time_predictor::ExecutionTimePrediction
     predict_moe_layer(
         const entities::Batch &batch,
-        const std::vector<entities::Request> &requests,
+        const entities::RequestCollection &requests,
         std::uint64_t local_moe_layer) const;
     [[nodiscard]] execution_time_predictor::MoEGroupLayerPrediction
     predict_moe_group_layer(

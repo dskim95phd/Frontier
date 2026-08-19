@@ -32,10 +32,10 @@ class EntityArena {
     [[nodiscard]] std::size_t request_count() const noexcept {
         return requests_.size();
     }
-    [[nodiscard]] std::vector<entities::Request> &requests() noexcept {
+    [[nodiscard]] entities::RequestCollection &requests() noexcept {
         return requests_;
     }
-    [[nodiscard]] const std::vector<entities::Request> &
+    [[nodiscard]] const entities::RequestCollection &
     requests() const noexcept {
         return requests_;
     }
@@ -104,7 +104,7 @@ class EntityArena {
         double predicted_batch_ms = 0.0;
     };
 
-    std::vector<entities::Request> requests_;
+    entities::RequestCollection requests_;
     std::unordered_map<BatchId::ValueType, BatchRuntimeState> batches_;
     CheckedIdGenerator<BatchId> batch_ids_{
         0, std::numeric_limits<BatchId::ValueType>::max() - 1};

@@ -1454,9 +1454,16 @@ std::string serialize_simulation_summary_json(const SimulationOutput &output,
 std::string
 serialize_request_metrics_csv(const std::vector<RequestMetricsRecord> &requests,
                               config::SystemArchitecture architecture) {
+    std::ostringstream output;
+    serialize_request_metrics_csv(requests, output, architecture);
+    return output.str();
+}
+
+void serialize_request_metrics_csv(
+    const std::vector<RequestMetricsRecord> &requests, std::ostream &output,
+    config::SystemArchitecture architecture) {
     validate_request_metrics(requests, architecture);
 
-    std::ostringstream output;
     output.imbue(std::locale::classic());
     output << std::setprecision(std::numeric_limits<double>::max_digits10);
     if (!is_pdd(architecture)) {
@@ -1569,12 +1576,18 @@ serialize_request_metrics_csv(const std::vector<RequestMetricsRecord> &requests,
         }
         output << '\n';
     }
-    return output.str();
 }
 
 std::string serialize_gpu_kv_occupancy_csv(
     const std::vector<GpuKVCacheOccupancyRecord> &occupancy) {
     std::ostringstream output;
+    serialize_gpu_kv_occupancy_csv(occupancy, output);
+    return output.str();
+}
+
+void serialize_gpu_kv_occupancy_csv(
+    const std::vector<GpuKVCacheOccupancyRecord> &occupancy,
+    std::ostream &output) {
     output.imbue(std::locale::classic());
     output << std::setprecision(std::numeric_limits<double>::max_digits10);
     output << "time_s,cluster_type,replica_id,dp_id,active_blocks,"
@@ -1640,7 +1653,6 @@ std::string serialize_gpu_kv_occupancy_csv(
         }
         output << '\n';
     }
-    return output.str();
 }
 
 } // namespace frontier::metrics

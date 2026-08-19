@@ -210,6 +210,10 @@ void validate_session_timing(const std::vector<WorkloadRequest> &requests) {
 
 std::vector<WorkloadRequest> parse_workload_csv(std::string_view csv_text) {
     std::istringstream input{std::string{csv_text}};
+    return parse_workload_csv(input);
+}
+
+std::vector<WorkloadRequest> parse_workload_csv(std::istream &input) {
     input.imbue(std::locale::classic());
 
     std::string line;
@@ -355,8 +359,14 @@ std::vector<WorkloadRequest> parse_workload_csv(std::string_view csv_text) {
 
 std::string
 serialize_workload_csv(const std::vector<WorkloadRequest> &requests) {
-    validate_session_timing(requests);
     std::ostringstream output;
+    serialize_workload_csv(requests, output);
+    return output.str();
+}
+
+void serialize_workload_csv(const std::vector<WorkloadRequest> &requests,
+                            std::ostream &output) {
+    validate_session_timing(requests);
     output.imbue(std::locale::classic());
     output << std::setprecision(std::numeric_limits<double>::max_digits10);
     output << "session_start_at,think_time,num_prefill_tokens,"
@@ -399,7 +409,6 @@ serialize_workload_csv(const std::vector<WorkloadRequest> &requests) {
         }
         output << '\n';
     }
-    return output.str();
 }
 
 void validate_workload_for_config(const std::vector<WorkloadRequest> &requests,
@@ -418,15 +427,22 @@ void validate_workload_for_config(const std::vector<WorkloadRequest> &requests,
 std::vector<WorkloadRequest>
 materialize_workload_for_config(const std::vector<WorkloadRequest> &raw,
                                 const config::SimulationConfig &config) {
-    validate_workload_for_config(raw, config);
+    std::vector<WorkloadRequest> result = raw;
+    materialize_workload_for_config_in_place(result, config);
+    return result;
+}
+
+void materialize_workload_for_config_in_place(
+    std::vector<WorkloadRequest> &workload,
+    const config::SimulationConfig &config) {
+    validate_workload_for_config(workload, config);
     if (!config.prefix_cache.enabled) {
-        return raw;
+        return;
     }
 
     std::unordered_map<SessionId::ValueType, std::uint64_t>
         context_tokens_by_session;
-    std::vector<WorkloadRequest> result = raw;
-    for (WorkloadRequest &request : result) {
+    for (WorkloadRequest &request : workload) {
         std::uint64_t &context =
             context_tokens_by_session[request.session_id.value()];
         if (context > std::numeric_limits<std::uint64_t>::max() -
@@ -447,7 +463,6 @@ materialize_workload_for_config(const std::vector<WorkloadRequest> &raw,
         }
         context = request.num_prefill_tokens + request.num_decode_tokens;
     }
-    return result;
 }
 
 } // namespace frontier::request_generator

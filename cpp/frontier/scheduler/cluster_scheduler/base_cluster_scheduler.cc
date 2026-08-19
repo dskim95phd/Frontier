@@ -143,7 +143,7 @@ void BaseClusterScheduler::MoEBarrierCoordinator::require_empty() const {
 }
 
 BaseClusterScheduler::BaseClusterScheduler(
-    const entities::Cluster &cluster, std::vector<entities::Request> &requests,
+    const entities::Cluster &cluster, entities::RequestCollection &requests,
     execution_time_predictor::ExecutionTimePredictorPtr predictor,
     std::shared_ptr<const kv_cache_transfer::BaseKVCacheTransferPredictor>
         kv_cache_transfer_predictor,
@@ -196,7 +196,7 @@ BaseClusterScheduler::BaseClusterScheduler(
 }
 
 SessionId BaseClusterScheduler::request_session_id(RequestId request_id) const {
-    if (!request_id.valid() || request_id.index() >= requests_->size()) {
+    if (!requests_->contains(request_id)) {
         throw ClusterSchedulerError(
             "cluster scheduler references an unknown request");
     }
@@ -205,7 +205,7 @@ SessionId BaseClusterScheduler::request_session_id(RequestId request_id) const {
 
 const entities::Request &
 BaseClusterScheduler::request(RequestId request_id) const {
-    if (!request_id.valid() || request_id.index() >= requests_->size()) {
+    if (!requests_->contains(request_id)) {
         throw ClusterSchedulerError(
             "cluster scheduler references an unknown request");
     }

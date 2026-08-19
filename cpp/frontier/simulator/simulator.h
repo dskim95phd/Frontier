@@ -6,6 +6,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <vector>
 
@@ -27,6 +28,11 @@ class SimulationError : public std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
+struct SimulatorOptions {
+    bool detailed_traces_enabled = true;
+    std::optional<SimTime> observation_end_time;
+};
+
 class Simulator {
   public:
     using WallClockProgressCallback =
@@ -34,7 +40,8 @@ class Simulator {
                            double wall_clock_elapsed_seconds)>;
 
     Simulator(const config::SimulationConfig &config,
-              const std::vector<request_generator::WorkloadRequest> &workload);
+              std::vector<request_generator::WorkloadRequest> workload,
+              SimulatorOptions options = {});
 
     [[nodiscard]] metrics::SimulationOutput run();
     [[nodiscard]] metrics::SimulationOutput run_until(SimTime end_time);
@@ -68,10 +75,10 @@ class Simulator {
     [[nodiscard]] const entities::Request &request(RequestId request_id) const;
     [[nodiscard]] entities::Batch &batch(BatchId batch_id);
     [[nodiscard]] const entities::Batch &batch(BatchId batch_id) const;
-    [[nodiscard]] std::vector<entities::Request> &requests() noexcept {
+    [[nodiscard]] entities::RequestCollection &requests() noexcept {
         return entities_.requests();
     }
-    [[nodiscard]] const std::vector<entities::Request> &
+    [[nodiscard]] const entities::RequestCollection &
     requests() const noexcept {
         return entities_.requests();
     }
@@ -135,6 +142,7 @@ class Simulator {
     void maybe_report_wall_clock_progress(SimTime simulation_time);
 
     config::SimulationConfig config_;
+    std::optional<SimTime> observation_end_time_;
     EntityArena entities_;
     std::map<ClusterType, entities::Cluster> clusters_;
     scheduler::GlobalScheduler::PredictorMap predictors_;

@@ -37,6 +37,7 @@ using frontier::RequestId;
 using frontier::SimTime;
 using frontier::entities::Batch;
 using frontier::entities::Request;
+using frontier::entities::RequestCollection;
 using frontier::entities::RequestBatchSnapshot;
 using frontier::request_generator::WorkloadRequest;
 using frontier::test::expect;
@@ -814,7 +815,7 @@ void test_batch_model_matches_python_golden() {
     bool observed_device_effect = false;
 
     for (const Json &test_case : golden.at("cases")) {
-        std::vector<Request> requests;
+        RequestCollection requests;
         std::vector<RequestBatchSnapshot> snapshots;
         std::uint64_t request_index = 0;
         for (const Json &slice : test_case.at("input").at("slices")) {
@@ -1026,7 +1027,7 @@ void test_kimi_k2_uneven_pipeline_and_lm_head() {
         execution, parallelism, model_config,
         frontier::config::MoeRoutingConfig{}};
 
-    std::vector<Request> requests;
+    RequestCollection requests;
     requests.emplace_back([&]() {
         WorkloadRequest value{};
         value.request_id = RequestId{0};
@@ -1090,7 +1091,7 @@ void test_kimi_k2_dcp_adds_decode_collectives() {
         execution, dcp_parallelism, model_config,
         frontier::config::MoeRoutingConfig{}};
 
-    std::vector<Request> requests;
+    RequestCollection requests;
     requests.emplace_back([&]() {
         WorkloadRequest value{};
         value.request_id = RequestId{0};
@@ -1169,7 +1170,7 @@ void test_kimi_k3_tp8_dcp8_hybrid_decode() {
         scaled_config, dcp_parallelism, model_config,
         frontier::config::MoeRoutingConfig{}};
 
-    std::vector<Request> requests;
+    RequestCollection requests;
     requests.emplace_back([&]() {
         WorkloadRequest value{};
         value.request_id = RequestId{0};
@@ -1263,7 +1264,7 @@ void test_kimi_k2_first_layer_scaled_prediction() {
         scaled_config, parallelism, model_config,
         frontier::config::MoeRoutingConfig{}};
 
-    std::vector<Request> requests;
+    RequestCollection requests;
     requests.emplace_back([&]() {
         WorkloadRequest value{};
         value.request_id = RequestId{0};
@@ -1376,7 +1377,7 @@ void test_kimi_k3_attention_family_scaled_prediction() {
         scaled_config, parallelism, model_config,
         frontier::config::MoeRoutingConfig{}};
 
-    std::vector<Request> requests;
+    RequestCollection requests;
     requests.emplace_back([&]() {
         WorkloadRequest value{};
         value.request_id = RequestId{0};
@@ -1546,7 +1547,7 @@ void test_stage_group_scaled_pp_signatures_and_routing_guard() {
 
     const auto make_batch = [](std::uint64_t scheduled_tokens = 128,
                                BatchId batch_id = BatchId{0}) {
-        std::vector<Request> requests;
+        RequestCollection requests;
         requests.emplace_back([&]() {
             WorkloadRequest value{};
             value.request_id = RequestId{0};
@@ -1727,7 +1728,7 @@ void test_kimi_k3_stage_group_scaled_all_pp_stages() {
     const auto model =
         frontier::config::load_model_config("moonshotai/Kimi-K3");
     const auto make_batch = [] {
-        std::vector<Request> requests;
+        RequestCollection requests;
         requests.emplace_back([&]() {
             WorkloadRequest value{};
             value.request_id = RequestId{0};

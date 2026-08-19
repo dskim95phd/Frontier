@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <iosfwd>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -44,12 +45,19 @@ class WorkloadError : public std::runtime_error {
 
 [[nodiscard]] std::vector<WorkloadRequest>
 parse_workload_csv(std::string_view csv_text);
+[[nodiscard]] std::vector<WorkloadRequest>
+parse_workload_csv(std::istream &input);
 [[nodiscard]] std::string
 serialize_workload_csv(const std::vector<WorkloadRequest> &requests);
+void serialize_workload_csv(const std::vector<WorkloadRequest> &requests,
+                            std::ostream &output);
 void validate_workload_for_config(const std::vector<WorkloadRequest> &requests,
                                   const config::SimulationConfig &config);
 [[nodiscard]] std::vector<WorkloadRequest>
 materialize_workload_for_config(const std::vector<WorkloadRequest> &raw,
                                 const config::SimulationConfig &config);
+void materialize_workload_for_config_in_place(
+    std::vector<WorkloadRequest> &workload,
+    const config::SimulationConfig &config);
 
 } // namespace frontier::request_generator

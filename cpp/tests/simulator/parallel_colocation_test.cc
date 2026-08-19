@@ -30,6 +30,8 @@ using frontier::metrics::BatchStageMetricsRecord;
 using frontier::metrics::serialize_simulation_output_json;
 using frontier::metrics::SimulationOutput;
 using frontier::request_generator::parse_workload_csv;
+using frontier::simulator::Simulator;
+using frontier::simulator::SimulatorOptions;
 using frontier::simulator::run_simulation;
 using frontier::test::expect;
 using frontier::test::expect_throws;
@@ -113,6 +115,48 @@ void test_round_robin_dp_replica_and_event_pipeline() {
     for (const EventType type : required) {
         expect(seen.find(type) != seen.end(), "required event type is missing");
     }
+}
+
+void test_bounded_online_pruning_preserves_request_ids() {
+    SimulationConfig online_config =
+        load_config("fixed_parallel_colocation.json");
+    online_config.simulation_mode =
+        frontier::config::SimulationMode::kOnline;
+    const auto workload = parse_workload_csv(
+        "session_start_at,think_time,num_prefill_tokens,num_decode_tokens,"
+        "session_id,session_turn_index\n"
+        "0,0,2,1,10,0\n"
+        "10,0,2,1,20,0\n"
+        ",0.01,2,1,10,1\n"
+        ",0.01,2,1,20,1\n"
+        "0.2,0,2,1,,\n");
+    SimulatorOptions options{};
+    options.detailed_traces_enabled = false;
+    options.observation_end_time = frontier::SimTime::from_seconds(1.0);
+
+    Simulator online{online_config, workload, options};
+    expect(online.requests().size() == 3 &&
+               online.requests().contains(frontier::RequestId{0}) &&
+               online.requests().contains(frontier::RequestId{2}) &&
+               online.requests().contains(frontier::RequestId{4}) &&
+               !online.requests().contains(frontier::RequestId{1}) &&
+               !online.requests().contains(frontier::RequestId{3}),
+           "bounded online pruning must retain sparse source request IDs");
+    const SimulationOutput output =
+        online.run_until(frontier::SimTime::from_seconds(1.0));
+    std::set<std::uint64_t> completed_ids;
+    for (const auto &request : output.requests) {
+        completed_ids.insert(request.request_id.value());
+    }
+    expect(completed_ids == std::set<std::uint64_t>{0, 2, 4},
+           "bounded output must preserve original workload row IDs");
+
+    SimulationConfig offline_config = online_config;
+    offline_config.simulation_mode =
+        frontier::config::SimulationMode::kOffline;
+    Simulator offline{offline_config, workload, options};
+    expect(offline.requests().size() == workload.size(),
+           "offline mode must ignore bounded online pruning");
 }
 
 void test_pp4_fill_drain_and_terminal_release() {
@@ -259,6 +303,8 @@ void test_dp_target_local_pressure_and_preemption() {
     std::map<std::uint64_t, std::uint64_t> preemptions_by_dp;
     for (const auto &request : output.requests) {
         preemptions_by_dp[request.dp_id.value()] += request.preemption_count;
+        expect(request.tokens_at_preemption.size() == request.preemption_count,
+               "request metrics must export every preemption frontier");
     }
     expect(output.requests.size() == 4 && preemptions_by_dp.size() == 2 &&
                preemptions_by_dp.at(0) > 0 && preemptions_by_dp.at(1) > 0,
@@ -374,6 +420,9 @@ int main() {
     failures +=
         frontier::test::run("round-robin DP/replica event pipeline",
                             test_round_robin_dp_replica_and_event_pipeline);
+    failures += frontier::test::run(
+        "bounded online pruning preserves request IDs",
+        test_bounded_online_pruning_preserves_request_ids);
     failures += frontier::test::run(
         "PP serialization and overlap",
         test_pipeline_serialization_overlap_and_fixed_timing);

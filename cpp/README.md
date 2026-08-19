@@ -133,6 +133,10 @@ reached canonical completion are exported, quiescence validation is skipped,
 and cache/transfer diagnostics are snapshotted at the horizon. The output
 then carries `observation_window_seconds`, and `summary.json` computes rates
 against that window rather than against first-arrival-to-last-completion.
+For online runs, complete sessions whose external start time is after the
+horizon are omitted before simulator entities are constructed. Retained
+requests keep their original workload-row `request_id`; offline runs are not
+pruned because they preload root requests at simulation time zero.
 
 Progress reporting is disabled unless `--wall-progress-interval-s` is set.
 For example, `--wall-progress-interval-s 60` prints the latest processed

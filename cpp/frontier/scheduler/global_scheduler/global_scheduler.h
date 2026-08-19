@@ -34,7 +34,7 @@ class GlobalScheduler final {
 
     GlobalScheduler(
         const std::map<ClusterType, entities::Cluster> &clusters,
-        std::vector<entities::Request> &requests,
+        entities::RequestCollection &requests,
         const PredictorMap &predictors,
         std::shared_ptr<const kv_cache_transfer::BaseKVCacheTransferPredictor>
             kv_cache_transfer_predictor,

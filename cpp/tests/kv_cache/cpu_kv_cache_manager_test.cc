@@ -43,12 +43,11 @@ void test_incremental_contiguous_and_metrics() {
            "commit must advance one contiguous CPU frontier");
 
     const auto lookup = manager.lookup(SessionId{1}, 4);
-    manager.record_successful_lookup(RequestId{10}, lookup);
-    manager.record_successful_lookup(RequestId{10}, lookup);
+    manager.record_successful_lookup(lookup);
     expect(manager.stats().successful_lookups == 1 &&
                manager.stats().query_blocks == 4 &&
                manager.stats().hit_blocks == 4,
-           "scheduler retry metrics must deduplicate by request");
+           "one admitted lookup must update metrics once");
     manager.validate_invariants();
 }
 

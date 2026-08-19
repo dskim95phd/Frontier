@@ -193,11 +193,11 @@ void Request::record_cpu_restore_transfer(std::uint64_t blocks,
     cpu_restore_service_time_s_ += service_time_ms / 1e3;
 }
 
-void Request::record_cpu_prefix_admission(
+bool Request::record_cpu_prefix_admission(
     std::uint64_t gpu_hit_blocks, std::uint64_t cpu_query_blocks,
     std::uint64_t cpu_consumed_blocks, std::uint64_t cpu_restored_tokens) {
     if (cpu_prefix_admission_recorded_) {
-        return;
+        return false;
     }
     if (cpu_consumed_blocks > cpu_query_blocks ||
         cpu_consumed_blocks > cpu_restore_transferred_blocks_ ||
@@ -210,6 +210,7 @@ void Request::record_cpu_prefix_admission(
     cpu_restore_consumed_blocks_ = cpu_consumed_blocks;
     cpu_restored_tokens_ = cpu_restored_tokens;
     cpu_prefix_admission_recorded_ = true;
+    return true;
 }
 
 void Request::record_cpu_offload_transfer(std::uint64_t bytes,
@@ -313,7 +314,11 @@ void Request::on_preempted(SimTime time, ClusterType cluster_type) {
     if (state_ != RequestState::kRunning || completed()) {
         throw RequestError("only a running request can be preempted");
     }
-    tokens_at_preemption_.push_back(scheduler_num_computed_tokens_);
+    if (tokens_at_preemption_ == nullptr) {
+        tokens_at_preemption_ =
+            std::make_unique<std::vector<std::uint64_t>>();
+    }
+    tokens_at_preemption_->push_back(scheduler_num_computed_tokens_);
     ++preemption_count_;
     ++runtime_epoch_;
     ++execution_epoch_;

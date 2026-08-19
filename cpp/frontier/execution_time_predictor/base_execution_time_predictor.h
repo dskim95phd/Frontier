@@ -155,7 +155,7 @@ class BaseExecutionTimePredictor {
 
     [[nodiscard]] virtual ExecutionTimePrediction
     predict_stage_execution_time(const entities::Batch &batch,
-                                 const std::vector<entities::Request> &requests,
+                                 const entities::RequestCollection &requests,
                                  StageId stage_id) const = 0;
 
     [[nodiscard]] virtual MoEGroupLayerPrediction
@@ -175,14 +175,14 @@ class BaseExecutionTimePredictor {
 
     [[nodiscard]] virtual ExecutionTimePrediction
     prepare_moe_stage_execution(const entities::Batch &batch,
-                                const std::vector<entities::Request> &requests,
+                                const entities::RequestCollection &requests,
                                 StageId stage_id) const {
         return predict_stage_execution_time(batch, requests, stage_id);
     }
 
     [[nodiscard]] virtual ExecutionTimePrediction
     predict_moe_layer_execution(const entities::Batch &,
-                                const std::vector<entities::Request> &, StageId,
+                                const entities::RequestCollection &, StageId,
                                 std::uint64_t) const {
         throw ExecutionTimePredictorError(
             "execution predictor does not support lazy MoE layers");

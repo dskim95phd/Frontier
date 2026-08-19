@@ -12,6 +12,7 @@
 #include <string_view>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <variant>
 
@@ -203,18 +204,62 @@ total_hbm_bytes_per_gpu(const config::ClusterRuntimeConfig &runtime) {
 
 std::vector<request_generator::WorkloadRequest> prepare_workload(
     const config::SimulationConfig &config,
-    const std::vector<request_generator::WorkloadRequest> &workload) {
+    std::vector<request_generator::WorkloadRequest> workload,
+    const SimulatorOptions &options) {
     validate_inputs(config, workload);
-    return request_generator::materialize_workload_for_config(workload, config);
+    request_generator::validate_workload_for_config(workload, config);
+    if (!options.observation_end_time.has_value() ||
+        config.simulation_mode != config::SimulationMode::kOnline) {
+        request_generator::materialize_workload_for_config_in_place(workload,
+                                                                    config);
+        return workload;
+    }
+    const SimTime horizon = options.observation_end_time.value();
+    if (!horizon.valid() || horizon.seconds() <= 0.0) {
+        throw SimulationError(
+            "observation end time must be finite and positive");
+    }
+
+    std::unordered_set<SessionId, StrongIdHash<SessionId>> excluded_sessions;
+    for (const request_generator::WorkloadRequest &request : workload) {
+        if (request.session_id.valid() && request.session_start_at.valid() &&
+            request.session_start_at > horizon) {
+            excluded_sessions.insert(request.session_id);
+        }
+    }
+
+    workload.erase(
+        std::remove_if(
+            workload.begin(), workload.end(),
+            [&](const request_generator::WorkloadRequest &request) {
+                const bool excluded_session =
+                    request.session_id.valid() &&
+                    excluded_sessions.find(request.session_id) !=
+                        excluded_sessions.end();
+                const bool excluded_standalone =
+                    !request.session_id.valid() &&
+                    request.session_start_at > horizon;
+                return excluded_session || excluded_standalone;
+            }),
+        workload.end());
+    request_generator::materialize_workload_for_config_in_place(workload,
+                                                                config);
+    return workload;
 }
 
 } // namespace
 
 Simulator::Simulator(
     const config::SimulationConfig &config,
-    const std::vector<request_generator::WorkloadRequest> &workload)
-    : config_(config), entities_(prepare_workload(config, workload)),
-      metrics_(config, workload.size()) {
+    std::vector<request_generator::WorkloadRequest> workload,
+    SimulatorOptions options)
+    : config_(config),
+      observation_end_time_(
+          config.simulation_mode == config::SimulationMode::kOnline
+              ? options.observation_end_time
+              : std::nullopt),
+      entities_(prepare_workload(config, std::move(workload), options)),
+      metrics_(config, options.detailed_traces_enabled) {
     const bool is_pdd = config_.system_architecture ==
                         config::SystemArchitecture::kPdDisaggregation;
 
@@ -239,7 +284,7 @@ Simulator::Simulator(
             entities::Cluster{ClusterType::kDecode, clusters.decode});
         entities_.add_target_domain(ClusterType::kPrefill);
         entities_.add_target_domain(ClusterType::kDecode);
-        expected_decode_arrivals_ = workload.size();
+        expected_decode_arrivals_ = entities_.request_count();
     } else {
         const config::ClusterRuntimeConfig &runtime = config_.cluster();
         clusters_.emplace(ClusterType::kMonolithic,
@@ -248,12 +293,15 @@ Simulator::Simulator(
     }
 
     for (const auto &[cluster_type, cluster] : clusters_) {
-        predictors_.emplace(
+        auto [position, inserted] = predictors_.emplace(
             cluster_type,
             execution_time_predictor::make_execution_time_predictor(
                 cluster.runtime_config().execution_model, cluster.parallelism(),
                 cluster.model(), cluster.runtime_config().moe_routing,
                 cluster.communication_backend()));
+        static_cast<void>(inserted);
+        position->second->set_detailed_diagnostics_enabled(
+            options.detailed_traces_enabled);
     }
     global_scheduler_ = std::make_unique<scheduler::GlobalScheduler>(
         clusters_, entities_.requests(), predictors_,
@@ -273,8 +321,10 @@ Simulator::Simulator(
         }
         const auto previous = latest_by_session.find(request.session_id());
         if (previous != latest_by_session.end()) {
-            session_successors_.at(previous->second.index()) = request.id();
-            has_predecessor.at(request.id().index()) = true;
+            session_successors_.at(entities_.requests().position(
+                previous->second)) = request.id();
+            has_predecessor.at(entities_.requests().position(request.id())) =
+                true;
             has_session_successors_ = true;
         }
         latest_by_session[request.session_id()] = request.id();
@@ -283,7 +333,7 @@ Simulator::Simulator(
     const SimTime simulation_start = SimTime::from_seconds(0.0);
     bool preloaded_offline_root = false;
     for (const entities::Request &request : entities_.requests()) {
-        if (has_predecessor.at(request.id().index())) {
+        if (has_predecessor.at(entities_.requests().position(request.id()))) {
             continue;
         }
         if (config_.simulation_mode == config::SimulationMode::kOffline) {
@@ -500,6 +550,7 @@ double Simulator::predicted_batch_ms(BatchId batch_id) const {
 void Simulator::release_batch(BatchId batch_id) {
     const ClusterType cluster_type = batch(batch_id).cluster_type();
     predictors_.at(cluster_type)->release_batch_timing_cache(batch_id);
+    metrics_.release_batch_diagnostics(batch_id);
     entities_.release_batch(batch_id);
 }
 
@@ -571,7 +622,8 @@ bool Simulator::on_decode_kv_arrival() {
 
 void Simulator::record_request_completion(RequestId request_id, SimTime time) {
     entities_.record_request_completion(request_id);
-    const RequestId successor = session_successors_.at(request_id.index());
+    const RequestId successor = session_successors_.at(
+        entities_.requests().position(request_id));
     if (!successor.valid()) {
         return;
     }
@@ -787,6 +839,11 @@ void Simulator::maybe_report_wall_clock_progress(SimTime simulation_time) {
 }
 
 metrics::SimulationOutput Simulator::run() {
+    if (observation_end_time_.has_value()) {
+        throw SimulationError(
+            "a bounded simulator must run to its configured observation end "
+            "time");
+    }
     const events::EventDispatcher dispatcher;
     start_wall_clock_progress();
     while (!event_queue_.empty()) {
@@ -811,6 +868,12 @@ metrics::SimulationOutput Simulator::run_until(SimTime end_time) {
     if (!end_time.valid() || end_time.seconds() <= 0.0) {
         throw SimulationError(
             "simulation end time must be finite and positive");
+    }
+    if (observation_end_time_.has_value() &&
+        observation_end_time_.value() != end_time) {
+        throw SimulationError(
+            "run_until end time differs from the configured observation "
+            "end time");
     }
     const events::EventDispatcher dispatcher;
     start_wall_clock_progress();

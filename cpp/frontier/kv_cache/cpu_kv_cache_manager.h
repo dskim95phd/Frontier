@@ -105,8 +105,7 @@ class CpuKVCacheManager {
 
     [[nodiscard]] CpuPrefixLookupResult
     lookup(SessionId session_id, std::uint64_t query_blocks) const noexcept;
-    void record_successful_lookup(RequestId request_id,
-                                  CpuPrefixLookupResult result,
+    void record_successful_lookup(CpuPrefixLookupResult result,
                                   SessionId session_id = SessionId{});
 
     [[nodiscard]] CpuOffloadReservationResult
@@ -275,8 +274,6 @@ class CpuKVCacheManager {
     std::unordered_map<CpuRestoreLeaseId, RestoreLease,
                        StrongIdHash<CpuRestoreLeaseId>>
         leases_;
-    std::unordered_set<RequestId, StrongIdHash<RequestId>>
-        recorded_lookup_requests_;
     std::unordered_set<SessionId, StrongIdHash<SessionId>> hit_sessions_;
     CpuKVCacheStats stats_;
 };

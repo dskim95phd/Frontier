@@ -5,10 +5,10 @@
 #include <iomanip>
 #include <iostream>
 #include <optional>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "frontier/config/config.h"
 #include "frontier/metrics/output_contract.h"
@@ -69,12 +69,31 @@ std::string read_text_file(const std::filesystem::path &path) {
     if (!input) {
         throw std::runtime_error("failed to open input file: " + path.string());
     }
-    std::ostringstream contents;
-    contents << input.rdbuf();
+    input.seekg(0, std::ios::end);
+    const std::streampos end = input.tellg();
+    if (end < 0) {
+        throw std::runtime_error("failed to size input file: " + path.string());
+    }
+    std::string contents(static_cast<std::size_t>(end), '\0');
+    input.seekg(0, std::ios::beg);
+    input.read(contents.data(), static_cast<std::streamsize>(contents.size()));
+    if (input.gcount() != static_cast<std::streamsize>(contents.size())) {
+        throw std::runtime_error("failed to read input file: " + path.string());
+    }
+    return contents;
+}
+
+std::vector<frontier::request_generator::WorkloadRequest>
+read_workload_file(const std::filesystem::path &path) {
+    std::ifstream input{path, std::ios::binary};
+    if (!input) {
+        throw std::runtime_error("failed to open input file: " + path.string());
+    }
+    auto workload = frontier::request_generator::parse_workload_csv(input);
     if (!input.good() && !input.eof()) {
         throw std::runtime_error("failed to read input file: " + path.string());
     }
-    return contents.str();
+    return workload;
 }
 
 void write_text_file(const std::filesystem::path &path,
@@ -197,12 +216,7 @@ std::optional<RunOptions> parse_run_options(int argc, char *argv[]) {
     return result;
 }
 
-void write_artifacts(
-    const RunOptions &options, const frontier::config::SimulationConfig &config,
-    const std::vector<frontier::request_generator::WorkloadRequest> &workload,
-    const frontier::metrics::SimulationOutput &output,
-    double wall_clock_seconds) {
-    const std::filesystem::path &directory = options.output_dir.value();
+void ensure_output_directory(const std::filesystem::path &directory) {
     std::error_code error;
     std::filesystem::create_directories(directory, error);
     if (error) {
@@ -213,27 +227,57 @@ void write_artifacts(
         throw std::runtime_error("output path is not a directory: " +
                                  directory.string());
     }
+}
+
+template <typename Writer>
+void write_stream_file(const std::filesystem::path &path, Writer writer) {
+    std::ofstream output{path, std::ios::binary};
+    if (!output) {
+        throw std::runtime_error("failed to open output file: " + path.string());
+    }
+    writer(output);
+    if (!output) {
+        throw std::runtime_error("failed to write output file: " + path.string());
+    }
+}
+
+void write_normalized_inputs(
+    const RunOptions &options, const frontier::config::SimulationConfig &config,
+    const std::vector<frontier::request_generator::WorkloadRequest> &workload) {
+    const std::filesystem::path &directory = options.output_dir.value();
+    ensure_output_directory(directory);
 
     write_text_file(directory / "config.normalized.json",
                     frontier::config::serialize_simulation_config_json(config));
-    write_text_file(
-        directory / "workload.normalized.csv",
-        frontier::request_generator::serialize_workload_csv(workload));
+    const std::filesystem::path workload_path =
+        directory / "workload.normalized.csv";
+    write_stream_file(workload_path, [&](std::ostream &output) {
+        frontier::request_generator::serialize_workload_csv(workload, output);
+    });
+}
+
+void write_artifacts(const RunOptions &options,
+                     const frontier::metrics::SimulationOutput &output,
+                     double wall_clock_seconds) {
+    const std::filesystem::path &directory = options.output_dir.value();
     write_text_file(directory / "summary.json",
                     frontier::metrics::serialize_simulation_summary_json(
                         output, wall_clock_seconds));
 
     if (options.output_mode == OutputMode::kRequests ||
         options.output_mode == OutputMode::kFull) {
-        write_text_file(directory / "requests.csv",
-                        frontier::metrics::serialize_request_metrics_csv(
-                            output.requests, output.run.system_architecture));
+        write_stream_file(directory / "requests.csv", [&](std::ostream &stream) {
+            frontier::metrics::serialize_request_metrics_csv(
+                output.requests, stream, output.run.system_architecture);
+        });
     }
     // Occupancy samples are compact change events and are retained for every
     // output mode, including summary mode where detailed traces are disabled.
-    write_text_file(directory / "gpu_kv_occupancy.csv",
-                    frontier::metrics::serialize_gpu_kv_occupancy_csv(
-                        output.gpu_kv_occupancy));
+    write_stream_file(directory / "gpu_kv_occupancy.csv",
+                      [&](std::ostream &stream) {
+                          frontier::metrics::serialize_gpu_kv_occupancy_csv(
+                              output.gpu_kv_occupancy, stream);
+                      });
     if (options.output_mode == OutputMode::kFull) {
         write_text_file(
             directory / "trace.json",
@@ -263,11 +307,9 @@ int main(int argc, char *argv[]) {
             return 0;
         }
         if (argc == 3 && std::string_view{argv[1]} == "--normalize-workload") {
-            const auto workload =
-                frontier::request_generator::parse_workload_csv(
-                    read_text_file(argv[2]));
-            std::cout << frontier::request_generator::serialize_workload_csv(
-                workload);
+            const auto workload = read_workload_file(argv[2]);
+            frontier::request_generator::serialize_workload_csv(workload,
+                                                                std::cout);
             return 0;
         }
 
@@ -280,11 +322,23 @@ int main(int argc, char *argv[]) {
         const frontier::config::SimulationConfig config =
             frontier::config::parse_simulation_config_json(
                 read_text_file(options->config));
-        const auto workload = frontier::request_generator::parse_workload_csv(
-            read_text_file(options->workload));
+        auto workload = read_workload_file(options->workload);
+        if (options->output_dir.has_value()) {
+            write_normalized_inputs(options.value(), config, workload);
+        }
 
         const auto started_at = std::chrono::steady_clock::now();
-        frontier::simulator::Simulator simulator{config, workload};
+        frontier::simulator::SimulatorOptions simulator_options{};
+        simulator_options.detailed_traces_enabled =
+            !options->output_dir.has_value() ||
+            options->output_mode == OutputMode::kFull;
+        if (options->simulation_end_time_s.has_value()) {
+            simulator_options.observation_end_time =
+                frontier::SimTime::from_seconds(
+                    options->simulation_end_time_s.value());
+        }
+        frontier::simulator::Simulator simulator{config, std::move(workload),
+                                                 simulator_options};
         simulator.set_runtime_validation_enabled(options->runtime_validation);
         simulator.metrics().set_gpu_kv_occupancy_enabled(
             options->gpu_kv_occupancy);
@@ -297,10 +351,6 @@ int main(int argc, char *argv[]) {
                               << simulation_time.seconds() << '\n'
                               << std::flush;
                 });
-        }
-        if (options->output_dir.has_value() &&
-            options->output_mode != OutputMode::kFull) {
-            simulator.set_detailed_traces_enabled(false);
         }
         const frontier::metrics::SimulationOutput output =
             options->simulation_end_time_s.has_value()
@@ -317,8 +367,7 @@ int main(int argc, char *argv[]) {
                 output);
             return 0;
         }
-        write_artifacts(options.value(), config, workload, output,
-                        wall_clock_seconds);
+        write_artifacts(options.value(), output, wall_clock_seconds);
         std::cout << "wrote simulation artifacts to "
                   << options->output_dir->string() << '\n';
         return 0;

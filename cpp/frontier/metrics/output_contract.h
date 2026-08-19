@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <iosfwd>
 #include <map>
 #include <optional>
 #include <string>
@@ -491,7 +492,14 @@ serialize_simulation_summary_json(const SimulationOutput &output,
 serialize_request_metrics_csv(const std::vector<RequestMetricsRecord> &requests,
                               config::SystemArchitecture architecture =
                                   config::SystemArchitecture::kCoLocation);
+void serialize_request_metrics_csv(
+    const std::vector<RequestMetricsRecord> &requests, std::ostream &output,
+    config::SystemArchitecture architecture =
+        config::SystemArchitecture::kCoLocation);
 [[nodiscard]] std::string serialize_gpu_kv_occupancy_csv(
     const std::vector<GpuKVCacheOccupancyRecord> &occupancy);
+void serialize_gpu_kv_occupancy_csv(
+    const std::vector<GpuKVCacheOccupancyRecord> &occupancy,
+    std::ostream &output);
 
 } // namespace frontier::metrics

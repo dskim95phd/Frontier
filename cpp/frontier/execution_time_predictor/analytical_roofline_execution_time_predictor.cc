@@ -17,9 +17,9 @@ namespace frontier::execution_time_predictor {
 namespace {
 
 const entities::Request &
-get_request(const std::vector<entities::Request> &requests,
+get_request(const entities::RequestCollection &requests,
             RequestId request_id) {
-    if (!request_id.valid() || request_id.index() >= requests.size()) {
+    if (!requests.contains(request_id)) {
         throw ExecutionTimePredictorError(
             "batch execution references an unknown request");
     }
@@ -62,7 +62,7 @@ make_attention_request_slice(const entities::RequestBatchSnapshot &snapshot) {
 
 StageBatchInfo
 build_stage_batch_info(const entities::Batch &batch,
-                       const std::vector<entities::Request> &requests) {
+                       const entities::RequestCollection &requests) {
     StageBatchInfo result{};
     result.dense_batch.total_tokens = batch.total_scheduled_tokens();
     for (const entities::RequestBatchSnapshot &snapshot : batch.requests()) {
@@ -666,7 +666,7 @@ AnalyticalRooflineExecutionTimePredictor::
 ExecutionTimePrediction
 AnalyticalRooflineExecutionTimePredictor::predict_stage_execution_time(
     const entities::Batch &batch,
-    const std::vector<entities::Request> &requests, StageId stage_id) const {
+    const entities::RequestCollection &requests, StageId stage_id) const {
     return predict_execution(batch, requests, stage_id, std::nullopt);
 }
 
@@ -863,7 +863,7 @@ AnalyticalRooflineExecutionTimePredictor::predict_moe_group_layer(
 ExecutionTimePrediction
 AnalyticalRooflineExecutionTimePredictor::prepare_moe_stage_execution(
     const entities::Batch &batch,
-    const std::vector<entities::Request> &requests, StageId stage_id) const {
+    const entities::RequestCollection &requests, StageId stage_id) const {
     if (!model_.is_moe()) {
         throw ExecutionTimePredictorError(
             "dense model cannot prepare lazy MoE execution");
@@ -878,7 +878,7 @@ AnalyticalRooflineExecutionTimePredictor::prepare_moe_stage_execution(
 ExecutionTimePrediction
 AnalyticalRooflineExecutionTimePredictor::predict_moe_layer_execution(
     const entities::Batch &batch,
-    const std::vector<entities::Request> &requests, StageId stage_id,
+    const entities::RequestCollection &requests, StageId stage_id,
     std::uint64_t local_moe_layer) const {
     if (!model_.is_moe() ||
         config_.moe_layer_event_mode == "first_layer_scaled" ||
@@ -892,7 +892,7 @@ AnalyticalRooflineExecutionTimePredictor::predict_moe_layer_execution(
 ExecutionTimePrediction
 AnalyticalRooflineExecutionTimePredictor::predict_execution(
     const entities::Batch &batch,
-    const std::vector<entities::Request> &requests, StageId stage_id,
+    const entities::RequestCollection &requests, StageId stage_id,
     std::optional<std::uint64_t> selected_moe_layer) const {
     if (!stage_id.valid() ||
         stage_id.index() >= parallelism_.pipeline_parallel_size) {

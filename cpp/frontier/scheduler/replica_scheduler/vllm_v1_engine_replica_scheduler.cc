@@ -80,7 +80,7 @@ std::uint64_t revalidate_contiguous_tiered_prefix_frontier(
 }
 
 VllmV1Scheduler::VllmV1Scheduler(config::SchedulerConfig config,
-                                 std::vector<entities::Request> &requests)
+                                 entities::RequestCollection &requests)
     : VllmV1Scheduler(
           std::move(config), requests,
           std::make_unique<
@@ -92,7 +92,7 @@ VllmV1Scheduler::VllmV1Scheduler(config::SchedulerConfig config,
           }())) {}
 
 VllmV1Scheduler::VllmV1Scheduler(config::SchedulerConfig config,
-                                 std::vector<entities::Request> &requests,
+                                 entities::RequestCollection &requests,
                                  config::PrefixCacheConfig prefix_cache_config)
     : VllmV1Scheduler(
           std::move(config), requests,
@@ -107,7 +107,7 @@ VllmV1Scheduler::VllmV1Scheduler(config::SchedulerConfig config,
           prefix_cache_config) {}
 
 VllmV1Scheduler::VllmV1Scheduler(
-    config::SchedulerConfig config, std::vector<entities::Request> &requests,
+    config::SchedulerConfig config, entities::RequestCollection &requests,
     std::unique_ptr<execution_time_predictor::BaseExecutionTimePredictor>
         predictor)
     : BaseReplicaScheduler(config, requests, default_replica(),
@@ -121,7 +121,7 @@ VllmV1Scheduler::VllmV1Scheduler(
 }
 
 VllmV1Scheduler::VllmV1Scheduler(
-    config::SchedulerConfig config, std::vector<entities::Request> &requests,
+    config::SchedulerConfig config, entities::RequestCollection &requests,
     execution_time_predictor::ExecutionTimePredictorPtr predictor,
     const entities::Replica &replica, DataParallelId dp_id,
     ClusterType cluster_type, config::PrefixCacheConfig prefix_cache_config,
@@ -201,7 +201,7 @@ std::uint64_t VllmV1Scheduler::queued_kv_blocks() const noexcept {
 
     std::uint64_t total = 0;
     const auto add = [&](RequestId request_id) {
-        if (!request_id.valid() || request_id.index() >= requests_->size()) {
+        if (!requests_->contains(request_id)) {
             total = std::numeric_limits<std::uint64_t>::max();
             return;
         }
@@ -1275,13 +1275,15 @@ ScheduleResult VllmV1Scheduler::schedule_requests(SimTime time) {
                             : 0;
                     const std::uint64_t gpu_used =
                         std::min(current_gpu, prefix_lookup.hit_blocks);
-                    value.record_cpu_prefix_admission(
-                        gpu_used, cpu_query, cpu_used,
-                        cpu_used * staged.block_size);
-                    cpu_kv_cache_->record_successful_lookup(
-                        request_id,
-                        kv_cache::CpuPrefixLookupResult{cpu_query, cpu_used},
-                        value.session_id());
+                    const bool first_cpu_admission =
+                        value.record_cpu_prefix_admission(
+                            gpu_used, cpu_query, cpu_used,
+                            cpu_used * staged.block_size);
+                    if (first_cpu_admission) {
+                        cpu_kv_cache_->record_successful_lookup(
+                            kv_cache::CpuPrefixLookupResult{cpu_query, cpu_used},
+                            value.session_id());
+                    }
                 } else if (kv_blocks_.prefix_cache_enabled() &&
                            !value.is_prefill_complete()) {
                     const std::uint64_t current_gpu =
@@ -1301,12 +1303,14 @@ ScheduleResult VllmV1Scheduler::schedule_requests(SimTime time) {
                                 : 0;
                         const std::uint64_t gpu_used =
                             std::min(current_gpu, prefix_lookup.hit_blocks);
-                        value.record_cpu_prefix_admission(gpu_used, cpu_query,
-                                                          0, 0);
-                        cpu_kv_cache_->record_successful_lookup(
-                            request_id,
-                            kv_cache::CpuPrefixLookupResult{cpu_query, 0},
-                            value.session_id());
+                        const bool first_cpu_admission =
+                            value.record_cpu_prefix_admission(
+                                gpu_used, cpu_query, 0, 0);
+                        if (first_cpu_admission) {
+                            cpu_kv_cache_->record_successful_lookup(
+                                kv_cache::CpuPrefixLookupResult{cpu_query, 0},
+                                value.session_id());
+                        }
                     }
                 } else {
                     kv_blocks_.reserve(request_id, accounted, num_tokens,
@@ -1521,16 +1525,8 @@ bool VllmV1Scheduler::prepare_cpu_kv_cache_offload(RequestId request_id,
         retired_session_requests_.end()) {
         return false;
     }
-    CpuOffloadGeneration &last = cpu_offload_generations_[value.session_id()];
-    if (last.valid() &&
-        last.value() ==
-            std::numeric_limits<CpuOffloadGeneration::ValueType>::max()) {
-        throw SchedulerError("CPU offload generation exhausted");
-    }
-    const CpuOffloadGeneration::ValueType next_value =
-        last.valid() ? last.value() + 1 : 0;
-    const CpuOffloadGeneration generation{next_value};
-    last = generation;
+    const CpuOffloadGeneration generation = cpu_offload_generation_ids_.next(
+        "CPU offload generation exhausted");
     const std::uint64_t desired =
         value.num_processed_prefill_tokens() / kv_blocks_.block_size();
     const auto reservation = cpu_kv_cache_->reserve_offload(

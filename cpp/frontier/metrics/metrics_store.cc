@@ -157,7 +157,7 @@ PipelineMemoryDiagnostics make_pipeline_memory_diagnostics(
 } // namespace
 
 MetricsStore::MetricsStore(const config::SimulationConfig &config,
-                           std::size_t expected_request_count)
+                           bool detailed_traces_enabled)
     : output_([&]() {
           SimulationOutput value{};
           value.schema_version = config.schema_version;
@@ -169,9 +169,8 @@ MetricsStore::MetricsStore(const config::SimulationConfig &config,
               return value;
           }();
           return value;
-      }()) {
-    output_.requests.reserve(expected_request_count);
-    output_.event_trace.reserve(expected_request_count * 12);
+      }()),
+      detailed_traces_enabled_(detailed_traces_enabled) {
     if (config.system_architecture ==
         config::SystemArchitecture::kPdDisaggregation) {
         output_.pipeline_memory_diagnostics.push_back(
@@ -200,7 +199,7 @@ void MetricsStore::record_request(RequestMetricsRecord record) {
 }
 
 void MetricsStore::record_batch(const entities::Batch &batch,
-                                const std::vector<entities::Request> &requests,
+                                const entities::RequestCollection &requests,
                                 double predicted_execution_ms,
                                 const config::ClusterRuntimeConfig &runtime) {
     if (!batch.completed_at().valid()) {
@@ -473,12 +472,27 @@ void MetricsStore::update_moe_grouped_gemm_geometry(
     }
 }
 
+void MetricsStore::release_batch_diagnostics(BatchId batch_id) {
+    if (!detailed_traces_enabled_) {
+        return;
+    }
+    for (auto position = moe_routing_positions_.begin();
+         position != moe_routing_positions_.end();) {
+        if (position->first.batch_id == batch_id) {
+            position = moe_routing_positions_.erase(position);
+        } else {
+            ++position;
+        }
+    }
+}
+
 void MetricsStore::collect_completed_requests(
     const config::SimulationConfig &config,
     const simulator::EntityArena &entities) {
     if (!output_.requests.empty()) {
         throw std::logic_error("request metrics were collected more than once");
     }
+    output_.requests.reserve(entities.completion_order().size());
     // Keep arrival-side demand independent of completion filtering.  A bounded
     // run can intentionally leave requests waiting or in flight, but those
     // requests still contribute demand from the moment their arrival event was
@@ -564,7 +578,7 @@ void MetricsStore::collect_completed_requests(
             value.first_token_completed_at = request.first_token_completed_at();
             value.num_processed_tokens = request.num_processed_tokens();
             value.preemption_count = request.preemption_count();
-            value.tokens_at_preemption = {};
+            value.tokens_at_preemption = request.tokens_at_preemption();
             value.replica_id = target.replica_id;
             value.dp_id = target.dp_id;
             value.prefill_replica_id = ReplicaId{};

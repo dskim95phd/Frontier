@@ -50,7 +50,7 @@ namespace frontier::metrics {
 class MetricsStore {
   public:
     explicit MetricsStore(const config::SimulationConfig &config,
-                          std::size_t expected_request_count = 0);
+                          bool detailed_traces_enabled = true);
 
     void set_detailed_traces_enabled(bool enabled) noexcept {
         detailed_traces_enabled_ = enabled;
@@ -61,7 +61,7 @@ class MetricsStore {
 
     void record_event(Event event);
     void record_batch(const entities::Batch &batch,
-                      const std::vector<entities::Request> &requests,
+                      const entities::RequestCollection &requests,
                       double predicted_execution_ms,
                       const config::ClusterRuntimeConfig &runtime);
     void record_batch_stage(const entities::BatchStage &batch_stage,
@@ -82,6 +82,7 @@ class MetricsStore {
         BatchId batch_id, StageId stage_id, LayerId layer_id,
         const execution_time_predictor::MoEGroupedGemmGeometryDiagnostic
             &geometry);
+    void release_batch_diagnostics(BatchId batch_id);
 
     void collect_completed_requests(const config::SimulationConfig &config,
                                     const simulator::EntityArena &entities);

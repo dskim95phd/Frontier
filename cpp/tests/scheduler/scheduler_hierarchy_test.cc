@@ -27,6 +27,7 @@ using frontier::config::SchedulerConfig;
 using frontier::entities::Batch;
 using frontier::entities::Cluster;
 using frontier::entities::Request;
+using frontier::entities::RequestCollection;
 using frontier::entities::RequestBatchSnapshot;
 using frontier::execution_time_predictor::FixedExecutionTimePredictor;
 using frontier::request_generator::WorkloadRequest;
@@ -94,7 +95,7 @@ void complete_single_monolithic_iteration(BaseReplicaScheduler &scheduler,
 }
 
 void test_colocation_scheduler_hierarchy_routes_and_executes() {
-    std::vector<Request> requests;
+    RequestCollection requests;
     requests.emplace_back([&]() {
         WorkloadRequest value{};
         value.request_id = RequestId{0};
@@ -227,7 +228,7 @@ void test_stage_scheduler_prioritizes_global_batch_id() {
 }
 
 void test_colocation_hierarchy_rejects_unknown_targets() {
-    std::vector<Request> requests;
+    RequestCollection requests;
     requests.emplace_back([&]() {
         WorkloadRequest value{};
         value.request_id = RequestId{0};
@@ -283,7 +284,7 @@ void test_stage_specific_factory_and_observable_routing_policies() {
     runtime.parallelism.num_replicas = 2;
     runtime.scheduler = scheduler_config();
 
-    std::vector<Request> queue_requests;
+    RequestCollection queue_requests;
     for (std::uint64_t index = 0; index < 4; ++index) {
         queue_requests.emplace_back(make_request(RequestId{index}));
         queue_requests.back().on_arrival(SimTime::from_seconds(0.0));
@@ -309,7 +310,7 @@ void test_stage_specific_factory_and_observable_routing_policies() {
                queue_assignments[3].replica_id == ReplicaId{1},
            "vLLM queue-aware routing must balance observable queue counts");
 
-    std::vector<Request> kv_requests;
+    RequestCollection kv_requests;
     kv_requests.emplace_back(make_request(RequestId{0}, 8, 100));
     kv_requests.emplace_back(make_request(RequestId{1}, 8, 1));
     kv_requests[0].on_arrival(SimTime::from_seconds(0.0));
@@ -334,7 +335,7 @@ void test_stage_specific_factory_and_observable_routing_policies() {
                          Cluster{ClusterType::kPrefill, runtime});
     pdd_clusters.emplace(ClusterType::kDecode,
                          Cluster{ClusterType::kDecode, runtime});
-    std::vector<Request> pdd_requests;
+    RequestCollection pdd_requests;
     GlobalScheduler::PredictorMap predictors;
     predictors.emplace(ClusterType::kPrefill, predictor);
     predictors.emplace(ClusterType::kDecode, predictor);
@@ -368,7 +369,7 @@ void test_kv_aware_prefill_avoids_virtual_commitment() {
         value.stage_latencies_ms = {};
         return value;
     }());
-    std::vector<Request> requests;
+    RequestCollection requests;
     requests.emplace_back(make_request(RequestId{0}, 16, 1));
     requests.emplace_back(make_request(RequestId{1}, 16, 1));
     for (Request &request : requests) {
@@ -418,7 +419,7 @@ void test_actual_cache_aware_routing_migrates_and_discards_old_gpu_kv() {
         value.stage_latencies_ms = {};
         return value;
     }());
-    std::vector<Request> requests;
+    RequestCollection requests;
     requests.emplace_back(make_request(RequestId{0}, 8, 1,
                                        frontier::SessionId{7}));
     requests.emplace_back(make_request(RequestId{1}, 2, 1,
@@ -463,7 +464,7 @@ void test_actual_cache_aware_routing_migrates_and_discards_old_gpu_kv() {
                frontier::SessionId{7}) == 0,
            "migration must discard every old-target GPU KV block");
 
-    std::vector<Request> low_hit_requests;
+    RequestCollection low_hit_requests;
     low_hit_requests.emplace_back(make_request(
         RequestId{0}, 8, 1, frontier::SessionId{17}));
     low_hit_requests.emplace_back(make_request(
@@ -507,7 +508,7 @@ void test_actual_cache_aware_routing_waits_for_session_owner_release() {
         value.stage_latencies_ms = {};
         return value;
     }());
-    std::vector<Request> requests;
+    RequestCollection requests;
     requests.emplace_back(make_request(RequestId{0}, 8, 1,
                                        frontier::SessionId{31}));
     requests.emplace_back(make_request(RequestId{1}, 12, 1,
@@ -576,7 +577,7 @@ void test_actual_cache_aware_routing_keeps_cpu_hit_affinity() {
         value.stage_latencies_ms = {};
         return value;
     }());
-    std::vector<Request> requests;
+    RequestCollection requests;
     requests.emplace_back(make_request(RequestId{0}, 8, 1,
                                        frontier::SessionId{23}));
     requests.emplace_back(make_request(RequestId{1}, 12, 1,
@@ -642,7 +643,7 @@ void test_actual_cache_aware_migration_discards_old_cpu_kv() {
         value.stage_latencies_ms = {};
         return value;
     }());
-    std::vector<Request> requests;
+    RequestCollection requests;
     requests.emplace_back(make_request(RequestId{0}, 8, 1,
                                        frontier::SessionId{29}));
     requests.emplace_back(make_request(RequestId{1}, 12, 1,

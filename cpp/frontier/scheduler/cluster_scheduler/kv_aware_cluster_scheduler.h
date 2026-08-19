@@ -15,7 +15,7 @@ class KvAwareClusterScheduler final : public BaseClusterScheduler {
   public:
     KvAwareClusterScheduler(
         const entities::Cluster &cluster,
-        std::vector<entities::Request> &requests,
+        entities::RequestCollection &requests,
         execution_time_predictor::ExecutionTimePredictorPtr predictor,
         std::shared_ptr<const kv_cache_transfer::BaseKVCacheTransferPredictor>
             kv_cache_transfer_predictor,

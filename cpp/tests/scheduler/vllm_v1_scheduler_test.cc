@@ -18,6 +18,7 @@ using frontier::SimTime;
 using frontier::config::SchedulerConfig;
 using frontier::entities::Batch;
 using frontier::entities::Request;
+using frontier::entities::RequestCollection;
 using frontier::entities::RequestBatchSnapshot;
 using frontier::request_generator::WorkloadRequest;
 using frontier::scheduler::ScheduleResult;
@@ -34,9 +35,9 @@ SchedulerConfig scheduler_config() {
     return config;
 }
 
-std::vector<Request> make_requests(
+RequestCollection make_requests(
     const std::vector<std::pair<std::uint64_t, std::uint64_t>> &tokens) {
-    std::vector<Request> requests;
+    RequestCollection requests;
     requests.reserve(tokens.size());
     for (std::size_t index = 0; index < tokens.size(); ++index) {
         requests.emplace_back([&]() {
@@ -54,7 +55,7 @@ std::vector<Request> make_requests(
     return requests;
 }
 
-void arrive_all(VllmV1Scheduler &scheduler, std::vector<Request> &requests) {
+void arrive_all(VllmV1Scheduler &scheduler, RequestCollection &requests) {
     for (Request &request : requests) {
         request.on_arrival(request.arrived_at());
         scheduler.add_request(request.id());
@@ -62,7 +63,7 @@ void arrive_all(VllmV1Scheduler &scheduler, std::vector<Request> &requests) {
 }
 
 Batch complete_schedule(VllmV1Scheduler &scheduler,
-                        std::vector<Request> &requests,
+                        RequestCollection &requests,
                         const ScheduleResult &schedule, std::uint64_t batch_id,
                         double completion_time) {
     std::vector<RequestBatchSnapshot> snapshots;
@@ -90,7 +91,7 @@ Batch complete_schedule(VllmV1Scheduler &scheduler,
 }
 
 Batch complete_prefill_schedule(VllmV1Scheduler &scheduler,
-                                std::vector<Request> &requests,
+                                RequestCollection &requests,
                                 const ScheduleResult &schedule,
                                 double completed_at);
 
@@ -539,7 +540,7 @@ void test_mixed_stale_and_valid_request_snapshots_are_applied_per_request() {
 
 void test_requester_self_preemption_and_disabled_pressure() {
     const auto reach_second_decode_boundary =
-        [](VllmV1Scheduler &scheduler, std::vector<Request> &requests) {
+        [](VllmV1Scheduler &scheduler, RequestCollection &requests) {
             const ScheduleResult prefill =
                 scheduler.schedule(SimTime::from_seconds(0.0));
             static_cast<void>(
@@ -590,7 +591,7 @@ void test_requester_self_preemption_and_disabled_pressure() {
 }
 
 void test_session_prefix_hit_and_all_hit_demotion() {
-    std::vector<Request> requests;
+    RequestCollection requests;
     for (const auto &[prefill, decode] :
          std::vector<std::pair<std::uint64_t, std::uint64_t>>{
              {4, 1}, {4, 1}, {5, 1}}) {
@@ -651,7 +652,7 @@ void test_session_prefix_hit_and_all_hit_demotion() {
 }
 
 void test_preemption_reentry_uses_resident_free_cache_once() {
-    std::vector<Request> requests;
+    RequestCollection requests;
     for (std::uint64_t index = 0; index < 2; ++index) {
         WorkloadRequest workload{};
         workload.request_id = RequestId{index};
@@ -808,9 +809,9 @@ void test_tiered_prefix_plan_first_gap_and_demotion() {
         "admission revalidation must stop at a gap and demote all-hit");
 }
 
-std::vector<Request> make_cpu_restore_requests(
+RequestCollection make_cpu_restore_requests(
     const std::vector<std::pair<std::uint64_t, std::int64_t>> &inputs) {
-    std::vector<Request> requests;
+    RequestCollection requests;
     for (std::size_t index = 0; index < inputs.size(); ++index) {
         WorkloadRequest workload{};
         workload.request_id = RequestId{index};
@@ -824,10 +825,10 @@ std::vector<Request> make_cpu_restore_requests(
     return requests;
 }
 
-std::vector<Request> make_same_session_requests(
+RequestCollection make_same_session_requests(
     const std::vector<std::pair<std::uint64_t, std::uint64_t>> &tokens,
     frontier::SessionId session_id) {
-    std::vector<Request> requests;
+    RequestCollection requests;
     requests.reserve(tokens.size());
     for (std::size_t index = 0; index < tokens.size(); ++index) {
         WorkloadRequest workload{};
@@ -1417,7 +1418,7 @@ void test_kda_restore_completion_failure_restores_gpu_snapshot() {
 }
 
 Batch complete_prefill_schedule(VllmV1Scheduler &scheduler,
-                                std::vector<Request> &requests,
+                                RequestCollection &requests,
                                 const ScheduleResult &schedule,
                                 double completed_at) {
     std::vector<RequestBatchSnapshot> snapshots;

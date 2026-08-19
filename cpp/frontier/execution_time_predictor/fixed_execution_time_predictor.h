@@ -16,7 +16,7 @@ class FixedExecutionTimePredictor final : public BaseExecutionTimePredictor {
 
     [[nodiscard]] ExecutionTimePrediction
     predict_stage_execution_time(const entities::Batch &batch,
-                                 const std::vector<entities::Request> &requests,
+                                 const entities::RequestCollection &requests,
                                  StageId stage_id) const override;
     [[nodiscard]] MoEGroupLayerPrediction
     predict_moe_group_layer(const MoEGroupLayerInput &input) const override;

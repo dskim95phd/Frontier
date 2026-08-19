@@ -5,7 +5,6 @@
 #include <iostream>
 #include <map>
 #include <optional>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -32,12 +31,18 @@ std::string read_text_file(const std::filesystem::path &path) {
     if (!input) {
         throw std::runtime_error("failed to open input file: " + path.string());
     }
-    std::ostringstream contents;
-    contents << input.rdbuf();
-    if (!input.good() && !input.eof()) {
+    input.seekg(0, std::ios::end);
+    const std::streampos end = input.tellg();
+    if (end < 0) {
+        throw std::runtime_error("failed to size input file: " + path.string());
+    }
+    std::string contents(static_cast<std::size_t>(end), '\0');
+    input.seekg(0, std::ios::beg);
+    input.read(contents.data(), static_cast<std::streamsize>(contents.size()));
+    if (input.gcount() != static_cast<std::streamsize>(contents.size())) {
         throw std::runtime_error("failed to read input file: " + path.string());
     }
-    return contents.str();
+    return contents;
 }
 
 std::optional<InputPaths> parse_input_paths(int argc, char *argv[]) {
@@ -191,12 +196,19 @@ int main(int argc, char *argv[]) {
         const frontier::config::SimulationConfig config =
             frontier::config::parse_simulation_config_json(
                 read_text_file(input_paths->config));
-        const auto workload = frontier::request_generator::parse_workload_csv(
-            read_text_file(input_paths->workload));
+        std::ifstream workload_input{input_paths->workload, std::ios::binary};
+        if (!workload_input) {
+            throw std::runtime_error("failed to open input file: " +
+                                     input_paths->workload.string());
+        }
+        auto workload =
+            frontier::request_generator::parse_workload_csv(workload_input);
 
         const auto started_at = std::chrono::steady_clock::now();
-        frontier::simulator::Simulator simulator{config, workload};
-        simulator.set_detailed_traces_enabled(false);
+        frontier::simulator::SimulatorOptions simulator_options{};
+        simulator_options.detailed_traces_enabled = false;
+        frontier::simulator::Simulator simulator{
+            config, std::move(workload), simulator_options};
         simulator.set_runtime_validation_enabled(false);
         const frontier::metrics::SimulationOutput output = simulator.run();
         const double wall_clock_seconds =

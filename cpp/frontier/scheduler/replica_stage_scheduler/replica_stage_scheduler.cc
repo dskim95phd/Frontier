@@ -66,7 +66,7 @@ std::optional<StageBatchTicket> ReplicaStageScheduler::pop_batch_if_not_busy() {
 execution_time_predictor::ExecutionTimePrediction
 ReplicaStageScheduler::predict(
     const entities::Batch &batch,
-    const std::vector<entities::Request> &requests) const {
+    const entities::RequestCollection &requests) const {
     if (!active_batch_id_.valid() || active_batch_id_ != batch.id()) {
         throw ReplicaStageSchedulerError(
             "only the active stage batch can be predicted");
@@ -77,7 +77,7 @@ ReplicaStageScheduler::predict(
 execution_time_predictor::ExecutionTimePrediction
 ReplicaStageScheduler::predict_collapsed(
     const entities::Batch &batch,
-    const std::vector<entities::Request> &requests) const {
+    const entities::RequestCollection &requests) const {
     return predictor_->predict_stage_execution_time(batch, requests, stage_id_);
 }
 
@@ -218,7 +218,7 @@ bool ReplicaStageScheduler::supports_lazy_moe_prediction() const noexcept {
 execution_time_predictor::ExecutionTimePrediction
 ReplicaStageScheduler::prepare_moe_stage(
     const entities::Batch &batch,
-    const std::vector<entities::Request> &requests) const {
+    const entities::RequestCollection &requests) const {
     if (!active_batch_id_.valid() || active_batch_id_ != batch.id()) {
         throw ReplicaStageSchedulerError(
             "only the active stage batch can prepare MoE execution");
@@ -229,7 +229,7 @@ ReplicaStageScheduler::prepare_moe_stage(
 execution_time_predictor::ExecutionTimePrediction
 ReplicaStageScheduler::predict_moe_layer(
     const entities::Batch &batch,
-    const std::vector<entities::Request> &requests,
+    const entities::RequestCollection &requests,
     std::uint64_t local_moe_layer) const {
     if (!active_batch_id_.valid() || active_batch_id_ != batch.id()) {
         throw ReplicaStageSchedulerError(

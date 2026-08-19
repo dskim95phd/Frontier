@@ -7,7 +7,7 @@ namespace {
 
 std::vector<entities::RequestBatchSnapshot>
 make_snapshots(const scheduler::ScheduleResult &schedule,
-               const std::vector<entities::Request> &requests) {
+               const entities::RequestCollection &requests) {
     std::vector<entities::RequestBatchSnapshot> result;
     result.reserve(schedule.scheduled_requests.size());
     for (const scheduler::ScheduledRequest &scheduled :
@@ -41,7 +41,7 @@ EntityArena::EntityArena(
 }
 
 entities::Request &EntityArena::request(RequestId request_id) {
-    if (!request_id.valid() || request_id.index() >= requests_.size()) {
+    if (!requests_.contains(request_id)) {
         throw std::out_of_range("event references unknown request");
     }
     entities::Request &result = requests_.at(request_id.index());
@@ -52,7 +52,7 @@ entities::Request &EntityArena::request(RequestId request_id) {
 }
 
 const entities::Request &EntityArena::request(RequestId request_id) const {
-    if (!request_id.valid() || request_id.index() >= requests_.size()) {
+    if (!requests_.contains(request_id)) {
         throw std::out_of_range("event references unknown request");
     }
     const entities::Request &result = requests_.at(request_id.index());
@@ -211,7 +211,7 @@ void EntityArena::assign_request_target(RequestId request_id,
                                         scheduler::ReplicaTarget target,
                                         ClusterType cluster_type) {
     scheduler::ReplicaTarget &current =
-        request_targets_.at(cluster_type).at(request_id.index());
+        request_targets_.at(cluster_type).at(requests_.position(request_id));
     if (current.replica_id.valid() && current != target) {
         throw std::logic_error("request was routed to more than one target");
     }
@@ -222,7 +222,7 @@ scheduler::ReplicaTarget
 EntityArena::request_target(RequestId request_id,
                             ClusterType cluster_type) const {
     const auto &target =
-        request_targets_.at(cluster_type).at(request_id.index());
+        request_targets_.at(cluster_type).at(requests_.position(request_id));
     if (!target.replica_id.valid() || !target.dp_id.valid()) {
         throw std::logic_error("request has no replica target");
     }
@@ -233,7 +233,7 @@ TransferId EntityArena::create_kv_cache_transfer(
     RequestId request_id, BatchId source_batch_id,
     scheduler::ReplicaTarget source_target, std::uint64_t size_bytes,
     double predicted_time_ms) {
-    const std::size_t request_index = request_id.index();
+    const std::size_t request_index = requests_.position(request_id);
     if (request_transfer_ids_.at(request_index).valid()) {
         throw std::logic_error("request already owns a KV transfer");
     }
@@ -276,7 +276,8 @@ EntityArena::kv_cache_transfer(TransferId transfer_id) const {
 }
 
 TransferId EntityArena::request_transfer_id(RequestId request_id) const {
-    const auto &transfer = request_transfer_ids_.at(request_id.index());
+    const auto &transfer =
+        request_transfer_ids_.at(requests_.position(request_id));
     if (!transfer.valid()) {
         throw std::logic_error("request has no KV transfer");
     }
@@ -284,7 +285,7 @@ TransferId EntityArena::request_transfer_id(RequestId request_id) const {
 }
 
 void EntityArena::record_request_completion(RequestId request_id) {
-    const std::size_t index = request_id.index();
+    const std::size_t index = requests_.position(request_id);
     if (!completion_recorded_.at(index)) {
         completion_recorded_[index] = true;
         completion_order_.push_back(request_id);
@@ -292,7 +293,7 @@ void EntityArena::record_request_completion(RequestId request_id) {
 }
 
 bool EntityArena::request_completion_recorded(RequestId request_id) const {
-    return completion_recorded_.at(request_id.index());
+    return completion_recorded_.at(requests_.position(request_id));
 }
 
 } // namespace frontier::simulator

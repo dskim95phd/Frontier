@@ -58,14 +58,10 @@ CpuKVCacheManager::lookup(SessionId session_id,
     return result;
 }
 
-void CpuKVCacheManager::record_successful_lookup(RequestId request_id,
-                                                 CpuPrefixLookupResult result,
+void CpuKVCacheManager::record_successful_lookup(CpuPrefixLookupResult result,
                                                  SessionId session_id) {
-    if (!request_id.valid() || result.hit_blocks > result.query_blocks) {
+    if (result.hit_blocks > result.query_blocks) {
         throw CpuKVCacheError("invalid CPU prefix lookup metrics");
-    }
-    if (!recorded_lookup_requests_.insert(request_id).second) {
-        return;
     }
     ++stats_.successful_lookups;
     stats_.query_blocks += result.query_blocks;

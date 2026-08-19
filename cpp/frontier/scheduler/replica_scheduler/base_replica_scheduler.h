@@ -76,7 +76,7 @@ class BaseReplicaScheduler {
   public:
     BaseReplicaScheduler(
         config::SchedulerConfig config,
-        std::vector<entities::Request> &requests,
+        entities::RequestCollection &requests,
         const entities::Replica &replica, DataParallelId dp_id,
         execution_time_predictor::ExecutionTimePredictorPtr predictor,
         ClusterType cluster_type = ClusterType::kMonolithic,
@@ -281,7 +281,7 @@ class BaseReplicaScheduler {
     virtual void validate_policy_state() const = 0;
 
     config::SchedulerConfig config_;
-    std::vector<entities::Request> *requests_;
+    entities::RequestCollection *requests_;
     kv_cache::ReplicaKVCacheManager kv_blocks_;
     std::deque<RequestId> waiting_;
     std::uint64_t pipeline_parallel_size_;

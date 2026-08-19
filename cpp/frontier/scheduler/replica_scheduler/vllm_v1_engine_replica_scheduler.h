@@ -35,18 +35,18 @@ namespace frontier::scheduler {
 class VllmV1Scheduler final : public BaseReplicaScheduler {
   public:
     VllmV1Scheduler(config::SchedulerConfig config,
-                    std::vector<entities::Request> &requests);
+                    entities::RequestCollection &requests);
     VllmV1Scheduler(config::SchedulerConfig config,
-                    std::vector<entities::Request> &requests,
+                    entities::RequestCollection &requests,
                     config::PrefixCacheConfig prefix_cache_config);
     VllmV1Scheduler(
         config::SchedulerConfig config,
-        std::vector<entities::Request> &requests,
+        entities::RequestCollection &requests,
         std::unique_ptr<execution_time_predictor::BaseExecutionTimePredictor>
             predictor);
     VllmV1Scheduler(
         config::SchedulerConfig config,
-        std::vector<entities::Request> &requests,
+        entities::RequestCollection &requests,
         execution_time_predictor::ExecutionTimePredictorPtr predictor,
         const entities::Replica &replica, DataParallelId dp_id,
         ClusterType cluster_type,
@@ -250,6 +250,7 @@ class VllmV1Scheduler final : public BaseReplicaScheduler {
     std::unique_ptr<cpu_kv_cache_transfer::AnalyticalCpuKVCacheTransferEngine>
         cpu_transfer_engine_;
     CheckedIdGenerator<CpuKvTransferId> cpu_transfer_ids_;
+    CheckedIdGenerator<CpuOffloadGeneration> cpu_offload_generation_ids_;
     std::unordered_map<CpuKvTransferId, entities::CpuKVCacheRestoreInfo,
                        StrongIdHash<CpuKvTransferId>>
         cpu_restore_operations_;
@@ -260,8 +261,6 @@ class VllmV1Scheduler final : public BaseReplicaScheduler {
         pending_cpu_restores_;
     std::unordered_map<RequestId, CpuKvTransferId, StrongIdHash<RequestId>>
         pending_cpu_offloads_;
-    std::unordered_map<SessionId, CpuOffloadGeneration, StrongIdHash<SessionId>>
-        cpu_offload_generations_;
     std::unordered_map<RequestId, entities::StagedCpuKVCacheRestore,
                        StrongIdHash<RequestId>>
         staged_cpu_restores_;
