@@ -53,15 +53,15 @@ void handle_event(const ReplicaStageSchedulePayload &payload, SimTime time,
         return;
     }
     const config::PipelineStageLayerRange stage_layers =
-        config::pipeline_stage_layer_range(
-            runtime.model.num_layers, runtime.parallelism,
-            payload.stage_id.index());
+        config::pipeline_stage_layer_range(runtime.model.num_layers,
+                                           runtime.parallelism,
+                                           payload.stage_id.index());
     bool stage_has_moe = false;
     if (runtime.model.is_moe()) {
         for (std::uint64_t model_layer = stage_layers.begin;
              model_layer < stage_layers.end; ++model_layer) {
-            stage_has_moe = stage_has_moe ||
-                            runtime.model.is_moe_layer(model_layer);
+            stage_has_moe =
+                stage_has_moe || runtime.model.is_moe_layer(model_layer);
         }
     }
     const bool requires_sync =
@@ -80,20 +80,18 @@ void handle_event(const ReplicaStageSchedulePayload &payload, SimTime time,
              ++stage_index) {
             const config::PipelineStageLayerRange candidate_layers =
                 config::pipeline_stage_layer_range(
-                    runtime.model.num_layers, runtime.parallelism,
-                    stage_index);
+                    runtime.model.num_layers, runtime.parallelism, stage_index);
             bool candidate_has_moe = false;
             if (runtime.model.is_moe()) {
                 for (std::uint64_t model_layer = candidate_layers.begin;
                      model_layer < candidate_layers.end; ++model_layer) {
-                    candidate_has_moe =
-                        candidate_has_moe ||
-                        runtime.model.is_moe_layer(model_layer);
+                    candidate_has_moe = candidate_has_moe ||
+                                        runtime.model.is_moe_layer(model_layer);
                 }
             }
             if (candidate_has_moe &&
-                cluster_scheduler.requires_moe_synchronization(
-                    batch, simulator)) {
+                cluster_scheduler.requires_moe_synchronization(batch,
+                                                               simulator)) {
                 pipeline_requires_sync = true;
                 break;
             }
@@ -127,8 +125,7 @@ void handle_event(const ReplicaStageSchedulePayload &payload, SimTime time,
                     .get_replica_stage_scheduler(stage_id);
             const auto prediction =
                 calendar_stage.predict_collapsed(batch, simulator.requests());
-            const double duration_ms =
-                prediction.execution_time.total_ms();
+            const double duration_ms = prediction.execution_time.total_ms();
             if (!std::isfinite(duration_ms) || duration_ms < 0.0) {
                 throw std::runtime_error(
                     "collapsed batch stage duration is invalid");
@@ -145,8 +142,8 @@ void handle_event(const ReplicaStageSchedulePayload &payload, SimTime time,
                 SimTime::from_seconds(completed_seconds);
             calendar_stage.reserve_collapsed_interval(batch.id(), started_at,
                                                       completed_at);
-            reservations.push_back(ReservedStage{
-                stage_id, started_at, completed_at, prediction});
+            reservations.push_back(
+                ReservedStage{stage_id, started_at, completed_at, prediction});
             arrival = completed_at;
         }
 
@@ -160,14 +157,13 @@ void handle_event(const ReplicaStageSchedulePayload &payload, SimTime time,
             if (simulator.execution_model(payload.cluster_type).type ==
                 config::ExecutionModelType::kAnalytical) {
                 simulator.metrics().record_analytical_diagnostic(
-                    "batch_" + std::to_string(batch.id().value()) +
-                        "_stage_" +
+                    "batch_" + std::to_string(batch.id().value()) + "_stage_" +
                         std::to_string(reserved.stage_id.value()),
                     prediction.diagnostics);
             }
             for (const auto &diagnostic : prediction.moe_routing) {
-                simulator.metrics().record_moe_routing(
-                    batch, reserved.stage_id, diagnostic, runtime);
+                simulator.metrics().record_moe_routing(batch, reserved.stage_id,
+                                                       diagnostic, runtime);
             }
         }
 
@@ -185,8 +181,7 @@ void handle_event(const ReplicaStageSchedulePayload &payload, SimTime time,
         return;
     }
 
-    const bool lazy_moe =
-        requires_sync && stage.supports_lazy_moe_prediction();
+    const bool lazy_moe = requires_sync && stage.supports_lazy_moe_prediction();
     const auto prediction =
         lazy_moe ? stage.prepare_moe_stage(batch, simulator.requests())
                  : stage.predict(batch, simulator.requests());

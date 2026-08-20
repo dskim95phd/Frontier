@@ -438,7 +438,7 @@ void validate_pdd_pressure(const SimulationOutput &output,
                                             record.decode_dp_id.value()}] +=
             record.preemption_count;
     }
-    for (const Target target : expected_targets(decode_topology)) {
+    for (const Target &target : expected_targets(decode_topology)) {
         expect(preemptions_by_decode_target[target] > 0,
                context + ": a DECODE target did not preempt under pressure");
     }

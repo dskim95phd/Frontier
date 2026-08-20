@@ -1,0 +1,162 @@
+name: C++ core
+
+"on":
+  push:
+    branches: [main, cxx-port]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  format:
+    name: Source contracts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned source-contract tools
+        run: >-
+          python -m pip install
+          clang-format==22.1.8
+          check-jsonschema==0.38.0
+      - name: Check C++ formatting
+        shell: bash
+        run: |
+          mapfile -t files < <(find cpp/frontier cpp/tests -type f \( -name '*.cc' -o -name '*.h' \) -print)
+          clang-format --dry-run --Werror "${files[@]}"
+      - name: Validate public configuration examples
+        shell: bash
+        run: >-
+          check-jsonschema
+          --schemafile cpp/schema/config-v1.schema.json
+          cpp/examples/configs/*.json
+          cpp/tests/fixtures/config/*.json
+
+  linux:
+    name: Linux ${{ matrix.compiler }} ${{ matrix.build_type }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+        build_type: [Debug, Release]
+    env:
+      CC: ${{ matrix.compiler == 'gcc' && 'gcc' || 'clang' }}
+      CXX: ${{ matrix.compiler == 'gcc' && 'g++' || 'clang++' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Ninja
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - name: Configure
+        run: >-
+          cmake -S cpp -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DBUILD_TESTING=ON
+          -DFRONTIER_WARNINGS_AS_ERRORS=ON
+      - name: Build
+        run: cmake --build build --parallel 4
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --parallel 4
+      - name: Install
+        run: cmake --install build --prefix "$RUNNER_TEMP/frontier"
+      - name: Verify installed analytical model assets
+        working-directory: ${{ runner.temp }}
+        run: >-
+          "$RUNNER_TEMP/frontier/bin/frontier_sim"
+          --config "$GITHUB_WORKSPACE/cpp/examples/configs/04_moe_expert_parallel.json"
+          --workload "$GITHUB_WORKSPACE/cpp/examples/workloads/00_tiny.csv"
+          --output-dir "$RUNNER_TEMP/install-smoke"
+          --output-mode summary
+      - name: Build release archive
+        if: matrix.compiler == 'gcc' && matrix.build_type == 'Release'
+        run: cpack --config build/CPackConfig.cmake -B packages
+      - name: Upload release archive
+        if: matrix.compiler == 'gcc' && matrix.build_type == 'Release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontier-linux-x86_64
+          path: packages/*
+
+  windows:
+    name: Windows MSVC Release
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: >-
+          cmake -S cpp -B build -A x64
+          -DBUILD_TESTING=ON
+          -DFRONTIER_WARNINGS_AS_ERRORS=ON
+      - name: Build
+        run: cmake --build build --config Release --parallel 4
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure --parallel 4
+      - name: Install
+        run: cmake --install build --config Release --prefix "$env:RUNNER_TEMP\frontier"
+      - name: Verify installed analytical model assets
+        working-directory: ${{ runner.temp }}
+        run: >-
+          & "$env:RUNNER_TEMP\frontier\bin\frontier_sim.exe"
+          --config "$env:GITHUB_WORKSPACE\cpp\examples\configs\04_moe_expert_parallel.json"
+          --workload "$env:GITHUB_WORKSPACE\cpp\examples\workloads\00_tiny.csv"
+          --output-dir "$env:RUNNER_TEMP\install-smoke"
+          --output-mode summary
+      - name: Build release archive
+        run: cpack --config build/CPackConfig.cmake -C Release -B packages
+      - name: Upload release archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontier-windows-x86_64
+          path: packages/*
+
+  sanitizers:
+    name: Linux ASan + UBSan
+    runs-on: ubuntu-latest
+    env:
+      ASAN_OPTIONS: detect_leaks=1:strict_init_order=1
+      UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Ninja
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - name: Configure
+        run: >-
+          cmake -S cpp -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DBUILD_TESTING=ON
+          -DFRONTIER_WARNINGS_AS_ERRORS=ON
+          -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
+          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+      - name: Build
+        run: cmake --build build --parallel 4
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --parallel 2
+
+  release:
+    name: Publish tagged release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [format, linux, windows, sanitizers]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify tag matches project version
+        shell: bash
+        run: |
+          project_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' pyproject.toml | head -n 1)
+          test "${GITHUB_REF_NAME}" = "v${project_version}"
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+          merge-multiple: true
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "${GITHUB_REF_NAME}"
+          release-artifacts/*
+          --verify-tag
+          --generate-notes

@@ -19,8 +19,8 @@ using frontier::config::PrefixCachingKeyMode;
 using frontier::config::SchedulerConfig;
 using frontier::entities::Request;
 using frontier::kv_cache::PrefixLookupResult;
-using frontier::kv_cache::ReplicaKVCacheManager;
 using frontier::kv_cache::ReplicaKVCacheError;
+using frontier::kv_cache::ReplicaKVCacheManager;
 using frontier::request_generator::WorkloadRequest;
 using frontier::test::expect;
 using frontier::test::expect_throws;
@@ -305,8 +305,7 @@ void test_empty_fit_is_independent_of_current_commitments() {
     SchedulerConfig config = scheduler_config(10);
     config.watermark_blocks_fraction = 0.1;
     ReplicaKVCacheManager cache{
-        config,
-        PrefixCacheConfig{true, PrefixCachingKeyMode::kSession}, true};
+        config, PrefixCacheConfig{true, PrefixCachingKeyMode::kSession}, true};
     cache.enable_full_sequence_commitments();
 
     Request owner = make_request(0, 24, 1, 44);
@@ -406,9 +405,7 @@ void test_failed_virtual_commit_does_not_reserve_kda_snapshot() {
         cache.gpu_cache_valid_prefix_blocks(SessionId{49});
 
     expect_throws<ReplicaKVCacheError>(
-        [&cache] {
-            cache.commit_virtual(RequestId{1}, SessionId{49}, 8);
-        },
+        [&cache] { cache.commit_virtual(RequestId{1}, SessionId{49}, 8); },
         "a commitment shorter than its resident prefix must fail");
 
     const auto after = cache.diagnostics();
@@ -728,9 +725,9 @@ int main() {
     failures += frontier::test::run(
         "empty fit is independent of current commitments",
         test_empty_fit_is_independent_of_current_commitments);
-    failures += frontier::test::run(
-        "KDA admission reserves cold snapshot capacity",
-        test_kda_admission_reserves_cold_snapshot_capacity);
+    failures +=
+        frontier::test::run("KDA admission reserves cold snapshot capacity",
+                            test_kda_admission_reserves_cold_snapshot_capacity);
     failures += frontier::test::run(
         "failed virtual commit leaves no KDA snapshot charge",
         test_failed_virtual_commit_does_not_reserve_kda_snapshot);
@@ -751,9 +748,9 @@ int main() {
     failures += frontier::test::run(
         "KDA unified LRU prefers older snapshot over newer KV",
         test_kda_unified_lru_prefers_older_snapshot_over_newer_kv);
-    failures += frontier::test::run(
-        "KDA snapshot atomic surplus reclaim",
-        test_kda_atomic_surplus_reclaim_stays_blank);
+    failures +=
+        frontier::test::run("KDA snapshot atomic surplus reclaim",
+                            test_kda_atomic_surplus_reclaim_stays_blank);
     failures += frontier::test::run(
         "KDA snapshot keeps zero-resident session",
         test_kda_snapshot_keeps_zero_resident_session_and_discard_is_explicit);

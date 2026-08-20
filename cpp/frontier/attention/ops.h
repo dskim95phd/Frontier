@@ -28,13 +28,11 @@ struct AttentionFamilyBinding {
                            const AttentionFamilyBinding &rhs) {
         return std::tie(lhs.memory_layout, lhs.variant,
                         lhs.execution_enabled) ==
-               std::tie(rhs.memory_layout, rhs.variant,
-                        rhs.execution_enabled);
+               std::tie(rhs.memory_layout, rhs.variant, rhs.execution_enabled);
     }
 };
 
-[[nodiscard]] std::string_view
-to_string(AttentionMemoryLayout layout) noexcept;
+[[nodiscard]] std::string_view to_string(AttentionMemoryLayout layout) noexcept;
 [[nodiscard]] std::string_view to_string(AttentionVariant variant) noexcept;
 
 } // namespace frontier::attention

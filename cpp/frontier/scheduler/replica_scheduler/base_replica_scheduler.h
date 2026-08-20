@@ -17,8 +17,8 @@
 #include "frontier/entities/replica.h"
 #include "frontier/entities/request.h"
 #include "frontier/execution_time_predictor/base_execution_time_predictor.h"
-#include "frontier/kv_cache/replica_kv_cache_manager.h"
 #include "frontier/kv_cache/cpu_kv_cache_manager.h"
+#include "frontier/kv_cache/replica_kv_cache_manager.h"
 #include "frontier/scheduler/replica_stage_scheduler/replica_stage_scheduler.h"
 
 namespace frontier::scheduler {
@@ -75,8 +75,7 @@ class SchedulerError : public std::runtime_error {
 class BaseReplicaScheduler {
   public:
     BaseReplicaScheduler(
-        config::SchedulerConfig config,
-        entities::RequestCollection &requests,
+        config::SchedulerConfig config, entities::RequestCollection &requests,
         const entities::Replica &replica, DataParallelId dp_id,
         execution_time_predictor::ExecutionTimePredictorPtr predictor,
         ClusterType cluster_type = ClusterType::kMonolithic,
@@ -102,7 +101,7 @@ class BaseReplicaScheduler {
             "replica scheduler has no pending KV transfer support");
     }
     virtual bool prepare_cpu_kv_cache_offload(RequestId request_id,
-                                               SimTime time) {
+                                              SimTime time) {
         static_cast<void>(request_id);
         static_cast<void>(time);
         return false;
@@ -116,17 +115,17 @@ class BaseReplicaScheduler {
         return {};
     }
     virtual void on_cpu_kv_cache_offload_start(CpuKvTransferId transfer_id,
-                                                CpuOffloadGeneration generation,
-                                                SimTime time);
+                                               CpuOffloadGeneration generation,
+                                               SimTime time);
     virtual bool on_cpu_kv_cache_offload_end(CpuKvTransferId transfer_id,
-                                              CpuOffloadGeneration generation,
-                                              SimTime time);
+                                             CpuOffloadGeneration generation,
+                                             SimTime time);
     virtual void on_cpu_kv_cache_restore_start(CpuKvTransferId transfer_id,
-                                                Generation generation,
-                                                SimTime time);
+                                               Generation generation,
+                                               SimTime time);
     virtual bool on_cpu_kv_cache_restore_end(CpuKvTransferId transfer_id,
-                                              Generation generation,
-                                              SimTime time);
+                                             Generation generation,
+                                             SimTime time);
 
     [[nodiscard]] bool has_in_flight_batch() const noexcept {
         return in_flight_batch_count_ > 0;
@@ -153,8 +152,7 @@ class BaseReplicaScheduler {
     virtual_committed_kv_blocks() const noexcept {
         return 0;
     }
-    [[nodiscard]] virtual std::uint64_t
-    available_kv_blocks() const noexcept {
+    [[nodiscard]] virtual std::uint64_t available_kv_blocks() const noexcept {
         return 0;
     }
     [[nodiscard]] virtual std::uint64_t kv_block_size() const noexcept {
@@ -174,8 +172,7 @@ class BaseReplicaScheduler {
     }
     [[nodiscard]] kv_cache::PrefixLookupResult
     tiered_prefix_cache_lookup(const entities::Request &request) const {
-        kv_cache::PrefixLookupResult result =
-            gpu_prefix_cache_lookup(request);
+        kv_cache::PrefixLookupResult result = gpu_prefix_cache_lookup(request);
         const kv_cache::CpuKVCacheManager *cpu = cpu_kv_cache_manager();
         if (cpu != nullptr) {
             const kv_cache::CpuPrefixLookupResult cpu_result =

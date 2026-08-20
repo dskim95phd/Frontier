@@ -156,7 +156,8 @@ class Request {
     [[nodiscard]] std::uint64_t cpu_prefix_hit_blocks() const noexcept {
         return cpu_prefix_hit_blocks_;
     }
-    [[nodiscard]] std::uint64_t cpu_restore_transferred_blocks() const noexcept {
+    [[nodiscard]] std::uint64_t
+    cpu_restore_transferred_blocks() const noexcept {
         return cpu_restore_transferred_blocks_;
     }
     [[nodiscard]] std::uint64_t cpu_restore_consumed_blocks() const noexcept {
@@ -203,17 +204,13 @@ class Request {
                                 std::uint64_t cached_tokens,
                                 config::PrefixCachingKeyMode key_mode =
                                     config::PrefixCachingKeyMode::kSession);
-    void record_cpu_restore_transfer(std::uint64_t blocks,
-                                     std::uint64_t bytes,
+    void record_cpu_restore_transfer(std::uint64_t blocks, std::uint64_t bytes,
                                      double queue_time_ms,
                                      double service_time_ms);
-    [[nodiscard]] bool
-    record_cpu_prefix_admission(std::uint64_t gpu_hit_blocks,
-                                std::uint64_t cpu_query_blocks,
-                                std::uint64_t cpu_consumed_blocks,
-                                std::uint64_t cpu_restored_tokens);
-    void record_cpu_offload_transfer(std::uint64_t bytes,
-                                     double queue_time_ms,
+    [[nodiscard]] bool record_cpu_prefix_admission(
+        std::uint64_t gpu_hit_blocks, std::uint64_t cpu_query_blocks,
+        std::uint64_t cpu_consumed_blocks, std::uint64_t cpu_restored_tokens);
+    void record_cpu_offload_transfer(std::uint64_t bytes, double queue_time_ms,
                                      double service_time_ms);
     void advance_scheduler_frontier(std::uint64_t scheduled_tokens);
     void
@@ -306,7 +303,8 @@ class RequestCollection {
         const RequestId request_id = requests_.back().id();
         if (!request_id.valid()) {
             requests_.pop_back();
-            throw std::invalid_argument("request collection requires valid IDs");
+            throw std::invalid_argument(
+                "request collection requires valid IDs");
         }
         if (identity_indexed_ && request_id.index() != position) {
             identity_indexed_ = false;

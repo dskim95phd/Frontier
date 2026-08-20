@@ -44,8 +44,8 @@ SimulationOutput run_config(frontier::config::SimulationConfig config) {
     return run_simulation(config, workload);
 }
 
-SimulationOutput run_config_without_details(
-    const frontier::config::SimulationConfig &config) {
+SimulationOutput
+run_config_without_details(const frontier::config::SimulationConfig &config) {
     const auto workload = parse_workload_csv(read_text_file(
         kExampleRoot / "workloads" / "06_cpu_kv_cache_sessions.csv"));
     frontier::simulator::Simulator simulator{config, workload};
@@ -61,11 +61,11 @@ SimulationOutput run_workload(
 
 const RequestMetricsRecord &request(const SimulationOutput &output,
                                     RequestId id) {
-    const auto position = std::find_if(
-        output.requests.begin(), output.requests.end(),
-        [id](const RequestMetricsRecord &value) {
-            return value.request_id == id;
-        });
+    const auto position =
+        std::find_if(output.requests.begin(), output.requests.end(),
+                     [id](const RequestMetricsRecord &value) {
+                         return value.request_id == id;
+                     });
     if (position == output.requests.end()) {
         throw std::runtime_error("missing request metrics");
     }
@@ -96,30 +96,33 @@ void validate_cpu_tier(const SimulationOutput &output,
                cpu.restore_blocks == 1 && cpu.query_blocks == 7 &&
                cpu.hit_blocks == 1,
            context + ": CPU target aggregate differs from the logical oracle");
-    expect(output.cpu_kv_cache_targets.size() == 1 &&
-               output.cpu_kv_cache_targets.front().resident_blocks == 6 &&
-               output.cpu_kv_cache_targets.front().reserved_blocks == 0 &&
-               output.cpu_kv_cache_targets.front()
-                       .active_offload_reservations == 0 &&
-               output.cpu_kv_cache_targets.front().active_restore_leases == 0,
-           context + ": final target diagnostics must be quiescent");
+    expect(
+        output.cpu_kv_cache_targets.size() == 1 &&
+            output.cpu_kv_cache_targets.front().resident_blocks == 6 &&
+            output.cpu_kv_cache_targets.front().reserved_blocks == 0 &&
+            output.cpu_kv_cache_targets.front().active_offload_reservations ==
+                0 &&
+            output.cpu_kv_cache_targets.front().active_restore_leases == 0,
+        context + ": final target diagnostics must be quiescent");
     const auto &target = output.cpu_kv_cache_targets.front();
-    expect(cpu.capacity_bytes == target.capacity_bytes &&
-               cpu.capacity_blocks == target.capacity_blocks &&
-               cpu.bytes_per_block == target.bytes_per_block &&
-               cpu.resident_bytes == target.resident_bytes &&
-               cpu.resident_blocks == target.resident_blocks &&
-               cpu.reserved_bytes == target.reserved_bytes &&
-               cpu.reserved_blocks == target.reserved_blocks &&
-               cpu.free_blocks == target.free_blocks &&
-               cpu.peak_resident_bytes == target.peak_resident_bytes &&
-               cpu.peak_reserved_bytes == target.peak_reserved_bytes &&
-               cpu.resident_sessions == target.resident_sessions &&
-               cpu.evicted_bytes == target.evicted_bytes &&
-               cpu.skipped_offloads == target.skipped_offloads &&
-               cpu.truncated_offloads == target.truncated_offloads &&
-               cpu.sessions_with_cpu_hits == target.sessions_with_cpu_hits,
-           context + ": single-target system statistics must equal target statistics");
+    expect(
+        cpu.capacity_bytes == target.capacity_bytes &&
+            cpu.capacity_blocks == target.capacity_blocks &&
+            cpu.bytes_per_block == target.bytes_per_block &&
+            cpu.resident_bytes == target.resident_bytes &&
+            cpu.resident_blocks == target.resident_blocks &&
+            cpu.reserved_bytes == target.reserved_bytes &&
+            cpu.reserved_blocks == target.reserved_blocks &&
+            cpu.free_blocks == target.free_blocks &&
+            cpu.peak_resident_bytes == target.peak_resident_bytes &&
+            cpu.peak_reserved_bytes == target.peak_reserved_bytes &&
+            cpu.resident_sessions == target.resident_sessions &&
+            cpu.evicted_bytes == target.evicted_bytes &&
+            cpu.skipped_offloads == target.skipped_offloads &&
+            cpu.truncated_offloads == target.truncated_offloads &&
+            cpu.sessions_with_cpu_hits == target.sessions_with_cpu_hits,
+        context +
+            ": single-target system statistics must equal target statistics");
     expect(output.cpu_kv_cache_transfers.size() == 4,
            context + ": full output must retain detailed CPU transfers");
     std::uint64_t request_offload_bytes = 0;
@@ -138,10 +141,9 @@ void validate_cpu_tier(const SimulationOutput &output,
                context + ": CPU transfer timing is invalid");
     }
     const auto has_event = [&](EventType type) {
-        return std::any_of(output.event_trace.begin(), output.event_trace.end(),
-                           [type](const auto &event) {
-                               return event.type() == type;
-                           });
+        return std::any_of(
+            output.event_trace.begin(), output.event_trace.end(),
+            [type](const auto &event) { return event.type() == type; });
     };
     expect(has_event(EventType::kCpuKvCacheOffloadStart) &&
                has_event(EventType::kCpuKvCacheOffloadEnd) &&
@@ -153,8 +155,7 @@ void validate_cpu_tier(const SimulationOutput &output,
     expect(json.find("\"cpu_restore_transferred_blocks\"") !=
                    std::string::npos &&
                json.find("\"cpu_kv_cache_targets\"") != std::string::npos &&
-               json.find("\"cpu_kv_cache_transfers\"") !=
-                   std::string::npos,
+               json.find("\"cpu_kv_cache_transfers\"") != std::string::npos,
            context + ": serialized output is missing CPU KV-cache contracts");
 }
 
@@ -195,8 +196,7 @@ void test_capacity_policies_and_slow_restore_latency() {
 }
 
 void test_online_and_offline_cpu_kv_cache_tiering() {
-    validate_cpu_tier(run_example("06_cpu_kv_cache_pdd_online.json"),
-                      "online");
+    validate_cpu_tier(run_example("06_cpu_kv_cache_pdd_online.json"), "online");
     validate_cpu_tier(run_example("07_cpu_kv_cache_pdd_offline.json"),
                       "offline");
 }
@@ -211,7 +211,8 @@ void test_cpu_disabled_and_detail_suppression_controls() {
                compact.cpu_kv_cache_targets.size() == 1 &&
                compact.cpu_kv_cache_transfers.empty() &&
                compact.event_trace.empty(),
-           "summary/request collection must retain CPU aggregates without detailed traces");
+           "summary/request collection must retain CPU aggregates without "
+           "detailed traces");
 
     enabled.run_id = "cpu-kv-cache-disabled-control";
     enabled.cpu_kv_cache = frontier::config::CpuKVCacheConfig{};
@@ -223,7 +224,8 @@ void test_cpu_disabled_and_detail_suppression_controls() {
                disabled.aggregate.cpu_kv_cache.restore_operations == 0 &&
                disabled.cpu_kv_cache_targets.empty() &&
                disabled.cpu_kv_cache_transfers.empty(),
-           "CPU-disabled control must preserve Step 4 PDD completion with additive zero metrics");
+           "CPU-disabled control must preserve Step 4 PDD completion with "
+           "additive zero metrics");
     for (const auto &record : disabled.requests) {
         expect(record.cpu_prefix_query_blocks == 0 &&
                    record.cpu_prefix_hit_blocks == 0 &&
@@ -304,8 +306,8 @@ void expect_slow_queue_cleanup(const SimulationOutput &output,
 }
 
 void test_slow_queues_are_full_duplex_when_memory_fits() {
-    const auto output = run_slow_queue_workload(
-        6, "cpu-kv-cache-slow-full-duplex-memory-fit");
+    const auto output =
+        run_slow_queue_workload(6, "cpu-kv-cache-slow-full-duplex-memory-fit");
     expect_slow_queue_cleanup(output, "memory-feasible full-duplex");
     expect(has_duplex_overlap(output),
            "an H2D restore must overlap an independently queued D2H offload "
@@ -325,15 +327,15 @@ void test_slow_queues_serialize_when_source_hold_blocks_restore() {
 
 int main() {
     int failures = 0;
-    failures += frontier::test::run(
-        "CPU KV-cache PDD online/offline E2E",
-        test_online_and_offline_cpu_kv_cache_tiering);
-    failures += frontier::test::run(
-        "CPU KV-cache policies and slow restore",
-        test_capacity_policies_and_slow_restore_latency);
-    failures += frontier::test::run(
-        "CPU KV-cache disabled and compact-output controls",
-        test_cpu_disabled_and_detail_suppression_controls);
+    failures +=
+        frontier::test::run("CPU KV-cache PDD online/offline E2E",
+                            test_online_and_offline_cpu_kv_cache_tiering);
+    failures +=
+        frontier::test::run("CPU KV-cache policies and slow restore",
+                            test_capacity_policies_and_slow_restore_latency);
+    failures +=
+        frontier::test::run("CPU KV-cache disabled and compact-output controls",
+                            test_cpu_disabled_and_detail_suppression_controls);
     failures += frontier::test::run(
         "CPU KV-cache slow full-duplex queues when memory fits",
         test_slow_queues_are_full_duplex_when_memory_fits);

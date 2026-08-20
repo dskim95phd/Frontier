@@ -26,27 +26,48 @@ Implemented behavior includes:
 Block-hash prefix caching, parallel PDD clusters, `pd-af-disaggregation`, and
 topology-aware communication backends remain outside the C++ surface.
 
-## Build in WSL
+## Build
 
-Use the Windows worktree as the source and a WSL-native build directory:
+On Linux or WSL, configure a build from the repository root:
 
 ```bash
-cd /mnt/c/Users/jklpr/Desktop/project/Frontier-cxx-port
-export PATH="$HOME/frontier-tools/bin:$PATH"
-
 cmake -S cpp \
-  -B "$HOME/frontier-build/cxx-port" \
+  -B build \
   -G Ninja \
   -DCMAKE_BUILD_TYPE=Debug \
   -DBUILD_TESTING=ON
 
-cmake --build "$HOME/frontier-build/cxx-port"
-ctest \
-  --test-dir "$HOME/frontier-build/cxx-port" \
-  --output-on-failure
+cmake --build build
+ctest --test-dir build --output-on-failure
 ```
 
 The baseline is C++17, GCC 11+ or Clang 14+, CMake 3.24+, and Ninja 1.10+.
+Windows is tested with current MSVC. When building a Windows worktree from
+WSL, keep the build directory on the WSL filesystem for substantially faster
+compilation.
+
+Preset users can run the following from `cpp/`:
+
+```bash
+cmake --preset dev
+cmake --build --preset dev
+ctest --preset dev
+```
+
+For an installable release tree and archive:
+
+```bash
+cmake --preset release
+cmake --build --preset release
+cmake --install ../build/release --prefix ../stage
+cpack --config ../build/release/CPackConfig.cmake -B ../packages
+```
+
+The installed layout contains `bin/frontier_sim`, model assets under
+`share/frontier/models`, and the public JSON Schema under
+`share/frontier/schema`. It can be moved as a unit; model discovery is relative
+to the executable. `FRONTIER_MODEL_CONFIG_DIR` remains available as the
+highest-priority override for custom assets.
 
 ## Core value contract
 
@@ -62,7 +83,7 @@ preemption victim.
 Dense co-location:
 
 ```bash
-"$HOME/frontier-build/cxx-port/frontier_sim" \
+build/frontier_sim \
   --config cpp/tests/fixtures/config/fixed_parallel_colocation.json \
   --workload cpp/tests/fixtures/workloads/step25_parallel.csv
 ```
@@ -70,7 +91,7 @@ Dense co-location:
 Sequential PDD:
 
 ```bash
-"$HOME/frontier-build/cxx-port/frontier_sim" \
+build/frontier_sim \
   --config cpp/tests/fixtures/config/fixed_sequential_pdd.json \
   --workload cpp/tests/fixtures/workloads/step3_pdd_small.csv
 ```
@@ -78,15 +99,15 @@ Sequential PDD:
 For user-facing recipes, start with `cpp/examples` instead of the test
 fixtures:
 
-```powershell
-python cpp/examples/run_example.py hello `
-  --binary .build-step5/frontier_sim.exe
+```bash
+python cpp/examples/run_example.py hello \
+  --binary build/frontier_sim
 
-python cpp/examples/run_example.py pdd `
-  --binary .build-step5/frontier_sim.exe
+python cpp/examples/run_example.py pdd \
+  --binary build/frontier_sim
 
-python cpp/examples/run_example.py cpu-kv-online `
-  --binary .build-step5/frontier_sim.exe
+python cpp/examples/run_example.py cpu-kv-online \
+  --binary build/frontier_sim
 ```
 
 The example runner writes normalized inputs and analysis-ready artifacts under
@@ -98,11 +119,11 @@ KV-pressure, MoE, PDD, and session-prefix-cache recipes.
 Pass an output directory to avoid emitting the entire detailed trace to
 stdout:
 
-```powershell
-.build-step5/frontier_sim.exe `
-  --config cpp/examples/configs/03_sequential_pdd.json `
-  --workload cpp/examples/workloads/00_tiny.csv `
-  --output-dir outputs/my-pdd-run `
+```bash
+build/frontier_sim \
+  --config cpp/examples/configs/03_sequential_pdd.json \
+  --workload cpp/examples/workloads/00_tiny.csv \
+  --output-dir outputs/my-pdd-run \
   --output-mode requests
 ```
 
@@ -147,11 +168,11 @@ used.
 Read-only normalization:
 
 ```bash
-"$HOME/frontier-build/cxx-port/frontier_sim" \
+build/frontier_sim \
   --normalize-config \
   cpp/tests/fixtures/config/fixed_parallel_colocation.json
 
-"$HOME/frontier-build/cxx-port/frontier_sim" \
+build/frontier_sim \
   --normalize-workload \
   cpp/tests/fixtures/workloads/session_prefix.csv
 ```
@@ -159,7 +180,9 @@ Read-only normalization:
 ## Configuration contract
 
 There is one current configuration contract: `schema_version: 1`. Older
-development-step schemas are not accepted.
+development-step schemas are not accepted. The machine-readable contract is
+[`schema/config-v1.schema.json`](schema/config-v1.schema.json); release archives
+install the same file under `share/frontier/schema`.
 
 Common top-level fields are:
 

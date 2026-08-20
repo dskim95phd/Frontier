@@ -633,15 +633,18 @@ OrderedJson serialize_moe_routing(const MoERoutingMetricsRecord &routing) {
             [](double value) {
                 return !std::isfinite(value) || value < 0.0;
             }) ||
-        std::any_of(routing.routed_lane_times_ms.begin(),
-                    routing.routed_lane_times_ms.end(), [](double value) {
-                        return !std::isfinite(value) || value < 0.0;
-                    }) ||
-        std::any_of(routing.source_local_lane_times_ms.begin(),
-                    routing.source_local_lane_times_ms.end(),
-                    [](double value) {
-                        return !std::isfinite(value) || value < 0.0;
-                    })) {
+        std::any_of(
+            routing.routed_lane_times_ms.begin(),
+            routing.routed_lane_times_ms.end(),
+            [](double value) {
+                return !std::isfinite(value) || value < 0.0;
+            }) ||
+        std::any_of(
+            routing.source_local_lane_times_ms.begin(),
+            routing.source_local_lane_times_ms.end(),
+            [](double value) {
+                return !std::isfinite(value) || value < 0.0;
+            })) {
         throw std::invalid_argument("MoE routing diagnostic is invalid");
     }
     const std::uint64_t global_total =
@@ -878,10 +881,8 @@ std::string serialize_simulation_output_json(const SimulationOutput &output) {
                  stage.kv_bytes_per_block_by_rank},
                 {"kda_snapshot_bytes_by_rank",
                  stage.kda_snapshot_bytes_by_rank},
-                {"timing_group_multiplicity",
-                 stage.timing_group_multiplicity},
-                {"memory_group_multiplicity",
-                 stage.memory_group_multiplicity},
+                {"timing_group_multiplicity", stage.timing_group_multiplicity},
+                {"memory_group_multiplicity", stage.memory_group_multiplicity},
             });
             if (stage.timing_group_id.has_value()) {
                 stage_value["timing_group_id"] = stage.timing_group_id.value();
@@ -1223,11 +1224,10 @@ std::string serialize_simulation_summary_json(const SimulationOutput &output,
         }
     }
 
-    const double simulation_window_s = output.observation_window_seconds
-                                           .value_or(output.requests.empty()
-                                                         ? 0.0
-                                                         : last_completion_s -
-                                                               first_arrival_s);
+    const double simulation_window_s =
+        output.observation_window_seconds.value_or(
+            output.requests.empty() ? 0.0
+                                    : last_completion_s - first_arrival_s);
     const auto rate = [simulation_window_s](std::uint64_t count) {
         return simulation_window_s > 0.0
                    ? static_cast<double>(count) / simulation_window_s

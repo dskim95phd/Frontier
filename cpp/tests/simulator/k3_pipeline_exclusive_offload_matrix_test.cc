@@ -24,8 +24,8 @@ using frontier::EventType;
 using frontier::RequestId;
 using frontier::SimTime;
 using frontier::config::ClusterRuntimeConfig;
-using frontier::config::SimulationConfig;
 using frontier::config::parse_simulation_config_json;
+using frontier::config::SimulationConfig;
 using frontier::metrics::CpuKVCacheTransferKind;
 using frontier::metrics::CpuKVCacheTransferMetricsRecord;
 using frontier::metrics::RequestMetricsRecord;
@@ -64,10 +64,9 @@ std::vector<WorkloadRequest> pdd_workload() {
 }
 
 SimulationConfig make_config(std::uint64_t pp, const char *event_mode) {
-    std::string config_text = read_text_file(
-        kExamples / "configs" / "06_cpu_kv_cache_pdd_online.json");
-    replace_all(config_text, "meta-llama/Llama-2-7b-hf",
-                "moonshotai/Kimi-K3");
+    std::string config_text = read_text_file(kExamples / "configs" /
+                                             "06_cpu_kv_cache_pdd_online.json");
+    replace_all(config_text, "meta-llama/Llama-2-7b-hf", "moonshotai/Kimi-K3");
     replace_all(config_text, "\"capacity_bytes\": 67108864",
                 "\"capacity_bytes\": 2147483648");
     // Keep a generous logical KV frontier while making a second resident K3
@@ -116,11 +115,11 @@ SimulationConfig make_config(std::uint64_t pp, const char *event_mode) {
 
 const RequestMetricsRecord &request(const SimulationOutput &output,
                                     RequestId id) {
-    const auto position = std::find_if(
-        output.requests.begin(), output.requests.end(),
-        [id](const RequestMetricsRecord &value) {
-            return value.request_id == id;
-        });
+    const auto position =
+        std::find_if(output.requests.begin(), output.requests.end(),
+                     [id](const RequestMetricsRecord &value) {
+                         return value.request_id == id;
+                     });
     if (position == output.requests.end()) {
         throw std::runtime_error("missing request metrics");
     }
@@ -146,8 +145,8 @@ SimTime stage_time(const SimulationOutput &output, RequestId request_id,
             !batch_contains_request(output, record.batch_id, request_id)) {
             continue;
         }
-        const SimTime candidate = completion ? record.completed_at
-                                             : record.arrived_at;
+        const SimTime candidate =
+            completion ? record.completed_at : record.arrived_at;
         if (!selected.valid() ||
             (completion ? selected < candidate : candidate < selected)) {
             selected = candidate;
@@ -166,8 +165,7 @@ void check_stage_local_profiles(const SimulationOutput &output,
         std::uint64_t kda_layers = 0;
         std::uint64_t mla_layers = 0;
         bool local_profile_varies = false;
-        for (std::size_t index = 0; index < diagnostic.stages.size();
-             ++index) {
+        for (std::size_t index = 0; index < diagnostic.stages.size(); ++index) {
             const auto &stage = diagnostic.stages[index];
             expect(stage.layer_count > 0 &&
                        stage.kv_bytes_per_block_by_rank.size() == 1 &&
@@ -205,35 +203,35 @@ void check_offload_boundaries(const SimulationOutput &output,
                    transfer.started_at >= transfer.submitted_at,
                "CPU transfer timing must be monotonic");
         if (transfer.kda_snapshot_bytes != 0) {
-            expect(transfer.kda_snapshot_bytes == kK3SnapshotBytes,
-                   "CPU transfer must carry one atomic snapshot, not PP copies");
+            expect(
+                transfer.kda_snapshot_bytes == kK3SnapshotBytes,
+                "CPU transfer must carry one atomic snapshot, not PP copies");
         }
         if (transfer.kind == CpuKVCacheTransferKind::kOffload) {
-            const SimTime final_stage = stage_time(
-                output, transfer.request_id, pp - 1, /*completion=*/true);
+            const SimTime final_stage = stage_time(output, transfer.request_id,
+                                                   pp - 1, /*completion=*/true);
             expect(final_stage.valid() && final_stage <= transfer.submitted_at,
                    "offload must submit after final PP stage completion");
         } else if (transfer.request_id == RequestId{3} ||
                    transfer.request_id == RequestId{4}) {
-            const SimTime pp0_arrival =
-                stage_time(output, transfer.request_id, 0, /*completion=*/false);
+            const SimTime pp0_arrival = stage_time(output, transfer.request_id,
+                                                   0, /*completion=*/false);
             expect(pp0_arrival.valid() && transfer.completed_at <= pp0_arrival,
                    "PP0 admission must wait for the complete CPU restore");
         }
     }
 }
 
-void check_collapsed_calendar(const SimulationOutput &output,
-                              bool collapsed) {
+void check_collapsed_calendar(const SimulationOutput &output, bool collapsed) {
     const bool has_pipeline_end = std::any_of(
-        output.event_trace.begin(), output.event_trace.end(), [](const auto &e) {
-            return e.type() == EventType::kBatchPipelineEnd;
-        });
-    const bool has_sync = std::any_of(
-        output.event_trace.begin(), output.event_trace.end(), [](const auto &e) {
-            return e.type() == EventType::kPrefillSync ||
-                   e.type() == EventType::kDecodeSync;
-        });
+        output.event_trace.begin(), output.event_trace.end(),
+        [](const auto &e) { return e.type() == EventType::kBatchPipelineEnd; });
+    const bool has_sync =
+        std::any_of(output.event_trace.begin(), output.event_trace.end(),
+                    [](const auto &e) {
+                        return e.type() == EventType::kPrefillSync ||
+                               e.type() == EventType::kDecodeSync;
+                    });
     expect(has_pipeline_end == collapsed && !has_sync,
            "pipeline-exclusive PDD must use one collapsed calendar without "
            "DP/EP synchronization events");
@@ -248,19 +246,20 @@ void compare_request_and_offload_contract(const SimulationOutput &exact,
            "count");
     for (const auto &record : exact.requests) {
         const auto &other = request(collapsed, record.request_id);
-        expect(record.cpu_prefix_query_blocks == other.cpu_prefix_query_blocks &&
-                   record.cpu_prefix_hit_blocks == other.cpu_prefix_hit_blocks &&
-                   record.cpu_restore_transferred_blocks ==
-                       other.cpu_restore_transferred_blocks &&
-                   record.cpu_restore_consumed_blocks ==
-                       other.cpu_restore_consumed_blocks &&
-                   record.cpu_restore_bytes == other.cpu_restore_bytes &&
-                   record.cpu_offload_bytes == other.cpu_offload_bytes &&
-                   record.cached_prefill_tokens == other.cached_prefill_tokens,
-               "exact and collapsed CPU/prefix request metrics must match");
+        expect(
+            record.cpu_prefix_query_blocks == other.cpu_prefix_query_blocks &&
+                record.cpu_prefix_hit_blocks == other.cpu_prefix_hit_blocks &&
+                record.cpu_restore_transferred_blocks ==
+                    other.cpu_restore_transferred_blocks &&
+                record.cpu_restore_consumed_blocks ==
+                    other.cpu_restore_consumed_blocks &&
+                record.cpu_restore_bytes == other.cpu_restore_bytes &&
+                record.cpu_offload_bytes == other.cpu_offload_bytes &&
+                record.cached_prefill_tokens == other.cached_prefill_tokens,
+            "exact and collapsed CPU/prefix request metrics must match");
     }
     expect(exact.aggregate.cpu_kv_cache.offload_operations ==
-               collapsed.aggregate.cpu_kv_cache.offload_operations &&
+                   collapsed.aggregate.cpu_kv_cache.offload_operations &&
                exact.aggregate.cpu_kv_cache.restore_operations ==
                    collapsed.aggregate.cpu_kv_cache.restore_operations &&
                exact.aggregate.cpu_kv_cache.offload_bytes ==
@@ -294,9 +293,8 @@ void test_k3_pipeline_exclusive_offload_matrix() {
 } // namespace
 
 int main() {
-    return frontier::test::run(
-               "K3 pipeline-exclusive PDD CPU offload matrix",
-               test_k3_pipeline_exclusive_offload_matrix) == 0
+    return frontier::test::run("K3 pipeline-exclusive PDD CPU offload matrix",
+                               test_k3_pipeline_exclusive_offload_matrix) == 0
                ? 0
                : 1;
 }

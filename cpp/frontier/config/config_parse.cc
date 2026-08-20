@@ -153,8 +153,9 @@ std::uint64_t require_uint64(const Json &object, std::string_view field,
     }
 }
 
-std::vector<std::uint64_t> require_uint64_array(
-    const Json &object, std::string_view field, std::string_view context) {
+std::vector<std::uint64_t> require_uint64_array(const Json &object,
+                                                std::string_view field,
+                                                std::string_view context) {
     const Json &value = object.at(field);
     if (!value.is_array()) {
         throw ConfigError(std::string{context} + "." + std::string{field} +
@@ -164,9 +165,9 @@ std::vector<std::uint64_t> require_uint64_array(
     result.reserve(value.size());
     for (std::size_t index = 0; index < value.size(); ++index) {
         const Json &element = value[index];
-        const std::string element_context =
-            std::string{context} + "." + std::string{field} + "[" +
-            std::to_string(index) + "]";
+        const std::string element_context = std::string{context} + "." +
+                                            std::string{field} + "[" +
+                                            std::to_string(index) + "]";
         if (!element.is_number_integer() || element.is_number_float()) {
             throw ConfigError(element_context +
                               " must be a nonnegative integer");
@@ -177,8 +178,7 @@ std::vector<std::uint64_t> require_uint64_array(
             } else {
                 const std::int64_t parsed = element.get<std::int64_t>();
                 if (parsed < 0) {
-                    throw ConfigError(element_context +
-                                      " must be nonnegative");
+                    throw ConfigError(element_context + " must be nonnegative");
                 }
                 result.push_back(static_cast<std::uint64_t>(parsed));
             }
@@ -522,8 +522,7 @@ SchedulerConfig parse_scheduler(const Json &root) {
                      "watermark_blocks_fraction",
                      "num_preallocate_tokens",
                  },
-                 {"num_blocks", "pipeline_event_mode"},
-                 "config.scheduler");
+                 {"num_blocks", "pipeline_event_mode"}, "config.scheduler");
 
     SchedulerConfig parsed = [&]() {
         SchedulerConfig value{};
@@ -602,9 +601,9 @@ GpuMemoryConfig parse_gpu_memory(const Json &cluster,
     const std::string memory_context = std::string{context} + ".gpu_memory";
     require_keys(memory, {"capacity_bytes_per_gpu"},
                  {"auto_calculate_num_blocks", "runtime_reserve_fraction",
-                  "runtime_reserve_bytes",
-                  "weight_overhead_fraction", "model_weight_bytes_per_gpu",
-                  "kv_cache_budget_bytes_per_gpu", "kv_cache_bytes_per_block"},
+                  "runtime_reserve_bytes", "weight_overhead_fraction",
+                  "model_weight_bytes_per_gpu", "kv_cache_budget_bytes_per_gpu",
+                  "kv_cache_bytes_per_block"},
                  memory_context);
     GpuMemoryConfig parsed{};
     // A scheduler.num_blocks field denotes an explicit/manual capacity unless
@@ -663,16 +662,15 @@ ParallelismConfig parse_parallelism(const Json &root,
                                "config.parallelism");
         }
         if (parallelism.contains("pipeline_exclusive")) {
-            value.pipeline_exclusive =
-                require_bool(parallelism, "pipeline_exclusive",
-                             "config.parallelism");
+            value.pipeline_exclusive = require_bool(
+                parallelism, "pipeline_exclusive", "config.parallelism");
         }
         value.pipeline_parallel_size = require_uint64(
             parallelism, "pipeline_parallel_size", "config.parallelism");
         if (parallelism.contains("pipeline_stage_layer_counts")) {
-            value.pipeline_stage_layer_counts = require_uint64_array(
-                parallelism, "pipeline_stage_layer_counts",
-                "config.parallelism");
+            value.pipeline_stage_layer_counts =
+                require_uint64_array(parallelism, "pipeline_stage_layer_counts",
+                                     "config.parallelism");
         }
         value.data_parallel_size = require_uint64(
             parallelism, "data_parallel_size", "config.parallelism");
@@ -691,19 +689,16 @@ ParallelismConfig parse_parallelism(const Json &root,
     }
     if (parsed.pipeline_exclusive) {
         if (parsed.pipeline_parallel_size <= 1) {
-            throw ConfigError(
-                "config.parallelism.pipeline_exclusive requires "
-                "pipeline_parallel_size > 1");
+            throw ConfigError("config.parallelism.pipeline_exclusive requires "
+                              "pipeline_parallel_size > 1");
         }
         if (parsed.data_parallel_size != 1) {
-            throw ConfigError(
-                "config.parallelism.pipeline_exclusive requires "
-                "data_parallel_size == 1");
+            throw ConfigError("config.parallelism.pipeline_exclusive requires "
+                              "data_parallel_size == 1");
         }
         if (parsed.moe_expert_parallel_size != 1) {
-            throw ConfigError(
-                "config.parallelism.pipeline_exclusive requires "
-                "moe_expert_parallel_size == 1");
+            throw ConfigError("config.parallelism.pipeline_exclusive requires "
+                              "moe_expert_parallel_size == 1");
         }
         if (parsed.moe_tensor_parallel_size != parsed.tensor_parallel_size) {
             throw ConfigError(
@@ -942,17 +937,34 @@ OperatorPrecisionConfig parse_operator_precisions(const Json &execution) {
     constexpr std::string_view context =
         "config.execution_model.operator_precisions";
     require_keys(operators, {},
-                 {"attention", "dense", "moe_expert", "moe_router", "kv_cache",
-                  "communication", "attention_weight", "attention_activation",
-                  "dense_weight", "dense_activation", "moe_expert_weight",
-                  "moe_expert_activation", "moe_router_weight",
-                  "moe_router_activation", "router_weight_storage", "lm_head",
+                 {"attention",
+                  "dense",
+                  "moe_expert",
+                  "moe_router",
+                  "kv_cache",
+                  "communication",
+                  "attention_weight",
+                  "attention_activation",
+                  "dense_weight",
+                  "dense_activation",
+                  "moe_expert_weight",
+                  "moe_expert_activation",
+                  "moe_router_weight",
+                  "moe_router_activation",
+                  "router_weight_storage",
+                  "lm_head",
                   "lm_head_weight",
-                  "lm_head_activation", "routed_expert_weight",
-                  "routed_expert_activation", "latent_moe_projection_weight",
-                  "latent_moe_projection_activation", "shared_expert_weight",
-                  "shared_expert_activation", "dense_mlp_weight",
-                  "dense_mlp_activation", "router_compute", "kda_snapshot"},
+                  "lm_head_activation",
+                  "routed_expert_weight",
+                  "routed_expert_activation",
+                  "latent_moe_projection_weight",
+                  "latent_moe_projection_activation",
+                  "shared_expert_weight",
+                  "shared_expert_activation",
+                  "dense_mlp_weight",
+                  "dense_mlp_activation",
+                  "router_compute",
+                  "kda_snapshot"},
                  context);
     const auto parse_optional = [&](std::string_view field,
                                     std::string &destination) {
@@ -991,8 +1003,7 @@ OperatorPrecisionConfig parse_operator_precisions(const Json &execution) {
     parse_optional("latent_moe_projection_activation",
                    result.latent_moe_projection_activation);
     parse_optional("shared_expert_weight", result.shared_expert_weight);
-    parse_optional("shared_expert_activation",
-                   result.shared_expert_activation);
+    parse_optional("shared_expert_activation", result.shared_expert_activation);
     parse_optional("dense_mlp_weight", result.dense_mlp_weight);
     parse_optional("dense_mlp_activation", result.dense_mlp_activation);
     parse_optional("router_compute", result.router_compute);
@@ -1037,21 +1048,21 @@ ExecutionModelConfig parse_execution_model(const Json &root,
     }
 
     if (type == "analytical") {
-        require_keys(
-            execution,
-            {
-                "type",
-                "device",
-                "precision",
-                "network_bandwidth_gbps",
-                "network_latency_us",
-                "intra_node_bandwidth_gbps",
-            },
-            {"operator_precisions", "device_overrides", "kernel_profile",
-             "moe_layer_event_mode", "moe_communication_backend",
-             "mega_moe_tail_io_fraction", "mega_moe_wave_exposure",
-             "mega_moe_cluster_task_latency_us"},
-            "config.execution_model");
+        require_keys(execution,
+                     {
+                         "type",
+                         "device",
+                         "precision",
+                         "network_bandwidth_gbps",
+                         "network_latency_us",
+                         "intra_node_bandwidth_gbps",
+                     },
+                     {"operator_precisions", "device_overrides",
+                      "kernel_profile", "moe_layer_event_mode",
+                      "moe_communication_backend", "mega_moe_tail_io_fraction",
+                      "mega_moe_wave_exposure",
+                      "mega_moe_cluster_task_latency_us"},
+                     "config.execution_model");
         AnalyticalExecutionModelConfig analytical = [&]() {
             AnalyticalExecutionModelConfig value{};
             value.device =
@@ -1071,9 +1082,9 @@ ExecutionModelConfig parse_execution_model(const Json &root,
                                    "config.execution_model");
             }
             if (execution.contains("moe_communication_backend")) {
-                value.moe_communication_backend = require_string(
-                    execution, "moe_communication_backend",
-                    "config.execution_model");
+                value.moe_communication_backend =
+                    require_string(execution, "moe_communication_backend",
+                                   "config.execution_model");
             }
             if (execution.contains("mega_moe_tail_io_fraction")) {
                 value.mega_moe_tail_io_fraction = require_finite_number(
@@ -1081,15 +1092,14 @@ ExecutionModelConfig parse_execution_model(const Json &root,
                     "config.execution_model");
             }
             if (execution.contains("mega_moe_wave_exposure")) {
-                value.mega_moe_wave_exposure = require_finite_number(
-                    execution, "mega_moe_wave_exposure",
-                    "config.execution_model");
+                value.mega_moe_wave_exposure =
+                    require_finite_number(execution, "mega_moe_wave_exposure",
+                                          "config.execution_model");
             }
             if (execution.contains("mega_moe_cluster_task_latency_us")) {
-                value.mega_moe_cluster_task_latency_us =
-                    require_finite_number(
-                        execution, "mega_moe_cluster_task_latency_us",
-                        "config.execution_model");
+                value.mega_moe_cluster_task_latency_us = require_finite_number(
+                    execution, "mega_moe_cluster_task_latency_us",
+                    "config.execution_model");
             }
             value.tensor_parallel_size = parallelism.tensor_parallel_size;
             value.network_bandwidth_gbps = require_finite_number(
@@ -1133,8 +1143,7 @@ ExecutionModelConfig parse_execution_model(const Json &root,
                 "'k3_sglang_mxfp4', or 'k3_deepgemm_megamoe'");
         }
         if (analytical.kernel_profile != "generic" &&
-            ((analytical.device != "gb300" &&
-              analytical.device != "rubin") ||
+            ((analytical.device != "gb300" && analytical.device != "rubin") ||
              model.model_type != "kimi_k3")) {
             throw ConfigError(
                 "K3 analytical kernel profiles require model Kimi-K3 and "
@@ -1146,9 +1155,8 @@ ExecutionModelConfig parse_execution_model(const Json &root,
             analytical.mega_moe_cluster_task_latency_us.has_value();
         if (has_mega_moe_override &&
             analytical.kernel_profile != "k3_deepgemm_megamoe") {
-            throw ConfigError(
-                "MegaMoE timing overrides require "
-                "kernel_profile='k3_deepgemm_megamoe'");
+            throw ConfigError("MegaMoE timing overrides require "
+                              "kernel_profile='k3_deepgemm_megamoe'");
         }
         const auto valid_fraction = [](const std::optional<double> &value) {
             return !value.has_value() || (*value >= 0.0 && *value <= 1.0);
@@ -1162,14 +1170,12 @@ ExecutionModelConfig parse_execution_model(const Json &root,
                 "cluster-task latency must be non-negative");
         }
         if (analytical.moe_communication_backend != "generic" &&
-            analytical.moe_communication_backend !=
-                "sm100_megamoe_public") {
+            analytical.moe_communication_backend != "sm100_megamoe_public") {
             throw ConfigError(
                 "config.execution_model.moe_communication_backend must be "
                 "'generic' or 'sm100_megamoe_public'");
         }
-        if (analytical.moe_communication_backend ==
-                "sm100_megamoe_public" &&
+        if (analytical.moe_communication_backend == "sm100_megamoe_public" &&
             analytical.device != "gb300" && analytical.device != "rubin") {
             throw ConfigError(
                 "sm100_megamoe_public requires execution device='gb300' or "

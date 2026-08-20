@@ -26,8 +26,8 @@ using frontier::config::ParallelismConfig;
 using frontier::config::parse_simulation_config_json;
 using frontier::config::SimulationConfig;
 using frontier::config::SimulationMode;
-using frontier::metrics::serialize_simulation_output_json;
 using frontier::metrics::serialize_gpu_kv_occupancy_csv;
+using frontier::metrics::serialize_simulation_output_json;
 using frontier::request_generator::parse_workload_csv;
 using frontier::simulator::run_simulation;
 using frontier::test::expect;
@@ -87,8 +87,7 @@ void test_online_prefill_transfer_decode_lifecycle() {
 
 void test_prefill_dcp_is_rejected_by_runtime_validation() {
     SimulationConfig config = load_config();
-    config.pdd()
-        .clusters.prefill.parallelism.decode_context_parallel_size = 2;
+    config.pdd().clusters.prefill.parallelism.decode_context_parallel_size = 2;
     expect_throws<frontier::simulator::SimulationError>(
         [&config] {
             static_cast<void>(run_simulation(
@@ -252,10 +251,11 @@ void test_gpu_kv_occupancy_change_stream() {
     bool saw_prefill = false;
     bool saw_decode = false;
     for (const Occupancy &sample : output.gpu_kv_occupancy) {
-        expect(sample.active_blocks <= sample.capacity_blocks &&
-                   sample.active_bytes_per_gpu > 0 ||
-                   sample.active_blocks == 0 && sample.active_bytes_per_gpu == 0,
-               "GPU KV occupancy bytes must track active blocks");
+        expect(
+            (sample.active_blocks <= sample.capacity_blocks &&
+             sample.active_bytes_per_gpu > 0) ||
+                (sample.active_blocks == 0 && sample.active_bytes_per_gpu == 0),
+            "GPU KV occupancy bytes must track active blocks");
         expect(sample.hbm_fraction.has_value() &&
                    sample.active_fraction_of_total_hbm == sample.hbm_fraction,
                "explicit HBM capacity must expose occupancy fractions for "
@@ -264,16 +264,18 @@ void test_gpu_kv_occupancy_change_stream() {
                             sample.replica_id.value(), sample.dp_id.value()};
         const auto previous = last_by_target.find(key);
         if (previous != last_by_target.end()) {
-            expect(previous->second.time <= sample.time,
-                   "GPU KV occupancy timestamps must be nondecreasing per target");
+            expect(
+                previous->second.time <= sample.time,
+                "GPU KV occupancy timestamps must be nondecreasing per target");
         }
         last_by_target[key] = sample;
         saw_active = saw_active || sample.active_blocks > 0;
-        saw_prefill = saw_prefill ||
-                      sample.cluster_type == ClusterType::kPrefill;
+        saw_prefill =
+            saw_prefill || sample.cluster_type == ClusterType::kPrefill;
         saw_decode = saw_decode || sample.cluster_type == ClusterType::kDecode;
     }
-    expect(saw_active && saw_prefill && saw_decode && last_by_target.size() == 2,
+    expect(saw_active && saw_prefill && saw_decode &&
+               last_by_target.size() == 2,
            "GPU KV occupancy must cover active PREFILL and DECODE targets");
     expect(std::all_of(last_by_target.begin(), last_by_target.end(),
                        [](const auto &entry) {
@@ -282,8 +284,8 @@ void test_gpu_kv_occupancy_change_stream() {
                        }),
            "GPU KV occupancy must terminate each target at zero active blocks");
 
-    const std::string csv = serialize_gpu_kv_occupancy_csv(
-        output.gpu_kv_occupancy);
+    const std::string csv =
+        serialize_gpu_kv_occupancy_csv(output.gpu_kv_occupancy);
     expect(csv.rfind("time_s,cluster_type,replica_id,dp_id,active_blocks,",
                      0) == 0,
            "GPU KV occupancy artifact must expose the canonical CSV header");
@@ -295,9 +297,9 @@ int main() {
     int failures = 0;
     failures += frontier::test::run(
         "online PDD lifecycle", test_online_prefill_transfer_decode_lifecycle);
-    failures += frontier::test::run(
-        "PDD PREFILL rejects DCP",
-        test_prefill_dcp_is_rejected_by_runtime_validation);
+    failures +=
+        frontier::test::run("PDD PREFILL rejects DCP",
+                            test_prefill_dcp_is_rejected_by_runtime_validation);
     failures +=
         frontier::test::run("offline PDD barrier and deterministic drain",
                             test_offline_barrier_and_deterministic_drain);

@@ -18,6 +18,7 @@
 #include <nlohmann/json.hpp>
 
 #include "frontier/attention/model_binding.h"
+#include "frontier/core/runtime_paths.h"
 
 namespace frontier::config {
 namespace {
@@ -673,9 +674,18 @@ std::vector<std::filesystem::path> model_directories() {
         directories.emplace_back(configured);
     }
 #endif
-#ifdef FRONTIER_MODEL_CONFIG_DIR
-    directories.emplace_back(FRONTIER_MODEL_CONFIG_DIR);
-#endif
+    if (const auto executable_dir = core::executable_directory();
+        executable_dir.has_value()) {
+        // Installed layouts place the binary in <prefix>/bin and model assets
+        // in <prefix>/share/frontier/models.  The data/config candidate also
+        // supports relocatable source-tree bundles without relying on cwd.
+        directories.push_back(*executable_dir / ".." / "share" / "frontier" /
+                              "models");
+        directories.push_back(*executable_dir / "share" / "frontier" /
+                              "models");
+        directories.push_back(*executable_dir / ".." / "data" / "config" /
+                              "models");
+    }
     directories.emplace_back("data/config/models");
     directories.emplace_back("../data/config/models");
     directories.emplace_back("../../data/config/models");

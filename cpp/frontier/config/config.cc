@@ -6,9 +6,9 @@
 #include <string>
 #include <utility>
 
-#include "frontier/kv_cache_transfer/analytical_transfer.h"
 #include "frontier/core/checked_math.h"
 #include "frontier/core/precision.h"
+#include "frontier/kv_cache_transfer/analytical_transfer.h"
 
 namespace frontier::config {
 
@@ -153,17 +153,17 @@ std::uint64_t stage_model_weight_bytes_per_gpu(
         storage_bytes_per_element(execution.dense_weight_precision());
     const double dense_mlp_bytes =
         storage_bytes_per_element(execution.dense_mlp_weight_precision());
-    const double routed_expert_bytes = storage_bytes_per_element(
-        execution.routed_expert_weight_precision());
+    const double routed_expert_bytes =
+        storage_bytes_per_element(execution.routed_expert_weight_precision());
     const double latent_moe_projection_bytes = storage_bytes_per_element(
         execution.latent_moe_projection_weight_precision());
-    const double shared_expert_bytes = storage_bytes_per_element(
-        execution.shared_expert_weight_precision());
+    const double shared_expert_bytes =
+        storage_bytes_per_element(execution.shared_expert_weight_precision());
     // Router weights remain resident in their storage dtype.  The router
     // compute dtype (normally FP32 for K3) controls the GEMM roofline, not the
     // automatic GPU HBM model; casts are assumed fused into the router kernel.
-    const double router_bytes = storage_bytes_per_element(
-        execution.router_weight_storage_precision());
+    const double router_bytes =
+        storage_bytes_per_element(execution.router_weight_storage_precision());
     const double lm_head_bytes =
         storage_bytes_per_element(execution.lm_head_weight_precision());
     if (stage >= parallelism.pipeline_parallel_size) {
@@ -174,16 +174,14 @@ std::uint64_t stage_model_weight_bytes_per_gpu(
         pipeline_stage_layer_range(model.num_layers, parallelism, stage);
     if (stage == 0) {
         add_weight_bytes(
-            total,
-            ceil_div(model.vocab_size, parallelism.tensor_parallel_size),
+            total, ceil_div(model.vocab_size, parallelism.tensor_parallel_size),
             model.hidden_size, lm_head_bytes);
     }
     if (stage + 1 == parallelism.pipeline_parallel_size) {
         // Conservatively model untied input embeddings and LM head. The model
         // contract currently has no tie_word_embeddings field.
         add_weight_bytes(
-            total,
-            ceil_div(model.vocab_size, parallelism.tensor_parallel_size),
+            total, ceil_div(model.vocab_size, parallelism.tensor_parallel_size),
             model.hidden_size, lm_head_bytes);
     }
     for (std::uint64_t layer = layers.begin; layer < layers.end; ++layer) {
@@ -200,12 +198,10 @@ std::uint64_t stage_model_weight_bytes_per_gpu(
         }
         add_weight_bytes(total, model.hidden_size, model.total_expert_num,
                          router_bytes);
-        const std::uint64_t local_intermediate =
-            ceil_div(model.moe_intermediate_size,
-                     parallelism.moe_tensor_parallel_size);
-        const std::uint64_t local_routed_experts =
-            ceil_div(model.total_expert_num,
-                     parallelism.moe_expert_parallel_size);
+        const std::uint64_t local_intermediate = ceil_div(
+            model.moe_intermediate_size, parallelism.moe_tensor_parallel_size);
+        const std::uint64_t local_routed_experts = ceil_div(
+            model.total_expert_num, parallelism.moe_expert_parallel_size);
         const std::uint64_t routed_hidden =
             model.has_latent_moe() ? model.routed_expert_hidden_size
                                    : model.hidden_size;
@@ -233,7 +229,8 @@ std::uint64_t stage_model_weight_bytes_per_gpu(
     }
     total *= 1.0L + static_cast<long double>(weight_overhead_fraction);
     if (!std::isfinite(total) ||
-        total > static_cast<long double>(std::numeric_limits<std::uint64_t>::max())) {
+        total > static_cast<long double>(
+                    std::numeric_limits<std::uint64_t>::max())) {
         throw ConfigError("per-GPU model weight storage overflows uint64");
     }
     return static_cast<std::uint64_t>(std::ceil(total));
@@ -252,14 +249,13 @@ std::uint64_t resolve_total_gpu_reserve_bytes(const GpuMemoryConfig &memory,
         static_cast<long double>(memory.runtime_reserve_fraction);
     if (!std::isfinite(fractional_reserve) ||
         fractional_reserve > static_cast<long double>(
-                                  std::numeric_limits<std::uint64_t>::max())) {
+                                 std::numeric_limits<std::uint64_t>::max())) {
         throw ConfigError("GPU runtime reserve overflows uint64");
     }
     const std::uint64_t reserve_from_fraction =
         static_cast<std::uint64_t>(std::ceil(fractional_reserve));
     if (memory.runtime_reserve_bytes > capacity_bytes ||
-        reserve_from_fraction >
-            capacity_bytes - memory.runtime_reserve_bytes) {
+        reserve_from_fraction > capacity_bytes - memory.runtime_reserve_bytes) {
         throw ConfigError("GPU runtime reserve exceeds device capacity");
     }
     return memory.runtime_reserve_bytes + reserve_from_fraction;
@@ -267,9 +263,10 @@ std::uint64_t resolve_total_gpu_reserve_bytes(const GpuMemoryConfig &memory,
 
 } // namespace
 
-StageTimingSignature build_pipeline_stage_timing_signature(
-    const ModelConfig &model, const ParallelismConfig &parallelism,
-    std::uint64_t stage) {
+StageTimingSignature
+build_pipeline_stage_timing_signature(const ModelConfig &model,
+                                      const ParallelismConfig &parallelism,
+                                      std::uint64_t stage) {
     const auto pp = parallelism.pipeline_parallel_size;
     const auto layers =
         pipeline_stage_layer_range(model.num_layers, parallelism, stage);
@@ -296,8 +293,8 @@ StageTimingSignature build_pipeline_stage_timing_signature(
     return signature;
 }
 
-double resolve_pdd_kda_snapshot_dtype_size_bytes(
-    const PddClustersConfig &clusters) {
+double
+resolve_pdd_kda_snapshot_dtype_size_bytes(const PddClustersConfig &clusters) {
     // Non-KDA models never append a recurrent-state payload to a PDD KV
     // transfer. Keep the default explicit for callers that construct a
     // predictor uniformly for all model families.
@@ -329,8 +326,8 @@ double resolve_pdd_kda_snapshot_dtype_size_bytes(
 
     const SnapshotPrecision prefill = resolve(clusters.prefill);
     const SnapshotPrecision decode = resolve(clusters.decode);
-    const bool prefill_analytical =
-        clusters.prefill.execution_model.type == ExecutionModelType::kAnalytical;
+    const bool prefill_analytical = clusters.prefill.execution_model.type ==
+                                    ExecutionModelType::kAnalytical;
     const bool decode_analytical =
         clusters.decode.execution_model.type == ExecutionModelType::kAnalytical;
 
@@ -361,19 +358,17 @@ void apply_model_native_precision_defaults(
         return;
     }
     OperatorPrecisionConfig &operators = execution.operator_precisions;
-    const auto set_if_family_unset = [](std::string &target,
-                                        const std::string &specific_fallback,
-                                        const std::string &family_fallback,
-                                        std::string_view native) {
-        if (target.empty() && specific_fallback.empty() &&
-            family_fallback.empty()) {
-            target = native;
-        }
-    };
+    const auto set_if_family_unset =
+        [](std::string &target, const std::string &specific_fallback,
+           const std::string &family_fallback, std::string_view native) {
+            if (target.empty() && specific_fallback.empty() &&
+                family_fallback.empty()) {
+                target = native;
+            }
+        };
 
-    set_if_family_unset(operators.attention_weight,
-                        operators.attention_weight, operators.attention,
-                        "bf16");
+    set_if_family_unset(operators.attention_weight, operators.attention_weight,
+                        operators.attention, "bf16");
     set_if_family_unset(operators.attention_activation,
                         operators.attention_activation, operators.attention,
                         "bf16");
@@ -469,8 +464,8 @@ build_pipeline_stage_memory_profiles(const ClusterRuntimeConfig &cluster) {
     for (std::uint64_t stage = 0; stage < pp; ++stage) {
         PipelineStageMemoryProfile profile{};
         profile.stage_id = StageId{stage};
-        profile.layers = pipeline_stage_layer_range(
-            cluster.model.num_layers, cluster.parallelism, stage);
+        profile.layers = pipeline_stage_layer_range(cluster.model.num_layers,
+                                                    cluster.parallelism, stage);
         profile.resident_weight_bytes =
             cluster.execution_model.type == ExecutionModelType::kAnalytical
                 ? stage_model_weight_bytes_per_gpu(
@@ -488,22 +483,21 @@ build_pipeline_stage_memory_profiles(const ClusterRuntimeConfig &cluster) {
         }
         profile.free_bytes = cluster.gpu_memory.capacity_bytes_per_gpu -
                              reserve_bytes - profile.resident_weight_bytes;
-        profile.kv_bytes_per_block_by_rank.reserve(
-            static_cast<std::size_t>(
-                cluster.parallelism.decode_context_parallel_size));
-        profile.kda_snapshot_bytes_by_rank.reserve(
-            static_cast<std::size_t>(
-                cluster.parallelism.decode_context_parallel_size));
+        profile.kv_bytes_per_block_by_rank.reserve(static_cast<std::size_t>(
+            cluster.parallelism.decode_context_parallel_size));
+        profile.kda_snapshot_bytes_by_rank.reserve(static_cast<std::size_t>(
+            cluster.parallelism.decode_context_parallel_size));
         try {
             for (std::uint64_t rank = 0;
                  rank < cluster.parallelism.decode_context_parallel_size;
                  ++rank) {
                 profile.kv_bytes_per_block_by_rank.push_back(
-                    kv_cache_transfer::model_kv_cache_size_bytes_stage_rank_local(
-                        cluster.scheduler.block_size, cluster.model,
-                        kv_dtype_size, profile.layers,
-                        cluster.parallelism.decode_context_parallel_size,
-                        rank));
+                    kv_cache_transfer::
+                        model_kv_cache_size_bytes_stage_rank_local(
+                            cluster.scheduler.block_size, cluster.model,
+                            kv_dtype_size, profile.layers,
+                            cluster.parallelism.decode_context_parallel_size,
+                            rank));
                 profile.kda_snapshot_bytes_by_rank.push_back(
                     kv_cache_transfer::
                         model_kda_state_snapshot_size_bytes_stage_rank_local(
@@ -534,16 +528,16 @@ PipelineStageGroupCatalogue build_pipeline_stage_group_catalogue(
     for (std::size_t index = 0; index < profiles.size(); ++index) {
         const auto stage = static_cast<std::uint64_t>(index);
         const StageTimingSignature timing =
-            build_pipeline_stage_timing_signature(
-                cluster.model, cluster.parallelism, stage);
+            build_pipeline_stage_timing_signature(cluster.model,
+                                                  cluster.parallelism, stage);
         const StageMemorySignature memory = profiles[index].memory_signature();
 
         auto timing_it = std::find(catalogue.timing_groups.begin(),
                                    catalogue.timing_groups.end(), timing);
         std::uint32_t timing_group = 0;
         if (timing_it == catalogue.timing_groups.end()) {
-            timing_group = static_cast<std::uint32_t>(
-                catalogue.timing_groups.size());
+            timing_group =
+                static_cast<std::uint32_t>(catalogue.timing_groups.size());
             catalogue.timing_groups.push_back(timing);
             catalogue.timing_group_multiplicity.push_back(0);
         } else {
@@ -557,8 +551,8 @@ PipelineStageGroupCatalogue build_pipeline_stage_group_catalogue(
                                    catalogue.memory_groups.end(), memory);
         std::uint32_t memory_group = 0;
         if (memory_it == catalogue.memory_groups.end()) {
-            memory_group = static_cast<std::uint32_t>(
-                catalogue.memory_groups.size());
+            memory_group =
+                static_cast<std::uint32_t>(catalogue.memory_groups.size());
             catalogue.memory_groups.push_back(memory);
             catalogue.memory_group_multiplicity.push_back(0);
         } else {
@@ -596,8 +590,8 @@ std::uint64_t resolve_pipeline_logical_kv_capacity(
             if (!found_kv || candidate < capacity) {
                 found_kv = true;
                 capacity = candidate;
-                selected_stage = static_cast<std::uint64_t>(
-                    profile.stage_id.value());
+                selected_stage =
+                    static_cast<std::uint64_t>(profile.stage_id.value());
                 selected_rank = static_cast<std::uint64_t>(rank);
             }
         }
@@ -629,8 +623,7 @@ std::uint64_t resolve_pipeline_kda_snapshot_charge(
         }
         if (profile.kda_snapshot_bytes_by_rank.size() !=
             profile.kv_bytes_per_block_by_rank.size()) {
-            throw ConfigError(
-                "stage KV/KDA rank profile lengths do not match");
+            throw ConfigError("stage KV/KDA rank profile lengths do not match");
         }
         for (std::size_t rank = 0;
              rank < profile.kda_snapshot_bytes_by_rank.size(); ++rank) {
@@ -645,20 +638,18 @@ std::uint64_t resolve_pipeline_kda_snapshot_charge(
                     "one KDA snapshot does not fit in stage/rank free HBM");
             }
             if (logical_kv_capacity != 0 &&
-                snapshot_bytes >
-                    std::numeric_limits<std::uint64_t>::max() /
-                        logical_kv_capacity) {
+                snapshot_bytes > std::numeric_limits<std::uint64_t>::max() /
+                                     logical_kv_capacity) {
                 throw ConfigError(
                     "normalized KDA snapshot charge overflows uint64");
             }
-            const std::uint64_t product =
-                logical_kv_capacity * snapshot_bytes;
+            const std::uint64_t product = logical_kv_capacity * snapshot_bytes;
             const std::uint64_t candidate =
                 ceil_div(product, profile.free_bytes);
             if (candidate > charge) {
                 charge = candidate;
-                selected_stage = static_cast<std::uint64_t>(
-                    profile.stage_id.value());
+                selected_stage =
+                    static_cast<std::uint64_t>(profile.stage_id.value());
                 selected_rank = static_cast<std::uint64_t>(rank);
             }
         }
@@ -872,17 +863,18 @@ void resolve_gpu_memory_config(
             build_pipeline_stage_group_catalogue(cluster, profiles);
         memory.ordinary_kv_capacity_blocks = physical_capacity;
         memory.model_weight_bytes_per_gpu = 0;
-        memory.kv_cache_budget_bytes_per_gpu = std::numeric_limits<
-            std::uint64_t>::max();
+        memory.kv_cache_budget_bytes_per_gpu =
+            std::numeric_limits<std::uint64_t>::max();
         memory.kv_cache_bytes_per_block = 0;
         for (const auto &profile : profiles) {
-            memory.model_weight_bytes_per_gpu = std::max(
-                memory.model_weight_bytes_per_gpu, profile.resident_weight_bytes);
+            memory.model_weight_bytes_per_gpu =
+                std::max(memory.model_weight_bytes_per_gpu,
+                         profile.resident_weight_bytes);
             memory.kv_cache_budget_bytes_per_gpu = std::min(
                 memory.kv_cache_budget_bytes_per_gpu, profile.free_bytes);
             for (const auto bytes : profile.kv_bytes_per_block_by_rank) {
-                memory.kv_cache_bytes_per_block = std::max(
-                    memory.kv_cache_bytes_per_block, bytes);
+                memory.kv_cache_bytes_per_block =
+                    std::max(memory.kv_cache_bytes_per_block, bytes);
             }
         }
         memory.kda_snapshot_limiting_stage = 0;
@@ -916,17 +908,17 @@ void resolve_gpu_memory_config(
             memory.model_weight_bytes_per_gpu, profile.resident_weight_bytes);
         // Compatibility scalar: expose the least-free physical stage while
         // retaining exact F/B vectors in pipeline_stage_memory_profiles.
-        memory.kv_cache_budget_bytes_per_gpu = std::min(
-            memory.kv_cache_budget_bytes_per_gpu, profile.free_bytes);
+        memory.kv_cache_budget_bytes_per_gpu =
+            std::min(memory.kv_cache_budget_bytes_per_gpu, profile.free_bytes);
         for (const auto bytes : profile.kv_bytes_per_block_by_rank) {
             memory.kv_cache_bytes_per_block =
                 std::max(memory.kv_cache_bytes_per_block, bytes);
         }
     }
     const std::uint64_t calculated_blocks =
-        resolve_pipeline_logical_kv_capacity(
-            profiles, &memory.ordinary_kv_limiting_stage,
-            &memory.ordinary_kv_limiting_rank);
+        resolve_pipeline_logical_kv_capacity(profiles,
+                                             &memory.ordinary_kv_limiting_stage,
+                                             &memory.ordinary_kv_limiting_rank);
     if (calculated_blocks == 0) {
         throw ConfigError(
             "remaining stage-local GPU KV budget cannot hold one cache block");
@@ -1016,13 +1008,12 @@ resolve_cpu_kv_cache_target(const SimulationConfig &config) {
         try {
             result.kda_snapshot_bytes =
                 kv_cache_transfer::model_kda_state_snapshot_size_bytes(
-                    prefill.model,
-                    prefill.execution_model.type ==
-                            ExecutionModelType::kAnalytical
-                        ? storage_bytes_per_element(
-                              prefill.execution_model.analytical
-                                  .kda_snapshot_precision())
-                        : 2.0);
+                    prefill.model, prefill.execution_model.type ==
+                                           ExecutionModelType::kAnalytical
+                                       ? storage_bytes_per_element(
+                                             prefill.execution_model.analytical
+                                                 .kda_snapshot_precision())
+                                       : 2.0);
         } catch (const kv_cache_transfer::TransferModelError &error) {
             throw ConfigError(std::string{"invalid CPU KDA snapshot layout: "} +
                               error.what());

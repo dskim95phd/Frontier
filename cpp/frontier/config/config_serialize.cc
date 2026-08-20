@@ -41,8 +41,7 @@ OrderedJson serialize_cpu_kv_cache(const CpuKVCacheConfig &config) {
         {"capacity_bytes", config.capacity_bytes},
         {"static_slice_per_gpu", config.static_slice_per_gpu},
         {"capacity_bytes_per_gpu", config.capacity_bytes_per_gpu},
-        {"dram_bandwidth_gbps_per_gpu",
-         config.dram_bandwidth_gbps_per_gpu},
+        {"dram_bandwidth_gbps_per_gpu", config.dram_bandwidth_gbps_per_gpu},
         {"c2c_bandwidth_gbps_per_gpu", config.c2c_bandwidth_gbps_per_gpu},
         {"write_bandwidth_gbps", config.write_bandwidth_gbps},
         {"write_latency_ms", config.write_latency_ms},
@@ -239,10 +238,8 @@ OrderedJson serialize_gpu_memory(const GpuMemoryConfig &memory) {
         {"runtime_reserve_fraction", memory.runtime_reserve_fraction},
         {"runtime_reserve_bytes", memory.runtime_reserve_bytes},
         {"weight_overhead_fraction", memory.weight_overhead_fraction},
-        {"model_weight_bytes_per_gpu",
-         memory.model_weight_bytes_per_gpu},
-        {"kv_cache_budget_bytes_per_gpu",
-         memory.kv_cache_budget_bytes_per_gpu},
+        {"model_weight_bytes_per_gpu", memory.model_weight_bytes_per_gpu},
+        {"kv_cache_budget_bytes_per_gpu", memory.kv_cache_budget_bytes_per_gpu},
         {"kv_cache_bytes_per_block", memory.kv_cache_bytes_per_block},
     });
 }

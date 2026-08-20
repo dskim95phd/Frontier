@@ -233,11 +233,13 @@ template <typename Writer>
 void write_stream_file(const std::filesystem::path &path, Writer writer) {
     std::ofstream output{path, std::ios::binary};
     if (!output) {
-        throw std::runtime_error("failed to open output file: " + path.string());
+        throw std::runtime_error("failed to open output file: " +
+                                 path.string());
     }
     writer(output);
     if (!output) {
-        throw std::runtime_error("failed to write output file: " + path.string());
+        throw std::runtime_error("failed to write output file: " +
+                                 path.string());
     }
 }
 
@@ -266,10 +268,11 @@ void write_artifacts(const RunOptions &options,
 
     if (options.output_mode == OutputMode::kRequests ||
         options.output_mode == OutputMode::kFull) {
-        write_stream_file(directory / "requests.csv", [&](std::ostream &stream) {
-            frontier::metrics::serialize_request_metrics_csv(
-                output.requests, stream, output.run.system_architecture);
-        });
+        write_stream_file(
+            directory / "requests.csv", [&](std::ostream &stream) {
+                frontier::metrics::serialize_request_metrics_csv(
+                    output.requests, stream, output.run.system_architecture);
+            });
     }
     // Occupancy samples are compact change events and are retained for every
     // output mode, including summary mode where detailed traces are disabled.
@@ -347,9 +350,10 @@ int main(int argc, char *argv[]) {
                 options->wall_progress_interval_s.value(),
                 [](frontier::SimTime simulation_time,
                    double /*wall_clock_elapsed_seconds*/) {
-                    std::cerr << "simulation_progress_s=" << std::setprecision(17)
-                              << simulation_time.seconds() << '\n'
-                              << std::flush;
+                    std::cerr
+                        << "simulation_progress_s=" << std::setprecision(17)
+                        << simulation_time.seconds() << '\n'
+                        << std::flush;
                 });
         }
         const frontier::metrics::SimulationOutput output =

@@ -253,15 +253,16 @@ void validate_output(const SimulationOutput &output,
     const auto &cache = output.aggregate.prefix_cache;
     const bool hits_match_contract =
         !test_case.require_prefix_hits || cache.hit_blocks > 0;
-    const bool evictions_match_contract =
-        test_case.require_evictions ? cache.evicted_blocks > 0
-                                    : cache.evicted_blocks == 0;
+    const bool evictions_match_contract = test_case.require_evictions
+                                              ? cache.evicted_blocks > 0
+                                              : cache.evicted_blocks == 0;
     expect(cache.successful_admissions >= output.requests.size() &&
                cache.query_blocks >= request_query_blocks &&
-               cache.hit_blocks >= request_hit_blocks &&
-               hits_match_contract && evictions_match_contract,
-           context + ": prefix-cache behavior violated the case contract "
-                     "(admissions=" +
+               cache.hit_blocks >= request_hit_blocks && hits_match_contract &&
+               evictions_match_contract,
+           context +
+               ": prefix-cache behavior violated the case contract "
+               "(admissions=" +
                std::to_string(cache.successful_admissions) +
                ", hits=" + std::to_string(cache.hit_blocks) +
                ", evictions=" + std::to_string(cache.evicted_blocks) +
@@ -308,7 +309,7 @@ void validate_output(const SimulationOutput &output,
             : test_case.prefill_or_monolithic;
     if (test_case.require_pressure_preemption) {
         expect_preemption_on_every_target(output, pressure_cluster,
-                                           pressure_topology, context);
+                                          pressure_topology, context);
     }
     const std::uint64_t pressure_capacity =
         test_case.pdd && !test_case.pressure_prefill ? test_case.decode_blocks

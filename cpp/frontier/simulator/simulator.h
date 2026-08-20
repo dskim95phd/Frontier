@@ -35,9 +35,8 @@ struct SimulatorOptions {
 
 class Simulator {
   public:
-    using WallClockProgressCallback =
-        std::function<void(SimTime simulation_time,
-                           double wall_clock_elapsed_seconds)>;
+    using WallClockProgressCallback = std::function<void(
+        SimTime simulation_time, double wall_clock_elapsed_seconds)>;
 
     Simulator(const config::SimulationConfig &config,
               std::vector<request_generator::WorkloadRequest> workload,
@@ -59,8 +58,8 @@ class Simulator {
     // Progress reporting is observational only. The callback runs on the
     // simulator thread after an event is dispatched whenever the configured
     // wall-clock interval has elapsed.
-    void set_wall_clock_progress_callback(
-        double interval_seconds, WallClockProgressCallback callback);
+    void set_wall_clock_progress_callback(double interval_seconds,
+                                          WallClockProgressCallback callback);
     // Keeps metrics retention and predictor-side diagnostic construction in
     // sync for compact output modes.
     void set_detailed_traces_enabled(bool enabled);
@@ -78,8 +77,7 @@ class Simulator {
     [[nodiscard]] entities::RequestCollection &requests() noexcept {
         return entities_.requests();
     }
-    [[nodiscard]] const entities::RequestCollection &
-    requests() const noexcept {
+    [[nodiscard]] const entities::RequestCollection &requests() const noexcept {
         return entities_.requests();
     }
     [[nodiscard]] const config::ParallelismConfig &

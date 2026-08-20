@@ -243,12 +243,12 @@ class ReplicaKVCacheManager {
         std::optional<SessionId> excluded_session = std::nullopt) const;
     [[nodiscard]] std::uint64_t additional_kda_snapshot_charge(
         std::optional<SessionId> session_id) const noexcept;
-    [[nodiscard]] bool required_capacity_fits(
-        std::uint64_t blocks, std::uint64_t extra_blocks,
-        std::uint64_t available_blocks) const noexcept;
-    [[nodiscard]] std::uint64_t reclaimable_snapshot_blocks(
-        std::optional<SessionId> excluded_session = std::nullopt) const
-        noexcept;
+    [[nodiscard]] bool
+    required_capacity_fits(std::uint64_t blocks, std::uint64_t extra_blocks,
+                           std::uint64_t available_blocks) const noexcept;
+    [[nodiscard]] std::uint64_t
+    reclaimable_snapshot_blocks(std::optional<SessionId> excluded_session =
+                                    std::nullopt) const noexcept;
     [[nodiscard]] std::uint64_t reclaimable_commitment_blocks(
         std::optional<SessionId> excluded_session = std::nullopt,
         std::uint64_t virtual_credit = 0) const noexcept;
@@ -271,8 +271,7 @@ class ReplicaKVCacheManager {
     void append_to_evictable_lru(SessionId session_id,
                                  SessionCacheEntry &entry);
     void remove_from_reclaim_lru(SessionCacheEntry &entry);
-    void append_to_reclaim_lru(SessionId session_id,
-                               SessionCacheEntry &entry);
+    void append_to_reclaim_lru(SessionId session_id, SessionCacheEntry &entry);
     void sync_reclaim_lru(SessionId session_id);
     void touch_reclaim_lru(SessionId session_id);
     void validate_accounting() const;

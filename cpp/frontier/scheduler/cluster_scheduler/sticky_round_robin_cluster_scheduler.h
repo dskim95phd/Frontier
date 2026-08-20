@@ -12,8 +12,7 @@ namespace frontier::scheduler {
 class StickyRoundRobinClusterScheduler final : public BaseClusterScheduler {
   public:
     StickyRoundRobinClusterScheduler(
-        const entities::Cluster &cluster,
-        entities::RequestCollection &requests,
+        const entities::Cluster &cluster, entities::RequestCollection &requests,
         execution_time_predictor::ExecutionTimePredictorPtr predictor,
         std::shared_ptr<const kv_cache_transfer::BaseKVCacheTransferPredictor>
             kv_cache_transfer_predictor,

@@ -26,8 +26,8 @@ using frontier::SessionId;
 using frontier::SimTime;
 using frontier::config::ClusterSchedulerType;
 using frontier::config::ExecutionModelType;
-using frontier::config::SimulationConfig;
 using frontier::config::parse_simulation_config_json;
+using frontier::config::SimulationConfig;
 using frontier::request_generator::WorkloadRequest;
 using frontier::simulator::run_simulation;
 using frontier::test::expect;
@@ -136,7 +136,8 @@ void require_matrix_result(const SimulationConfig &config,
                                 transfer.dp_id.value()}];
     }
     expect(operations_by_target.size() == expected_targets,
-           context + ": every CPU target must exercise its own transfer engine");
+           context +
+               ": every CPU target must exercise its own transfer engine");
     if (expected_targets > 1) {
         bool cross_target_overlap = false;
         for (const auto &left : output.cpu_kv_cache_transfers) {
@@ -152,8 +153,10 @@ void require_matrix_result(const SimulationConfig &config,
                 }
             }
         }
-        expect(cross_target_overlap,
-               context + ": different targets must have independent overlapping queues");
+        expect(
+            cross_target_overlap,
+            context +
+                ": different targets must have independent overlapping queues");
     }
 
     std::uint64_t offload_operations = 0;
@@ -184,26 +187,24 @@ void require_matrix_result(const SimulationConfig &config,
             h2d_service_ms += transfer.service_time_ms;
         }
     }
-    expect(offload_operations == aggregate.offload_operations &&
-               offload_blocks == aggregate.offload_blocks &&
-               offload_bytes == aggregate.offload_bytes &&
-               restore_operations == aggregate.restore_operations &&
-               restore_blocks == aggregate.restore_blocks &&
-               restore_bytes == aggregate.restore_bytes &&
-               std::abs(d2h_queue_ms - aggregate.d2h_queue_time_ms) < 1e-9 &&
-               std::abs(d2h_service_ms - aggregate.d2h_service_time_ms) <
-                   1e-9 &&
-               std::abs(h2d_queue_ms - aggregate.h2d_queue_time_ms) < 1e-9 &&
-               std::abs(h2d_service_ms - aggregate.h2d_service_time_ms) <
-                   1e-9 &&
-               std::abs(source_hold_ms -
-                        aggregate.source_gpu_hold_time_ms) < 1e-9,
-           context + ": aggregate transfer totals must equal detailed records");
+    expect(
+        offload_operations == aggregate.offload_operations &&
+            offload_blocks == aggregate.offload_blocks &&
+            offload_bytes == aggregate.offload_bytes &&
+            restore_operations == aggregate.restore_operations &&
+            restore_blocks == aggregate.restore_blocks &&
+            restore_bytes == aggregate.restore_bytes &&
+            std::abs(d2h_queue_ms - aggregate.d2h_queue_time_ms) < 1e-9 &&
+            std::abs(d2h_service_ms - aggregate.d2h_service_time_ms) < 1e-9 &&
+            std::abs(h2d_queue_ms - aggregate.h2d_queue_time_ms) < 1e-9 &&
+            std::abs(h2d_service_ms - aggregate.h2d_service_time_ms) < 1e-9 &&
+            std::abs(source_hold_ms - aggregate.source_gpu_hold_time_ms) < 1e-9,
+        context + ": aggregate transfer totals must equal detailed records");
 }
 
 void test_dense_multi_target_tp_pp_dp() {
-    auto config = load(kExamples / "configs" /
-                       "06_cpu_kv_cache_pdd_online.json");
+    auto config =
+        load(kExamples / "configs" / "06_cpu_kv_cache_pdd_online.json");
     const auto cpu = config.cpu_kv_cache;
     prepare(config, cpu);
     auto &prefill = config.pdd().clusters.prefill;
@@ -221,12 +222,12 @@ void test_dense_multi_target_tp_pp_dp() {
 }
 
 void test_dense_analytical_runtime() {
-    auto config = load(kExamples / "configs" /
-                       "06_cpu_kv_cache_pdd_online.json");
+    auto config =
+        load(kExamples / "configs" / "06_cpu_kv_cache_pdd_online.json");
     const auto cpu = config.cpu_kv_cache;
     prepare(config, cpu);
-    for (auto *runtime : {&config.pdd().clusters.prefill,
-                          &config.pdd().clusters.decode}) {
+    for (auto *runtime :
+         {&config.pdd().clusters.prefill, &config.pdd().clusters.decode}) {
         runtime->execution_model.type = ExecutionModelType::kAnalytical;
         runtime->execution_model.analytical.tensor_parallel_size = 1;
     }
@@ -234,10 +235,9 @@ void test_dense_analytical_runtime() {
 }
 
 void test_moe_tp_pp_runtime() {
-    auto cpu_source = load(kExamples / "configs" /
-                           "06_cpu_kv_cache_pdd_online.json");
-    auto config = load(kFixtures / "config" /
-                       "fixed_moe_sequential_pdd.json");
+    auto cpu_source =
+        load(kExamples / "configs" / "06_cpu_kv_cache_pdd_online.json");
+    auto config = load(kFixtures / "config" / "fixed_moe_sequential_pdd.json");
     prepare(config, cpu_source.cpu_kv_cache);
     require_matrix_result(config, 3, 1, "MoE TP/PP");
 }
@@ -250,7 +250,7 @@ int main() {
                                     test_dense_multi_target_tp_pp_dp);
     failures += frontier::test::run("CPU KV analytical execution topology",
                                     test_dense_analytical_runtime);
-    failures += frontier::test::run("CPU KV MoE topology",
-                                    test_moe_tp_pp_runtime);
+    failures +=
+        frontier::test::run("CPU KV MoE topology", test_moe_tp_pp_runtime);
     return failures == 0 ? 0 : 1;
 }

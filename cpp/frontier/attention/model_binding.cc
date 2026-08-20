@@ -52,9 +52,8 @@ AttentionFamilyBinding bind_attention_family(const config::ModelConfig &model) {
         throw std::invalid_argument(
             "attention query and KV head counts must be positive");
     }
-    if (model.use_mfa &&
-        (model.share_q_dim == 0 || model.head_dim == 0 ||
-         model.num_kv_heads != 1)) {
+    if (model.use_mfa && (model.share_q_dim == 0 || model.head_dim == 0 ||
+                          model.num_kv_heads != 1)) {
         throw std::invalid_argument(
             "MFA attention requires share_q_dim, head_dim, and exactly one "
             "dense KV head");

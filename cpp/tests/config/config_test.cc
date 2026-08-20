@@ -1,8 +1,8 @@
 #include "frontier/config/config.h"
 #include "tests/test_support.h"
 
-#include <cstdlib>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <stdexcept>
 #include <string>
@@ -45,8 +45,8 @@ class ScopedModelConfigDirectory {
 #ifdef _WIN32
         char *previous = nullptr;
         std::size_t previous_size = 0;
-        if (_dupenv_s(&previous, &previous_size,
-                      "FRONTIER_MODEL_CONFIG_DIR") == 0 &&
+        if (_dupenv_s(&previous, &previous_size, "FRONTIER_MODEL_CONFIG_DIR") ==
+                0 &&
             previous != nullptr) {
             had_previous_ = true;
             previous_ = previous;
@@ -112,8 +112,8 @@ void test_colocation_contract_round_trip() {
            "co-location config must round-trip deterministically");
 
     config.cluster().scheduler.pipeline_event_mode = "collapsed";
-    const auto collapsed = parse_simulation_config_json(
-        serialize_simulation_config_json(config));
+    const auto collapsed =
+        parse_simulation_config_json(serialize_simulation_config_json(config));
     expect(collapsed.cluster().scheduler.pipeline_event_mode == "collapsed" &&
                collapsed == config,
            "collapsed pipeline event mode must round-trip");
@@ -156,8 +156,8 @@ void test_moe_routing_layer_scope_contract() {
     // The field is orthogonal to the distribution: a seed-weighted
     // distribution may still share one assignment across layers.
     config.cluster().moe_routing.layer_scope = MoeRoutingLayerScope::kShared;
-    const auto shared = parse_simulation_config_json(
-        serialize_simulation_config_json(config));
+    const auto shared =
+        parse_simulation_config_json(serialize_simulation_config_json(config));
     expect(shared.cluster().moe_routing.layer_scope ==
                    MoeRoutingLayerScope::kShared &&
                shared.cluster().moe_routing.distribution ==
@@ -177,7 +177,6 @@ void test_moe_routing_layer_scope_contract() {
             static_cast<void>(parse_simulation_config_json(invalid));
         },
         "invalid layer_scope must fail fast");
-
 }
 
 void test_pdd_contract_round_trip() {
@@ -342,8 +341,7 @@ void test_operator_precision_contract_round_trip() {
                resolved.routed_expert_weight_precision() == "mxfp4" &&
                resolved.routed_expert_activation_precision() == "mxfp8" &&
                resolved.latent_moe_projection_weight_precision() == "bf16" &&
-               resolved.latent_moe_projection_activation_precision() ==
-                   "fp8" &&
+               resolved.latent_moe_projection_activation_precision() == "fp8" &&
                resolved.shared_expert_weight_precision() == "mxfp4" &&
                resolved.shared_expert_activation_precision() == "mxfp8" &&
                resolved.dense_mlp_weight_precision() == "mxfp8" &&
@@ -402,8 +400,7 @@ void test_operator_precision_contract_round_trip() {
         "unsupported operator precision must fail fast");
 
     std::string invalid_native = serialized;
-    const std::string valid_native_precision =
-        "\"router_compute\": \"mxfp8\"";
+    const std::string valid_native_precision = "\"router_compute\": \"mxfp8\"";
     const auto native_position = invalid_native.find(valid_native_precision);
     expect(native_position != std::string::npos,
            "serialized K3-native precision must be present");
@@ -463,8 +460,8 @@ void test_gpu_memory_auto_block_calculation() {
                cluster.scheduler.num_blocks == expected_stage_capacity &&
                cluster.gpu_memory.ordinary_kv_capacity_blocks ==
                    expected_stage_capacity,
-            "GPU capacity must resolve stage-local profiles and logical "
-            "blocks");
+           "GPU capacity must resolve stage-local profiles and logical "
+           "blocks");
 
     std::string without_manual_blocks =
         serialize_simulation_config_json(config);
@@ -575,9 +572,7 @@ void test_gpu_memory_capacity_is_required_and_mode_round_trips() {
            "serialized HBM capacity must be comma-terminated");
     zero.replace(zero_value_begin, zero_value_end - zero_value_begin, " 0");
     expect_throws<ConfigError>(
-        [&zero] {
-            static_cast<void>(parse_simulation_config_json(zero));
-        },
+        [&zero] { static_cast<void>(parse_simulation_config_json(zero)); },
         "GPU HBM capacity must be strictly positive");
 
     auto unset = fixed.cluster();
@@ -615,8 +610,7 @@ void test_gpu_memory_capacity_is_required_and_mode_round_trips() {
 void test_kimi_k3_gated_mla_weight_memory() {
     auto config = load("analytical_parallel_colocation.json");
     auto &cluster = config.cluster();
-    cluster.model =
-        frontier::config::load_model_config("moonshotai/Kimi-K3");
+    cluster.model = frontier::config::load_model_config("moonshotai/Kimi-K3");
     cluster.gpu_memory.auto_calculate_num_blocks = true;
     cluster.gpu_memory.capacity_bytes_per_gpu = 10'000'000'000'000'000ULL;
     cluster.gpu_memory.runtime_reserve_fraction = 0.10;
@@ -659,8 +653,7 @@ void test_kimi_k3_gated_mla_weight_memory() {
 void test_kimi_k3_latent_moe_projection_weight_memory() {
     auto config = load("analytical_parallel_colocation.json");
     auto &cluster = config.cluster();
-    cluster.model =
-        frontier::config::load_model_config("moonshotai/Kimi-K3");
+    cluster.model = frontier::config::load_model_config("moonshotai/Kimi-K3");
     cluster.parallelism.pipeline_parallel_size = 1;
     cluster.gpu_memory.auto_calculate_num_blocks = true;
     cluster.gpu_memory.capacity_bytes_per_gpu = 10'000'000'000'000'000ULL;
@@ -709,8 +702,7 @@ void test_kimi_k3_tp8_dcp8_gpu_memory_layout() {
     replicated.parallelism.moe_expert_parallel_size = 8;
     replicated.execution_model.analytical.tensor_parallel_size = 8;
     replicated.gpu_memory.auto_calculate_num_blocks = true;
-    replicated.gpu_memory.capacity_bytes_per_gpu =
-        10'000'000'000'000'000ULL;
+    replicated.gpu_memory.capacity_bytes_per_gpu = 10'000'000'000'000'000ULL;
     frontier::config::resolve_gpu_memory_config(replicated);
 
     auto dcp = replicated;
@@ -788,21 +780,22 @@ void test_pdd_kda_snapshot_precision_contract() {
     // Analytical BF16 and FP16 are both two bytes, but they are distinct
     // state contracts and must not be silently accepted as interchangeable.
     const auto analytical =
-        load("analytical_parallel_colocation.json")
-            .cluster()
-            .execution_model;
+        load("analytical_parallel_colocation.json").cluster().execution_model;
     config.pdd().clusters.prefill.execution_model = analytical;
     config.pdd().clusters.decode.execution_model = analytical;
-    config.pdd().clusters.prefill.execution_model.analytical
-        .operator_precisions.kda_snapshot = "bf16";
-    config.pdd().clusters.decode.execution_model.analytical
-        .operator_precisions.kda_snapshot = "bf16";
+    config.pdd()
+        .clusters.prefill.execution_model.analytical.operator_precisions
+        .kda_snapshot = "bf16";
+    config.pdd()
+        .clusters.decode.execution_model.analytical.operator_precisions
+        .kda_snapshot = "bf16";
     expect(resolve_pdd_kda_snapshot_dtype_size_bytes(config.pdd().clusters) ==
                2.0,
            "matching analytical BF16 KDA snapshots must resolve to two bytes");
 
-    config.pdd().clusters.decode.execution_model.analytical
-        .operator_precisions.kda_snapshot = "fp16";
+    config.pdd()
+        .clusters.decode.execution_model.analytical.operator_precisions
+        .kda_snapshot = "fp16";
     expect_throws<ConfigError>(
         [&config] {
             static_cast<void>(resolve_pdd_kda_snapshot_dtype_size_bytes(
@@ -816,8 +809,9 @@ void test_pdd_kda_snapshot_precision_contract() {
     expect(resolve_pdd_kda_snapshot_dtype_size_bytes(config.pdd().clusters) ==
                2.0,
            "mixed fixed/analytical BF16 KDA snapshots must pass");
-    config.pdd().clusters.prefill.execution_model.analytical
-        .operator_precisions.kda_snapshot = "fp32";
+    config.pdd()
+        .clusters.prefill.execution_model.analytical.operator_precisions
+        .kda_snapshot = "fp32";
     expect_throws<ConfigError>(
         [&config] {
             static_cast<void>(resolve_pdd_kda_snapshot_dtype_size_bytes(
@@ -1177,8 +1171,7 @@ void test_kimi_k3_nested_model_asset_and_aliases() {
     const auto k2 =
         frontier::config::load_model_config("moonshotai/Kimi-K2-Instruct");
     expect(!k2.has_kda() && !k2.mla_use_nope && !k2.mla_use_output_gate &&
-               k2.num_mla_layers == k2.num_layers &&
-               k2.is_mla_layer(0),
+               k2.num_mla_layers == k2.num_layers && k2.is_mla_layer(0),
            "legacy flat Kimi K2 must retain all-layer MLA semantics");
 
     std::string runtime =
@@ -1222,8 +1215,7 @@ void test_kimi_k3_nested_model_asset_and_aliases() {
                precision.router_weight_storage == "bf16" &&
                precision.moe_router_activation == "bf16" &&
                precision.router_compute == "fp32" &&
-               precision.lm_head == "bf16" &&
-               precision.kv_cache == "fp8" &&
+               precision.lm_head == "bf16" && precision.kv_cache == "fp8" &&
                precision.kda_snapshot == "bf16",
            "K3 analytical runtime must install the native mixed-precision "
            "policy");
@@ -1240,18 +1232,17 @@ void test_kimi_k3_nested_model_asset_and_aliases() {
     overridden_execution.operator_precisions.kda_snapshot = "fp32";
     frontier::config::apply_model_native_precision_defaults(
         overridden_execution, overridden.cluster().model);
-    expect(overridden_execution.routed_expert_weight_precision() == "int4" &&
-               overridden_execution
-                       .latent_moe_projection_weight_precision() == "fp8" &&
-               overridden_execution.shared_expert_weight_precision() ==
-                   "mxfp4" &&
-               overridden_execution.router_weight_storage_precision() ==
-                   "fp8" &&
-               overridden_execution.kv_cache_precision() == "bf16" &&
-               overridden_execution.kda_snapshot_precision() == "fp32" &&
-               overridden_execution.router_compute_precision() == "fp32",
-           "explicit K3 precision overrides must win while unspecified "
-           "families retain native defaults");
+    expect(
+        overridden_execution.routed_expert_weight_precision() == "int4" &&
+            overridden_execution.latent_moe_projection_weight_precision() ==
+                "fp8" &&
+            overridden_execution.shared_expert_weight_precision() == "mxfp4" &&
+            overridden_execution.router_weight_storage_precision() == "fp8" &&
+            overridden_execution.kv_cache_precision() == "bf16" &&
+            overridden_execution.kda_snapshot_precision() == "fp32" &&
+            overridden_execution.router_compute_precision() == "fp32",
+        "explicit K3 precision overrides must win while unspecified "
+        "families retain native defaults");
     frontier::config::resolve_gpu_memory_config(
         overridden.cluster(), overridden.cluster().scheduler.num_blocks);
     const auto expected_overridden_snapshot_charge =
@@ -1259,7 +1250,7 @@ void test_kimi_k3_nested_model_asset_and_aliases() {
             overridden.cluster().gpu_memory.pipeline_stage_memory_profiles,
             overridden.cluster().scheduler.num_blocks);
     expect(overridden.cluster().scheduler.kda_snapshot_blocks_per_session ==
-               expected_overridden_snapshot_charge &&
+                   expected_overridden_snapshot_charge &&
                expected_overridden_snapshot_charge > 0,
            "explicit BF16 KV and FP32 KDA snapshot overrides must preserve "
            "the physical snapshot charge");
@@ -1271,10 +1262,10 @@ void test_kimi_k3_nested_model_asset_and_aliases() {
     runtime.replace(prefix_position, disabled_prefix.size(),
                     "\"enabled\": true");
     const auto prefix_enabled = parse_simulation_config_json(runtime);
-    expect(prefix_enabled.cluster().scheduler
-                   .kda_snapshot_blocks_per_session > 0 &&
-               prefix_enabled.cluster().scheduler
-                       .kda_snapshot_blocks_per_session <=
+    expect(prefix_enabled.cluster().scheduler.kda_snapshot_blocks_per_session >
+                   0 &&
+               prefix_enabled.cluster()
+                       .scheduler.kda_snapshot_blocks_per_session <=
                    prefix_enabled.cluster().scheduler.num_blocks,
            "K3 prefix caching must use the normalized physical snapshot "
            "charge when the HBM snapshot fits");
@@ -1554,8 +1545,7 @@ void test_pipeline_stage_profiles_k3_partitions_and_groups() {
         auto cluster = base;
         cluster.model = k3;
         cluster.parallelism.pipeline_parallel_size = pp;
-        cluster.gpu_memory.capacity_bytes_per_gpu =
-            10'000'000'000'000'000ULL;
+        cluster.gpu_memory.capacity_bytes_per_gpu = 10'000'000'000'000'000ULL;
         cluster.gpu_memory.auto_calculate_num_blocks = true;
 
         const auto first =
@@ -1573,19 +1563,21 @@ void test_pipeline_stage_profiles_k3_partitions_and_groups() {
                    "K3 stage profile ranges must be nonempty and bounded");
             for (std::uint64_t layer = profile.layers.begin;
                  layer < profile.layers.end; ++layer) {
-                kda_layers += static_cast<std::uint64_t>(
-                    k3.is_kda_layer(layer));
-                mla_layers += static_cast<std::uint64_t>(
-                    k3.is_mla_layer(layer));
+                kda_layers +=
+                    static_cast<std::uint64_t>(k3.is_kda_layer(layer));
+                mla_layers +=
+                    static_cast<std::uint64_t>(k3.is_mla_layer(layer));
             }
         }
         expect(kda_layers == 69 && mla_layers == 24,
                "K3 PP stage profiles must preserve 69 KDA and 24 MLA layers");
 
-        const auto groups = frontier::config::build_pipeline_stage_group_catalogue(
-            cluster, first);
+        const auto groups =
+            frontier::config::build_pipeline_stage_group_catalogue(cluster,
+                                                                   first);
         const auto groups_again =
-            frontier::config::build_pipeline_stage_group_catalogue(cluster, second);
+            frontier::config::build_pipeline_stage_group_catalogue(cluster,
+                                                                   second);
         expect(groups == groups_again &&
                    groups.stage_to_timing_group.size() == pp &&
                    groups.stage_to_memory_group.size() == pp,
@@ -1631,7 +1623,7 @@ void test_pipeline_stage_profile_capacity_and_snapshot_charge() {
     kv_stage.kda_snapshot_bytes_by_rank = {0};
 
     const std::vector<PipelineStageMemoryProfile> profiles = {kda_only,
-                                                               kv_stage};
+                                                              kv_stage};
     std::uint64_t limiting_stage = 0;
     std::uint64_t limiting_rank = 0;
     const auto capacity =
@@ -1648,8 +1640,8 @@ void test_pipeline_stage_profile_capacity_and_snapshot_charge() {
             auto invalid = profiles;
             invalid[0].free_bytes = 49;
             static_cast<void>(
-                frontier::config::resolve_pipeline_kda_snapshot_charge(
-                    invalid, 100));
+                frontier::config::resolve_pipeline_kda_snapshot_charge(invalid,
+                                                                       100));
         },
         "KDA snapshot larger than stage free HBM must fail");
 }
@@ -1657,8 +1649,7 @@ void test_pipeline_stage_profile_capacity_and_snapshot_charge() {
 void test_pipeline_stage_profile_pp1_compatibility_and_uneven_ranges() {
     auto cluster = load("analytical_parallel_colocation.json").cluster();
     cluster.parallelism.pipeline_parallel_size = 1;
-    cluster.gpu_memory.capacity_bytes_per_gpu =
-        10'000'000'000'000'000ULL;
+    cluster.gpu_memory.capacity_bytes_per_gpu = 10'000'000'000'000'000ULL;
     cluster.gpu_memory.auto_calculate_num_blocks = true;
     const auto profiles =
         frontier::config::build_pipeline_stage_memory_profiles(cluster);
@@ -1667,8 +1658,8 @@ void test_pipeline_stage_profile_pp1_compatibility_and_uneven_ranges() {
            "PP1 must retain the full model range in one stage");
     const auto legacy_block =
         frontier::kv_cache_transfer::model_kv_cache_size_bytes_rank_local(
-            cluster.scheduler.block_size, cluster.model,
-            2.0, cluster.parallelism.decode_context_parallel_size, 0);
+            cluster.scheduler.block_size, cluster.model, 2.0,
+            cluster.parallelism.decode_context_parallel_size, 0);
     expect(profiles.front().kv_bytes_per_block_by_rank.front() == legacy_block,
            "PP1 stage-local KV bytes must match the legacy full-model helper");
 
@@ -1680,10 +1671,10 @@ void test_pipeline_stage_profile_pp1_compatibility_and_uneven_ranges() {
         expect(range.end > range.begin,
                "uneven PP partitions must assign every Kimi K2 stage layers");
     }
-    const auto first = frontier::config::pipeline_stage_layer_range(
-        kimi.num_layers, 4, 0);
-    const auto second = frontier::config::pipeline_stage_layer_range(
-        kimi.num_layers, 4, 1);
+    const auto first =
+        frontier::config::pipeline_stage_layer_range(kimi.num_layers, 4, 0);
+    const auto second =
+        frontier::config::pipeline_stage_layer_range(kimi.num_layers, 4, 1);
     expect(first.size() == 16 && second.size() == 15,
            "uneven Kimi K2 PP4 partition must preserve 16/15 stage sizes");
 }
@@ -1707,16 +1698,13 @@ void test_k3_kernel_profile_contract() {
     const std::string serialized = serialize_simulation_config_json(config);
     const auto parsed = parse_simulation_config_json(serialized);
     expect(serialized.find("\"kernel_profile\"") != std::string::npos &&
-               parsed.cluster()
-                       .execution_model.analytical.kernel_profile ==
+               parsed.cluster().execution_model.analytical.kernel_profile ==
                    "k3_deepgemm_megamoe" &&
                parsed.cluster()
-                       .execution_model.analytical
-                       .mega_moe_tail_io_fraction ==
+                       .execution_model.analytical.mega_moe_tail_io_fraction ==
                    std::optional<double>{0.25} &&
                parsed.cluster()
-                       .execution_model.analytical
-                       .mega_moe_wave_exposure ==
+                       .execution_model.analytical.mega_moe_wave_exposure ==
                    std::optional<double>{0.75} &&
                parsed.cluster()
                        .execution_model.analytical
@@ -1746,8 +1734,8 @@ void test_k3_kernel_profile_contract() {
         "MegaMoE sensitivity fractions must reject values outside [0, 1]");
 
     auto wrong_override_profile = config;
-    wrong_override_profile.cluster()
-        .execution_model.analytical.kernel_profile = "k3_sglang_mxfp4";
+    wrong_override_profile.cluster().execution_model.analytical.kernel_profile =
+        "k3_sglang_mxfp4";
     expect_throws<ConfigError>(
         [&wrong_override_profile] {
             static_cast<void>(parse_simulation_config_json(
@@ -1759,8 +1747,8 @@ void test_k3_kernel_profile_contract() {
     rubin.cluster().execution_model.analytical.device = "rubin";
     rubin.cluster().execution_model.analytical.moe_communication_backend =
         "sm100_megamoe_public";
-    const auto parsed_rubin = parse_simulation_config_json(
-        serialize_simulation_config_json(rubin));
+    const auto parsed_rubin =
+        parse_simulation_config_json(serialize_simulation_config_json(rubin));
     expect(parsed_rubin.cluster().execution_model.analytical.device ==
                    "rubin" &&
                parsed_rubin.cluster()
@@ -1769,8 +1757,7 @@ void test_k3_kernel_profile_contract() {
            "K3 MegaMoE public priors must support explicit Rubin projection");
 
     auto wrong_device = config;
-    auto &wrong_analytical =
-        wrong_device.cluster().execution_model.analytical;
+    auto &wrong_analytical = wrong_device.cluster().execution_model.analytical;
     wrong_analytical.device = "custom";
     wrong_analytical.device_overrides.hbm_bandwidth_tbps = 22.0;
     wrong_analytical.device_overrides.fp32_tflops = 130.0;
@@ -1799,18 +1786,17 @@ void test_k3_kernel_profile_contract() {
 void test_explicit_pipeline_stage_layer_counts() {
     auto config = load("analytical_moe_ep4_colocation.json");
     config.cluster().parallelism.pipeline_stage_layer_counts = {5, 27};
-    const auto round_trip = parse_simulation_config_json(
-        serialize_simulation_config_json(config));
-    expect(round_trip.cluster()
-                   .parallelism.pipeline_stage_layer_counts ==
+    const auto round_trip =
+        parse_simulation_config_json(serialize_simulation_config_json(config));
+    expect(round_trip.cluster().parallelism.pipeline_stage_layer_counts ==
                std::vector<std::uint64_t>({5, 27}),
            "explicit pipeline layer counts must parse and round-trip");
     const auto first = frontier::config::pipeline_stage_layer_range(
-        round_trip.cluster().model.num_layers,
-        round_trip.cluster().parallelism, 0);
+        round_trip.cluster().model.num_layers, round_trip.cluster().parallelism,
+        0);
     const auto second = frontier::config::pipeline_stage_layer_range(
-        round_trip.cluster().model.num_layers,
-        round_trip.cluster().parallelism, 1);
+        round_trip.cluster().model.num_layers, round_trip.cluster().parallelism,
+        1);
     expect(first == frontier::config::PipelineStageLayerRange{0, 5} &&
                second == frontier::config::PipelineStageLayerRange{5, 32},
            "explicit pipeline layer counts must define contiguous ranges");
@@ -1839,14 +1825,12 @@ void test_explicit_pipeline_stage_layer_counts() {
         "explicit pipeline partition must cover every model layer");
 
     auto cluster = load("analytical_parallel_colocation.json").cluster();
-    cluster.model =
-        frontier::config::load_model_config("moonshotai/Kimi-K3");
+    cluster.model = frontier::config::load_model_config("moonshotai/Kimi-K3");
     cluster.parallelism.pipeline_parallel_size = 24;
     cluster.parallelism.pipeline_stage_layer_counts =
         std::vector<std::uint64_t>(24, 4);
     cluster.parallelism.pipeline_stage_layer_counts.back() = 1;
-    cluster.gpu_memory.capacity_bytes_per_gpu =
-        10'000'000'000'000'000ULL;
+    cluster.gpu_memory.capacity_bytes_per_gpu = 10'000'000'000'000'000ULL;
     const auto profiles =
         frontier::config::build_pipeline_stage_memory_profiles(cluster);
     expect(profiles.at(0).layers ==
@@ -1897,18 +1881,16 @@ int main() {
         test_gpu_memory_capacity_is_required_and_mode_round_trips);
     failures += frontier::test::run("Kimi K3 gated MLA weight memory",
                                     test_kimi_k3_gated_mla_weight_memory);
-    failures += frontier::test::run(
-        "Kimi K3 latent MoE projection weight memory",
-        test_kimi_k3_latent_moe_projection_weight_memory);
-    failures += frontier::test::run(
-        "Kimi K3 TP8 DCP8 GPU memory layout",
-        test_kimi_k3_tp8_dcp8_gpu_memory_layout);
+    failures +=
+        frontier::test::run("Kimi K3 latent MoE projection weight memory",
+                            test_kimi_k3_latent_moe_projection_weight_memory);
+    failures += frontier::test::run("Kimi K3 TP8 DCP8 GPU memory layout",
+                                    test_kimi_k3_tp8_dcp8_gpu_memory_layout);
     failures +=
         frontier::test::run("PDD KV precision matches transfer dtype",
                             test_pdd_kv_precision_matches_transfer_dtype);
-    failures += frontier::test::run(
-        "PDD KDA snapshot precision contract",
-        test_pdd_kda_snapshot_precision_contract);
+    failures += frontier::test::run("PDD KDA snapshot precision contract",
+                                    test_pdd_kda_snapshot_precision_contract);
     failures +=
         frontier::test::run("analytical attention family configs parse",
                             test_analytical_attention_family_configs_parse);
@@ -1922,17 +1904,16 @@ int main() {
         test_schema_version_range_is_checked_before_conversion);
     failures += frontier::test::run("MoE contract and invalid topologies",
                                     test_moe_contract_and_invalid_topologies);
-    failures += frontier::test::run(
-        "pipeline-exclusive parallelism contract",
-        test_pipeline_exclusive_contract);
+    failures += frontier::test::run("pipeline-exclusive parallelism contract",
+                                    test_pipeline_exclusive_contract);
     failures += frontier::test::run("model registry and attention binding",
                                     test_model_registry_and_attention_binding);
     failures +=
         frontier::test::run("nested Kimi K3 model asset and aliases",
                             test_kimi_k3_nested_model_asset_and_aliases);
-    failures += frontier::test::run(
-        "explicit hybrid attention metadata is strict",
-        test_explicit_hybrid_attention_metadata_is_strict);
+    failures +=
+        frontier::test::run("explicit hybrid attention metadata is strict",
+                            test_explicit_hybrid_attention_metadata_is_strict);
     failures += frontier::test::run("model runtime overrides are optional",
                                     test_model_runtime_overrides_are_optional);
     failures += frontier::test::run(
@@ -1951,8 +1932,7 @@ int main() {
     failures += frontier::test::run(
         "PP stage profile PP1 compatibility and uneven ranges",
         test_pipeline_stage_profile_pp1_compatibility_and_uneven_ranges);
-    failures += frontier::test::run(
-        "explicit PP stage layer counts",
-        test_explicit_pipeline_stage_layer_counts);
+    failures += frontier::test::run("explicit PP stage layer counts",
+                                    test_explicit_pipeline_stage_layer_counts);
     return failures == 0 ? 0 : 1;
 }

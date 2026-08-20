@@ -17,8 +17,7 @@ namespace frontier::execution_time_predictor {
 namespace {
 
 const entities::Request &
-get_request(const entities::RequestCollection &requests,
-            RequestId request_id) {
+get_request(const entities::RequestCollection &requests, RequestId request_id) {
     if (!requests.contains(request_id)) {
         throw ExecutionTimePredictorError(
             "batch execution references an unknown request");
@@ -327,8 +326,7 @@ AnalyticalRooflineExecutionTimePredictor::build_stage_layer_times(
                                                        : &standard_layer_times);
         if (!representative->has_value()) {
             *representative = detail::predict_dense_layer(
-                device_, analytical_, dense_model, dense_batch,
-                precisions);
+                device_, analytical_, dense_model, dense_batch, precisions);
         }
         result.push_back(representative->value());
     }
@@ -565,9 +563,9 @@ AnalyticalRooflineExecutionTimePredictor::shared_routing_for_batch(
         parallelism_.moe_expert_parallel_size, routing_, 0,
         static_cast<std::uint64_t>(batch_id.value()));
     value->lane_prediction = detail::predict_moe_lanes(
-        device_, analytical_,
-        internal::make_moe_model(model_, parallelism_), value->allocation,
-        model_.router_topk, internal::make_moe_operator_precisions(config_));
+        device_, analytical_, internal::make_moe_model(model_, parallelism_),
+        value->allocation, model_.router_topk,
+        internal::make_moe_operator_precisions(config_));
     std::lock_guard<std::mutex> lock(timing_cache_mutex_);
     if (cache_generation != timing_cache_generation_) {
         return value;
@@ -638,8 +636,8 @@ AnalyticalRooflineExecutionTimePredictor::
         std::shared_ptr<const cc_backend::BaseCCBackend> communication_backend)
     : config_(std::move(config)),
       device_(detail::DeviceCeilings::from_config(config_)),
-      analytical_(detail::analytical_config_from_profile(
-          config_.kernel_profile, config_.device)),
+      analytical_(detail::analytical_config_from_profile(config_.kernel_profile,
+                                                         config_.device)),
       parallelism_(parallelism), model_(std::move(model)), routing_(routing),
       communication_backend_(std::move(communication_backend)) {
     if (config_.mega_moe_tail_io_fraction.has_value()) {
@@ -647,8 +645,7 @@ AnalyticalRooflineExecutionTimePredictor::
             *config_.mega_moe_tail_io_fraction;
     }
     if (config_.mega_moe_wave_exposure.has_value()) {
-        analytical_.mega_moe_wave_exposure =
-            *config_.mega_moe_wave_exposure;
+        analytical_.mega_moe_wave_exposure = *config_.mega_moe_wave_exposure;
     }
     if (config_.mega_moe_cluster_task_latency_us.has_value()) {
         analytical_.mega_moe_cluster_task_latency_us =
@@ -665,8 +662,8 @@ AnalyticalRooflineExecutionTimePredictor::
 
 ExecutionTimePrediction
 AnalyticalRooflineExecutionTimePredictor::predict_stage_execution_time(
-    const entities::Batch &batch,
-    const entities::RequestCollection &requests, StageId stage_id) const {
+    const entities::Batch &batch, const entities::RequestCollection &requests,
+    StageId stage_id) const {
     return predict_execution(batch, requests, stage_id, std::nullopt);
 }
 
@@ -716,8 +713,8 @@ AnalyticalRooflineExecutionTimePredictor::predict_moe_group_layer(
     }
     std::uint64_t source_input_total = 0;
     for (const std::uint64_t tokens : input.source_input_tokens) {
-        if (tokens > std::numeric_limits<std::uint64_t>::max() -
-                         source_input_total) {
+        if (tokens >
+            std::numeric_limits<std::uint64_t>::max() - source_input_total) {
             throw ExecutionTimePredictorError(
                 "analytical group MoE source input token count overflows");
         }
@@ -753,9 +750,9 @@ AnalyticalRooflineExecutionTimePredictor::predict_moe_group_layer(
             allocation.lane_unique_tokens.at(lane) += unique_row.at(lane);
         }
     }
-    const std::uint64_t lane_routed_total = std::accumulate(
-        allocation.lane_routed_tokens.begin(),
-        allocation.lane_routed_tokens.end(), std::uint64_t{0});
+    const std::uint64_t lane_routed_total =
+        std::accumulate(allocation.lane_routed_tokens.begin(),
+                        allocation.lane_routed_tokens.end(), std::uint64_t{0});
     if (lane_routed_total != allocation.routed_tokens) {
         throw ExecutionTimePredictorError(
             "analytical group MoE source traffic does not conserve routed "
@@ -766,8 +763,7 @@ AnalyticalRooflineExecutionTimePredictor::predict_moe_group_layer(
             allocation.lane_expert_tokens.at(lane).begin(),
             allocation.lane_expert_tokens.at(lane).end(), std::uint64_t{0});
         if (expert_lane_total != allocation.lane_routed_tokens.at(lane) ||
-            allocation.lane_unique_tokens.at(lane) >
-                allocation.input_tokens) {
+            allocation.lane_unique_tokens.at(lane) > allocation.input_tokens) {
             throw ExecutionTimePredictorError(
                 "analytical group MoE destination traffic is inconsistent "
                 "with expert routing");
@@ -784,9 +780,9 @@ AnalyticalRooflineExecutionTimePredictor::predict_moe_group_layer(
     const detail::MoEOperatorPrecisions moe_precisions =
         internal::make_moe_operator_precisions(config_);
     const detail::MoERoutedLanePrediction prediction =
-        detail::predict_routed_moe_lanes(
-            device_, analytical_, moe_model, allocation, model_.router_topk,
-            moe_precisions, true);
+        detail::predict_routed_moe_lanes(device_, analytical_, moe_model,
+                                         allocation, model_.router_topk,
+                                         moe_precisions, true);
 
     MoEGroupLayerPrediction result{};
     result.lane_times_ms = prediction.lane_times_ms;
@@ -827,8 +823,8 @@ AnalyticalRooflineExecutionTimePredictor::predict_moe_group_layer(
                 throw ExecutionTimePredictorError(
                     "analytical group MoE shared-expert path is invalid");
             }
-            maximum_shared_expert_ms = std::max(
-                maximum_shared_expert_ms, source_shared_expert_ms);
+            maximum_shared_expert_ms =
+                std::max(maximum_shared_expert_ms, source_shared_expert_ms);
         }
         // Preserve the historical overlap window's shared-expert component,
         // but evaluate it per source instead of on the DP-summed token count.
@@ -838,17 +834,15 @@ AnalyticalRooflineExecutionTimePredictor::predict_moe_group_layer(
             detail::precision_from_string(config_.communication_precision());
         const detail::MoECommunicationTime communication =
             detail::predict_moe_communication(
-                *communication_backend_, input.input_tokens,
-                model_.hidden_size, input.routed_tokens,
-                parallelism_.tensor_parallel_size,
+                *communication_backend_, input.input_tokens, model_.hidden_size,
+                input.routed_tokens, parallelism_.tensor_parallel_size,
                 parallelism_.moe_tensor_parallel_size,
                 parallelism_.moe_expert_parallel_size,
                 parallelism_.data_parallel_size, false,
                 detail::bytes_per_element(communication_precision),
                 model_.routed_expert_hidden_size,
                 config_.moe_communication_backend, &allocation,
-                fused_expert_compute_ms,
-                analytical_.moe_a2a_overlap_residual,
+                fused_expert_compute_ms, analytical_.moe_a2a_overlap_residual,
                 analytical_.mega_moe_a2a_bandwidth_scale,
                 analytical_.mega_moe_a2a_startup_scale);
         result.has_source_aware_ep_communication = true;
@@ -862,8 +856,8 @@ AnalyticalRooflineExecutionTimePredictor::predict_moe_group_layer(
 
 ExecutionTimePrediction
 AnalyticalRooflineExecutionTimePredictor::prepare_moe_stage_execution(
-    const entities::Batch &batch,
-    const entities::RequestCollection &requests, StageId stage_id) const {
+    const entities::Batch &batch, const entities::RequestCollection &requests,
+    StageId stage_id) const {
     if (!model_.is_moe()) {
         throw ExecutionTimePredictorError(
             "dense model cannot prepare lazy MoE execution");
@@ -877,9 +871,8 @@ AnalyticalRooflineExecutionTimePredictor::prepare_moe_stage_execution(
 
 ExecutionTimePrediction
 AnalyticalRooflineExecutionTimePredictor::predict_moe_layer_execution(
-    const entities::Batch &batch,
-    const entities::RequestCollection &requests, StageId stage_id,
-    std::uint64_t local_moe_layer) const {
+    const entities::Batch &batch, const entities::RequestCollection &requests,
+    StageId stage_id, std::uint64_t local_moe_layer) const {
     if (!model_.is_moe() ||
         config_.moe_layer_event_mode == "first_layer_scaled" ||
         config_.moe_layer_event_mode == "stage_group_scaled") {
@@ -891,9 +884,8 @@ AnalyticalRooflineExecutionTimePredictor::predict_moe_layer_execution(
 
 ExecutionTimePrediction
 AnalyticalRooflineExecutionTimePredictor::predict_execution(
-    const entities::Batch &batch,
-    const entities::RequestCollection &requests, StageId stage_id,
-    std::optional<std::uint64_t> selected_moe_layer) const {
+    const entities::Batch &batch, const entities::RequestCollection &requests,
+    StageId stage_id, std::optional<std::uint64_t> selected_moe_layer) const {
     if (!stage_id.valid() ||
         stage_id.index() >= parallelism_.pipeline_parallel_size) {
         throw ExecutionTimePredictorError(
@@ -1000,9 +992,8 @@ AnalyticalRooflineExecutionTimePredictor::predict_execution(
     execution_time.pp_communication_ms = pp_communication_ms;
     if (stage_id.index() + 1 == parallelism_.pipeline_parallel_size) {
         execution_time.lm_head_ms = detail::predict_output_projection_ms(
-            device_, analytical_, batch_info.lm_head_tokens,
-            model_.hidden_size, model_.vocab_size,
-            parallelism_.tensor_parallel_size,
+            device_, analytical_, batch_info.lm_head_tokens, model_.hidden_size,
+            model_.vocab_size, parallelism_.tensor_parallel_size,
             detail::precision_from_string(config_.lm_head_weight_precision()),
             detail::precision_from_string(
                 config_.lm_head_activation_precision()));

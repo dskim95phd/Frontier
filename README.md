@@ -7,7 +7,7 @@
 <h4>A Discrete-Event Simulator for Modern LLM Serving</h4>
 
 [![docs](https://img.shields.io/badge/docs-latest-brightgreen.svg?style=flat)](./docs)
-[![version](https://img.shields.io/badge/release-pre--v0.2-green)](#latest-news-)
+[![version](https://img.shields.io/badge/release-v0.2.0-green)](#latest-news-)
 [![license](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 [![arxiv](https://img.shields.io/badge/arXiv-2605.21312-b31b1b.svg)](https://arxiv.org/abs/2605.21312)
 
@@ -30,16 +30,27 @@ Frontier helps researchers and engineers better understand serving system design
 
 ### Key Features
 
-- **Co-located & Disaggregated Serving**: This branch supports monolithic co-location and PDD serving. AFD support is planned for a later public release.
-- **Modern Runtime Optimizations**: Frontier captures production techniques such as CUDA Graph, speculative decoding / MTP, prefix caching, quantization, chunked prefill, and hierarchical caching as part of the scheduler-batch-engine loop. These optimizations change batch shape, memory state, and per-request progress, so Frontier models them as runtime behavior rather than simple speedup factors.
-- **Fidelity**: Frontier combines calibrated operator, communication, transfer, and KV-cache memory models to make simulation results useful for deployment decisions. This helps users compare configurations under SLA constraints, explore large GPU-scale design spaces ex-situ, and avoid conclusions that would be distorted by coarse average-case models.
+- **Co-located & Disaggregated Serving**: The primary C++ core supports
+  monolithic co-location and sequential PDD serving. AFD is not part of this
+  release.
+- **Modern Runtime Optimizations**: The C++ core models prefix caching,
+  chunked prefill, recompute preemption, quantized analytical operators, and
+  tiered CPU KV-cache behavior inside the scheduler-batch-engine loop. The
+  retained Python path provides the experimental speculative decoding/MTP,
+  learned predictors, and profiling workflows described below.
+- **Fidelity**: Frontier combines operator, communication, transfer, and
+  KV-cache memory models with deterministic event ordering. This supports
+  repeatable SLA and design-space comparisons without reducing behavior to
+  coarse average speedup factors.
 
 > AFD serving architecture is intentionally not included in this release and will be available in a later public release.
 
 ## Minimum Hardware Requirements
 
-- **Simulation:** Frontier supports E2E execution entirely on CPU-only machines, leveraging pre-compiled profiling databases.
-- **Profiling:** At least **1 GPU** is required exclusively for running the Frontier profiling module to collect operator-level performance metrics on new hardware or software stacks.
+- **C++ simulation:** CPU-only; fixed latency and analytical roofline modes do
+  not require a GPU or profiling database.
+- **Python profiling:** At least **1 GPU** is required only when collecting new
+  operator-level performance data.
 
 ## Use Cases
 
@@ -74,41 +85,39 @@ Frontier is designed for what-if studies that would be expensive or slow to run 
 
 ## Quick Start and Examples
 
-Install the release package and test extras from the repository root:
+The deterministic C++ core under `cpp/` is the primary implementation. It
+requires CMake 3.24+, Ninja, and a C++17 compiler (GCC 11+, Clang 14+, or a
+current MSVC toolchain):
 
 ```bash
-python -m pip install -e '.[test]'
-PYTHONPATH=$PWD PYTHONDONTWRITEBYTECODE=1 pytest tests/unit/test_examples_pdd_scripts.py -q -p no:cacheprovider
+cmake -S cpp -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+cmake --build build
+ctest --test-dir build --output-on-failure
+
+./build/frontier_sim \
+  --config cpp/examples/configs/00_hello_colocation_fixed.json \
+  --workload cpp/examples/workloads/00_tiny.csv \
+  --output-dir outputs/hello \
+  --output-mode requests
 ```
 
-Current release-facing PDD and co-location examples are split by simulation mode and default to the formula-based `analytical` backend for one-click smoke runs:
+Preset users can run `cmake --preset dev`, `cmake --build --preset dev`, and
+`ctest --preset dev` from `cpp/`. To create a relocatable release archive,
+configure the `release` preset and run `cpack --config ../build/release/CPackConfig.cmake`
+from `cpp/`.
 
-- `examples/architecture/pdd/offline/dense_model_basic.sh`
-- `examples/architecture/pdd/online/dense_model_basic_online.sh`
-- `examples/architecture/co-location/online/dense_model_basic_online.sh`
-- `examples/architecture/co-location/online/moe_model_basic_online.sh`
-- `examples/architecture/co-location/online/thinking_mode_basic_online.sh`
+The runnable C++ recipes cover dense analytical serving, KV pressure, MoE,
+PDD, session prefix caching, and CPU KV-cache tiering. See
+[`cpp/examples/README.md`](cpp/examples/README.md).
 
-These examples cover most runtime optimizations. Note that dummy analytical smoke runs only validate runtime plumbing, not profiling fidelity. Profiling outputs and reusable compute data are organized under data/profiling/compute.
+The Python simulator under `frontier/` is retained for capabilities not yet in
+C++, including speculative decoding/MTP, learned execution-time predictors,
+GPU profiling, topology-aware communication backends, SGLang scheduling, and
+Thinking Mode. Its examples remain under `examples/`; see
+[`docs/cli/README.md`](docs/cli/README.md) before using that path.
 
-> Currently, only the `h800` and `rtx_pro_6000` datasets contain full-feature format profiles; we highly recommend re-collecting profiling data locally for your specific hardware.
-
-Example fixtures live under:
-
-```text
-examples/
-├── architecture/
-│   ├── pdd/
-│   │   ├── run_all.sh
-│   │   ├── offline/
-│   │   └── online/
-│   └── co-location/
-│       ├── run_all.sh
-│       ├── offline/
-│       └── online/
-├── fixtures/
-└── profiling/
-```
+For contributor setup, supported test gates, and pull-request expectations,
+see [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ## Communication Backend
 

@@ -12,7 +12,7 @@ void handle_event(const CpuKVCacheRestoreStartPayload &payload, SimTime time,
         simulator.cluster(payload.cluster_type)
             .get_replica_scheduler(payload.replica_id, payload.dp_id);
     scheduler.on_cpu_kv_cache_restore_start(payload.transfer_id,
-                                             payload.generation, time);
+                                            payload.generation, time);
     for (scheduler::ScheduledAuxiliaryEvent &event :
          scheduler.drain_auxiliary_events()) {
         simulator.event_queue().push(event.time, std::move(event.payload));

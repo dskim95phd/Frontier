@@ -100,8 +100,7 @@ void handle_event(const BatchPipelineEndPayload &payload, SimTime time,
             throw std::runtime_error(
                 "collapsed batch stage completion is nonfinite");
         }
-        batch_stage.mark_completed(
-            SimTime::from_seconds(completed_seconds));
+        batch_stage.mark_completed(SimTime::from_seconds(completed_seconds));
         simulator.metrics().record_batch_stage(batch_stage, batch, runtime);
     }
     simulator.event_queue().push(time, [&]() {

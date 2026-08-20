@@ -30,9 +30,9 @@ mla_kv_cache_size_bytes(std::uint64_t num_tokens, std::uint64_t num_layers,
                         const MlaKvCacheLayout &layout);
 
 // vLLM-style token-interleaved DCP assigns token i to rank i % dcp_size.
-[[nodiscard]] std::uint64_t
-mla_dcp_local_token_count(std::uint64_t num_tokens, std::uint64_t dcp_size,
-                          std::uint64_t dcp_rank);
+[[nodiscard]] std::uint64_t mla_dcp_local_token_count(std::uint64_t num_tokens,
+                                                      std::uint64_t dcp_size,
+                                                      std::uint64_t dcp_rank);
 
 [[nodiscard]] std::uint64_t mla_dcp_rank_kv_cache_size_bytes(
     std::uint64_t num_tokens, std::uint64_t num_layers,

@@ -76,8 +76,7 @@ bool CacheAwareClusterScheduler::targets_are_imbalanced(
                    static_cast<double>(minimum);
 }
 
-std::vector<ClusterRequestAssignment>
-CacheAwareClusterScheduler::schedule() {
+std::vector<ClusterRequestAssignment> CacheAwareClusterScheduler::schedule() {
     std::stable_sort(request_queue_.begin(), request_queue_.end(),
                      [](const QueuedRequest &lhs, const QueuedRequest &rhs) {
                          return lhs.arrived_at < rhs.arrived_at;
@@ -125,9 +124,8 @@ CacheAwareClusterScheduler::schedule() {
         const auto mapped = session_to_target_.find(session_id);
         if (mapped != session_to_target_.end() &&
             !targets_are_imbalanced(ordered_targets)) {
-            const BaseReplicaScheduler &cache_target =
-                get_replica_scheduler(mapped->second.first,
-                                      mapped->second.second);
+            const BaseReplicaScheduler &cache_target = get_replica_scheduler(
+                mapped->second.first, mapped->second.second);
             const kv_cache::PrefixLookupResult lookup =
                 cache_target.tiered_prefix_cache_lookup(incoming);
             const double hit_ratio =

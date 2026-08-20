@@ -1,0 +1,342 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frontier-simulator.dev/schema/config-v1.schema.json",
+  "title": "Frontier simulator configuration",
+  "description": "Public input contract for Frontier C++ schema_version 1. frontier_sim also checks cross-field hardware and model compatibility.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "run_id",
+    "simulation_mode",
+    "system_architecture",
+    "enable_parallel_clusters",
+    "prefix_cache",
+    "cluster_scheduler",
+    "clusters"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "run_id": { "type": "string", "pattern": "\\S" },
+    "simulation_mode": { "enum": ["offline", "online"] },
+    "system_architecture": { "enum": ["co-location", "pd-disaggregation"] },
+    "enable_parallel_clusters": { "const": false },
+    "prefix_cache": { "$ref": "#/$defs/prefixCache" },
+    "cpu_kv_cache": { "$ref": "#/$defs/cpuKvCache" },
+    "cluster_scheduler": { "$ref": "#/$defs/clusterScheduler" },
+    "clusters": { "type": "object" },
+    "kv_cache_transfer": { "$ref": "#/$defs/kvCacheTransfer" }
+  },
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": { "system_architecture": { "const": "co-location" } },
+        "required": ["system_architecture"]
+      },
+      "then": {
+        "properties": {
+          "clusters": {
+            "type": "object",
+            "required": ["monolithic"],
+            "properties": { "monolithic": { "$ref": "#/$defs/clusterRuntime" } },
+            "additionalProperties": false
+          },
+          "kv_cache_transfer": false
+        }
+      },
+      "else": {
+        "required": ["kv_cache_transfer"],
+        "properties": {
+          "clusters": {
+            "type": "object",
+            "required": ["prefill", "decode"],
+            "properties": {
+              "prefill": { "$ref": "#/$defs/clusterRuntime" },
+              "decode": { "$ref": "#/$defs/clusterRuntime" }
+            },
+            "additionalProperties": false
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "uint64": { "type": "integer", "minimum": 0, "maximum": 18446744073709551615 },
+    "positiveUint64": { "type": "integer", "minimum": 1, "maximum": 18446744073709551615 },
+    "nonnegativeNumber": { "type": "number", "minimum": 0 },
+    "positiveNumber": { "type": "number", "exclusiveMinimum": 0 },
+    "fraction": { "type": "number", "minimum": 0, "maximum": 1 },
+    "precision": {
+      "enum": ["fp32", "fp16", "bf16", "fp8", "int8", "fp4", "int4", "mxfp8", "mxfp4"]
+    },
+    "prefixCache": {
+      "type": "object",
+      "required": ["enabled", "key_mode"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "key_mode": { "const": "session" }
+      },
+      "additionalProperties": false
+    },
+    "cpuKvCache": {
+      "type": "object",
+      "required": [
+        "enabled",
+        "capacity_bytes",
+        "static_slice_per_gpu",
+        "capacity_bytes_per_gpu",
+        "dram_bandwidth_gbps_per_gpu",
+        "c2c_bandwidth_gbps_per_gpu",
+        "write_bandwidth_gbps",
+        "write_latency_ms",
+        "read_bandwidth_gbps",
+        "read_latency_ms",
+        "eviction_policy",
+        "capacity_pressure_policy",
+        "transfer_concurrency"
+      ],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "capacity_bytes": { "$ref": "#/$defs/uint64" },
+        "static_slice_per_gpu": { "type": "boolean" },
+        "capacity_bytes_per_gpu": { "$ref": "#/$defs/positiveUint64" },
+        "dram_bandwidth_gbps_per_gpu": { "$ref": "#/$defs/positiveNumber" },
+        "c2c_bandwidth_gbps_per_gpu": { "$ref": "#/$defs/positiveNumber" },
+        "write_bandwidth_gbps": { "$ref": "#/$defs/positiveNumber" },
+        "write_latency_ms": { "$ref": "#/$defs/nonnegativeNumber" },
+        "read_bandwidth_gbps": { "$ref": "#/$defs/positiveNumber" },
+        "read_latency_ms": { "$ref": "#/$defs/nonnegativeNumber" },
+        "eviction_policy": { "const": "session_lru_suffix" },
+        "capacity_pressure_policy": { "enum": ["prefix_fit", "skip_offload"] },
+        "transfer_concurrency": { "const": "full_duplex_serialized" }
+      },
+      "additionalProperties": false
+    },
+    "clusterSchedulerType": {
+      "enum": ["round_robin", "sticky_round_robin", "vllm_queue_aware", "kv_aware", "cache_aware"]
+    },
+    "clusterScheduler": {
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "type": { "$ref": "#/$defs/clusterSchedulerType" },
+        "prefill_type": { "$ref": "#/$defs/clusterSchedulerType" },
+        "decode_type": { "$ref": "#/$defs/clusterSchedulerType" },
+        "cache_threshold": { "$ref": "#/$defs/fraction" },
+        "balance_abs_threshold": { "$ref": "#/$defs/uint64" },
+        "balance_rel_threshold": { "type": "number", "minimum": 1 }
+      },
+      "additionalProperties": false
+    },
+    "clusterRuntime": {
+      "type": "object",
+      "required": ["parallelism", "scheduler", "execution_model", "model_name", "moe_routing", "gpu_memory"],
+      "properties": {
+        "parallelism": { "$ref": "#/$defs/parallelism" },
+        "scheduler": { "$ref": "#/$defs/scheduler" },
+        "execution_model": { "$ref": "#/$defs/executionModel" },
+        "model_name": { "type": "string", "minLength": 1 },
+        "moe_routing": { "$ref": "#/$defs/moeRouting" },
+        "gpu_memory": { "$ref": "#/$defs/gpuMemory" },
+        "total_expert_num": { "$ref": "#/$defs/uint64" },
+        "router_topk": { "$ref": "#/$defs/uint64" },
+        "first_k_dense_replace": { "$ref": "#/$defs/uint64" },
+        "num_shared_experts": { "$ref": "#/$defs/uint64" }
+      },
+      "additionalProperties": false
+    },
+    "parallelism": {
+      "type": "object",
+      "required": [
+        "num_replicas",
+        "tensor_parallel_size",
+        "pipeline_parallel_size",
+        "data_parallel_size",
+        "moe_tensor_parallel_size",
+        "moe_expert_parallel_size"
+      ],
+      "properties": {
+        "num_replicas": { "$ref": "#/$defs/positiveUint64" },
+        "tensor_parallel_size": { "enum": [1, 2, 4, 8] },
+        "decode_context_parallel_size": { "$ref": "#/$defs/positiveUint64" },
+        "pipeline_parallel_size": { "$ref": "#/$defs/positiveUint64" },
+        "pipeline_exclusive": { "type": "boolean" },
+        "pipeline_stage_layer_counts": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/positiveUint64" }
+        },
+        "data_parallel_size": { "$ref": "#/$defs/positiveUint64" },
+        "moe_tensor_parallel_size": { "$ref": "#/$defs/positiveUint64" },
+        "moe_expert_parallel_size": { "$ref": "#/$defs/positiveUint64" }
+      },
+      "additionalProperties": false
+    },
+    "scheduler": {
+      "type": "object",
+      "required": [
+        "type",
+        "scheduling_policy",
+        "batch_size_cap",
+        "max_tokens_in_batch",
+        "enable_preemption",
+        "enable_chunked_prefill",
+        "long_prefill_token_threshold",
+        "block_size",
+        "watermark_blocks_fraction",
+        "num_preallocate_tokens"
+      ],
+      "properties": {
+        "type": { "const": "vllm_v1" },
+        "scheduling_policy": { "const": "fcfs" },
+        "batch_size_cap": { "$ref": "#/$defs/positiveUint64" },
+        "max_tokens_in_batch": { "$ref": "#/$defs/positiveUint64" },
+        "enable_preemption": { "type": "boolean" },
+        "enable_chunked_prefill": { "type": "boolean" },
+        "long_prefill_token_threshold": { "$ref": "#/$defs/uint64" },
+        "block_size": { "$ref": "#/$defs/positiveUint64" },
+        "num_blocks": { "$ref": "#/$defs/positiveUint64" },
+        "watermark_blocks_fraction": { "type": "number", "minimum": 0, "exclusiveMaximum": 1 },
+        "num_preallocate_tokens": { "$ref": "#/$defs/uint64" },
+        "pipeline_event_mode": { "enum": ["exact", "collapsed"] }
+      },
+      "additionalProperties": false
+    },
+    "moeRouting": {
+      "type": "object",
+      "required": ["mode", "distribution", "seed"],
+      "properties": {
+        "mode": { "enum": ["simulation", "uniform_legacy", "uniform_random"] },
+        "distribution": { "enum": ["balanced", "random", "skewed", "zipf"] },
+        "seed": { "$ref": "#/$defs/uint64" },
+        "layer_scope": { "enum": ["shared", "per_layer"] }
+      },
+      "additionalProperties": false
+    },
+    "gpuMemory": {
+      "type": "object",
+      "required": ["capacity_bytes_per_gpu"],
+      "properties": {
+        "capacity_bytes_per_gpu": { "$ref": "#/$defs/positiveUint64" },
+        "auto_calculate_num_blocks": { "type": "boolean" },
+        "runtime_reserve_fraction": { "type": "number", "minimum": 0, "exclusiveMaximum": 1 },
+        "runtime_reserve_bytes": { "$ref": "#/$defs/uint64" },
+        "weight_overhead_fraction": { "$ref": "#/$defs/nonnegativeNumber" },
+        "model_weight_bytes_per_gpu": { "$ref": "#/$defs/uint64" },
+        "kv_cache_budget_bytes_per_gpu": { "$ref": "#/$defs/uint64" },
+        "kv_cache_bytes_per_block": { "$ref": "#/$defs/uint64" }
+      },
+      "additionalProperties": false
+    },
+    "executionModel": {
+      "oneOf": [
+        { "$ref": "#/$defs/fixedExecutionModel" },
+        { "$ref": "#/$defs/analyticalExecutionModel" }
+      ]
+    },
+    "fixedExecutionModel": {
+      "type": "object",
+      "required": ["type", "stage_latencies_ms"],
+      "properties": {
+        "type": { "const": "fixed" },
+        "stage_latencies_ms": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/nonnegativeNumber" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "analyticalExecutionModel": {
+      "type": "object",
+      "required": ["type", "device", "precision", "network_bandwidth_gbps", "network_latency_us", "intra_node_bandwidth_gbps"],
+      "properties": {
+        "type": { "const": "analytical" },
+        "device": { "enum": ["rubin", "gb300", "custom"] },
+        "precision": { "$ref": "#/$defs/precision" },
+        "operator_precisions": { "$ref": "#/$defs/operatorPrecisions" },
+        "device_overrides": { "$ref": "#/$defs/deviceOverrides" },
+        "network_bandwidth_gbps": { "$ref": "#/$defs/positiveNumber" },
+        "network_latency_us": { "$ref": "#/$defs/nonnegativeNumber" },
+        "intra_node_bandwidth_gbps": { "$ref": "#/$defs/positiveNumber" },
+        "kernel_profile": { "enum": ["generic", "k3_sglang_mxfp4", "k3_deepgemm_megamoe"] },
+        "moe_layer_event_mode": { "enum": ["detailed", "first_layer_scaled", "stage_group_scaled"] },
+        "moe_communication_backend": { "enum": ["generic", "sm100_megamoe_public"] },
+        "mega_moe_tail_io_fraction": { "$ref": "#/$defs/fraction" },
+        "mega_moe_wave_exposure": { "$ref": "#/$defs/fraction" },
+        "mega_moe_cluster_task_latency_us": { "$ref": "#/$defs/nonnegativeNumber" }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": { "properties": { "device": { "const": "custom" } }, "required": ["device"] },
+          "then": {
+            "required": ["device_overrides"],
+            "properties": {
+              "device_overrides": {
+                "required": ["hbm_bandwidth_tbps", "fp32_tflops", "fp16_tflops", "fp8_tflops", "fp4_tflops"]
+              }
+            }
+          }
+        }
+      ]
+    },
+    "deviceOverrides": {
+      "type": "object",
+      "properties": {
+        "hbm_bandwidth_tbps": { "$ref": "#/$defs/positiveNumber" },
+        "fp32_tflops": { "$ref": "#/$defs/positiveNumber" },
+        "fp16_tflops": { "$ref": "#/$defs/positiveNumber" },
+        "fp8_tflops": { "$ref": "#/$defs/positiveNumber" },
+        "fp4_tflops": { "$ref": "#/$defs/positiveNumber" }
+      },
+      "additionalProperties": false
+    },
+    "operatorPrecisions": {
+      "type": "object",
+      "properties": {
+        "attention": { "$ref": "#/$defs/precision" },
+        "dense": { "$ref": "#/$defs/precision" },
+        "moe_expert": { "$ref": "#/$defs/precision" },
+        "moe_router": { "$ref": "#/$defs/precision" },
+        "kv_cache": { "$ref": "#/$defs/precision" },
+        "communication": { "$ref": "#/$defs/precision" },
+        "attention_weight": { "$ref": "#/$defs/precision" },
+        "attention_activation": { "$ref": "#/$defs/precision" },
+        "dense_weight": { "$ref": "#/$defs/precision" },
+        "dense_activation": { "$ref": "#/$defs/precision" },
+        "moe_expert_weight": { "$ref": "#/$defs/precision" },
+        "moe_expert_activation": { "$ref": "#/$defs/precision" },
+        "moe_router_weight": { "$ref": "#/$defs/precision" },
+        "moe_router_activation": { "$ref": "#/$defs/precision" },
+        "router_weight_storage": { "$ref": "#/$defs/precision" },
+        "lm_head": { "$ref": "#/$defs/precision" },
+        "lm_head_weight": { "$ref": "#/$defs/precision" },
+        "lm_head_activation": { "$ref": "#/$defs/precision" },
+        "routed_expert_weight": { "$ref": "#/$defs/precision" },
+        "routed_expert_activation": { "$ref": "#/$defs/precision" },
+        "latent_moe_projection_weight": { "$ref": "#/$defs/precision" },
+        "latent_moe_projection_activation": { "$ref": "#/$defs/precision" },
+        "shared_expert_weight": { "$ref": "#/$defs/precision" },
+        "shared_expert_activation": { "$ref": "#/$defs/precision" },
+        "dense_mlp_weight": { "$ref": "#/$defs/precision" },
+        "dense_mlp_activation": { "$ref": "#/$defs/precision" },
+        "router_compute": { "$ref": "#/$defs/precision" },
+        "kda_snapshot": { "$ref": "#/$defs/precision" }
+      },
+      "additionalProperties": false
+    },
+    "kvCacheTransfer": {
+      "type": "object",
+      "required": ["type", "network_bandwidth_gbps", "network_latency_ms", "kv_cache_dtype_size_bytes", "enable_compression"],
+      "properties": {
+        "type": { "const": "analytical" },
+        "network_bandwidth_gbps": { "$ref": "#/$defs/positiveNumber" },
+        "network_latency_ms": { "$ref": "#/$defs/nonnegativeNumber" },
+        "kv_cache_dtype_size_bytes": { "$ref": "#/$defs/positiveNumber" },
+        "enable_compression": { "const": false }
+      },
+      "additionalProperties": false
+    }
+  }
+}

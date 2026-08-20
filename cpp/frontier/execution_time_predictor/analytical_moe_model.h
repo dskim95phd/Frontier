@@ -226,8 +226,8 @@ predict_moe_lanes(const DeviceCeilings &device, const AnalyticalConfig &config,
 [[nodiscard]] MoELanePrediction
 predict_moe_lanes(const DeviceCeilings &device, const AnalyticalConfig &config,
                   const MoEModel &model, const RoutingAllocation &routing,
-                   std::uint64_t router_topk, Precision precision,
-                   bool enable_group_mega_moe_geometry = false);
+                  std::uint64_t router_topk, Precision precision,
+                  bool enable_group_mega_moe_geometry = false);
 [[nodiscard]] MoERoutedLanePrediction predict_routed_moe_lanes(
     const DeviceCeilings &device, const AnalyticalConfig &config,
     const MoEModel &model, const RoutingAllocation &routing,
@@ -242,9 +242,7 @@ predict_moe_lanes(const DeviceCeilings &device, const AnalyticalConfig &config,
     std::uint64_t routed_hidden_size = 0,
     std::string_view moe_communication_backend = "generic",
     const RoutingAllocation *routing = nullptr,
-    double fused_expert_compute_ms = 0.0,
-    double overlap_residual = 0.35,
-    double a2a_bandwidth_scale = 1.0,
-    double a2a_startup_scale = 1.0);
+    double fused_expert_compute_ms = 0.0, double overlap_residual = 0.35,
+    double a2a_bandwidth_scale = 1.0, double a2a_startup_scale = 1.0);
 
 } // namespace frontier::execution_time_predictor::detail

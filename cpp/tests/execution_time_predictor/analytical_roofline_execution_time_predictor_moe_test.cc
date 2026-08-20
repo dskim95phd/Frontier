@@ -177,18 +177,17 @@ void test_uniform_random_topk_is_distinct_per_input_token() {
                             allocation.global_expert_tokens.end(),
                             std::uint64_t{0}) == kInputTokens * kTopK,
             "uniform top-k routing must conserve all selections");
-    require(std::all_of(allocation.global_expert_tokens.begin(),
-                        allocation.global_expert_tokens.end(),
-                        [](std::uint64_t count) {
-                            return count <= kInputTokens;
-                        }),
-            "one input token must not select the same expert twice");
+    require(
+        std::all_of(allocation.global_expert_tokens.begin(),
+                    allocation.global_expert_tokens.end(),
+                    [](std::uint64_t count) { return count <= kInputTokens; }),
+        "one input token must not select the same expert twice");
 
     // A one-token prefill-sized draw makes the distinctness contract directly
     // observable from the aggregate histogram: exactly k experts have count 1.
     const auto one_token =
-        frontier::execution_time_predictor::detail::route_tokens(
-            1, kTopK, 16, 4, routing, 0);
+        frontier::execution_time_predictor::detail::route_tokens(1, kTopK, 16,
+                                                                 4, routing, 0);
     require(std::count(one_token.global_expert_tokens.begin(),
                        one_token.global_expert_tokens.end(),
                        std::uint64_t{1}) == kTopK &&
@@ -204,9 +203,8 @@ void test_uniform_routing_varies_by_batch_and_reports_lane_traffic() {
     routing.layer_scope = frontier::config::MoeRoutingLayerScope::kShared;
     routing.seed = 42;
 
-    const auto first =
-        frontier::execution_time_predictor::detail::route_tokens(
-            64, 8, 256, 32, routing, 7, 1001);
+    const auto first = frontier::execution_time_predictor::detail::route_tokens(
+        64, 8, 256, 32, routing, 7, 1001);
     const auto repeated =
         frontier::execution_time_predictor::detail::route_tokens(
             64, 8, 256, 32, routing, 7, 1001);
@@ -290,25 +288,20 @@ void test_sm100_megamoe_public_profile_models_overlap_and_layout_transition() {
                     public_balanced.raw_ep_combine_ms,
             "multiple expert routes to one destination lane must not duplicate "
             "the one-sided communication payload");
-    require(std::abs(synchronized.ep_dispatch_ms +
-                         synchronized.ep_combine_ms -
+    require(std::abs(synchronized.ep_dispatch_ms + synchronized.ep_combine_ms -
                      synchronized.raw_ep_dispatch_ms -
-                         synchronized.raw_ep_combine_ms) <
-                1e-12,
+                     synchronized.raw_ep_combine_ms) < 1e-12,
             "synchronized MegaMoE must expose the full A2A path");
     const double ep32_position = 2.0 / 3.0;
-    const double dispatch_startup_ms =
-        (18.0 + 4.0 * ep32_position) / 1000.0;
-    const double combine_startup_ms =
-        (31.0 + 2.0 * ep32_position) / 1000.0;
-    require(std::abs(
-                rubin_bandwidth.raw_ep_dispatch_ms - dispatch_startup_ms -
-                0.5 * (public_balanced.raw_ep_dispatch_ms -
-                       dispatch_startup_ms)) < 1e-12 &&
-                std::abs(
-                    rubin_bandwidth.raw_ep_combine_ms - combine_startup_ms -
-                    0.5 * (public_balanced.raw_ep_combine_ms -
-                           combine_startup_ms)) < 1e-12,
+    const double dispatch_startup_ms = (18.0 + 4.0 * ep32_position) / 1000.0;
+    const double combine_startup_ms = (31.0 + 2.0 * ep32_position) / 1000.0;
+    require(std::abs(rubin_bandwidth.raw_ep_dispatch_ms - dispatch_startup_ms -
+                     0.5 * (public_balanced.raw_ep_dispatch_ms -
+                            dispatch_startup_ms)) < 1e-12 &&
+                std::abs(rubin_bandwidth.raw_ep_combine_ms -
+                         combine_startup_ms -
+                         0.5 * (public_balanced.raw_ep_combine_ms -
+                                combine_startup_ms)) < 1e-12,
             "Rubin NVLink scaling must halve payload time without scaling "
             "the fixed A2A startup");
 }
@@ -332,8 +325,7 @@ void test_group_moe_communication_aggregates_dp_source_rows() {
         frontier::config::load_model_config("moonshotai/Kimi-K3");
     frontier::config::MoeRoutingConfig routing{};
     routing.mode = frontier::config::MoeRoutingMode::kUniformRandom;
-    routing.distribution =
-        frontier::config::MoeRoutingDistribution::kBalanced;
+    routing.distribution = frontier::config::MoeRoutingDistribution::kBalanced;
     routing.layer_scope = frontier::config::MoeRoutingLayerScope::kShared;
 
     const auto source0 =
@@ -431,10 +423,8 @@ void test_group_moe_communication_aggregates_dp_source_rows() {
             "change the live routed group prediction");
     require(synchronized_group.grouped_gemm_geometry.enabled &&
                 synchronized_group.grouped_gemm_geometry.block_m > 0 &&
-                synchronized_group.grouped_gemm_geometry.up_cluster_tasks >
-                    0 &&
-                synchronized_group.grouped_gemm_geometry
-                        .down_cluster_tasks > 0,
+                synchronized_group.grouped_gemm_geometry.up_cluster_tasks > 0 &&
+                synchronized_group.grouped_gemm_geometry.down_cluster_tasks > 0,
             "production group prediction must retain critical-lane MegaMoE "
             "geometry");
 
@@ -445,8 +435,7 @@ void test_group_moe_communication_aggregates_dp_source_rows() {
             execution, parallelism, no_shared_model, routing);
     const auto no_shared_group =
         no_shared_predictor.predict_moe_group_layer(make_input(true));
-    require(no_shared_group.lane_times_ms ==
-                synchronized_group.lane_times_ms,
+    require(no_shared_group.lane_times_ms == synchronized_group.lane_times_ms,
             "DP-group destination work must not include source-local shared "
             "experts");
 }
@@ -684,20 +673,17 @@ void test_mega_moe_geometry_uses_exact_expert_histogram() {
     model.moe_tensor_parallel_size = 1;
     model.gated_mlp = true;
 
-    const std::vector<std::uint64_t> aligned = {
-        16, 16, 16, 16, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
-    const std::vector<std::uint64_t> fragmented = {
-        31, 16, 16, 16, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    const std::vector<std::uint64_t> aligned = {16, 16, 16, 16, 16, 0, 0, 0,
+                                                0,  0,  0,  0,  0,  0, 0, 0};
+    const std::vector<std::uint64_t> fragmented = {31, 16, 16, 16, 1, 0, 0, 0,
+                                                   0,  0,  0,  0,  0, 0, 0, 0};
     const AnalyticalConfig generic{};
-    const AnalyticalConfig mega =
-        frontier::execution_time_predictor::detail::
-            analytical_config_from_profile("k3_deepgemm_megamoe");
-    const AnalyticalConfig rubin_mega =
-        frontier::execution_time_predictor::detail::
-            analytical_config_from_profile("k3_deepgemm_megamoe", "rubin");
-    const AnalyticalConfig rubin_generic =
-        frontier::execution_time_predictor::detail::
-            analytical_config_from_profile("generic", "rubin");
+    const AnalyticalConfig mega = frontier::execution_time_predictor::detail::
+        analytical_config_from_profile("k3_deepgemm_megamoe");
+    const AnalyticalConfig rubin_mega = frontier::execution_time_predictor::
+        detail::analytical_config_from_profile("k3_deepgemm_megamoe", "rubin");
+    const AnalyticalConfig rubin_generic = frontier::execution_time_predictor::
+        detail::analytical_config_from_profile("generic", "rubin");
     require(rubin_mega.mega_moe_sm_count == 224 &&
                 rubin_mega.mega_moe_a2a_bandwidth_scale == 2.0 &&
                 rubin_mega.mega_moe_a2a_startup_scale == 1.0 &&
@@ -741,20 +727,19 @@ void test_mega_moe_geometry_uses_exact_expert_histogram() {
                 mega_fragmented.grouped_down_projection_ms >
                     mega_aligned.grouped_down_projection_ms,
             "MegaMoE geometry must charge the extra expert M block");
-    require(mega_aligned.grouped_gemm_geometry.enabled &&
-                mega_aligned.grouped_gemm_geometry.block_m == 16 &&
-                mega_aligned.grouped_gemm_geometry.routed_m_blocks == 5 &&
-                mega_fragmented.grouped_gemm_geometry.routed_m_blocks == 6 &&
-                mega_aligned.grouped_gemm_geometry.routed_padded_tokens == 80 &&
-                mega_fragmented.grouped_gemm_geometry.routed_padded_tokens ==
-                    96 &&
-                std::abs(mega_aligned.grouped_gemm_geometry
-                             .up_cluster_task_overhead_ms -
-                         static_cast<double>(mega_aligned
-                                                 .grouped_gemm_geometry
-                                                 .up_cluster_tasks) *
-                             0.06325 / 1000.0) < 1e-12,
-            "MegaMoE diagnostics must expose block-M padding geometry");
+    require(
+        mega_aligned.grouped_gemm_geometry.enabled &&
+            mega_aligned.grouped_gemm_geometry.block_m == 16 &&
+            mega_aligned.grouped_gemm_geometry.routed_m_blocks == 5 &&
+            mega_fragmented.grouped_gemm_geometry.routed_m_blocks == 6 &&
+            mega_aligned.grouped_gemm_geometry.routed_padded_tokens == 80 &&
+            mega_fragmented.grouped_gemm_geometry.routed_padded_tokens == 96 &&
+            std::abs(
+                mega_aligned.grouped_gemm_geometry.up_cluster_task_overhead_ms -
+                static_cast<double>(
+                    mega_aligned.grouped_gemm_geometry.up_cluster_tasks) *
+                    0.06325 / 1000.0) < 1e-12,
+        "MegaMoE diagnostics must expose block-M padding geometry");
     require(mega_aligned.shuffling_ms == generic_aligned.shuffling_ms,
             "expert GEMM geometry must not scale shuffling work");
 
@@ -769,8 +754,7 @@ void test_mega_moe_geometry_uses_exact_expert_histogram() {
     const auto group_composed =
         frontier::execution_time_predictor::detail::predict_routed_moe_lanes(
             DeviceCeilings::gb300(), mega, model, allocation, 1,
-            frontier::execution_time_predictor::detail::
-                MoEOperatorPrecisions{},
+            frontier::execution_time_predictor::detail::MoEOperatorPrecisions{},
             true);
     require(!source_local.lane_times.front().grouped_gemm_geometry.enabled &&
                 group_composed.critical_lane_geometry.enabled &&
@@ -786,13 +770,11 @@ void test_mega_moe_geometry_uses_exact_expert_histogram() {
     const auto low =
         frontier::execution_time_predictor::detail::predict_moe_layer(
             DeviceCeilings::gb300(), mega, threshold_model, 68, 1,
-            threshold_low,
-            Precision::kFp8);
+            threshold_low, Precision::kFp8);
     const auto high =
         frontier::execution_time_predictor::detail::predict_moe_layer(
             DeviceCeilings::gb300(), mega, threshold_model, 69, 1,
-            threshold_high,
-            Precision::kFp8);
+            threshold_high, Precision::kFp8);
     require(low.grouped_gemm_geometry.block_m == 16 &&
                 high.grouped_gemm_geometry.block_m == 32,
             "MegaMoE block-M policy must switch above 8.5 tokens/expert");

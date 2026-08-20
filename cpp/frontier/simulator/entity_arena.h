@@ -1,8 +1,8 @@
 #pragma once
 
 #include <cstddef>
-#include <map>
 #include <limits>
+#include <map>
 #include <memory>
 #include <optional>
 #include <unordered_map>
@@ -35,8 +35,7 @@ class EntityArena {
     [[nodiscard]] entities::RequestCollection &requests() noexcept {
         return requests_;
     }
-    [[nodiscard]] const entities::RequestCollection &
-    requests() const noexcept {
+    [[nodiscard]] const entities::RequestCollection &requests() const noexcept {
         return requests_;
     }
     [[nodiscard]] entities::Request &request(RequestId request_id);

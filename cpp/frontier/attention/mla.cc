@@ -45,14 +45,14 @@ std::uint64_t mla_dcp_local_token_count(std::uint64_t num_tokens,
     if (dcp_size == 0 || dcp_rank >= dcp_size) {
         throw MlaLayoutError("invalid MLA DCP size or rank");
     }
-    return num_tokens / dcp_size +
-           (dcp_rank < num_tokens % dcp_size ? 1 : 0);
+    return num_tokens / dcp_size + (dcp_rank < num_tokens % dcp_size ? 1 : 0);
 }
 
-std::uint64_t mla_dcp_rank_kv_cache_size_bytes(
-    std::uint64_t num_tokens, std::uint64_t num_layers,
-    const MlaKvCacheLayout &layout, std::uint64_t dcp_size,
-    std::uint64_t dcp_rank) {
+std::uint64_t mla_dcp_rank_kv_cache_size_bytes(std::uint64_t num_tokens,
+                                               std::uint64_t num_layers,
+                                               const MlaKvCacheLayout &layout,
+                                               std::uint64_t dcp_size,
+                                               std::uint64_t dcp_rank) {
     return mla_kv_cache_size_bytes(
         mla_dcp_local_token_count(num_tokens, dcp_size, dcp_rank), num_layers,
         layout);

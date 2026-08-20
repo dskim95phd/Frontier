@@ -245,9 +245,9 @@ moe_stage_communication(const MoEStageContext &context,
     const std::uint64_t input_tokens = context.dense_batch.total_tokens;
     const detail::MoELayerTime &critical = lane_prediction.lane_times.at(
         static_cast<std::size_t>(lane_prediction.critical_lane));
-    const double fused_expert_compute_ms =
-        critical.grouped_up_projection_ms +
-        critical.grouped_down_projection_ms + critical.shuffling_ms;
+    const double fused_expert_compute_ms = critical.grouped_up_projection_ms +
+                                           critical.grouped_down_projection_ms +
+                                           critical.shuffling_ms;
     return detail::predict_moe_communication(
         context.communication_backend, input_tokens, context.model.hidden_size,
         input_tokens * context.model.router_topk,
@@ -258,8 +258,7 @@ moe_stage_communication(const MoEStageContext &context,
         context.communication_element_bytes,
         context.model.routed_expert_hidden_size,
         context.config.moe_communication_backend, &allocation,
-        fused_expert_compute_ms,
-        context.analytical.moe_a2a_overlap_residual,
+        fused_expert_compute_ms, context.analytical.moe_a2a_overlap_residual,
         context.analytical.mega_moe_a2a_bandwidth_scale,
         context.analytical.mega_moe_a2a_startup_scale);
 }
@@ -378,8 +377,8 @@ predict_selected_moe_layer_execution(const MoEStageContext &context,
                 context.reusable_moe_lane_prediction;
             if (lane_prediction == nullptr) {
                 owned_lane_prediction.emplace(detail::predict_moe_lanes(
-                    context.device, context.analytical, moe_model,
-                    *allocation, model.router_topk, moe_precisions));
+                    context.device, context.analytical, moe_model, *allocation,
+                    model.router_topk, moe_precisions));
                 lane_prediction = &*owned_lane_prediction;
             }
             record_moe_layer(result, context, local_moe_layer, model_layer,
@@ -491,8 +490,7 @@ MoEStagePrediction predict_moe_stage_execution(const MoEStageContext &context) {
                 communication.moe_tp_ms;
             result.execution_time.ep_dispatch_ms +=
                 communication.ep_dispatch_ms;
-            result.execution_time.ep_combine_ms +=
-                communication.ep_combine_ms;
+            result.execution_time.ep_combine_ms += communication.ep_combine_ms;
             if (context.cluster_type == ClusterType::kDecode) {
                 result.execution_time.dp_input_communication_ms +=
                     communication.dp_input_ms;
@@ -521,8 +519,8 @@ MoEStagePrediction predict_moe_stage_execution(const MoEStageContext &context) {
             shared_lane_prediction;
         if (lane_prediction == nullptr || !layer_shared) {
             owned_lane_prediction.emplace(detail::predict_moe_lanes(
-                context.device, context.analytical, moe_model,
-                *allocation, model.router_topk, moe_precisions));
+                context.device, context.analytical, moe_model, *allocation,
+                model.router_topk, moe_precisions));
             lane_prediction = &*owned_lane_prediction;
             if (layer_shared) {
                 shared_lane_prediction = lane_prediction;

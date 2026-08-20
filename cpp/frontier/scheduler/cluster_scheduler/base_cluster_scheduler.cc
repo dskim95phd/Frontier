@@ -15,133 +15,6 @@
 
 namespace frontier::scheduler {
 
-std::optional<BaseClusterScheduler::MoEBarrierReady>
-BaseClusterScheduler::MoEBarrierCoordinator::arrive(
-    const MoEBarrierKey &key, MoEBarrierParticipant participant,
-    std::uint64_t expected_participants) {
-    if (!key.replica_id.valid() || !key.stage_id.valid() ||
-        !key.sync_group_id.valid() || !key.layer_id.valid() ||
-        !key.generation.valid()) {
-        throw MoEBarrierError("MoE barrier key contains an invalid ID");
-    }
-    if (expected_participants == 0 || !participant.participant_id.valid() ||
-        static_cast<std::uint64_t>(participant.participant_id.value()) >=
-            expected_participants) {
-        throw MoEBarrierError("MoE participant is outside the barrier domain");
-    }
-    if (!participant.arrival_time.valid() ||
-        !std::isfinite(participant.elapsed_component_ms) ||
-        participant.elapsed_component_ms < 0.0) {
-        throw MoEBarrierError("MoE barrier participant timing is invalid");
-    }
-    if (consumed_.find(key) != consumed_.end()) {
-        return std::nullopt;
-    }
-
-    Entry &entry = waiting_[key];
-    if (entry.expected_participants == 0) {
-        entry.expected_participants = expected_participants;
-    } else if (entry.expected_participants != expected_participants) {
-        throw MoEBarrierError("MoE barrier participant count changed");
-    }
-
-    const auto position = entry.participants.find(participant.participant_id);
-    if (position == entry.participants.end()) {
-        entry.participants.emplace(participant.participant_id,
-                                   std::move(participant));
-    } else if (position->second.is_idle && !participant.is_idle) {
-        position->second = std::move(participant);
-    } else if (!position->second.is_idle && participant.is_idle) {
-        return maybe_ready(key, entry);
-    } else if (position->second == participant) {
-        return maybe_ready(key, entry);
-    } else {
-        throw MoEBarrierError("duplicate MoE barrier participant");
-    }
-    return maybe_ready(key, entry);
-}
-
-std::optional<BaseClusterScheduler::MoEBarrierReady>
-BaseClusterScheduler::MoEBarrierCoordinator::compact_missing_idle(
-    const MoEBarrierKey &key, std::uint64_t expected_participants,
-    SimTime arrival_time) {
-    std::optional<MoEBarrierReady> ready;
-    for (std::uint64_t participant = 0; participant < expected_participants;
-         ++participant) {
-        const MoEParticipantId id{participant};
-        const auto waiting = waiting_.find(key);
-        if (waiting != waiting_.end() &&
-            waiting->second.participants.find(id) !=
-                waiting->second.participants.end()) {
-            continue;
-        }
-        ready = arrive(
-            key,
-            [&]() {
-                MoEBarrierParticipant value{};
-                value.participant_id = id;
-                value.batch_id = BatchId{};
-                value.arrival_time = arrival_time;
-                value.elapsed_component_ms = 0.0;
-                value.is_idle = true;
-                return value;
-            }(),
-            expected_participants);
-    }
-    return ready;
-}
-
-std::optional<BaseClusterScheduler::MoEBarrierReady>
-BaseClusterScheduler::MoEBarrierCoordinator::maybe_ready(
-    const MoEBarrierKey &key, Entry &entry) {
-    if (entry.collective_emitted ||
-        entry.participants.size() != entry.expected_participants) {
-        return std::nullopt;
-    }
-    SimTime maximum;
-    for (const auto &[unused, participant] : entry.participants) {
-        static_cast<void>(unused);
-        if (!maximum.valid() || participant.arrival_time > maximum) {
-            maximum = participant.arrival_time;
-        }
-    }
-    entry.collective_emitted = true;
-    return MoEBarrierReady{key, maximum};
-}
-
-std::vector<BaseClusterScheduler::MoEBarrierParticipant>
-BaseClusterScheduler::MoEBarrierCoordinator::consume(const MoEBarrierKey &key) {
-    if (consumed_.find(key) != consumed_.end()) {
-        return {};
-    }
-    const auto position = waiting_.find(key);
-    if (position == waiting_.end()) {
-        return {};
-    }
-    if (!position->second.collective_emitted ||
-        position->second.participants.size() !=
-            position->second.expected_participants) {
-        throw MoEBarrierError(
-            "MoE barrier consumed before collective readiness");
-    }
-    std::vector<MoEBarrierParticipant> participants;
-    participants.reserve(position->second.participants.size());
-    for (auto &[unused, participant] : position->second.participants) {
-        static_cast<void>(unused);
-        participants.push_back(std::move(participant));
-    }
-    waiting_.erase(position);
-    consumed_.emplace(key, true);
-    return participants;
-}
-
-void BaseClusterScheduler::MoEBarrierCoordinator::require_empty() const {
-    if (!waiting_.empty()) {
-        throw MoEBarrierError(
-            "MoE barrier state remains at simulator quiescence");
-    }
-}
-
 BaseClusterScheduler::BaseClusterScheduler(
     const entities::Cluster &cluster, entities::RequestCollection &requests,
     execution_time_predictor::ExecutionTimePredictorPtr predictor,
@@ -271,8 +144,8 @@ BaseClusterScheduler::get_replica_scheduler(ReplicaId replica_id,
     return *replica_schedulers_.at(target_index(replica_id, dp_id));
 }
 
-BatchGlobalId BaseClusterScheduler::next_batch_global_id(
-    ReplicaId replica_id, DataParallelId dp_id) {
+BatchGlobalId BaseClusterScheduler::next_batch_global_id(ReplicaId replica_id,
+                                                         DataParallelId dp_id) {
     const BatchCounterKey key = [&]() {
         BatchCounterKey value{};
         value.replica_id = replica_id;
@@ -534,8 +407,8 @@ void BaseClusterScheduler::begin_moe_stage(
         (path == MoESyncPath::kDecode
              ? initial_routing.pre_moe_tp_communication_ms
              : 0.0);
-    const SimTime initial_pre_arrival = SimTime::from_seconds(
-        started_at.seconds() + initial_pre_moe_ms * 1e-3);
+    const SimTime initial_pre_arrival =
+        SimTime::from_seconds(started_at.seconds() + initial_pre_moe_ms * 1e-3);
     const std::uint64_t maximum_id =
         static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max());
     std::uint64_t group_value = 0;
@@ -729,8 +602,7 @@ void BaseClusterScheduler::begin_moe_stage(
                                 .pre_moe_tp_communication_ms_per_layer
                           : 0.0));
             }
-            if (grouped_attention_layers !=
-                value.remaining_scaled_moe_layers) {
+            if (grouped_attention_layers != value.remaining_scaled_moe_layers) {
                 throw std::logic_error(
                     "scaled MoE attention groups do not cover the remaining "
                     "logical layers");
@@ -782,11 +654,11 @@ void BaseClusterScheduler::begin_moe_stage(
             throw std::logic_error(
                 "two real MoE batches claim one synchronization participant");
         }
-        enqueue_moe_arrival(
-            stored, participant, LayerId{0}, MoESyncPhase::kPreMoe,
-            SimTime::from_seconds(started_at.seconds() +
-                                  initial_pre_moe_ms * 1e-3),
-            initial_pre_moe_ms, simulator);
+        enqueue_moe_arrival(stored, participant, LayerId{0},
+                            MoESyncPhase::kPreMoe,
+                            SimTime::from_seconds(started_at.seconds() +
+                                                  initial_pre_moe_ms * 1e-3),
+                            initial_pre_moe_ms, simulator);
     }
 }
 
@@ -840,7 +712,7 @@ void BaseClusterScheduler::ensure_moe_group_participants(
     }
 }
 
-std::optional<BaseClusterScheduler::MoEBarrierReady>
+std::optional<MoEBarrierReady>
 BaseClusterScheduler::compact_moe_group_participants(
     const MoEBarrierKey &key, MoESyncPath path, SimTime time,
     simulator::Simulator &simulator) {
@@ -967,8 +839,7 @@ void BaseClusterScheduler::continue_moe_stage(
                 }
                 add_checked(group_input.input_tokens, routing.input_tokens);
                 add_checked(group_input.routed_tokens, routing.routed_tokens);
-                group_input.source_input_tokens.push_back(
-                    routing.input_tokens);
+                group_input.source_input_tokens.push_back(routing.input_tokens);
                 group_input.source_shared_expert_path_ms.push_back(
                     routing.shared_expert_path_ms);
                 for (std::size_t expert = 0;
@@ -1105,8 +976,7 @@ void BaseClusterScheduler::continue_moe_stage(
                     continue;
                 }
                 if (attention_group_layout.empty()) {
-                    attention_group_layout =
-                        state.scaled_moe_attention_groups;
+                    attention_group_layout = state.scaled_moe_attention_groups;
                     maximum_pre_transition_ms_by_family.assign(
                         attention_group_layout.size(), 0.0);
                 } else if (attention_group_layout.size() !=
@@ -1161,9 +1031,9 @@ void BaseClusterScheduler::continue_moe_stage(
                 const double local_ep_communication_ms =
                     state.decode_local_ep_communication_ms_by_layer.at(
                         layer_index);
-                const double source_aware_ep_extra_ms = std::max(
-                    0.0, state.decode_ep_communication_ms_per_layer -
-                             local_ep_communication_ms);
+                const double source_aware_ep_extra_ms =
+                    std::max(0.0, state.decode_ep_communication_ms_per_layer -
+                                      local_ep_communication_ms);
                 synchronization_breakdown.moe_ep_aggregation_extra_ms +=
                     source_aware_ep_extra_ms;
                 if (state.remaining_scaled_moe_layers > 0) {

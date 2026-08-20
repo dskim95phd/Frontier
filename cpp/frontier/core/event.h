@@ -281,9 +281,8 @@ struct CpuKVCacheRestoreEndPayload {
 using EventPayload = std::variant<
     RequestArrivalPayload, GlobalSchedulePayload, ClusterSchedulePayload,
     ReplicaSchedulePayload, BatchStageArrivalPayload,
-    ReplicaStageSchedulePayload, BatchStageEndPayload,
-    BatchPipelineEndPayload, ClusterBatchEndPayload,
-    GlobalBatchEndPayload, KVCacheTransferStartPayload,
+    ReplicaStageSchedulePayload, BatchStageEndPayload, BatchPipelineEndPayload,
+    ClusterBatchEndPayload, GlobalBatchEndPayload, KVCacheTransferStartPayload,
     KVCacheTransferEndPayload, PrefillSyncPayload, PrefillSyncCollectivePayload,
     DecodeSyncPayload, DecodeSyncCollectivePayload,
     CpuKVCacheOffloadStartPayload, CpuKVCacheOffloadEndPayload,
@@ -295,8 +294,8 @@ namespace detail {
     template <typename T, typename = void>                                     \
     struct has_##field : std::false_type {};                                   \
     template <typename T>                                                      \
-    struct has_##field<T,                                                      \
-                       std::void_t<decltype(std::declval<const T &>().field)>> \
+    struct has_##                                                              \
+        field<T, std::void_t<decltype(std::declval<const T &>().field)>>       \
         : std::true_type {}
 
 FRONTIER_DEFINE_FIELD_TRAIT(request_id);

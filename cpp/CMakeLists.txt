@@ -2,15 +2,23 @@ cmake_minimum_required(VERSION 3.24)
 
 project(
   FrontierCpp
-  VERSION 0.1.0
+  VERSION 0.2.0
   DESCRIPTION "C++ discrete-event simulation core for Frontier"
   LANGUAGES CXX
 )
+
+include(GNUInstallDirs)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+option(
+  FRONTIER_WARNINGS_AS_ERRORS
+  "Treat compiler warnings as build errors"
+  OFF
+)
 
 option(
   FRONTIER_FETCH_DEPENDENCIES
@@ -58,11 +66,17 @@ endif()
 function(frontier_enable_warnings target_name)
   if(MSVC)
     target_compile_options(${target_name} PRIVATE /W4 /permissive-)
+    if(FRONTIER_WARNINGS_AS_ERRORS)
+      target_compile_options(${target_name} PRIVATE /WX)
+    endif()
   elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(
       ${target_name}
       PRIVATE -Wall -Wextra -Wpedantic
     )
+    if(FRONTIER_WARNINGS_AS_ERRORS)
+      target_compile_options(${target_name} PRIVATE -Werror)
+    endif()
   endif()
 endfunction()
 
@@ -77,6 +91,7 @@ add_library(
   frontier/config/config_serialize.cc
   frontier/cc_backend/analytical_model.cc
   frontier/core/event_queue.cc
+  frontier/core/runtime_paths.cc
   frontier/entities/request.cc
   frontier/entities/batch.cc
   frontier/entities/batch_stage.cc
@@ -122,6 +137,7 @@ add_library(
   frontier/metrics/metrics_store.cc
   frontier/request_generator/workload.cc
   frontier/scheduler/cluster_scheduler/base_cluster_scheduler.cc
+  frontier/scheduler/cluster_scheduler/moe_barrier_coordinator.cc
   frontier/scheduler/cluster_scheduler/actual_cache_aware_cluster_scheduler.cc
   frontier/scheduler/cluster_scheduler/kv_aware_cluster_scheduler.cc
   frontier/scheduler/cluster_scheduler/round_robin_cluster_scheduler.cc
@@ -131,6 +147,7 @@ add_library(
   frontier/scheduler/kv_block_accounting.cc
   frontier/scheduler/replica_scheduler/base_replica_scheduler.cc
   frontier/scheduler/replica_scheduler/replica_scheduler_factory.cc
+  frontier/scheduler/replica_scheduler/tiered_prefix_plan.cc
   frontier/scheduler/replica_scheduler/vllm_v1_engine_replica_scheduler.cc
   frontier/scheduler/replica_stage_scheduler/replica_stage_scheduler.cc
   frontier/simulator/entity_arena.cc
@@ -138,10 +155,15 @@ add_library(
 )
 target_include_directories(frontier_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(frontier_core PRIVATE nlohmann_json::nlohmann_json)
-target_compile_definitions(
-  frontier_core
-  PRIVATE FRONTIER_MODEL_CONFIG_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../data/config/models"
+add_custom_target(
+  frontier_model_assets ALL
+  COMMAND
+    ${CMAKE_COMMAND} -E copy_directory
+    "${CMAKE_CURRENT_SOURCE_DIR}/../data/config/models"
+    "${CMAKE_CURRENT_BINARY_DIR}/share/frontier/models"
+  COMMENT "Copying Frontier model assets"
 )
+add_dependencies(frontier_core frontier_model_assets)
 frontier_enable_warnings(frontier_core)
 
 add_executable(frontier_sim frontier/main.cc)
@@ -164,16 +186,69 @@ target_link_libraries(
 )
 frontier_enable_warnings(frontier_load_benchmark_summary)
 
+install(
+  TARGETS frontier_sim
+  RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)
+install(
+  DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../data/config/models/"
+  DESTINATION "${CMAKE_INSTALL_DATADIR}/frontier/models"
+  FILES_MATCHING PATTERN "*.json"
+)
+install(
+  FILES "${CMAKE_CURRENT_SOURCE_DIR}/schema/config-v1.schema.json"
+  DESTINATION "${CMAKE_INSTALL_DATADIR}/frontier/schema"
+)
+
+set(CPACK_PACKAGE_NAME "frontier-simulator")
+set(CPACK_PACKAGE_VENDOR "Frontier contributors")
+set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "${PROJECT_DESCRIPTION}")
+set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_CURRENT_SOURCE_DIR}/../LICENSE")
+set(CPACK_PACKAGE_CHECKSUM SHA256)
+if(WIN32)
+  set(CPACK_GENERATOR ZIP)
+else()
+  set(CPACK_GENERATOR TGZ)
+endif()
+include(CPack)
+
 include(CTest)
 
 if(BUILD_TESTING)
+  add_test(
+    NAME frontier_release.metadata
+    COMMAND
+      ${CMAKE_COMMAND}
+      "-DFRONTIER_REPOSITORY_ROOT=${CMAKE_CURRENT_SOURCE_DIR}/.."
+      "-DFRONTIER_VERSION=${PROJECT_VERSION}"
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/verify_release_metadata.cmake
+  )
+  add_test(
+    NAME frontier_release.install_smoke
+    COMMAND
+      ${CMAKE_COMMAND}
+      "-DFRONTIER_BUILD_DIR=${CMAKE_CURRENT_BINARY_DIR}"
+      "-DFRONTIER_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+      "-DFRONTIER_INSTALL_DIR=${CMAKE_CURRENT_BINARY_DIR}/install-smoke"
+      "-DFRONTIER_BUILD_CONFIG=$<CONFIG>"
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/install_smoke.cmake
+  )
+  set_tests_properties(
+    frontier_release.install_smoke
+    PROPERTIES
+      LABELS packaging
+      RUN_SERIAL TRUE
+      TIMEOUT 60
+  )
+
   add_test(
     NAME frontier_sim.version
     COMMAND $<TARGET_FILE:frontier_sim> --version
   )
   set_tests_properties(
     frontier_sim.version
-    PROPERTIES PASS_REGULAR_EXPRESSION "^frontier_sim 0\\.1\\.0"
+    PROPERTIES PASS_REGULAR_EXPRESSION "^frontier_sim 0\\.2\\.0"
   )
   add_test(
     NAME frontier_sim.cli
@@ -265,6 +340,17 @@ if(BUILD_TESTING)
   add_test(
     NAME frontier_core.event_queue
     COMMAND $<TARGET_FILE:frontier_event_queue_test>
+  )
+
+  add_executable(
+    frontier_runtime_paths_test
+    tests/core/runtime_paths_test.cc
+  )
+  target_link_libraries(frontier_runtime_paths_test PRIVATE frontier_core)
+  frontier_enable_warnings(frontier_runtime_paths_test)
+  add_test(
+    NAME frontier_core.runtime_paths
+    COMMAND $<TARGET_FILE:frontier_runtime_paths_test>
   )
 
   add_executable(
@@ -470,6 +556,20 @@ if(BUILD_TESTING)
   add_test(
     NAME frontier_scheduler.hierarchy
     COMMAND $<TARGET_FILE:frontier_scheduler_hierarchy_test>
+  )
+
+  add_executable(
+    frontier_moe_barrier_coordinator_test
+    tests/scheduler/moe_barrier_coordinator_test.cc
+  )
+  target_link_libraries(
+    frontier_moe_barrier_coordinator_test
+    PRIVATE frontier_core
+  )
+  frontier_enable_warnings(frontier_moe_barrier_coordinator_test)
+  add_test(
+    NAME frontier_scheduler.moe_barrier_coordinator
+    COMMAND $<TARGET_FILE:frontier_moe_barrier_coordinator_test>
   )
 
   add_executable(

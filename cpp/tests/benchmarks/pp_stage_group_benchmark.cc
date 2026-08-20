@@ -52,8 +52,8 @@ struct BenchmarkResult {
 };
 
 frontier::config::SimulationConfig make_config(std::uint64_t pp,
-                                                std::string event_mode,
-                                                const std::string &fixture) {
+                                               std::string event_mode,
+                                               const std::string &fixture) {
     Json root = Json::parse(fixture);
     Json &cluster = root.at("clusters").at("monolithic");
     cluster.at("parallelism").at("pipeline_parallel_size") = pp;
@@ -73,11 +73,9 @@ frontier::config::SimulationConfig make_config(std::uint64_t pp,
     return parse_simulation_config_json(root.dump());
 }
 
-BenchmarkResult run_once(std::uint64_t pp, std::string event_mode,
-                        const std::string &fixture,
-                        const std::vector<
-                            frontier::request_generator::WorkloadRequest>
-                            &workload) {
+BenchmarkResult run_once(
+    std::uint64_t pp, std::string event_mode, const std::string &fixture,
+    const std::vector<frontier::request_generator::WorkloadRequest> &workload) {
     auto config = make_config(pp, event_mode, fixture);
     frontier::simulator::Simulator simulator(config, workload);
     const auto start = std::chrono::steady_clock::now();
@@ -95,8 +93,8 @@ BenchmarkResult run_once(std::uint64_t pp, std::string event_mode,
                 timing_groups.insert(static_cast<std::uint64_t>(value));
             } else if (name == "timing_cache_hits_total" &&
                        std::isfinite(value) && value >= 0.0) {
-                timing_cache_hits = std::max(
-                    timing_cache_hits, static_cast<std::uint64_t>(value));
+                timing_cache_hits = std::max(timing_cache_hits,
+                                             static_cast<std::uint64_t>(value));
             } else if (name == "timing_cache_misses_total" &&
                        std::isfinite(value) && value >= 0.0) {
                 timing_cache_misses = std::max(
@@ -104,8 +102,7 @@ BenchmarkResult run_once(std::uint64_t pp, std::string event_mode,
             } else if (name == "timing_cache_unique_templates_total" &&
                        std::isfinite(value) && value >= 0.0) {
                 unique_timing_templates = std::max(
-                    unique_timing_templates,
-                    static_cast<std::uint64_t>(value));
+                    unique_timing_templates, static_cast<std::uint64_t>(value));
             }
         }
     }
@@ -127,17 +124,15 @@ BenchmarkResult run_once(std::uint64_t pp, std::string event_mode,
 }
 
 void print_result(const BenchmarkResult &result) {
-    std::cout << "mode=" << result.pipeline_event_mode
-              << " pp=" << result.pp << " wall_clock_ms=" << std::fixed
-              << std::setprecision(3) << result.wall_clock_ms
-              << " events=" << result.events
+    std::cout << "mode=" << result.pipeline_event_mode << " pp=" << result.pp
+              << " wall_clock_ms=" << std::fixed << std::setprecision(3)
+              << result.wall_clock_ms << " events=" << result.events
               << " batch_stages=" << result.batch_stages
               << " predictor_calls=" << result.predictor_calls
               << " unique_timing_groups=" << result.unique_timing_groups
               << " timing_cache_hits=" << result.timing_cache_hits
               << " timing_cache_misses=" << result.timing_cache_misses
-              << " unique_timing_templates="
-              << result.unique_timing_templates
+              << " unique_timing_templates=" << result.unique_timing_templates
               << " peak_event_queue=" << result.peak_event_queue << '\n';
 }
 
@@ -154,9 +149,9 @@ int main(int argc, char **argv) {
             }
             iterations = parsed;
         }
-        const std::string fixture = read_file(
-            std::string{FRONTIER_TEST_FIXTURE_DIR} +
-            "/config/analytical_parallel_colocation.json");
+        const std::string fixture =
+            read_file(std::string{FRONTIER_TEST_FIXTURE_DIR} +
+                      "/config/analytical_parallel_colocation.json");
         const auto workload = parse_workload_csv(
             "session_start_at,think_time,num_prefill_tokens,num_decode_tokens\n"
             "0,0,32,2\n"

@@ -16,8 +16,8 @@
 #include <utility>
 #include <variant>
 
-#include "frontier/events/event_dispatcher.h"
 #include "frontier/core/precision.h"
+#include "frontier/events/event_dispatcher.h"
 #include "frontier/execution_time_predictor/execution_time_predictor_factory.h"
 #include "frontier/kv_cache_transfer/analytical_transfer.h"
 #include "frontier/scheduler/global_scheduler/global_scheduler.h"
@@ -166,8 +166,8 @@ gpu_kv_physical_block_layout(const config::ClusterRuntimeConfig &runtime,
         for (std::uint64_t stage = 0;
              stage < runtime.parallelism.pipeline_parallel_size; ++stage) {
             const config::PipelineStageLayerRange layers =
-                config::pipeline_stage_layer_range(
-                    runtime.model.num_layers, runtime.parallelism, stage);
+                config::pipeline_stage_layer_range(runtime.model.num_layers,
+                                                   runtime.parallelism, stage);
             for (std::uint64_t rank = 0; rank < dcp; ++rank) {
                 result.max_rank_bytes = std::max(
                     result.max_rank_bytes,
@@ -202,10 +202,10 @@ total_hbm_bytes_per_gpu(const config::ClusterRuntimeConfig &runtime) {
     return std::nullopt;
 }
 
-std::vector<request_generator::WorkloadRequest> prepare_workload(
-    const config::SimulationConfig &config,
-    std::vector<request_generator::WorkloadRequest> workload,
-    const SimulatorOptions &options) {
+std::vector<request_generator::WorkloadRequest>
+prepare_workload(const config::SimulationConfig &config,
+                 std::vector<request_generator::WorkloadRequest> workload,
+                 const SimulatorOptions &options) {
     validate_inputs(config, workload);
     request_generator::validate_workload_for_config(workload, config);
     if (!options.observation_end_time.has_value() ||
@@ -229,18 +229,17 @@ std::vector<request_generator::WorkloadRequest> prepare_workload(
     }
 
     workload.erase(
-        std::remove_if(
-            workload.begin(), workload.end(),
-            [&](const request_generator::WorkloadRequest &request) {
-                const bool excluded_session =
-                    request.session_id.valid() &&
-                    excluded_sessions.find(request.session_id) !=
-                        excluded_sessions.end();
-                const bool excluded_standalone =
-                    !request.session_id.valid() &&
-                    request.session_start_at > horizon;
-                return excluded_session || excluded_standalone;
-            }),
+        std::remove_if(workload.begin(), workload.end(),
+                       [&](const request_generator::WorkloadRequest &request) {
+                           const bool excluded_session =
+                               request.session_id.valid() &&
+                               excluded_sessions.find(request.session_id) !=
+                                   excluded_sessions.end();
+                           const bool excluded_standalone =
+                               !request.session_id.valid() &&
+                               request.session_start_at > horizon;
+                           return excluded_session || excluded_standalone;
+                       }),
         workload.end());
     request_generator::materialize_workload_for_config_in_place(workload,
                                                                 config);
@@ -249,15 +248,14 @@ std::vector<request_generator::WorkloadRequest> prepare_workload(
 
 } // namespace
 
-Simulator::Simulator(
-    const config::SimulationConfig &config,
-    std::vector<request_generator::WorkloadRequest> workload,
-    SimulatorOptions options)
+Simulator::Simulator(const config::SimulationConfig &config,
+                     std::vector<request_generator::WorkloadRequest> workload,
+                     SimulatorOptions options)
     : config_(config),
-      observation_end_time_(
-          config.simulation_mode == config::SimulationMode::kOnline
-              ? options.observation_end_time
-              : std::nullopt),
+      observation_end_time_(config.simulation_mode ==
+                                    config::SimulationMode::kOnline
+                                ? options.observation_end_time
+                                : std::nullopt),
       entities_(prepare_workload(config, std::move(workload), options)),
       metrics_(config, options.detailed_traces_enabled) {
     const bool is_pdd = config_.system_architecture ==
@@ -321,8 +319,8 @@ Simulator::Simulator(
         }
         const auto previous = latest_by_session.find(request.session_id());
         if (previous != latest_by_session.end()) {
-            session_successors_.at(entities_.requests().position(
-                previous->second)) = request.id();
+            session_successors_.at(
+                entities_.requests().position(previous->second)) = request.id();
             has_predecessor.at(entities_.requests().position(request.id())) =
                 true;
             has_session_successors_ = true;
@@ -622,8 +620,8 @@ bool Simulator::on_decode_kv_arrival() {
 
 void Simulator::record_request_completion(RequestId request_id, SimTime time) {
     entities_.record_request_completion(request_id);
-    const RequestId successor = session_successors_.at(
-        entities_.requests().position(request_id));
+    const RequestId successor =
+        session_successors_.at(entities_.requests().position(request_id));
     if (!successor.valid()) {
         return;
     }
@@ -801,9 +799,9 @@ void Simulator::set_wall_clock_progress_callback(
     if (!callback) {
         throw SimulationError("wall-clock progress callback must be set");
     }
-    const auto interval = std::chrono::duration_cast<
-        std::chrono::steady_clock::duration>(
-        std::chrono::duration<double>{interval_seconds});
+    const auto interval =
+        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+            std::chrono::duration<double>{interval_seconds});
     if (interval <= std::chrono::steady_clock::duration::zero()) {
         throw SimulationError(
             "wall-clock progress interval is below clock resolution");

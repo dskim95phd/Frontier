@@ -2,11 +2,11 @@
 
 #include <utility>
 
-#include "frontier/scheduler/cluster_scheduler/round_robin_cluster_scheduler.h"
 #include "frontier/scheduler/cluster_scheduler/actual_cache_aware_cluster_scheduler.h"
+#include "frontier/scheduler/cluster_scheduler/kv_aware_cluster_scheduler.h"
+#include "frontier/scheduler/cluster_scheduler/round_robin_cluster_scheduler.h"
 #include "frontier/scheduler/cluster_scheduler/sticky_round_robin_cluster_scheduler.h"
 #include "frontier/scheduler/cluster_scheduler/vllm_queue_aware_cluster_scheduler.h"
-#include "frontier/scheduler/cluster_scheduler/kv_aware_cluster_scheduler.h"
 
 namespace frontier::scheduler {
 
@@ -61,11 +61,10 @@ GlobalScheduler::GlobalScheduler(
                 cpu_kv_cache_config);
             break;
         case config::ClusterSchedulerType::kCacheAware:
-            cluster_scheduler =
-                std::make_unique<CacheAwareClusterScheduler>(
-                    cluster, requests, predictor->second,
-                    kv_cache_transfer_predictor_, prefix_cache_config,
-                    cpu_kv_cache_config, scheduler_config);
+            cluster_scheduler = std::make_unique<CacheAwareClusterScheduler>(
+                cluster, requests, predictor->second,
+                kv_cache_transfer_predictor_, prefix_cache_config,
+                cpu_kv_cache_config, scheduler_config);
             break;
         }
         if (cluster_scheduler == nullptr ||

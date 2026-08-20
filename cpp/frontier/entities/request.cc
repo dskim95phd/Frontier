@@ -175,12 +175,12 @@ void Request::record_cpu_restore_transfer(std::uint64_t blocks,
         !std::isfinite(service_time_ms) || service_time_ms < 0.0 ||
         blocks > std::numeric_limits<std::uint64_t>::max() -
                      cpu_restore_transferred_blocks_ ||
-        bytes > std::numeric_limits<std::uint64_t>::max() -
-                    cpu_restore_bytes_ ||
+        bytes >
+            std::numeric_limits<std::uint64_t>::max() - cpu_restore_bytes_ ||
         queue_time_ms / 1e3 >
             std::numeric_limits<double>::max() - cpu_restore_queue_time_s_ ||
-        service_time_ms / 1e3 > std::numeric_limits<double>::max() -
-                                      cpu_restore_service_time_s_) {
+        service_time_ms / 1e3 >
+            std::numeric_limits<double>::max() - cpu_restore_service_time_s_) {
         throw RequestError("invalid CPU restore transfer metrics");
     }
     // A waiting request can be restored more than once when cache-aware
@@ -193,9 +193,10 @@ void Request::record_cpu_restore_transfer(std::uint64_t blocks,
     cpu_restore_service_time_s_ += service_time_ms / 1e3;
 }
 
-bool Request::record_cpu_prefix_admission(
-    std::uint64_t gpu_hit_blocks, std::uint64_t cpu_query_blocks,
-    std::uint64_t cpu_consumed_blocks, std::uint64_t cpu_restored_tokens) {
+bool Request::record_cpu_prefix_admission(std::uint64_t gpu_hit_blocks,
+                                          std::uint64_t cpu_query_blocks,
+                                          std::uint64_t cpu_consumed_blocks,
+                                          std::uint64_t cpu_restored_tokens) {
     if (cpu_prefix_admission_recorded_) {
         return false;
     }
@@ -259,7 +260,8 @@ void Request::on_batch_completion(SimTime time, std::uint64_t scheduled_tokens,
         }
         if (scheduled_prefill_tokens_ >
             std::numeric_limits<std::uint64_t>::max() - scheduled_tokens) {
-            throw RequestError("scheduled PREFILL token count overflows uint64");
+            throw RequestError(
+                "scheduled PREFILL token count overflows uint64");
         }
         if (prefill_recompute_pending_ &&
             preemption_recomputed_prefill_tokens_ >
@@ -315,8 +317,7 @@ void Request::on_preempted(SimTime time, ClusterType cluster_type) {
         throw RequestError("only a running request can be preempted");
     }
     if (tokens_at_preemption_ == nullptr) {
-        tokens_at_preemption_ =
-            std::make_unique<std::vector<std::uint64_t>>();
+        tokens_at_preemption_ = std::make_unique<std::vector<std::uint64_t>>();
     }
     tokens_at_preemption_->push_back(scheduler_num_computed_tokens_);
     ++preemption_count_;

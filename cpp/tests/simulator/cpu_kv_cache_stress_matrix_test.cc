@@ -26,9 +26,9 @@ using frontier::RequestId;
 using frontier::SessionId;
 using frontier::SimTime;
 using frontier::config::CpuKVCacheCapacityPressurePolicy;
+using frontier::config::parse_simulation_config_json;
 using frontier::config::SimulationConfig;
 using frontier::config::SimulationMode;
-using frontier::config::parse_simulation_config_json;
 using frontier::metrics::SimulationOutput;
 using frontier::request_generator::WorkloadRequest;
 using frontier::simulator::run_simulation;
@@ -99,15 +99,13 @@ std::vector<WorkloadRequest> make_workload(std::uint64_t sessions,
                                                   0.0001)
                           : SimTime::from_seconds((session / 2) * 0.2 +
                                                   (session % 2) * 0.01);
-                value.num_prefill_tokens =
-                    oversized_first && session == 0
-                        ? 40
-                        : 8 + (session % 2) * 4;
+                value.num_prefill_tokens = oversized_first && session == 0
+                                               ? 40
+                                               : 8 + (session % 2) * 4;
             } else {
                 // Session-relative arrivals exercise restore after other
                 // sessions have evicted the initial prefix.
-                value.think_time =
-                    SimTime::from_seconds(burst ? 0.001 : 0.05);
+                value.think_time = SimTime::from_seconds(burst ? 0.001 : 0.05);
                 // Keep the accumulated per-session GPU frontier within the
                 // five-block stress tier (the decode tokens consume pages as
                 // well as the prefill prompt).
@@ -120,7 +118,8 @@ std::vector<WorkloadRequest> make_workload(std::uint64_t sessions,
 }
 
 std::uint64_t bytes_per_block(const SimulationConfig &config) {
-    return frontier::config::resolve_cpu_kv_cache_target(config).bytes_per_block;
+    return frontier::config::resolve_cpu_kv_cache_target(config)
+        .bytes_per_block;
 }
 
 SimulationConfig configure(const MatrixScenario &scenario) {
@@ -251,7 +250,8 @@ void require_quiescent(const SimulationOutput &output,
     }
     for (const auto &transfer : output.cpu_kv_cache_transfers) {
         expect(transfer.blocks > 0 && transfer.size_bytes > 0 &&
-                   transfer.submitted_at.valid() && transfer.started_at.valid() &&
+                   transfer.submitted_at.valid() &&
+                   transfer.started_at.valid() &&
                    transfer.completed_at.valid() &&
                    transfer.submitted_at <= transfer.started_at &&
                    transfer.started_at <= transfer.completed_at,
@@ -264,7 +264,7 @@ void require_affinity(const SimulationOutput &output,
     std::map<std::int64_t, std::pair<std::int64_t, std::int64_t>> affinity;
     for (const auto &record : output.requests) {
         const auto target = std::make_pair(record.prefill_replica_id.value(),
-                                            record.prefill_dp_id.value());
+                                           record.prefill_dp_id.value());
         const auto [position, inserted] =
             affinity.emplace(record.session_id.value(), target);
         expect(inserted || position->second == target,
@@ -272,8 +272,7 @@ void require_affinity(const SimulationOutput &output,
     }
 }
 
-TierSummary summarize(const SimulationOutput &output,
-                      std::uint64_t sessions) {
+TierSummary summarize(const SimulationOutput &output, std::uint64_t sessions) {
     TierSummary summary{};
     for (const auto &batch : output.batches) {
         if (batch.cluster_type != ClusterType::kPrefill) {
@@ -292,16 +291,15 @@ TierSummary summarize(const SimulationOutput &output,
             first_arrival = record.arrived_at.seconds();
             have_request = true;
         } else {
-            first_arrival = std::min(first_arrival, record.arrived_at.seconds());
+            first_arrival =
+                std::min(first_arrival, record.arrived_at.seconds());
         }
-        last_completion = std::max(last_completion,
-                                   record.completed_at.seconds());
-        if (record.request_id.value() >=
-            static_cast<std::int64_t>(sessions)) {
-            const double ttft_ms =
-                (record.first_token_completed_at.seconds() -
-                 record.arrived_at.seconds()) *
-                1'000.0;
+        last_completion =
+            std::max(last_completion, record.completed_at.seconds());
+        if (record.request_id.value() >= static_cast<std::int64_t>(sessions)) {
+            const double ttft_ms = (record.first_token_completed_at.seconds() -
+                                    record.arrived_at.seconds()) *
+                                   1'000.0;
             summary.successor_ttft_sum_ms += ttft_ms;
             ++summary.successor_count;
         }
@@ -311,20 +309,19 @@ TierSummary summarize(const SimulationOutput &output,
     summary.restores = output.aggregate.cpu_kv_cache.restore_operations;
     summary.evicted_blocks = output.aggregate.cpu_kv_cache.evicted_blocks;
     summary.evicted_sessions = output.aggregate.cpu_kv_cache.evicted_sessions;
-    summary.skipped_offloads =
-        output.aggregate.cpu_kv_cache.skipped_offloads;
+    summary.skipped_offloads = output.aggregate.cpu_kv_cache.skipped_offloads;
     summary.truncated_offloads =
         output.aggregate.cpu_kv_cache.truncated_offloads;
     return summary;
 }
 
 void print_summary(const std::string &label, const TierSummary &summary) {
-    const double average = summary.successor_count == 0
-                               ? 0.0
-                               : summary.successor_ttft_sum_ms /
-                                     static_cast<double>(summary.successor_count);
-    std::cout << "[CPU-MATRIX] " << label
-              << " prefill_scheduled_tokens="
+    const double average =
+        summary.successor_count == 0
+            ? 0.0
+            : summary.successor_ttft_sum_ms /
+                  static_cast<double>(summary.successor_count);
+    std::cout << "[CPU-MATRIX] " << label << " prefill_scheduled_tokens="
               << summary.prefill_scheduled_tokens
               << " cached_prefill_tokens=" << summary.cached_tokens
               << " successor_ttft_sum_ms=" << summary.successor_ttft_sum_ms
@@ -335,8 +332,7 @@ void print_summary(const std::string &label, const TierSummary &summary) {
               << " evicted_blocks=" << summary.evicted_blocks
               << " evicted_sessions=" << summary.evicted_sessions
               << " skipped_offloads=" << summary.skipped_offloads
-              << " truncated_offloads=" << summary.truncated_offloads
-              << '\n';
+              << " truncated_offloads=" << summary.truncated_offloads << '\n';
 }
 
 void require_pdd_functional_equivalence(const SimulationOutput &enabled,
@@ -345,20 +341,19 @@ void require_pdd_functional_equivalence(const SimulationOutput &enabled,
     expect(enabled.requests.size() == disabled.requests.size(),
            context + ": CPU toggle changed completion count");
     expect(enabled.aggregate.kv_cache_transfer_count ==
-               disabled.aggregate.kv_cache_transfer_count &&
+                   disabled.aggregate.kv_cache_transfer_count &&
                enabled.aggregate.kv_cache_transfer_count > 0,
            context + ": CPU toggle changed PDD transfer count");
-    std::map<std::int64_t, std::tuple<std::int64_t, std::int64_t,
-                                     std::int64_t, std::int64_t, std::uint64_t>>
+    std::map<std::int64_t, std::tuple<std::int64_t, std::int64_t, std::int64_t,
+                                      std::int64_t, std::uint64_t>>
         enabled_requests;
     for (const auto &record : enabled.requests) {
         enabled_requests.emplace(
             record.request_id.value(),
-            std::make_tuple(record.prefill_replica_id.value(),
-                            record.prefill_dp_id.value(),
-                            record.decode_replica_id.value(),
-                            record.decode_dp_id.value(),
-                            record.kv_cache_transfer_size_bytes));
+            std::make_tuple(
+                record.prefill_replica_id.value(), record.prefill_dp_id.value(),
+                record.decode_replica_id.value(), record.decode_dp_id.value(),
+                record.kv_cache_transfer_size_bytes));
     }
     for (const auto &record : disabled.requests) {
         const auto position = enabled_requests.find(record.request_id.value());
@@ -387,7 +382,8 @@ void require_cpu_disabled_zero_metrics(const SimulationOutput &output,
         expect(record.cpu_prefix_query_blocks == 0 &&
                    record.cpu_prefix_hit_blocks == 0 &&
                    record.cpu_restore_transferred_blocks == 0 &&
-                   record.cpu_restore_bytes == 0 && record.cpu_offload_bytes == 0,
+                   record.cpu_restore_bytes == 0 &&
+                   record.cpu_offload_bytes == 0,
                context + ": CPU-disabled request metrics are nonzero");
     }
 }
@@ -431,18 +427,17 @@ void test_capacity_policy_mode_matrix() {
         require_quiescent(output, config, sessions * 2, expected_targets,
                           scenario.name);
         require_affinity(output, scenario.name);
-        print_summary(
-            std::string{"matrix "} + scenario.name,
-            summarize(output, sessions));
+        print_summary(std::string{"matrix "} + scenario.name,
+                      summarize(output, sessions));
 
         const auto &cpu = output.aggregate.cpu_kv_cache;
         const auto resolved =
             frontier::config::resolve_cpu_kv_cache_target(config);
-        expect(cpu.capacity_blocks == expected_targets *
-                                      resolved.capacity_blocks,
+        expect(cpu.capacity_blocks ==
+                   expected_targets * resolved.capacity_blocks,
                std::string{scenario.name} + ": capacity resolution mismatch");
         if (scenario.pressure_policy ==
-            CpuKVCacheCapacityPressurePolicy::kPrefixFit &&
+                CpuKVCacheCapacityPressurePolicy::kPrefixFit &&
             scenario.capacity_blocks == 1 && !scenario.static_slice) {
             expect(cpu.truncated_offloads > 0,
                    std::string{scenario.name} +
@@ -456,7 +451,7 @@ void test_capacity_policy_mode_matrix() {
                        ": skip_offload must report skipped snapshots");
         }
         if (scenario.pressure_policy ==
-                CpuKVCacheCapacityPressurePolicy::kPrefixFit) {
+            CpuKVCacheCapacityPressurePolicy::kPrefixFit) {
             expect(cpu.offload_operations > 0 && cpu.evicted_blocks > 0,
                    std::string{scenario.name} +
                        ": prefix_fit must materialize and evict snapshots");
@@ -464,13 +459,15 @@ void test_capacity_policy_mode_matrix() {
         if (scenario.pressure_policy ==
                 CpuKVCacheCapacityPressurePolicy::kPrefixFit &&
             scenario.capacity_blocks == 8 && !scenario.multi_target &&
-            !scenario.slow_transfer && scenario.mode == SimulationMode::kOnline) {
+            !scenario.slow_transfer &&
+            scenario.mode == SimulationMode::kOnline) {
             expect(cpu.offload_operations > sessions &&
                        cpu.offload_operations >= 16 &&
                        cpu.restore_operations >= 4 && cpu.hit_blocks > 0 &&
                        cpu.evicted_blocks >= 16 && cpu.evicted_sessions >= 4,
                    std::string{scenario.name} +
-                       ": pressure workload must repeatedly evict/offload/restore");
+                       ": pressure workload must repeatedly "
+                       "evict/offload/restore");
         }
         if (scenario.pressure_policy ==
                 CpuKVCacheCapacityPressurePolicy::kSkipOffload &&
@@ -486,7 +483,7 @@ void test_capacity_policy_mode_matrix() {
                 operations_by_target;
             for (const auto &transfer : output.cpu_kv_cache_transfers) {
                 ++operations_by_target[{transfer.replica_id.value(),
-                                         transfer.dp_id.value()}];
+                                        transfer.dp_id.value()}];
             }
             expect(operations_by_target.size() == 4,
                    "multi-target scenario must exercise every CPU target");
@@ -495,9 +492,13 @@ void test_capacity_policy_mode_matrix() {
 }
 
 void test_cpu_on_off_and_fast_slow_observability() {
-    MatrixScenario fast_scenario{
-        "online_direct_prefix_capacity_8_fast_compare", SimulationMode::kOnline,
-        8, CpuKVCacheCapacityPressurePolicy::kPrefixFit, false, false, false};
+    MatrixScenario fast_scenario{"online_direct_prefix_capacity_8_fast_compare",
+                                 SimulationMode::kOnline,
+                                 8,
+                                 CpuKVCacheCapacityPressurePolicy::kPrefixFit,
+                                 false,
+                                 false,
+                                 false};
     MatrixScenario slow_scenario = fast_scenario;
     slow_scenario.name = "online_direct_prefix_capacity_8_slow_compare";
     slow_scenario.slow_transfer = true;
@@ -568,8 +569,8 @@ void test_cpu_on_off_and_fast_slow_observability() {
         run_simulation(offline_disabled_config, workload);
     require_quiescent(offline_enabled, offline_config, workload.size(), 1,
                       "offline CPU-on");
-    require_quiescent(offline_disabled, offline_disabled_config, workload.size(),
-                      0, "offline CPU-off");
+    require_quiescent(offline_disabled, offline_disabled_config,
+                      workload.size(), 0, "offline CPU-off");
     require_cpu_disabled_zero_metrics(offline_disabled, "offline CPU-off");
     require_affinity(offline_enabled, "offline CPU-on");
     require_affinity(offline_disabled, "offline CPU-off");
@@ -592,7 +593,7 @@ void test_cpu_on_off_and_fast_slow_observability() {
     // end-to-end speedup: slower bandwidth must increase H2D service time when
     // a restore is actually consumed.
     expect(slow_enabled.aggregate.cpu_kv_cache.h2d_service_time_ms >
-               fast_enabled.aggregate.cpu_kv_cache.h2d_service_time_ms &&
+                   fast_enabled.aggregate.cpu_kv_cache.h2d_service_time_ms &&
                slow_enabled.aggregate.cpu_kv_cache.d2h_service_time_ms >
                    fast_enabled.aggregate.cpu_kv_cache.d2h_service_time_ms,
            "slow tier must expose greater causal transfer service time");
@@ -602,8 +603,9 @@ void test_cpu_on_off_and_fast_slow_observability() {
 
 int main() {
     int failures = 0;
-    failures += frontier::test::run("CPU KV-cache stress capacity/policy/mode matrix",
-                                    test_capacity_policy_mode_matrix);
+    failures +=
+        frontier::test::run("CPU KV-cache stress capacity/policy/mode matrix",
+                            test_capacity_policy_mode_matrix);
     failures += frontier::test::run(
         "CPU KV-cache stress CPU-on/off and fast/slow observability",
         test_cpu_on_off_and_fast_slow_observability);

@@ -38,8 +38,8 @@ void handle_event(const ClusterBatchEndPayload &payload, SimTime time,
                     snapshot.request_id, time));
                 for (scheduler::ScheduledAuxiliaryEvent &auxiliary :
                      replica.drain_auxiliary_events()) {
-                    simulator.event_queue().push(
-                        auxiliary.time, std::move(auxiliary.payload));
+                    simulator.event_queue().push(auxiliary.time,
+                                                 std::move(auxiliary.payload));
                 }
                 const TransferId transfer_id =
                     simulator.create_kv_cache_transfer(

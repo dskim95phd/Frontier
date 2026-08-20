@@ -203,9 +203,9 @@ int main() {
     failures += frontier::test::run(
         "partial and repeated replay boundaries",
         test_partial_and_repeated_prefill_replay_boundaries);
-    failures += frontier::test::run(
-        "cached prefill is excluded from scheduled work",
-        test_cached_prefill_is_not_scheduled_work);
+    failures +=
+        frontier::test::run("cached prefill is excluded from scheduled work",
+                            test_cached_prefill_is_not_scheduled_work);
     failures += frontier::test::run(
         "repeated CPU restore transfers accumulate metrics",
         test_repeated_cpu_restore_transfers_accumulate_metrics);

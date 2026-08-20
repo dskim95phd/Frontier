@@ -63,14 +63,12 @@ class ReplicaStageScheduler {
                       const entities::RequestCollection &requests) const;
     [[nodiscard]] bool supports_lazy_moe_prediction() const noexcept;
     [[nodiscard]] execution_time_predictor::ExecutionTimePrediction
-    prepare_moe_stage(
-        const entities::Batch &batch,
-        const entities::RequestCollection &requests) const;
+    prepare_moe_stage(const entities::Batch &batch,
+                      const entities::RequestCollection &requests) const;
     [[nodiscard]] execution_time_predictor::ExecutionTimePrediction
-    predict_moe_layer(
-        const entities::Batch &batch,
-        const entities::RequestCollection &requests,
-        std::uint64_t local_moe_layer) const;
+    predict_moe_layer(const entities::Batch &batch,
+                      const entities::RequestCollection &requests,
+                      std::uint64_t local_moe_layer) const;
     [[nodiscard]] execution_time_predictor::MoEGroupLayerPrediction
     predict_moe_group_layer(
         const execution_time_predictor::MoEGroupLayerInput &input) const;

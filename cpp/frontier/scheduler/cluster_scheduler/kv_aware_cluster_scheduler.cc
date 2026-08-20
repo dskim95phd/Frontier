@@ -46,16 +46,15 @@ std::vector<ClusterRequestAssignment> KvAwareClusterScheduler::schedule() {
              incoming.scheduler_num_computed_tokens()});
         ReplicaId selected_replica;
         DataParallelId selected_dp;
-        std::tuple<std::uint64_t, std::uint64_t, std::uint64_t,
-                   std::uint64_t, std::uint64_t, std::int64_t, std::int64_t>
-            best{
-                std::numeric_limits<std::uint64_t>::max(),
-                std::numeric_limits<std::uint64_t>::max(),
-                std::numeric_limits<std::uint64_t>::max(),
-                std::numeric_limits<std::uint64_t>::max(),
-                std::numeric_limits<std::uint64_t>::max(),
-                std::numeric_limits<std::int64_t>::max(),
-                std::numeric_limits<std::int64_t>::max()};
+        std::tuple<std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
+                   std::uint64_t, std::int64_t, std::int64_t>
+            best{std::numeric_limits<std::uint64_t>::max(),
+                 std::numeric_limits<std::uint64_t>::max(),
+                 std::numeric_limits<std::uint64_t>::max(),
+                 std::numeric_limits<std::uint64_t>::max(),
+                 std::numeric_limits<std::uint64_t>::max(),
+                 std::numeric_limits<std::int64_t>::max(),
+                 std::numeric_limits<std::int64_t>::max()};
         for (std::size_t target_index = 0;
              target_index < ordered_targets.size(); ++target_index) {
             const auto [replica_id, dp_id] = ordered_targets.at(target_index);
@@ -72,9 +71,9 @@ std::vector<ClusterRequestAssignment> KvAwareClusterScheduler::schedule() {
                 saturated_add(queued_blocks, incoming_blocks);
             const std::uint64_t fits =
                 required_blocks <= target.available_kv_blocks() ? 0 : 1;
-            const std::uint64_t committed_load = saturated_add(
-                target.allocated_kv_blocks(),
-                target.virtual_committed_kv_blocks());
+            const std::uint64_t committed_load =
+                saturated_add(target.allocated_kv_blocks(),
+                              target.virtual_committed_kv_blocks());
             const std::uint64_t kv_load =
                 saturated_add(committed_load, queued_blocks);
             const std::uint64_t projected_load =
@@ -87,8 +86,8 @@ std::vector<ClusterRequestAssignment> KvAwareClusterScheduler::schedule() {
                  (next_tie_target_ % target_count)) %
                 target_count;
             const auto candidate = std::tuple{
-                fits, projected_load, kv_load, outstanding, tie_rank,
-                replica_id.value(), dp_id.value()};
+                fits,     projected_load,     kv_load,      outstanding,
+                tie_rank, replica_id.value(), dp_id.value()};
             if (candidate < best) {
                 best = candidate;
                 selected_replica = replica_id;
@@ -99,8 +98,8 @@ std::vector<ClusterRequestAssignment> KvAwareClusterScheduler::schedule() {
             get_replica_scheduler(selected_replica, selected_dp);
         target.add_request(queued.request_id);
         next_tie_target_ = (next_tie_target_ + 1) % target_count;
-        result.push_back(ClusterRequestAssignment{
-            selected_replica, selected_dp, queued.request_id});
+        result.push_back(ClusterRequestAssignment{selected_replica, selected_dp,
+                                                  queued.request_id});
     }
     request_queue_.clear();
     return result;

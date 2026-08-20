@@ -37,8 +37,8 @@ using frontier::RequestId;
 using frontier::SimTime;
 using frontier::entities::Batch;
 using frontier::entities::Request;
-using frontier::entities::RequestCollection;
 using frontier::entities::RequestBatchSnapshot;
+using frontier::entities::RequestCollection;
 using frontier::request_generator::WorkloadRequest;
 using frontier::test::expect;
 using frontier::test::expect_throws;
@@ -322,12 +322,21 @@ void test_operator_precisions_split_dense_and_kv_costs() {
             analytical::DeviceCeilings::rubin(), analytical::AnalyticalConfig{},
             analytical::DenseModel::llama2_7b_tp8(), batch, precisions);
     };
-    const auto fp16 =
-        predict({analytical::Precision::kFp16, analytical::Precision::kFp16,
-                 analytical::Precision::kFp16});
-    const auto fp8_kv =
-        predict({analytical::Precision::kFp8, analytical::Precision::kFp16,
-                 analytical::Precision::kFp8});
+    const auto precisions = [](analytical::Precision attention,
+                               analytical::Precision dense,
+                               analytical::Precision kv_cache) {
+        analytical::DenseOperatorPrecisions value{};
+        value.attention = attention;
+        value.dense = dense;
+        value.kv_cache = kv_cache;
+        return value;
+    };
+    const auto fp16 = predict(precisions(analytical::Precision::kFp16,
+                                         analytical::Precision::kFp16,
+                                         analytical::Precision::kFp16));
+    const auto fp8_kv = predict(precisions(analytical::Precision::kFp8,
+                                           analytical::Precision::kFp16,
+                                           analytical::Precision::kFp8));
     expect(fp8_kv.decode_attention_ms < fp16.decode_attention_ms &&
                fp8_kv.kv_cache_save_ms < fp16.kv_cache_save_ms,
            "FP8 attention/KV must reduce long-context reads and KV writes");
@@ -335,20 +344,23 @@ void test_operator_precisions_split_dense_and_kv_costs() {
                                fp16.mlp_up_projection_ms,
                                "dense precision independence");
 
-    const auto fp4_dense =
-        predict({analytical::Precision::kFp16, analytical::Precision::kFp4,
-                 analytical::Precision::kFp16});
+    const auto fp4_dense = predict(precisions(analytical::Precision::kFp16,
+                                              analytical::Precision::kFp4,
+                                              analytical::Precision::kFp16));
     expect(fp4_dense.mlp_up_projection_ms < fp16.mlp_up_projection_ms,
            "FP4 dense override must reduce MLP projection time");
     expect_approximately_equal(fp4_dense.attention_pre_projection_ms,
                                fp16.attention_pre_projection_ms,
                                "attention precision independence");
 
-    const auto fp4_weight_fp16_activation =
-        predict({analytical::Precision::kFp16, analytical::Precision::kFp16,
-                 analytical::Precision::kFp16, analytical::Precision::kFp4,
-                 analytical::Precision::kFp16, analytical::Precision::kFp4,
-                 analytical::Precision::kFp16});
+    auto fp4_weight_precisions =
+        precisions(analytical::Precision::kFp16, analytical::Precision::kFp16,
+                   analytical::Precision::kFp16);
+    fp4_weight_precisions.attention_weight = analytical::Precision::kFp4;
+    fp4_weight_precisions.attention_activation = analytical::Precision::kFp16;
+    fp4_weight_precisions.dense_weight = analytical::Precision::kFp4;
+    fp4_weight_precisions.dense_activation = analytical::Precision::kFp16;
+    const auto fp4_weight_fp16_activation = predict(fp4_weight_precisions);
     expect(fp4_weight_fp16_activation.attention_pre_projection_ms <
                    fp16.attention_pre_projection_ms &&
                fp4_weight_fp16_activation.mlp_up_projection_ms <
@@ -370,12 +382,21 @@ void test_operator_precisions_split_moe_expert_and_router_costs() {
             analytical::DeviceCeilings::rubin(), analytical::AnalyticalConfig{},
             model, 512, 2, expert_tokens, precisions);
     };
-    const auto fp16 =
-        predict({analytical::Precision::kFp16, analytical::Precision::kFp16,
-                 analytical::Precision::kFp16});
-    const auto fp4_expert =
-        predict({analytical::Precision::kFp4, analytical::Precision::kFp16,
-                 analytical::Precision::kFp16});
+    const auto precisions = [](analytical::Precision expert,
+                               analytical::Precision router,
+                               analytical::Precision dense) {
+        analytical::MoEOperatorPrecisions value{};
+        value.expert = expert;
+        value.router = router;
+        value.dense = dense;
+        return value;
+    };
+    const auto fp16 = predict(precisions(analytical::Precision::kFp16,
+                                         analytical::Precision::kFp16,
+                                         analytical::Precision::kFp16));
+    const auto fp4_expert = predict(precisions(analytical::Precision::kFp4,
+                                               analytical::Precision::kFp16,
+                                               analytical::Precision::kFp16));
     expect(fp4_expert.grouped_up_projection_ms <
                    fp16.grouped_up_projection_ms &&
                fp4_expert.grouped_down_projection_ms <
@@ -385,9 +406,9 @@ void test_operator_precisions_split_moe_expert_and_router_costs() {
                                fp16.gating_linear_ms,
                                "router precision independence");
 
-    const auto fp8_router =
-        predict({analytical::Precision::kFp16, analytical::Precision::kFp8,
-                 analytical::Precision::kFp16});
+    const auto fp8_router = predict(precisions(analytical::Precision::kFp16,
+                                               analytical::Precision::kFp8,
+                                               analytical::Precision::kFp16));
     expect(fp8_router.gating_linear_ms < fp16.gating_linear_ms &&
                fp8_router.gating_routing_topk_ms < fp16.gating_routing_topk_ms,
            "FP8 router override must reduce router operator time");

@@ -176,11 +176,10 @@ struct ModelConfig {
     // so every entry point can reject unsupported generalized Kimi-Linear
     // shapes instead of silently applying the K3 formulas to them.
     [[nodiscard]] bool kda_topology_is_symmetric() const noexcept {
-        return !has_kda() ||
-               (kda_num_heads == kda_num_k_heads &&
-                kda_num_heads == kda_num_v_heads &&
-                kda_head_dim == kda_key_head_dim &&
-                kda_head_dim == kda_value_head_dim);
+        return !has_kda() || (kda_num_heads == kda_num_k_heads &&
+                              kda_num_heads == kda_num_v_heads &&
+                              kda_head_dim == kda_key_head_dim &&
+                              kda_head_dim == kda_value_head_dim);
     }
 
     [[nodiscard]] bool is_kda_layer(std::uint64_t layer) const noexcept {
@@ -244,8 +243,8 @@ struct ModelConfig {
                         lhs.router_topk, lhs.num_shared_experts,
                         lhs.first_k_dense_replace, lhs.moe_layer_freq,
                         lhs.vocab_size, lhs.use_mla, lhs.mla_use_output_gate,
-                        lhs.mla_use_nope, lhs.use_mfa,
-                        lhs.q_lora_rank, lhs.kv_lora_rank, lhs.qk_nope_head_dim,
+                        lhs.mla_use_nope, lhs.use_mfa, lhs.q_lora_rank,
+                        lhs.kv_lora_rank, lhs.qk_nope_head_dim,
                         lhs.qk_rope_head_dim, lhs.qk_head_dim, lhs.v_head_dim,
                         lhs.share_q_dim, lhs.num_kda_layers, lhs.num_mla_layers,
                         lhs.kda_num_heads, lhs.kda_num_k_heads,
@@ -266,8 +265,8 @@ struct ModelConfig {
                         rhs.router_topk, rhs.num_shared_experts,
                         rhs.first_k_dense_replace, rhs.moe_layer_freq,
                         rhs.vocab_size, rhs.use_mla, rhs.mla_use_output_gate,
-                        rhs.mla_use_nope, rhs.use_mfa,
-                        rhs.q_lora_rank, rhs.kv_lora_rank, rhs.qk_nope_head_dim,
+                        rhs.mla_use_nope, rhs.use_mfa, rhs.q_lora_rank,
+                        rhs.kv_lora_rank, rhs.qk_nope_head_dim,
                         rhs.qk_rope_head_dim, rhs.qk_head_dim, rhs.v_head_dim,
                         rhs.share_q_dim, rhs.num_kda_layers, rhs.num_mla_layers,
                         rhs.kda_num_heads, rhs.kda_num_k_heads,
@@ -331,10 +330,8 @@ struct LayerStaticSignature {
 
     friend bool operator==(const LayerStaticSignature &lhs,
                            const LayerStaticSignature &rhs) noexcept {
-        return std::tie(lhs.attention_family, lhs.is_moe,
-                        lhs.has_dense_mlp) ==
-               std::tie(rhs.attention_family, rhs.is_moe,
-                        rhs.has_dense_mlp);
+        return std::tie(lhs.attention_family, lhs.is_moe, lhs.has_dense_mlp) ==
+               std::tie(rhs.attention_family, rhs.is_moe, rhs.has_dense_mlp);
     }
     friend bool operator!=(const LayerStaticSignature &lhs,
                            const LayerStaticSignature &rhs) noexcept {
@@ -431,13 +428,11 @@ struct PipelineStageGroupCatalogue {
     friend bool operator==(const PipelineStageGroupCatalogue &lhs,
                            const PipelineStageGroupCatalogue &rhs) noexcept {
         return std::tie(lhs.timing_groups, lhs.memory_groups,
-                        lhs.stage_to_timing_group,
-                        lhs.stage_to_memory_group,
+                        lhs.stage_to_timing_group, lhs.stage_to_memory_group,
                         lhs.timing_group_multiplicity,
                         lhs.memory_group_multiplicity) ==
                std::tie(rhs.timing_groups, rhs.memory_groups,
-                        rhs.stage_to_timing_group,
-                        rhs.stage_to_memory_group,
+                        rhs.stage_to_timing_group, rhs.stage_to_memory_group,
                         rhs.timing_group_multiplicity,
                         rhs.memory_group_multiplicity);
     }
@@ -539,26 +534,25 @@ struct ParallelismConfig {
 
     friend bool operator==(const ParallelismConfig &lhs,
                            const ParallelismConfig &rhs) {
-        return std::tie(lhs.num_replicas, lhs.tensor_parallel_size,
-                        lhs.pipeline_parallel_size, lhs.data_parallel_size,
-                        lhs.moe_tensor_parallel_size,
-                        lhs.moe_expert_parallel_size,
-                        lhs.decode_context_parallel_size,
-                        lhs.pipeline_exclusive,
-                        lhs.pipeline_stage_layer_counts) ==
-               std::tie(rhs.num_replicas, rhs.tensor_parallel_size,
-                        rhs.pipeline_parallel_size, rhs.data_parallel_size,
-                        rhs.moe_tensor_parallel_size,
-                        rhs.moe_expert_parallel_size,
-                        rhs.decode_context_parallel_size,
-                        rhs.pipeline_exclusive,
-                        rhs.pipeline_stage_layer_counts);
+        return std::tie(
+                   lhs.num_replicas, lhs.tensor_parallel_size,
+                   lhs.pipeline_parallel_size, lhs.data_parallel_size,
+                   lhs.moe_tensor_parallel_size, lhs.moe_expert_parallel_size,
+                   lhs.decode_context_parallel_size, lhs.pipeline_exclusive,
+                   lhs.pipeline_stage_layer_counts) ==
+               std::tie(
+                   rhs.num_replicas, rhs.tensor_parallel_size,
+                   rhs.pipeline_parallel_size, rhs.data_parallel_size,
+                   rhs.moe_tensor_parallel_size, rhs.moe_expert_parallel_size,
+                   rhs.decode_context_parallel_size, rhs.pipeline_exclusive,
+                   rhs.pipeline_stage_layer_counts);
     }
 };
 
-[[nodiscard]] inline PipelineStageLayerRange pipeline_stage_layer_range(
-    std::uint64_t num_layers, const ParallelismConfig &parallelism,
-    std::uint64_t stage) {
+[[nodiscard]] inline PipelineStageLayerRange
+pipeline_stage_layer_range(std::uint64_t num_layers,
+                           const ParallelismConfig &parallelism,
+                           std::uint64_t stage) {
     if (parallelism.pipeline_stage_layer_counts.empty()) {
         return pipeline_stage_layer_range(
             num_layers, parallelism.pipeline_parallel_size, stage);
@@ -567,11 +561,11 @@ struct ParallelismConfig {
         parallelism.pipeline_stage_layer_counts.size() !=
             parallelism.pipeline_parallel_size ||
         stage >= parallelism.pipeline_parallel_size) {
-        throw std::invalid_argument("invalid explicit pipeline layer partition");
+        throw std::invalid_argument(
+            "invalid explicit pipeline layer partition");
     }
     std::uint64_t assigned_layers = 0;
-    for (const std::uint64_t count :
-         parallelism.pipeline_stage_layer_counts) {
+    for (const std::uint64_t count : parallelism.pipeline_stage_layer_counts) {
         if (count == 0 || count > num_layers - assigned_layers) {
             throw std::invalid_argument(
                 "invalid explicit pipeline layer partition");
@@ -579,7 +573,8 @@ struct ParallelismConfig {
         assigned_layers += count;
     }
     if (assigned_layers != num_layers) {
-        throw std::invalid_argument("invalid explicit pipeline layer partition");
+        throw std::invalid_argument(
+            "invalid explicit pipeline layer partition");
     }
     std::uint64_t begin = 0;
     for (std::uint64_t index = 0; index < stage; ++index) {
@@ -737,8 +732,7 @@ struct OperatorPrecisionConfig {
                moe_expert_activation.empty() && moe_router_weight.empty() &&
                moe_router_activation.empty() && lm_head.empty() &&
                lm_head_weight.empty() && lm_head_activation.empty() &&
-               router_weight_storage.empty() &&
-               routed_expert_weight.empty() &&
+               router_weight_storage.empty() && routed_expert_weight.empty() &&
                routed_expert_activation.empty() &&
                latent_moe_projection_weight.empty() &&
                latent_moe_projection_activation.empty() &&
@@ -757,15 +751,13 @@ struct OperatorPrecisionConfig {
                         lhs.moe_expert_weight, lhs.moe_expert_activation,
                         lhs.moe_router_weight, lhs.moe_router_activation,
                         lhs.router_weight_storage, lhs.lm_head,
-                        lhs.lm_head_weight,
-                        lhs.lm_head_activation, lhs.routed_expert_weight,
-                        lhs.routed_expert_activation,
+                        lhs.lm_head_weight, lhs.lm_head_activation,
+                        lhs.routed_expert_weight, lhs.routed_expert_activation,
                         lhs.latent_moe_projection_weight,
                         lhs.latent_moe_projection_activation,
-                        lhs.shared_expert_weight,
-                        lhs.shared_expert_activation, lhs.dense_mlp_weight,
-                        lhs.dense_mlp_activation, lhs.router_compute,
-                        lhs.kda_snapshot) ==
+                        lhs.shared_expert_weight, lhs.shared_expert_activation,
+                        lhs.dense_mlp_weight, lhs.dense_mlp_activation,
+                        lhs.router_compute, lhs.kda_snapshot) ==
                std::tie(rhs.attention, rhs.dense, rhs.moe_expert,
                         rhs.moe_router, rhs.kv_cache, rhs.communication,
                         rhs.attention_weight, rhs.attention_activation,
@@ -773,15 +765,13 @@ struct OperatorPrecisionConfig {
                         rhs.moe_expert_weight, rhs.moe_expert_activation,
                         rhs.moe_router_weight, rhs.moe_router_activation,
                         rhs.router_weight_storage, rhs.lm_head,
-                        rhs.lm_head_weight,
-                        rhs.lm_head_activation, rhs.routed_expert_weight,
-                        rhs.routed_expert_activation,
+                        rhs.lm_head_weight, rhs.lm_head_activation,
+                        rhs.routed_expert_weight, rhs.routed_expert_activation,
                         rhs.latent_moe_projection_weight,
                         rhs.latent_moe_projection_activation,
-                        rhs.shared_expert_weight,
-                        rhs.shared_expert_activation, rhs.dense_mlp_weight,
-                        rhs.dense_mlp_activation, rhs.router_compute,
-                        rhs.kda_snapshot);
+                        rhs.shared_expert_weight, rhs.shared_expert_activation,
+                        rhs.dense_mlp_weight, rhs.dense_mlp_activation,
+                        rhs.router_compute, rhs.kda_snapshot);
     }
 };
 
@@ -849,20 +839,17 @@ struct AnalyticalExecutionModelConfig {
 
     friend bool operator==(const AnalyticalExecutionModelConfig &lhs,
                            const AnalyticalExecutionModelConfig &rhs) {
-        return std::tie(lhs.device, lhs.device_overrides, lhs.precision,
-                        lhs.operator_precisions, lhs.kernel_profile,
-                        lhs.moe_layer_event_mode,
-                        lhs.moe_communication_backend,
-                        lhs.mega_moe_tail_io_fraction,
-                        lhs.mega_moe_wave_exposure,
-                        lhs.mega_moe_cluster_task_latency_us,
-                        lhs.tensor_parallel_size, lhs.network_bandwidth_gbps,
-                        lhs.network_latency_us,
-                        lhs.intra_node_bandwidth_gbps) ==
+        return std::tie(
+                   lhs.device, lhs.device_overrides, lhs.precision,
+                   lhs.operator_precisions, lhs.kernel_profile,
+                   lhs.moe_layer_event_mode, lhs.moe_communication_backend,
+                   lhs.mega_moe_tail_io_fraction, lhs.mega_moe_wave_exposure,
+                   lhs.mega_moe_cluster_task_latency_us,
+                   lhs.tensor_parallel_size, lhs.network_bandwidth_gbps,
+                   lhs.network_latency_us, lhs.intra_node_bandwidth_gbps) ==
                std::tie(rhs.device, rhs.device_overrides, rhs.precision,
                         rhs.operator_precisions, rhs.kernel_profile,
-                        rhs.moe_layer_event_mode,
-                        rhs.moe_communication_backend,
+                        rhs.moe_layer_event_mode, rhs.moe_communication_backend,
                         rhs.mega_moe_tail_io_fraction,
                         rhs.mega_moe_wave_exposure,
                         rhs.mega_moe_cluster_task_latency_us,
@@ -1016,14 +1003,14 @@ struct AnalyticalExecutionModelConfig {
                    ? moe_expert_activation_precision()
                    : operator_precisions.shared_expert_activation;
     }
-    [[nodiscard]] const std::string &dense_mlp_weight_precision() const
-        noexcept {
+    [[nodiscard]] const std::string &
+    dense_mlp_weight_precision() const noexcept {
         return operator_precisions.dense_mlp_weight.empty()
                    ? dense_weight_precision()
                    : operator_precisions.dense_mlp_weight;
     }
-    [[nodiscard]] const std::string &dense_mlp_activation_precision() const
-        noexcept {
+    [[nodiscard]] const std::string &
+    dense_mlp_activation_precision() const noexcept {
         return operator_precisions.dense_mlp_activation.empty()
                    ? dense_activation_precision()
                    : operator_precisions.dense_mlp_activation;
@@ -1098,14 +1085,14 @@ struct GpuMemoryConfig {
 
     friend bool operator==(const GpuMemoryConfig &lhs,
                            const GpuMemoryConfig &rhs) {
-        return std::tie(
-                   lhs.auto_calculate_num_blocks, lhs.capacity_bytes_per_gpu,
-                   lhs.runtime_reserve_fraction, lhs.runtime_reserve_bytes,
-                   lhs.weight_overhead_fraction) ==
-               std::tie(
-                   rhs.auto_calculate_num_blocks, rhs.capacity_bytes_per_gpu,
-                   rhs.runtime_reserve_fraction, rhs.runtime_reserve_bytes,
-                   rhs.weight_overhead_fraction);
+        return std::tie(lhs.auto_calculate_num_blocks,
+                        lhs.capacity_bytes_per_gpu,
+                        lhs.runtime_reserve_fraction, lhs.runtime_reserve_bytes,
+                        lhs.weight_overhead_fraction) ==
+               std::tie(rhs.auto_calculate_num_blocks,
+                        rhs.capacity_bytes_per_gpu,
+                        rhs.runtime_reserve_fraction, rhs.runtime_reserve_bytes,
+                        rhs.weight_overhead_fraction);
     }
 };
 
@@ -1291,8 +1278,8 @@ resolve_cpu_kv_cache_target(const SimulationConfig &config);
 // analytical PREFILL/DECODE clusters must agree on the exact precision when
 // the model exposes KDA layers. A mixed analytical/fixed pair is therefore
 // valid only when the analytical side also uses BF16.
-[[nodiscard]] double resolve_pdd_kda_snapshot_dtype_size_bytes(
-    const PddClustersConfig &clusters);
+[[nodiscard]] double
+resolve_pdd_kda_snapshot_dtype_size_bytes(const PddClustersConfig &clusters);
 
 // Build the exact static PP memory view for one logical (replica, DP) target.
 // The returned profiles contain one entry per physical pipeline stage and one
@@ -1303,9 +1290,10 @@ build_pipeline_stage_memory_profiles(const ClusterRuntimeConfig &cluster);
 
 // Build the canonical execution signature for one physical PP stage. Both
 // configuration/metrics grouping and predictor caching must use this helper.
-[[nodiscard]] StageTimingSignature build_pipeline_stage_timing_signature(
-    const ModelConfig &model, const ParallelismConfig &parallelism,
-    std::uint64_t stage);
+[[nodiscard]] StageTimingSignature
+build_pipeline_stage_timing_signature(const ModelConfig &model,
+                                      const ParallelismConfig &parallelism,
+                                      std::uint64_t stage);
 
 // Build deterministic first-occurrence-order timing and memory groups for a
 // profile set.  `profiles` must be ordered by stage id and cover every PP
@@ -1327,8 +1315,7 @@ build_pipeline_stage_memory_profiles(const ClusterRuntimeConfig &cluster);
 // nonzero snapshot shard fits in its stage/rank's free HBM budget.
 [[nodiscard]] std::uint64_t resolve_pipeline_kda_snapshot_charge(
     const std::vector<PipelineStageMemoryProfile> &profiles,
-    std::uint64_t logical_kv_capacity,
-    std::uint64_t *limiting_stage = nullptr,
+    std::uint64_t logical_kv_capacity, std::uint64_t *limiting_stage = nullptr,
     std::uint64_t *limiting_rank = nullptr);
 
 // Resolve per-rank model weight storage and the remaining rank-local KV block

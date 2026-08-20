@@ -56,7 +56,7 @@ void accumulate_execution_time(entities::ExecutionTime &total,
 
 std::uint64_t
 prefill_attention_token_pairs_for_request(std::uint64_t query_tokens,
-                                           std::uint64_t past_context) {
+                                          std::uint64_t past_context) {
     return checked_math::prefill_attention_token_pairs<std::overflow_error>(
         query_tokens, past_context,
         "PREFILL attention token-pair count overflows uint64");
@@ -69,19 +69,20 @@ void accumulate_prefill_attention_token_pairs(std::uint64_t &total,
         "aggregate PREFILL attention token-pair count overflows uint64");
 }
 
-PipelineMemoryDiagnostics make_pipeline_memory_diagnostics(
-    ClusterType cluster_type, const config::ClusterRuntimeConfig &runtime) {
+PipelineMemoryDiagnostics
+make_pipeline_memory_diagnostics(ClusterType cluster_type,
+                                 const config::ClusterRuntimeConfig &runtime) {
     const config::GpuMemoryConfig &memory = runtime.gpu_memory;
     PipelineMemoryDiagnostics diagnostics{};
     diagnostics.cluster_type = cluster_type;
     diagnostics.capacity_bytes_per_gpu = memory.capacity_bytes_per_gpu;
-    diagnostics.model_weight_bytes_per_gpu =
-        memory.model_weight_bytes_per_gpu;
+    diagnostics.model_weight_bytes_per_gpu = memory.model_weight_bytes_per_gpu;
     diagnostics.kv_cache_budget_bytes_per_gpu =
         memory.kv_cache_budget_bytes_per_gpu;
     diagnostics.kv_cache_bytes_per_block = memory.kv_cache_bytes_per_block;
     diagnostics.configured_num_blocks = runtime.scheduler.num_blocks;
-    diagnostics.ordinary_kv_capacity_blocks = memory.ordinary_kv_capacity_blocks;
+    diagnostics.ordinary_kv_capacity_blocks =
+        memory.ordinary_kv_capacity_blocks;
     diagnostics.ordinary_kv_limiting_stage = memory.ordinary_kv_limiting_stage;
     diagnostics.ordinary_kv_limiting_rank = memory.ordinary_kv_limiting_rank;
     diagnostics.kda_snapshot_blocks_per_session =
@@ -102,19 +103,19 @@ PipelineMemoryDiagnostics make_pipeline_memory_diagnostics(
         stage_diagnostic.cluster_type = cluster_type;
         stage_diagnostic.stage_id = StageId{stage};
         const config::PipelineStageLayerRange layers =
-            config::pipeline_stage_layer_range(
-                runtime.model.num_layers, runtime.parallelism, stage);
+            config::pipeline_stage_layer_range(runtime.model.num_layers,
+                                               runtime.parallelism, stage);
         stage_diagnostic.layer_begin = layers.begin;
         stage_diagnostic.layer_end = layers.end;
         stage_diagnostic.layer_count = layers.size();
         for (std::uint64_t layer = stage_diagnostic.layer_begin;
              layer < stage_diagnostic.layer_end; ++layer) {
-            stage_diagnostic.kda_layer_count += static_cast<std::uint64_t>(
-                runtime.model.is_kda_layer(layer));
-            stage_diagnostic.mla_layer_count += static_cast<std::uint64_t>(
-                runtime.model.is_mla_layer(layer));
-            stage_diagnostic.moe_layer_count += static_cast<std::uint64_t>(
-                runtime.model.is_moe_layer(layer));
+            stage_diagnostic.kda_layer_count +=
+                static_cast<std::uint64_t>(runtime.model.is_kda_layer(layer));
+            stage_diagnostic.mla_layer_count +=
+                static_cast<std::uint64_t>(runtime.model.is_mla_layer(layer));
+            stage_diagnostic.moe_layer_count +=
+                static_cast<std::uint64_t>(runtime.model.is_moe_layer(layer));
         }
 
         if (stage < memory.pipeline_stage_memory_profiles.size()) {
@@ -919,12 +920,10 @@ void MetricsStore::record_gpu_kv_cache_occupancy(
     if (diagnostics.active_blocks > diagnostics.capacity_blocks) {
         throw std::logic_error("GPU KV occupancy exceeds target capacity");
     }
-    if (diagnostics.active_blocks >
-            std::numeric_limits<std::uint64_t>::max() /
-                max_rank_bytes_per_block ||
-        diagnostics.active_blocks >
-            std::numeric_limits<std::uint64_t>::max() /
-                pipeline_bytes_per_block) {
+    if (diagnostics.active_blocks > std::numeric_limits<std::uint64_t>::max() /
+                                        max_rank_bytes_per_block ||
+        diagnostics.active_blocks > std::numeric_limits<std::uint64_t>::max() /
+                                        pipeline_bytes_per_block) {
         throw std::overflow_error(
             "GPU KV occupancy byte count overflows uint64");
     }

@@ -44,26 +44,25 @@ void validate_stage_range(const config::ModelConfig &model,
     }
 }
 
-std::uint64_t count_stage_kv_layers(
-    const config::ModelConfig &model,
-    const config::PipelineStageLayerRange &layers) {
+std::uint64_t
+count_stage_kv_layers(const config::ModelConfig &model,
+                      const config::PipelineStageLayerRange &layers) {
     validate_stage_range(model, layers);
     std::uint64_t count = 0;
     for (std::uint64_t layer = layers.begin; layer < layers.end; ++layer) {
         // KDA's recurrent state is not token-proportional KV.  For MLA
         // checkpoints only explicitly marked MLA layers own latent KV; for a
         // dense/KDA checkpoint every non-KDA layer retains the dense KV path.
-        const bool kv_bearing = model.use_mla
-                                    ? model.is_mla_layer(layer)
-                                    : !model.is_kda_layer(layer);
+        const bool kv_bearing = model.use_mla ? model.is_mla_layer(layer)
+                                              : !model.is_kda_layer(layer);
         count += static_cast<std::uint64_t>(kv_bearing);
     }
     return count;
 }
 
-std::uint64_t count_stage_kda_layers(
-    const config::ModelConfig &model,
-    const config::PipelineStageLayerRange &layers) {
+std::uint64_t
+count_stage_kda_layers(const config::ModelConfig &model,
+                       const config::PipelineStageLayerRange &layers) {
     validate_stage_range(model, layers);
     if (!model.has_kda()) {
         return 0;
@@ -298,13 +297,14 @@ std::uint64_t model_kv_cache_size_bytes_stage_rank_local(
             throw TransferModelError(error.what());
         }
     }
-    return dense_kv_cache_size_bytes(num_tokens, DenseKvLayout{
-                                                    layer_count,
-                                                    model.runtime_num_kv_heads(),
-                                                    model.runtime_head_size(),
-                                                    model.kv_factor(),
-                                                    kv_cache_dtype_size_bytes,
-                                                });
+    return dense_kv_cache_size_bytes(num_tokens,
+                                     DenseKvLayout{
+                                         layer_count,
+                                         model.runtime_num_kv_heads(),
+                                         model.runtime_head_size(),
+                                         model.kv_factor(),
+                                         kv_cache_dtype_size_bytes,
+                                     });
 }
 
 std::uint64_t model_kv_cache_size_bytes_stage_physical(
@@ -400,10 +400,10 @@ std::uint64_t model_kda_state_snapshot_size_bytes_stage_rank_local(
             "KDA model must expose positive recurrent and convolution state "
             "dimensions");
     }
-    const std::uint64_t stage_bytes = checked_state_size(
-        static_cast<long double>(layer_count) *
-            static_cast<long double>(elements_per_layer),
-        state_dtype_size_bytes);
+    const std::uint64_t stage_bytes =
+        checked_state_size(static_cast<long double>(layer_count) *
+                               static_cast<long double>(elements_per_layer),
+                           state_dtype_size_bytes);
     return checked_ceil_div(stage_bytes, attention_tensor_parallel_size);
 }
 
@@ -473,9 +473,8 @@ TransferPrediction AnalyticalKVCacheTransferPredictor::predict(
     // The simplified K3 contract transfers one latest KDA snapshot as an
     // indivisible object.  Rewinding that snapshot is modeled as free, but
     // moving it between PREFILL and DECODE still consumes bandwidth.
-    const std::uint64_t kda_size_bytes =
-        model_kda_state_snapshot_size_bytes(
-            model, kda_snapshot_dtype_size_bytes_);
+    const std::uint64_t kda_size_bytes = model_kda_state_snapshot_size_bytes(
+        model, kda_snapshot_dtype_size_bytes_);
     if (kv_size_bytes >
         std::numeric_limits<std::uint64_t>::max() - kda_size_bytes) {
         throw TransferModelError(

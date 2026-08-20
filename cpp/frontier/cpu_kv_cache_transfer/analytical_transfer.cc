@@ -22,9 +22,10 @@ AnalyticalCpuKVCacheTransferEngine::AnalyticalCpuKVCacheTransferEngine(
     }
 }
 
-CpuTransferTiming AnalyticalCpuKVCacheTransferEngine::schedule(
-    CpuTransferDirection direction, std::uint64_t size_bytes,
-    SimTime submitted_at) {
+CpuTransferTiming
+AnalyticalCpuKVCacheTransferEngine::schedule(CpuTransferDirection direction,
+                                             std::uint64_t size_bytes,
+                                             SimTime submitted_at) {
     if (!submitted_at.valid()) {
         throw CpuTransferModelError("CPU transfer submission time is invalid");
     }
@@ -43,8 +44,7 @@ CpuTransferTiming AnalyticalCpuKVCacheTransferEngine::schedule(
     const double service_ms =
         latency + static_cast<double>(size_bytes) / bytes_per_ms;
     const double end_seconds = start_seconds + service_ms * 1e-3;
-    const double queue_ms =
-        (start_seconds - submitted_at.seconds()) * 1e3;
+    const double queue_ms = (start_seconds - submitted_at.seconds()) * 1e3;
     if (!std::isfinite(start_seconds) || !std::isfinite(service_ms) ||
         !std::isfinite(end_seconds) || !std::isfinite(queue_ms) ||
         service_ms < 0.0 || queue_ms < 0.0) {

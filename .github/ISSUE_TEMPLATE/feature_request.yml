@@ -1,0 +1,23 @@
+name: Feature request
+description: Propose a simulator capability or modeling improvement
+title: "[feature] "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: contract
+    attributes:
+      label: Modeled contract
+      description: Describe the serving-system behavior the simulator should represent.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Fidelity evidence
+      description: Link papers, runtime behavior, traces, or profiling evidence when available.
+  - type: textarea
+    id: scope
+    attributes:
+      label: Expected configuration and output surface
+    validations:
+      required: true

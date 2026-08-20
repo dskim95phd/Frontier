@@ -26,12 +26,12 @@
 namespace {
 
 using frontier::EventType;
-using frontier::config::ExecutionModelType;
 using frontier::config::ConfigError;
-using frontier::config::SimulationConfig;
-using frontier::config::SimulationMode;
+using frontier::config::ExecutionModelType;
 using frontier::config::parse_simulation_config_json;
 using frontier::config::serialize_simulation_config_json;
+using frontier::config::SimulationConfig;
+using frontier::config::SimulationMode;
 using frontier::metrics::SimulationOutput;
 using frontier::request_generator::parse_workload_csv;
 using frontier::simulator::run_simulation;
@@ -67,8 +67,8 @@ SimulationConfig make_k3_config(ExecutionFlavor flavor, Topology topology,
                                 std::uint64_t batch_size_cap = 2) {
     // Parse the checked-in example first so model loading and all ordinary
     // scheduler defaults remain covered by the public configuration path.
-    std::string config_text = read_text_file(
-        kExampleRoot / "configs" / "00_hello_colocation_fixed.json");
+    std::string config_text = read_text_file(kExampleRoot / "configs" /
+                                             "00_hello_colocation_fixed.json");
     replace_all(config_text, "meta-llama/Llama-2-7b-hf", "moonshotai/Kimi-K3");
     SimulationConfig config = parse_simulation_config_json(config_text);
 
@@ -102,8 +102,8 @@ SimulationConfig make_k3_config(ExecutionFlavor flavor, Topology topology,
         cluster.execution_model.type = ExecutionModelType::kFixed;
         cluster.execution_model.fixed.stage_latencies_ms.resize(
             static_cast<std::size_t>(topology.pipeline_parallel_size));
-        for (std::uint64_t stage = 0;
-             stage < topology.pipeline_parallel_size; ++stage) {
+        for (std::uint64_t stage = 0; stage < topology.pipeline_parallel_size;
+             ++stage) {
             // Deliberately vary stage costs so serialization checks cannot
             // pass by observing one constant interval accidentally.
             cluster.execution_model.fixed.stage_latencies_ms.at(stage) =
@@ -128,8 +128,8 @@ SimulationConfig make_k3_config(ExecutionFlavor flavor, Topology topology,
     return config;
 }
 
-std::vector<frontier::request_generator::WorkloadRequest> workload(
-    std::string_view csv) {
+std::vector<frontier::request_generator::WorkloadRequest>
+workload(std::string_view csv) {
     return parse_workload_csv(csv);
 }
 
@@ -140,12 +140,12 @@ std::size_t count_events(const SimulationOutput &output, EventType type) {
 }
 
 void expect_no_moe_sync_events(const SimulationOutput &output) {
-    for (const EventType type : {EventType::kPrefillSync,
-                                 EventType::kPrefillSyncCollective,
-                                 EventType::kDecodeSync,
-                                 EventType::kDecodeSyncCollective}) {
-        expect(count_events(output, type) == 0,
-               "pipeline-exclusive K3 must not emit MoE synchronization events");
+    for (const EventType type :
+         {EventType::kPrefillSync, EventType::kPrefillSyncCollective,
+          EventType::kDecodeSync, EventType::kDecodeSyncCollective}) {
+        expect(
+            count_events(output, type) == 0,
+            "pipeline-exclusive K3 must not emit MoE synchronization events");
     }
 }
 
@@ -160,14 +160,14 @@ void expect_positive_hbm_contract(const SimulationOutput &output,
                    diagnostic.ordinary_kv_capacity_blocks,
            "pipeline-exclusive K3 requires a positive HBM/KV contract");
     expect(diagnostic.stages.size() ==
-               static_cast<std::size_t>(topology.pipeline_parallel_size) &&
+                   static_cast<std::size_t>(topology.pipeline_parallel_size) &&
                diagnostic.timing_group_count > 0 &&
                diagnostic.memory_group_count > 0,
            "K3 memory diagnostics must cover every PP stage and groups");
     for (std::size_t index = 0; index < diagnostic.stages.size(); ++index) {
         const auto &stage = diagnostic.stages.at(index);
         expect(stage.stage_id.value() ==
-                   static_cast<decltype(stage.stage_id.value())>(index) &&
+                       static_cast<decltype(stage.stage_id.value())>(index) &&
                    stage.layer_count > 0 &&
                    stage.layer_end > stage.layer_begin && stage.free_bytes > 0,
                "every uneven K3 PP stage must retain positive free HBM");
@@ -201,8 +201,8 @@ void expect_all_stages_visited(const SimulationOutput &output,
                "K3 stage timestamps must be finite and causal");
     }
     std::set<std::uint64_t> expected;
-    for (std::uint64_t stage = 0;
-         stage < topology.pipeline_parallel_size; ++stage) {
+    for (std::uint64_t stage = 0; stage < topology.pipeline_parallel_size;
+         ++stage) {
         expected.insert(stage);
     }
     expect(stages == expected, "all K3 pipeline stages must be visited");
@@ -210,7 +210,8 @@ void expect_all_stages_visited(const SimulationOutput &output,
 
 void expect_stage_serialization(const SimulationOutput &output) {
     using Key = std::tuple<std::uint64_t, std::uint64_t, std::uint64_t>;
-    std::map<Key, std::vector<const frontier::metrics::BatchStageMetricsRecord *>>
+    std::map<Key,
+             std::vector<const frontier::metrics::BatchStageMetricsRecord *>>
         by_stage;
     for (const auto &record : output.batch_stages) {
         by_stage[Key{record.replica_id.value(), record.dp_id.value(),
@@ -219,10 +220,10 @@ void expect_stage_serialization(const SimulationOutput &output) {
     }
     for (auto &[key, records] : by_stage) {
         static_cast<void>(key);
-        std::sort(records.begin(), records.end(), [](const auto *left,
-                                                     const auto *right) {
-            return left->started_at < right->started_at;
-        });
+        std::sort(records.begin(), records.end(),
+                  [](const auto *left, const auto *right) {
+                      return left->started_at < right->started_at;
+                  });
         for (std::size_t index = 1; index < records.size(); ++index) {
             expect(records.at(index - 1)->completed_at <=
                        records.at(index)->started_at,
@@ -232,16 +233,16 @@ void expect_stage_serialization(const SimulationOutput &output) {
 }
 
 Json sorted_stage_json(const SimulationOutput &output) {
-    const Json root =
-        Json::parse(frontier::metrics::serialize_simulation_output_json(output));
+    const Json root = Json::parse(
+        frontier::metrics::serialize_simulation_output_json(output));
     Json stages = root.at("batch_stages");
-    std::sort(stages.begin(), stages.end(), [](const Json &left,
-                                               const Json &right) {
-        if (left.at("batch_id") != right.at("batch_id")) {
-            return left.at("batch_id") < right.at("batch_id");
-        }
-        return left.at("stage_id") < right.at("stage_id");
-    });
+    std::sort(stages.begin(), stages.end(),
+              [](const Json &left, const Json &right) {
+                  if (left.at("batch_id") != right.at("batch_id")) {
+                      return left.at("batch_id") < right.at("batch_id");
+                  }
+                  return left.at("stage_id") < right.at("stage_id");
+              });
     return stages;
 }
 
@@ -257,7 +258,7 @@ void expect_exact_collapsed_parity(const SimulationOutput &exact,
     expect(sorted_stage_json(exact) == sorted_stage_json(collapsed),
            "collapsed K3 PP must preserve every stage timestamp and duration");
     expect(count_events(collapsed, EventType::kBatchPipelineEnd) ==
-               collapsed.batches.size() &&
+                   collapsed.batches.size() &&
                count_events(collapsed, EventType::kBatchStageEnd) == 0 &&
                collapsed.aggregate.event_count < exact.aggregate.event_count &&
                count_events(exact, EventType::kBatchStageEnd) > 0,
@@ -310,27 +311,38 @@ void test_k3_pipeline_exclusive_topology_matrix() {
         expect_all_stages_visited(output, topology);
         expect_no_moe_sync_events(output);
         expect_positive_hbm_contract(output, topology);
-        expect(std::all_of(
-                   output.batch_stages.begin(), output.batch_stages.end(),
-                   [](const auto &stage) {
-                       return stage.model_kind == frontier::config::ModelKind::kMoe &&
-                              stage.execution_time.total_ms() > 0.0;
-                   }),
+        expect(std::all_of(output.batch_stages.begin(),
+                           output.batch_stages.end(),
+                           [](const auto &stage) {
+                               return stage.model_kind ==
+                                          frontier::config::ModelKind::kMoe &&
+                                      stage.execution_time.total_ms() > 0.0;
+                           }),
                "analytical K3 stage_group_scaled timings must be positive");
     }
 }
 
 void test_k3_fixed_and_analytical_workload_matrix() {
     const std::vector<std::tuple<std::string_view, std::string_view,
-                                 ExecutionFlavor, Topology>> cases{
-        {"prefill-heavy", kPrefillHeavy, ExecutionFlavor::kFixed, {2, 3, 1}},
-        {"decode-heavy", kDecodeHeavy, ExecutionFlavor::kAnalytical,
-         {4, 4, 1}},
-        {"concurrent-batches", kConcurrent, ExecutionFlavor::kFixed,
-         {8, 8, 1}},
-        {"staggered-arrivals", kStaggered, ExecutionFlavor::kAnalytical,
-         {8, 24, 8}},
-    };
+                                 ExecutionFlavor, Topology>>
+        cases{
+            {"prefill-heavy",
+             kPrefillHeavy,
+             ExecutionFlavor::kFixed,
+             {2, 3, 1}},
+            {"decode-heavy",
+             kDecodeHeavy,
+             ExecutionFlavor::kAnalytical,
+             {4, 4, 1}},
+            {"concurrent-batches",
+             kConcurrent,
+             ExecutionFlavor::kFixed,
+             {8, 8, 1}},
+            {"staggered-arrivals",
+             kStaggered,
+             ExecutionFlavor::kAnalytical,
+             {8, 24, 8}},
+        };
     for (const auto &[name, csv, flavor, topology] : cases) {
         static_cast<void>(name);
         const auto config = make_k3_config(flavor, topology, "exact",
@@ -360,12 +372,9 @@ void test_k3_exact_collapsed_parity_and_event_reduction() {
         const std::string &csv;
     };
     const std::vector<Case> cases{
-        {{2, 3, 1}, 1, kConcurrent},
-        {{4, 8, 4}, 1, kConcurrent},
-        {{8, 24, 8}, 1, kConcurrent},
-        {{2, 3, 1}, 4, kPipelined},
-        {{4, 8, 4}, 4, kPipelined},
-        {{4, 8, 4}, 16, kPipelined},
+        {{2, 3, 1}, 1, kConcurrent},  {{4, 8, 4}, 1, kConcurrent},
+        {{8, 24, 8}, 1, kConcurrent}, {{2, 3, 1}, 4, kPipelined},
+        {{4, 8, 4}, 4, kPipelined},   {{4, 8, 4}, 16, kPipelined},
         {{8, 24, 8}, 8, kPipelined},
     };
     for (const auto &[topology, batch_size_cap, csv] : cases) {
@@ -389,8 +398,8 @@ void test_k3_exact_collapsed_parity_and_event_reduction() {
 
 void test_k3_pipeline_exclusive_rejects_invalid_matrix_points() {
     const Topology topology{4, 4, 1};
-    const auto valid = make_k3_config(ExecutionFlavor::kFixed, topology,
-                                      "exact");
+    const auto valid =
+        make_k3_config(ExecutionFlavor::kFixed, topology, "exact");
     {
         auto invalid = valid;
         invalid.cluster().parallelism.data_parallel_size = 2;
@@ -419,15 +428,15 @@ void test_k3_pipeline_exclusive_rejects_invalid_matrix_points() {
 
 int main() {
     int failures = 0;
-    failures += frontier::test::run(
-        "K3 pipeline-exclusive TP/PP/DCP analytical matrix",
-        test_k3_pipeline_exclusive_topology_matrix);
+    failures +=
+        frontier::test::run("K3 pipeline-exclusive TP/PP/DCP analytical matrix",
+                            test_k3_pipeline_exclusive_topology_matrix);
     failures += frontier::test::run(
         "K3 pipeline-exclusive fixed/analytical workload matrix",
         test_k3_fixed_and_analytical_workload_matrix);
-    failures += frontier::test::run(
-        "K3 exact/collapsed parity and event reduction",
-        test_k3_exact_collapsed_parity_and_event_reduction);
+    failures +=
+        frontier::test::run("K3 exact/collapsed parity and event reduction",
+                            test_k3_exact_collapsed_parity_and_event_reduction);
     failures += frontier::test::run(
         "K3 pipeline-exclusive invalid matrix points",
         test_k3_pipeline_exclusive_rejects_invalid_matrix_points);

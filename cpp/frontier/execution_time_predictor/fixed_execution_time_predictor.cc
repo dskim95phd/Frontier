@@ -35,8 +35,8 @@ FixedExecutionTimePredictor::FixedExecutionTimePredictor(
 
 ExecutionTimePrediction
 FixedExecutionTimePredictor::predict_stage_execution_time(
-    const entities::Batch &batch,
-    const entities::RequestCollection &requests, StageId stage_id) const {
+    const entities::Batch &batch, const entities::RequestCollection &requests,
+    StageId stage_id) const {
     static_cast<void>(requests);
     double latency = config_.batch_latency_ms;
     if (!config_.stage_latencies_ms.empty()) {

@@ -105,7 +105,7 @@ void ReplicaStageScheduler::prune_collapsed_reservations(SimTime time) {
 }
 
 SimTime ReplicaStageScheduler::collapsed_start_time(SimTime requested,
-                                                     double duration_ms) {
+                                                    double duration_ms) {
     if (!requested.valid() || !std::isfinite(duration_ms) ||
         duration_ms < 0.0) {
         throw ReplicaStageSchedulerError(
@@ -138,8 +138,8 @@ SimTime ReplicaStageScheduler::collapsed_start_time(SimTime requested,
 }
 
 void ReplicaStageScheduler::reserve_collapsed_interval(BatchId batch_id,
-                                                        SimTime start,
-                                                        SimTime end) {
+                                                       SimTime start,
+                                                       SimTime end) {
     if (!batch_id.valid() || !start.valid() || !end.valid() || end < start) {
         throw ReplicaStageSchedulerError(
             "collapsed stage reservation has invalid identity or timing");
@@ -166,8 +166,7 @@ void ReplicaStageScheduler::reserve_collapsed_interval(BatchId batch_id,
                 "collapsed stage reservations overlap");
         }
     }
-    if (position != collapsed_reservations_.end() &&
-        position->start < end) {
+    if (position != collapsed_reservations_.end() && position->start < end) {
         throw ReplicaStageSchedulerError(
             "collapsed stage reservations overlap");
     }
@@ -228,15 +227,14 @@ ReplicaStageScheduler::prepare_moe_stage(
 
 execution_time_predictor::ExecutionTimePrediction
 ReplicaStageScheduler::predict_moe_layer(
-    const entities::Batch &batch,
-    const entities::RequestCollection &requests,
+    const entities::Batch &batch, const entities::RequestCollection &requests,
     std::uint64_t local_moe_layer) const {
     if (!active_batch_id_.valid() || active_batch_id_ != batch.id()) {
         throw ReplicaStageSchedulerError(
             "only the active stage batch can predict a MoE layer");
     }
-    return predictor_->predict_moe_layer_execution(
-        batch, requests, stage_id_, local_moe_layer);
+    return predictor_->predict_moe_layer_execution(batch, requests, stage_id_,
+                                                   local_moe_layer);
 }
 
 execution_time_predictor::MoEGroupLayerPrediction

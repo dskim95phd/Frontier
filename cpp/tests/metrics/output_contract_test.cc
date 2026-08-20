@@ -248,8 +248,8 @@ SimulationOutput make_output() {
         time_bucket.predicted_execution_ms = 1.0;
         time_bucket.prefill_attention_token_pairs = 42;
         time_bucket.execution_time = batch_aggregate.execution_time;
-        value.aggregate.prefill_attention_token_pairs_by_arrival_time_bucket[0] =
-            87;
+        value.aggregate
+            .prefill_attention_token_pairs_by_arrival_time_bucket[0] = 87;
         value.prefix_cache_targets = {
             [&]() {
                 frontier::metrics::PrefixCacheTargetMetricsRecord value{};
@@ -357,8 +357,7 @@ void test_csv_contract() {
                "active_fraction_of_kv_budget,active_fraction_of_total_hbm\n",
                0) == 0,
            "GPU KV occupancy CSV must expose per-GPU and fraction fields");
-    expect(occupancy_csv.find(
-               "0,PREFILL,0,0,2,8,1249280,2498560,") !=
+    expect(occupancy_csv.find("0,PREFILL,0,0,2,8,1249280,2498560,") !=
                    std::string::npos &&
                occupancy_csv.find("1,PREFILL,0,0,0,8,0,0,,0,\n") !=
                    std::string::npos,
@@ -412,8 +411,8 @@ void test_summary_contract() {
 
     SimulationOutput bounded = make_output();
     bounded.observation_window_seconds = 43'200.0;
-    const Json bounded_summary = Json::parse(
-        serialize_simulation_summary_json(bounded, 0.25));
+    const Json bounded_summary =
+        Json::parse(serialize_simulation_summary_json(bounded, 0.25));
     expect(bounded_summary.at("simulation_window_seconds") == 43'200.0,
            "bounded summary must retain its explicit observation horizon");
     const Json bounded_output =

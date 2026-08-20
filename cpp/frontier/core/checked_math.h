@@ -47,9 +47,9 @@ prefill_attention_token_pairs(std::uint64_t query_tokens,
                               overflow_message)
             : multiply<Error>(query_tokens, query_tokens / 2 + 1,
                               overflow_message);
-    return add<Error>(multiply<Error>(query_tokens, past_context,
-                                      overflow_message),
-                      triangular, overflow_message);
+    return add<Error>(
+        multiply<Error>(query_tokens, past_context, overflow_message),
+        triangular, overflow_message);
 }
 
 } // namespace frontier::checked_math

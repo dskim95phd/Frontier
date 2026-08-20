@@ -14,8 +14,8 @@
 
 namespace {
 
-using frontier::RequestId;
 using frontier::EventType;
+using frontier::RequestId;
 using frontier::config::parse_simulation_config_json;
 using frontier::metrics::CpuKVCacheTransferKind;
 using frontier::request_generator::parse_workload_csv;
@@ -76,8 +76,7 @@ void run_k3_cpu_snapshot_offload_and_restore(std::uint64_t pp_size) {
         }
         expect(maximum_snapshot_bytes > 0,
                "K3 PP fixture must expose a stage-local snapshot shard");
-        cluster->gpu_memory.capacity_bytes_per_gpu =
-            2 * maximum_snapshot_bytes;
+        cluster->gpu_memory.capacity_bytes_per_gpu = 2 * maximum_snapshot_bytes;
         frontier::config::resolve_gpu_memory_config(
             *cluster, cluster->scheduler.num_blocks);
     }
@@ -98,14 +97,12 @@ void run_k3_cpu_snapshot_offload_and_restore(std::uint64_t pp_size) {
                                return event.type() ==
                                       EventType::kBatchPipelineEnd;
                            }) &&
-                   std::none_of(output.event_trace.begin(),
-                                output.event_trace.end(),
-                                [](const auto &event) {
-                                    return event.type() ==
-                                               EventType::kPrefillSync ||
-                                           event.type() ==
-                                               EventType::kDecodeSync;
-                                }),
+                   std::none_of(
+                       output.event_trace.begin(), output.event_trace.end(),
+                       [](const auto &event) {
+                           return event.type() == EventType::kPrefillSync ||
+                                  event.type() == EventType::kDecodeSync;
+                       }),
                "K3 pipeline-exclusive PP must use the collapsed calendar "
                "without DP/EP synchronization events");
     }
@@ -144,22 +141,23 @@ void run_k3_cpu_snapshot_offload_and_restore(std::uint64_t pp_size) {
            "detailed CPU transfer trace must identify the atomic KDA payload");
 
     for (std::uint64_t stage = 0; stage < pp_size; ++stage) {
-        expect(std::any_of(output.batch_stages.begin(), output.batch_stages.end(),
-                           [stage](const auto &record) {
-                               return record.cluster_type ==
-                                          frontier::ClusterType::kPrefill &&
-                                      record.stage_id == frontier::StageId{stage};
-                           }),
-               "K3 CPU offload run must execute every PREFILL PP stage");
+        expect(
+            std::any_of(output.batch_stages.begin(), output.batch_stages.end(),
+                        [stage](const auto &record) {
+                            return record.cluster_type ==
+                                       frontier::ClusterType::kPrefill &&
+                                   record.stage_id == frontier::StageId{stage};
+                        }),
+            "K3 CPU offload run must execute every PREFILL PP stage");
     }
 
     const auto batch_contains_request = [&](frontier::BatchId batch_id,
                                             RequestId request_id) {
-        const auto batch = std::find_if(
-            output.batches.begin(), output.batches.end(),
-            [batch_id](const auto &record) {
-                return record.batch_id == batch_id;
-            });
+        const auto batch =
+            std::find_if(output.batches.begin(), output.batches.end(),
+                         [batch_id](const auto &record) {
+                             return record.batch_id == batch_id;
+                         });
         return batch != output.batches.end() &&
                std::find(batch->request_ids.begin(), batch->request_ids.end(),
                          request_id) != batch->request_ids.end();
@@ -213,8 +211,8 @@ void test_k3_cpu_snapshot_offload_and_restore() {
 }
 
 void test_k3_pdd_tp8_dcp8_analytical_decode() {
-    std::string config_text = read_text_file(kExampleRoot / "configs" /
-                                             "03_sequential_pdd.json");
+    std::string config_text =
+        read_text_file(kExampleRoot / "configs" / "03_sequential_pdd.json");
     replace_all(config_text, "meta-llama/Llama-2-7b-hf", "moonshotai/Kimi-K3");
     auto config = parse_simulation_config_json(config_text);
     auto &clusters = config.pdd().clusters;
@@ -261,18 +259,18 @@ void test_k3_pdd_tp8_dcp8_analytical_decode() {
                decode_stage->execution_time.tp_communication_ms > 0.0,
            "K3 decode stage must execute analytical TP8/DCP8 compute and "
            "collectives");
-    expect(std::any_of(output.event_trace.begin(), output.event_trace.end(),
-                       [](const auto &event) {
-                           return event.type() ==
-                                  EventType::kBatchPipelineEnd;
-                       }) &&
-               std::none_of(output.event_trace.begin(),
-                            output.event_trace.end(), [](const auto &event) {
-                                return event.type() == EventType::kPrefillSync ||
-                                       event.type() == EventType::kDecodeSync;
-                            }),
-           "K3 TP8 pipeline-exclusive analytical run must collapse PP "
-           "without DP/EP synchronization");
+    expect(
+        std::any_of(output.event_trace.begin(), output.event_trace.end(),
+                    [](const auto &event) {
+                        return event.type() == EventType::kBatchPipelineEnd;
+                    }) &&
+            std::none_of(output.event_trace.begin(), output.event_trace.end(),
+                         [](const auto &event) {
+                             return event.type() == EventType::kPrefillSync ||
+                                    event.type() == EventType::kDecodeSync;
+                         }),
+        "K3 TP8 pipeline-exclusive analytical run must collapse PP "
+        "without DP/EP synchronization");
     expect(output.kv_cache_transfers.front().size_bytes > 232'316'928ULL,
            "K3 PDD transfer must include MLA KV and the full KDA snapshot");
 }

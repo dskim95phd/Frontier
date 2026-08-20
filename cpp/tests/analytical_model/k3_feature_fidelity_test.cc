@@ -38,8 +38,8 @@ using frontier::StageId;
 using frontier::entities::Batch;
 using frontier::entities::BatchKind;
 using frontier::entities::Request;
-using frontier::entities::RequestCollection;
 using frontier::entities::RequestBatchSnapshot;
+using frontier::entities::RequestCollection;
 using frontier::request_generator::WorkloadRequest;
 using frontier::test::expect;
 

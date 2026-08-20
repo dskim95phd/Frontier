@@ -30,9 +30,9 @@ using frontier::metrics::BatchStageMetricsRecord;
 using frontier::metrics::serialize_simulation_output_json;
 using frontier::metrics::SimulationOutput;
 using frontier::request_generator::parse_workload_csv;
+using frontier::simulator::run_simulation;
 using frontier::simulator::Simulator;
 using frontier::simulator::SimulatorOptions;
-using frontier::simulator::run_simulation;
 using frontier::test::expect;
 using frontier::test::expect_throws;
 using frontier::test::read_text_file;
@@ -120,8 +120,7 @@ void test_round_robin_dp_replica_and_event_pipeline() {
 void test_bounded_online_pruning_preserves_request_ids() {
     SimulationConfig online_config =
         load_config("fixed_parallel_colocation.json");
-    online_config.simulation_mode =
-        frontier::config::SimulationMode::kOnline;
+    online_config.simulation_mode = frontier::config::SimulationMode::kOnline;
     const auto workload = parse_workload_csv(
         "session_start_at,think_time,num_prefill_tokens,num_decode_tokens,"
         "session_id,session_turn_index\n"
@@ -152,8 +151,7 @@ void test_bounded_online_pruning_preserves_request_ids() {
            "bounded output must preserve original workload row IDs");
 
     SimulationConfig offline_config = online_config;
-    offline_config.simulation_mode =
-        frontier::config::SimulationMode::kOffline;
+    offline_config.simulation_mode = frontier::config::SimulationMode::kOffline;
     Simulator offline{offline_config, workload, options};
     expect(offline.requests().size() == workload.size(),
            "offline mode must ignore bounded online pruning");
@@ -247,19 +245,19 @@ void test_collapsed_pp_calendar_matches_exact_timeline() {
         for (Json &entry : value) {
             entry.erase("batch_id");
         }
-        std::sort(value.begin(), value.end(), [](const Json &lhs,
-                                                 const Json &rhs) {
-            if (lhs.at("dp_id") != rhs.at("dp_id")) {
-                return lhs.at("dp_id") < rhs.at("dp_id");
-            }
-            if (lhs.at("replica_id") != rhs.at("replica_id")) {
-                return lhs.at("replica_id") < rhs.at("replica_id");
-            }
-            if (lhs.at("started_at_s") != rhs.at("started_at_s")) {
-                return lhs.at("started_at_s") < rhs.at("started_at_s");
-            }
-            return lhs.at("stage_id") < rhs.at("stage_id");
-        });
+        std::sort(
+            value.begin(), value.end(), [](const Json &lhs, const Json &rhs) {
+                if (lhs.at("dp_id") != rhs.at("dp_id")) {
+                    return lhs.at("dp_id") < rhs.at("dp_id");
+                }
+                if (lhs.at("replica_id") != rhs.at("replica_id")) {
+                    return lhs.at("replica_id") < rhs.at("replica_id");
+                }
+                if (lhs.at("started_at_s") != rhs.at("started_at_s")) {
+                    return lhs.at("started_at_s") < rhs.at("started_at_s");
+                }
+                return lhs.at("stage_id") < rhs.at("stage_id");
+            });
         return value;
     };
     expect(sort_stages(exact_json.at("batch_stages")) ==
@@ -281,8 +279,7 @@ void test_collapsed_pp_calendar_matches_exact_timeline() {
 }
 
 void test_collapsed_pp_falls_back_for_synchronized_moe() {
-    SimulationConfig config =
-        load_config("analytical_moe_ep4_colocation.json");
+    SimulationConfig config = load_config("analytical_moe_ep4_colocation.json");
     config.cluster().scheduler.pipeline_event_mode = "collapsed";
     const SimulationOutput output = run_simulation(config, load_workload());
     expect(std::none_of(output.event_trace.begin(), output.event_trace.end(),
@@ -420,9 +417,9 @@ int main() {
     failures +=
         frontier::test::run("round-robin DP/replica event pipeline",
                             test_round_robin_dp_replica_and_event_pipeline);
-    failures += frontier::test::run(
-        "bounded online pruning preserves request IDs",
-        test_bounded_online_pruning_preserves_request_ids);
+    failures +=
+        frontier::test::run("bounded online pruning preserves request IDs",
+                            test_bounded_online_pruning_preserves_request_ids);
     failures += frontier::test::run(
         "PP serialization and overlap",
         test_pipeline_serialization_overlap_and_fixed_timing);
@@ -431,9 +428,9 @@ int main() {
     failures += frontier::test::run(
         "collapsed PP calendar timeline and event reduction",
         test_collapsed_pp_calendar_matches_exact_timeline);
-    failures += frontier::test::run(
-        "collapsed PP synchronized MoE fallback",
-        test_collapsed_pp_falls_back_for_synchronized_moe);
+    failures +=
+        frontier::test::run("collapsed PP synchronized MoE fallback",
+                            test_collapsed_pp_falls_back_for_synchronized_moe);
     failures +=
         frontier::test::run("DP target-local pressure and preemption",
                             test_dp_target_local_pressure_and_preemption);

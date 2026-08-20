@@ -43,11 +43,11 @@ VllmQueueAwareClusterScheduler::schedule() {
     for (const QueuedRequest &queued : request_queue_) {
         ReplicaId selected_replica;
         DataParallelId selected_dp;
-        std::tuple<std::uint64_t, std::uint64_t, std::int64_t, std::int64_t> best{
-            std::numeric_limits<std::uint64_t>::max(),
-            std::numeric_limits<std::uint64_t>::max(),
-            std::numeric_limits<std::int64_t>::max(),
-            std::numeric_limits<std::int64_t>::max()};
+        std::tuple<std::uint64_t, std::uint64_t, std::int64_t, std::int64_t>
+            best{std::numeric_limits<std::uint64_t>::max(),
+                 std::numeric_limits<std::uint64_t>::max(),
+                 std::numeric_limits<std::int64_t>::max(),
+                 std::numeric_limits<std::int64_t>::max()};
         for (std::size_t target_index = 0;
              target_index < ordered_targets.size(); ++target_index) {
             const auto [replica_id, dp_id] = ordered_targets.at(target_index);
@@ -72,8 +72,8 @@ VllmQueueAwareClusterScheduler::schedule() {
             get_replica_scheduler(selected_replica, selected_dp);
         target.add_request(queued.request_id);
         next_tie_target_ = (next_tie_target_ + 1) % target_count;
-        result.push_back(ClusterRequestAssignment{
-            selected_replica, selected_dp, queued.request_id});
+        result.push_back(ClusterRequestAssignment{selected_replica, selected_dp,
+                                                  queued.request_id});
     }
     request_queue_.clear();
     return result;

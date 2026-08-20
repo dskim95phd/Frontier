@@ -277,8 +277,7 @@ std::uint64_t mega_moe_block_m(const MoELayerContext &context) {
     return 192;
 }
 
-std::uint64_t padded_m_tokens(std::uint64_t tokens,
-                              std::uint64_t block_m) {
+std::uint64_t padded_m_tokens(std::uint64_t tokens, std::uint64_t block_m) {
     return checked_math::multiply<AnalyticalModelError>(
         ceil_div(tokens, block_m), block_m,
         "MegaMoE padded token count overflows");
@@ -289,8 +288,7 @@ std::uint64_t add_geometry_count(std::uint64_t lhs, std::uint64_t rhs) {
         lhs, rhs, "MegaMoE geometry count overflows");
 }
 
-std::uint64_t multiply_geometry_count(std::uint64_t lhs,
-                                      std::uint64_t rhs) {
+std::uint64_t multiply_geometry_count(std::uint64_t lhs, std::uint64_t rhs) {
     return checked_math::multiply<AnalyticalModelError>(
         lhs, rhs, "MegaMoE geometry count overflows");
 }
@@ -345,14 +343,14 @@ MegaMoeGeometryWork build_mega_moe_geometry_work(
         const std::uint64_t padded =
             padded_m_tokens(tokens, result.geometry.block_m);
         add_expert_gemm_work(result.padded_work, context, padded, true);
-        result.geometry.routed_m_blocks = add_geometry_count(
-            result.geometry.routed_m_blocks,
-            ceil_div(tokens, result.geometry.block_m));
-        result.geometry.routed_padded_tokens = add_geometry_count(
-            result.geometry.routed_padded_tokens, padded);
+        result.geometry.routed_m_blocks =
+            add_geometry_count(result.geometry.routed_m_blocks,
+                               ceil_div(tokens, result.geometry.block_m));
+        result.geometry.routed_padded_tokens =
+            add_geometry_count(result.geometry.routed_padded_tokens, padded);
     }
-    for (std::uint64_t expert = 0;
-         expert < context.model.num_shared_experts; ++expert) {
+    for (std::uint64_t expert = 0; expert < context.model.num_shared_experts;
+         ++expert) {
         if (context.input_tokens == 0) {
             continue;
         }
@@ -362,17 +360,16 @@ MegaMoeGeometryWork build_mega_moe_geometry_work(
         result.geometry.shared_m_blocks = add_geometry_count(
             result.geometry.shared_m_blocks,
             ceil_div(context.input_tokens, result.geometry.block_m));
-        result.geometry.shared_padded_tokens = add_geometry_count(
-            result.geometry.shared_padded_tokens, padded);
+        result.geometry.shared_padded_tokens =
+            add_geometry_count(result.geometry.shared_padded_tokens, padded);
     }
 
     const std::uint64_t cluster_n = multiply_geometry_count(
-        context.config.mega_moe_cluster_size,
-        context.config.mega_moe_block_n);
-    const std::uint64_t up_width = context.model.gated_mlp
-                                       ? multiply_geometry_count(
-                                             context.local_intermediate, 2)
-                                       : context.local_intermediate;
+        context.config.mega_moe_cluster_size, context.config.mega_moe_block_n);
+    const std::uint64_t up_width =
+        context.model.gated_mlp
+            ? multiply_geometry_count(context.local_intermediate, 2)
+            : context.local_intermediate;
     const std::uint64_t up_n_clusters = ceil_div(up_width, cluster_n);
     const std::uint64_t routed_down_width =
         context.model.routed_expert_hidden_size == 0
@@ -383,10 +380,10 @@ MegaMoeGeometryWork build_mega_moe_geometry_work(
     const std::uint64_t shared_down_n_clusters =
         ceil_div(context.model.hidden_size, cluster_n);
 
-    result.routed_up_cluster_tasks = multiply_geometry_count(
-        result.geometry.routed_m_blocks, up_n_clusters);
-    result.shared_up_cluster_tasks = multiply_geometry_count(
-        result.geometry.shared_m_blocks, up_n_clusters);
+    result.routed_up_cluster_tasks =
+        multiply_geometry_count(result.geometry.routed_m_blocks, up_n_clusters);
+    result.shared_up_cluster_tasks =
+        multiply_geometry_count(result.geometry.shared_m_blocks, up_n_clusters);
     result.routed_down_cluster_tasks = multiply_geometry_count(
         result.geometry.routed_m_blocks, routed_down_n_clusters);
     result.shared_down_cluster_tasks = multiply_geometry_count(
@@ -423,23 +420,21 @@ KernelWork mega_moe_tail_work(const KernelWork &actual,
 }
 
 double predict_mega_moe_work_ms(const MoELayerContext &context,
-                                Precision precision,
-                                const KernelWork &actual,
+                                Precision precision, const KernelWork &actual,
                                 const KernelWork &padded,
                                 std::uint64_t cluster_tasks) {
     const KernelWork work = mega_moe_tail_work(
         actual, padded, context.config.mega_moe_tail_io_fraction);
-    const RooflineResult roofline = predict_roofline(
-        context.device, precision, work, context.config.moe,
-        context.config.kernel_launch_latency_us);
+    const RooflineResult roofline =
+        predict_roofline(context.device, precision, work, context.config.moe,
+                         context.config.kernel_launch_latency_us);
     if (roofline.predicted_time_ms == 0.0) {
         return 0.0;
     }
     const double utilization =
         mega_moe_wave_utilization(context.config, cluster_tasks);
     const double wave_factor =
-        1.0 + context.config.mega_moe_wave_exposure *
-                  (1.0 / utilization - 1.0);
+        1.0 + context.config.mega_moe_wave_exposure * (1.0 / utilization - 1.0);
     return roofline.launch_time_ms +
            (roofline.predicted_time_ms - roofline.launch_time_ms) *
                wave_factor +
@@ -516,18 +511,18 @@ predict_moe_layer(const DeviceCeilings &device, const AnalyticalConfig &config,
         context.shared_expert_element_bytes == context.expert_element_bytes;
     const double routed_up_projection_ms =
         context.config.mega_moe_geometry_enabled
-            ? predict_mega_moe_work_ms(
-                  context, context.expert_weight_precision,
-                  expert_work.routed_up, mega_moe.padded_work.routed_up,
-                  mega_moe.routed_up_cluster_tasks)
+            ? predict_mega_moe_work_ms(context, context.expert_weight_precision,
+                                       expert_work.routed_up,
+                                       mega_moe.padded_work.routed_up,
+                                       mega_moe.routed_up_cluster_tasks)
             : predict_expert_work_ms(context, expert_work.routed_up,
                                      context.config.moe);
     const double routed_down_projection_ms =
         context.config.mega_moe_geometry_enabled
-            ? predict_mega_moe_work_ms(
-                  context, context.expert_weight_precision,
-                  expert_work.routed_down, mega_moe.padded_work.routed_down,
-                  mega_moe.routed_down_cluster_tasks)
+            ? predict_mega_moe_work_ms(context, context.expert_weight_precision,
+                                       expert_work.routed_down,
+                                       mega_moe.padded_work.routed_down,
+                                       mega_moe.routed_down_cluster_tasks)
             : predict_expert_work_ms(context, expert_work.routed_down,
                                      context.config.moe);
     const double shared_up_projection_ms =
@@ -536,16 +531,16 @@ predict_moe_layer(const DeviceCeilings &device, const AnalyticalConfig &config,
                   context, context.shared_expert_weight_precision,
                   expert_work.shared_up, mega_moe.padded_work.shared_up,
                   mega_moe.shared_up_cluster_tasks)
-            : predict_shared_expert_work_ms(
-                  context, expert_work.shared_up, context.config.moe);
+            : predict_shared_expert_work_ms(context, expert_work.shared_up,
+                                            context.config.moe);
     const double shared_down_projection_ms =
         context.config.mega_moe_geometry_enabled
             ? predict_mega_moe_work_ms(
                   context, context.shared_expert_weight_precision,
                   expert_work.shared_down, mega_moe.padded_work.shared_down,
                   mega_moe.shared_down_cluster_tasks)
-            : predict_shared_expert_work_ms(
-                  context, expert_work.shared_down, context.config.moe);
+            : predict_shared_expert_work_ms(context, expert_work.shared_down,
+                                            context.config.moe);
     if (shared_uses_routed_kernel) {
         KernelWork combined_up = expert_work.routed_up;
         KernelWork combined_down = expert_work.routed_down;
@@ -553,11 +548,10 @@ predict_moe_layer(const DeviceCeilings &device, const AnalyticalConfig &config,
         add_kernel_work(combined_down, expert_work.shared_down);
         if (context.config.mega_moe_geometry_enabled) {
             const KernelWork padded_up = combined_kernel_work(
-                mega_moe.padded_work.routed_up,
-                mega_moe.padded_work.shared_up);
-            const KernelWork padded_down = combined_kernel_work(
-                mega_moe.padded_work.routed_down,
-                mega_moe.padded_work.shared_down);
+                mega_moe.padded_work.routed_up, mega_moe.padded_work.shared_up);
+            const KernelWork padded_down =
+                combined_kernel_work(mega_moe.padded_work.routed_down,
+                                     mega_moe.padded_work.shared_down);
             result.grouped_up_projection_ms = predict_mega_moe_work_ms(
                 context, context.expert_weight_precision, combined_up,
                 padded_up, mega_moe.geometry.up_cluster_tasks);
@@ -650,25 +644,22 @@ MoELanePrediction predict_moe_lanes(const DeviceCeilings &device,
         config.mega_moe_geometry_enabled && enable_group_mega_moe_geometry;
     MoELanePrediction prediction;
     prediction.lane_times.reserve(routing.lane_expert_tokens.size());
-    prediction.routed_lane_times_ms.reserve(
-        routing.lane_expert_tokens.size());
+    prediction.routed_lane_times_ms.reserve(routing.lane_expert_tokens.size());
     prediction.source_local_lane_times_ms.reserve(
         routing.lane_expert_tokens.size());
     for (const auto &lane : routing.lane_expert_tokens) {
-        MoELayerTime layer = predict_moe_layer(
-            device, effective_config, model, routing.input_tokens,
-            router_topk, lane, precisions);
+        MoELayerTime layer = predict_moe_layer(device, effective_config, model,
+                                               routing.input_tokens,
+                                               router_topk, lane, precisions);
         if (prediction.lane_times.empty()) {
-            prediction.shared_expert_path_ms =
-                layer.shared_expert_path_ms;
+            prediction.shared_expert_path_ms = layer.shared_expert_path_ms;
         } else if (layer.shared_expert_path_ms !=
                    prediction.shared_expert_path_ms) {
             throw AnalyticalModelError(
                 "source-local shared-expert time must be lane invariant");
         }
         prediction.routed_lane_times_ms.push_back(layer.routed_path_ms);
-        prediction.source_local_lane_times_ms.push_back(
-            layer.source_local_ms);
+        prediction.source_local_lane_times_ms.push_back(layer.source_local_ms);
         prediction.lane_times.push_back(std::move(layer));
     }
     for (std::size_t lane = 0; lane < prediction.lane_times.size(); ++lane) {
@@ -680,8 +671,7 @@ MoELanePrediction predict_moe_lanes(const DeviceCeilings &device,
         const double routed_time = prediction.routed_lane_times_ms.at(lane);
         if (lane == 0 ||
             routed_time > prediction.routed_critical_lane_time_ms) {
-            prediction.routed_critical_lane =
-                static_cast<std::uint64_t>(lane);
+            prediction.routed_critical_lane = static_cast<std::uint64_t>(lane);
             prediction.routed_critical_lane_time_ms = routed_time;
         }
     }
@@ -723,11 +713,9 @@ MoERoutedLanePrediction predict_routed_moe_lanes(
         const std::size_t lane_index = result.lane_times_ms.size() - 1;
         if (lane_index == 0 ||
             time.routed_path_ms > result.critical_lane_time_ms) {
-            result.critical_lane =
-                static_cast<std::uint64_t>(lane_index);
+            result.critical_lane = static_cast<std::uint64_t>(lane_index);
             result.critical_lane_time_ms = time.routed_path_ms;
-            result.critical_lane_geometry =
-                time.grouped_gemm_geometry;
+            result.critical_lane_geometry = time.grouped_gemm_geometry;
         }
     }
     return result;
@@ -796,10 +784,10 @@ MoECommunicationTime predict_moe_communication(
             // and effective bandwidth range (about 0.59--0.75 TB/s) follow
             // published DeepEP/MegaMoE-family measurements rather than peak
             // NVLink bandwidth. Interpolate conservatively in log2(EP).
-            const double log_ep = std::log2(
-                static_cast<double>(expert_parallel_size));
-            const double ep_position = std::clamp((log_ep - 3.0) / 3.0,
-                                                  0.0, 1.0);
+            const double log_ep =
+                std::log2(static_cast<double>(expert_parallel_size));
+            const double ep_position =
+                std::clamp((log_ep - 3.0) / 3.0, 0.0, 1.0);
             const double dispatch_startup_us =
                 (18.0 + 4.0 * ep_position) * a2a_startup_scale;
             const double combine_startup_us =
@@ -823,9 +811,9 @@ MoECommunicationTime predict_moe_communication(
                               static_cast<std::uint64_t>(
                                   routed_tokens % expert_parallel_size != 0));
             if (routing != nullptr && !routing->lane_unique_tokens.empty()) {
-                maximum_lane_unique_tokens = *std::max_element(
-                    routing->lane_unique_tokens.begin(),
-                    routing->lane_unique_tokens.end());
+                maximum_lane_unique_tokens =
+                    *std::max_element(routing->lane_unique_tokens.begin(),
+                                      routing->lane_unique_tokens.end());
             }
             const std::uint64_t routed_width =
                 routed_hidden_size == 0 ? hidden_size : routed_hidden_size;
@@ -833,16 +821,18 @@ MoECommunicationTime predict_moe_communication(
                 maximum_lane_unique_tokens, routed_width, element_bytes);
             // MegaMoE combines BF16 expert outputs even when the dispatch
             // activation is FP8.
-            const std::uint64_t maximum_combine_bytes = payload_bytes(
-                maximum_lane_unique_tokens, routed_width,
-                std::max(2.0, element_bytes));
+            const std::uint64_t maximum_combine_bytes =
+                payload_bytes(maximum_lane_unique_tokens, routed_width,
+                              std::max(2.0, element_bytes));
             const double remote_fraction =
                 static_cast<double>(expert_parallel_size - 1) /
                 static_cast<double>(expert_parallel_size);
-            value.raw_ep_dispatch_ms = dispatch_startup_us * 1e-3 +
+            value.raw_ep_dispatch_ms =
+                dispatch_startup_us * 1e-3 +
                 remote_fraction * static_cast<double>(maximum_dispatch_bytes) /
                     (dispatch_gbps * 1e6);
-            value.raw_ep_combine_ms = combine_startup_us * 1e-3 +
+            value.raw_ep_combine_ms =
+                combine_startup_us * 1e-3 +
                 remote_fraction * static_cast<double>(maximum_combine_bytes) /
                     (combine_gbps * 1e6);
 
@@ -853,14 +843,12 @@ MoECommunicationTime predict_moe_communication(
             // explicitly request the full producer/consumer critical path.
             const double fused_total =
                 std::max(fused_expert_compute_ms, raw_total) +
-                overlap_residual *
-                    std::min(fused_expert_compute_ms, raw_total);
+                overlap_residual * std::min(fused_expert_compute_ms, raw_total);
             const double exposed =
                 std::max(0.0, fused_total - fused_expert_compute_ms);
             value.ep_dispatch_ms =
-                raw_total > 0.0
-                    ? exposed * value.raw_ep_dispatch_ms / raw_total
-                    : 0.0;
+                raw_total > 0.0 ? exposed * value.raw_ep_dispatch_ms / raw_total
+                                : 0.0;
             value.ep_combine_ms = exposed - value.ep_dispatch_ms;
             // With DP attention + EP experts, dispatch/combine are the layout
             // transition. Charging another DP all-reduce would double-count
@@ -874,10 +862,10 @@ MoECommunicationTime predict_moe_communication(
                 communication.all_to_all_ms(routed_bytes, expert_parallel_size);
             value.raw_ep_dispatch_ms = value.ep_dispatch_ms;
             value.raw_ep_combine_ms = value.ep_combine_ms;
-            value.dp_input_ms = communication.allreduce_ms(
-                activation_bytes, data_parallel_size);
-            value.dp_output_ms = communication.allreduce_ms(
-                activation_bytes, data_parallel_size);
+            value.dp_input_ms = communication.allreduce_ms(activation_bytes,
+                                                           data_parallel_size);
+            value.dp_output_ms = communication.allreduce_ms(activation_bytes,
+                                                            data_parallel_size);
         }
         value.pipeline_parallel_ms =
             has_pipeline_boundary

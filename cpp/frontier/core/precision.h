@@ -50,8 +50,8 @@ parse_precision(std::string_view value) noexcept {
     return std::nullopt;
 }
 
-[[nodiscard]] constexpr double storage_bytes_per_element(
-    Precision precision) noexcept {
+[[nodiscard]] constexpr double
+storage_bytes_per_element(Precision precision) noexcept {
     switch (precision) {
     case Precision::kFp32:
         return 4.0;

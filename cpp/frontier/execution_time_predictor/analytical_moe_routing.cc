@@ -85,14 +85,11 @@ distribution_weights(std::uint64_t experts,
     return weights;
 }
 
-void accumulate_uniform_topk_counts(std::uint64_t input_tokens,
-                                    std::uint64_t router_topk,
-                                    std::uint64_t total_experts,
-                                    const ExpertParallelDomain &domain,
-                                    RoutingRng &generator,
-                                    std::vector<std::uint64_t> &counts,
-                                    std::vector<std::uint64_t>
-                                        &lane_unique_tokens) {
+void accumulate_uniform_topk_counts(
+    std::uint64_t input_tokens, std::uint64_t router_topk,
+    std::uint64_t total_experts, const ExpertParallelDomain &domain,
+    RoutingRng &generator, std::vector<std::uint64_t> &counts,
+    std::vector<std::uint64_t> &lane_unique_tokens) {
     // A router selects a set of k distinct experts for each input token. Keep
     // only the aggregate expert loads needed by the timing model, but obtain
     // them from a real without-replacement top-k draw. The partial
@@ -232,11 +229,11 @@ route_tokens(std::uint64_t input_tokens, std::uint64_t router_topk,
         // An omitted sample ID retains the historical explicit helper
         // contract. Real batches pass an engaged optional, including batch 0,
         // and therefore use the collision-resistant batch/layer mixer.
-        const std::uint64_t seed =
-            !sample_id.has_value()
-                ? config.seed + layer_id
-                : mix_seed(config.seed) ^ mix_seed(layer_id) ^
-                      mix_seed(*sample_id);
+        const std::uint64_t seed = !sample_id.has_value()
+                                       ? config.seed + layer_id
+                                       : mix_seed(config.seed) ^
+                                             mix_seed(layer_id) ^
+                                             mix_seed(*sample_id);
         RoutingRng generator(seed);
         accumulate_uniform_topk_counts(input_tokens, router_topk, total_experts,
                                        domain, generator, counts,
@@ -259,14 +256,16 @@ route_tokens(std::uint64_t input_tokens, std::uint64_t router_topk,
         for (const auto &lane : value.lane_expert_tokens) {
             value.lane_routed_tokens.push_back(
                 std::accumulate(lane.begin(), lane.end(), std::uint64_t{0}));
-            value.lane_active_experts.push_back(static_cast<std::uint64_t>(
-                std::count_if(lane.begin(), lane.end(),
-                              [](std::uint64_t tokens) { return tokens > 0; })));
+            value.lane_active_experts.push_back(
+                static_cast<std::uint64_t>(std::count_if(
+                    lane.begin(), lane.end(),
+                    [](std::uint64_t tokens) { return tokens > 0; })));
         }
         if (config.mode != config::MoeRoutingMode::kUniformRandom) {
             // Aggregate-only routing modes do not retain token identities.
             // This upper bound is exact for top-1 and conservative otherwise.
-            for (std::size_t lane = 0; lane < lane_unique_tokens.size(); ++lane) {
+            for (std::size_t lane = 0; lane < lane_unique_tokens.size();
+                 ++lane) {
                 lane_unique_tokens[lane] =
                     std::min(input_tokens, value.lane_routed_tokens[lane]);
             }

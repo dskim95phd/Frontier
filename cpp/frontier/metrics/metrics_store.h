@@ -114,8 +114,7 @@ class MetricsStore {
     [[nodiscard]] SimulationOutput take_output() noexcept;
 
   private:
-    using OccupancyTarget =
-        std::tuple<ClusterType, ReplicaId, DataParallelId>;
+    using OccupancyTarget = std::tuple<ClusterType, ReplicaId, DataParallelId>;
 
     struct MoERoutingKey {
         BatchId batch_id;
@@ -125,8 +124,7 @@ class MetricsStore {
         friend bool operator==(const MoERoutingKey &lhs,
                                const MoERoutingKey &rhs) noexcept {
             return lhs.batch_id == rhs.batch_id &&
-                   lhs.stage_id == rhs.stage_id &&
-                   lhs.layer_id == rhs.layer_id;
+                   lhs.stage_id == rhs.stage_id && lhs.layer_id == rhs.layer_id;
         }
     };
 

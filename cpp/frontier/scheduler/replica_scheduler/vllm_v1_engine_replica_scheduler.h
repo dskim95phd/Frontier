@@ -20,17 +20,9 @@
 #include "frontier/kv_cache/cpu_kv_cache_manager.h"
 #include "frontier/scheduler/kv_block_accounting.h"
 #include "frontier/scheduler/replica_scheduler/base_replica_scheduler.h"
+#include "frontier/scheduler/replica_scheduler/tiered_prefix_plan.h"
 
 namespace frontier::scheduler {
-
-[[nodiscard]] entities::TieredPrefixPlan build_contiguous_tiered_prefix_plan(
-    std::uint64_t query_blocks, std::uint64_t gpu_frontier_blocks,
-    std::uint64_t cpu_frontier_blocks, std::uint64_t block_size,
-    std::uint64_t prompt_tokens);
-
-[[nodiscard]] std::uint64_t revalidate_contiguous_tiered_prefix_frontier(
-    std::uint64_t current_gpu_frontier_blocks,
-    const entities::StagedCpuKVCacheRestore &staged);
 
 class VllmV1Scheduler final : public BaseReplicaScheduler {
   public:
@@ -40,13 +32,11 @@ class VllmV1Scheduler final : public BaseReplicaScheduler {
                     entities::RequestCollection &requests,
                     config::PrefixCacheConfig prefix_cache_config);
     VllmV1Scheduler(
-        config::SchedulerConfig config,
-        entities::RequestCollection &requests,
+        config::SchedulerConfig config, entities::RequestCollection &requests,
         std::unique_ptr<execution_time_predictor::BaseExecutionTimePredictor>
             predictor);
     VllmV1Scheduler(
-        config::SchedulerConfig config,
-        entities::RequestCollection &requests,
+        config::SchedulerConfig config, entities::RequestCollection &requests,
         execution_time_predictor::ExecutionTimePredictorPtr predictor,
         const entities::Replica &replica, DataParallelId dp_id,
         ClusterType cluster_type,
@@ -84,8 +74,7 @@ class VllmV1Scheduler final : public BaseReplicaScheduler {
 
     [[nodiscard]] bool has_pending_work() const noexcept override {
         return !preempted_.empty() || !waiting_.empty() || !running_.empty() ||
-               !restored_ready_.empty() ||
-               !pending_cpu_restores_.empty() ||
+               !restored_ready_.empty() || !pending_cpu_restores_.empty() ||
                !staged_cpu_restores_.empty() || !pending_exports_.empty();
     }
     [[nodiscard]] bool idle() const noexcept override {
@@ -175,11 +164,9 @@ class VllmV1Scheduler final : public BaseReplicaScheduler {
     [[nodiscard]] std::vector<entities::CpuKVCacheRestoreInfo>
     cpu_kv_cache_restore_operations() const override;
     [[nodiscard]] std::optional<entities::CpuKVCacheOffloadInfo>
-    take_completed_cpu_kv_cache_offload(
-        CpuKvTransferId transfer_id) override;
+    take_completed_cpu_kv_cache_offload(CpuKvTransferId transfer_id) override;
     [[nodiscard]] std::optional<entities::CpuKVCacheRestoreInfo>
-    take_completed_cpu_kv_cache_restore(
-        CpuKvTransferId transfer_id) override;
+    take_completed_cpu_kv_cache_restore(CpuKvTransferId transfer_id) override;
     [[nodiscard]] bool cancel_cpu_kv_cache_restore(RequestId request_id,
                                                    SimTime time);
 

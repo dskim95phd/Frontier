@@ -23,12 +23,14 @@ using frontier::ReplicaId;
 using frontier::RequestId;
 using frontier::SimTime;
 using frontier::StageId;
+using frontier::config::ClusterSchedulerConfig;
+using frontier::config::ClusterSchedulerType;
 using frontier::config::SchedulerConfig;
 using frontier::entities::Batch;
 using frontier::entities::Cluster;
 using frontier::entities::Request;
-using frontier::entities::RequestCollection;
 using frontier::entities::RequestBatchSnapshot;
+using frontier::entities::RequestCollection;
 using frontier::execution_time_predictor::FixedExecutionTimePredictor;
 using frontier::request_generator::WorkloadRequest;
 using frontier::scheduler::BaseClusterScheduler;
@@ -38,11 +40,9 @@ using frontier::scheduler::ClusterSchedulerError;
 using frontier::scheduler::ClusterType;
 using frontier::scheduler::GlobalScheduler;
 using frontier::scheduler::GlobalSchedulerError;
+using frontier::scheduler::KvAwareClusterScheduler;
 using frontier::scheduler::ReplicaStageScheduler;
 using frontier::scheduler::SchedulerError;
-using frontier::config::ClusterSchedulerConfig;
-using frontier::config::ClusterSchedulerType;
-using frontier::scheduler::KvAwareClusterScheduler;
 using frontier::scheduler::StickyRoundRobinClusterScheduler;
 using frontier::scheduler::VllmQueueAwareClusterScheduler;
 using frontier::test::expect;
@@ -345,12 +345,12 @@ void test_stage_specific_factory_and_observable_routing_policies() {
     stage_config.decode_type = ClusterSchedulerType::kVllmQueueAware;
     GlobalScheduler global{pdd_clusters, pdd_requests, predictors, nullptr,
                            stage_config};
-    expect(dynamic_cast<StickyRoundRobinClusterScheduler *>(
-               &global.get_cluster_scheduler(ClusterType::kPrefill)) != nullptr &&
-               dynamic_cast<VllmQueueAwareClusterScheduler *>(
-                   &global.get_cluster_scheduler(ClusterType::kDecode)) !=
-               nullptr,
-           "PDD stages must instantiate independent configured cluster policies");
+    expect(
+        dynamic_cast<StickyRoundRobinClusterScheduler *>(
+            &global.get_cluster_scheduler(ClusterType::kPrefill)) != nullptr &&
+            dynamic_cast<VllmQueueAwareClusterScheduler *>(
+                &global.get_cluster_scheduler(ClusterType::kDecode)) != nullptr,
+        "PDD stages must instantiate independent configured cluster policies");
 }
 
 void test_kv_aware_prefill_avoids_virtual_commitment() {
@@ -394,14 +394,14 @@ void test_kv_aware_prefill_avoids_virtual_commitment() {
                ", physical=" +
                std::to_string(committed_target.allocated_kv_blocks()) +
                ", virtual=" +
-               std::to_string(
-                   committed_target.virtual_committed_kv_blocks()) +
+               std::to_string(committed_target.virtual_committed_kv_blocks()) +
                ")");
 
     scheduler.add_request(RequestId{1}, SimTime::from_seconds(0.0));
     const auto second = scheduler.schedule();
     expect(second.size() == 1 && second.front().replica_id == ReplicaId{1},
-           "KV-aware PREFILL routing must avoid a target with a virtual commitment");
+           "KV-aware PREFILL routing must avoid a target with a virtual "
+           "commitment");
     BaseReplicaScheduler &queued_target =
         scheduler.get_replica_scheduler(ReplicaId{1}, DataParallelId{0});
     expect(queued_target.queued_kv_blocks() == 4,
@@ -420,12 +420,12 @@ void test_actual_cache_aware_routing_migrates_and_discards_old_gpu_kv() {
         return value;
     }());
     RequestCollection requests;
-    requests.emplace_back(make_request(RequestId{0}, 8, 1,
-                                       frontier::SessionId{7}));
-    requests.emplace_back(make_request(RequestId{1}, 2, 1,
-                                       frontier::SessionId{99}));
-    requests.emplace_back(make_request(RequestId{2}, 12, 1,
-                                       frontier::SessionId{7}));
+    requests.emplace_back(
+        make_request(RequestId{0}, 8, 1, frontier::SessionId{7}));
+    requests.emplace_back(
+        make_request(RequestId{1}, 2, 1, frontier::SessionId{99}));
+    requests.emplace_back(
+        make_request(RequestId{2}, 12, 1, frontier::SessionId{7}));
     for (Request &request : requests) {
         request.on_arrival(SimTime::from_seconds(0.0));
     }
@@ -435,10 +435,14 @@ void test_actual_cache_aware_routing_migrates_and_discards_old_gpu_kv() {
     routing.balance_abs_threshold = 0;
     routing.balance_rel_threshold = 1.0;
     CacheAwareClusterScheduler scheduler{
-        cluster, requests, predictor, nullptr,
+        cluster,
+        requests,
+        predictor,
+        nullptr,
         frontier::config::PrefixCacheConfig{
             true, frontier::config::PrefixCachingKeyMode::kSession},
-        {}, routing};
+        {},
+        routing};
 
     scheduler.add_request(RequestId{0}, SimTime::from_seconds(0.0));
     const auto producer_assignment = scheduler.schedule();
@@ -448,8 +452,8 @@ void test_actual_cache_aware_routing_migrates_and_discards_old_gpu_kv() {
     BaseReplicaScheduler &old_target =
         scheduler.get_replica_scheduler(ReplicaId{0}, DataParallelId{0});
     complete_single_monolithic_iteration(old_target, requests[0], BatchId{0});
-    expect(old_target.gpu_cache_valid_prefix_blocks(
-               frontier::SessionId{7}) == 2,
+    expect(old_target.gpu_cache_valid_prefix_blocks(frontier::SessionId{7}) ==
+               2,
            "producer must leave two actual GPU prefix blocks");
 
     // Create one observable outstanding request on the affinity target. With
@@ -457,18 +461,17 @@ void test_actual_cache_aware_routing_migrates_and_discards_old_gpu_kv() {
     old_target.add_request(RequestId{1});
     scheduler.add_request(RequestId{2}, SimTime::from_seconds(0.0));
     const auto migrated = scheduler.schedule();
-    expect(migrated.size() == 1 &&
-               migrated.front().replica_id == ReplicaId{1},
+    expect(migrated.size() == 1 && migrated.front().replica_id == ReplicaId{1},
            "load imbalance must override a nonzero cache hit");
-    expect(old_target.gpu_cache_valid_prefix_blocks(
-               frontier::SessionId{7}) == 0,
+    expect(old_target.gpu_cache_valid_prefix_blocks(frontier::SessionId{7}) ==
+               0,
            "migration must discard every old-target GPU KV block");
 
     RequestCollection low_hit_requests;
-    low_hit_requests.emplace_back(make_request(
-        RequestId{0}, 8, 1, frontier::SessionId{17}));
-    low_hit_requests.emplace_back(make_request(
-        RequestId{1}, 12, 1, frontier::SessionId{17}));
+    low_hit_requests.emplace_back(
+        make_request(RequestId{0}, 8, 1, frontier::SessionId{17}));
+    low_hit_requests.emplace_back(
+        make_request(RequestId{1}, 12, 1, frontier::SessionId{17}));
     for (Request &request : low_hit_requests) {
         request.on_arrival(SimTime::from_seconds(0.0));
     }
@@ -476,25 +479,27 @@ void test_actual_cache_aware_routing_migrates_and_discards_old_gpu_kv() {
     low_hit_routing.type = ClusterSchedulerType::kCacheAware;
     low_hit_routing.cache_threshold = 0.8;
     CacheAwareClusterScheduler low_hit_scheduler{
-        cluster, low_hit_requests, predictor, nullptr,
+        cluster,
+        low_hit_requests,
+        predictor,
+        nullptr,
         frontier::config::PrefixCacheConfig{
             true, frontier::config::PrefixCachingKeyMode::kSession},
-        {}, low_hit_routing};
+        {},
+        low_hit_routing};
     low_hit_scheduler.add_request(RequestId{0}, SimTime::from_seconds(0.0));
     const auto low_hit_producer = low_hit_scheduler.schedule();
     BaseReplicaScheduler &low_hit_old = low_hit_scheduler.get_replica_scheduler(
-        low_hit_producer.front().replica_id,
-        low_hit_producer.front().dp_id);
+        low_hit_producer.front().replica_id, low_hit_producer.front().dp_id);
     complete_single_monolithic_iteration(low_hit_old, low_hit_requests[0],
                                          BatchId{0});
-    low_hit_scheduler.add_request(RequestId{1},
-                                  SimTime::from_seconds(0.0));
+    low_hit_scheduler.add_request(RequestId{1}, SimTime::from_seconds(0.0));
     const auto low_hit_migration = low_hit_scheduler.schedule();
     expect(low_hit_migration.size() == 1 &&
                low_hit_migration.front().replica_id == ReplicaId{1},
            "GPU hit ratio below threshold must use least-load routing");
-    expect(low_hit_old.gpu_cache_valid_prefix_blocks(
-               frontier::SessionId{17}) == 0,
+    expect(low_hit_old.gpu_cache_valid_prefix_blocks(frontier::SessionId{17}) ==
+               0,
            "low-hit migration must discard the partial old GPU prefix");
 }
 
@@ -509,20 +514,24 @@ void test_actual_cache_aware_routing_waits_for_session_owner_release() {
         return value;
     }());
     RequestCollection requests;
-    requests.emplace_back(make_request(RequestId{0}, 8, 1,
-                                       frontier::SessionId{31}));
-    requests.emplace_back(make_request(RequestId{1}, 12, 1,
-                                       frontier::SessionId{31}));
+    requests.emplace_back(
+        make_request(RequestId{0}, 8, 1, frontier::SessionId{31}));
+    requests.emplace_back(
+        make_request(RequestId{1}, 12, 1, frontier::SessionId{31}));
     for (Request &request : requests) {
         request.on_arrival(SimTime::from_seconds(0.0));
     }
     ClusterSchedulerConfig routing{};
     routing.type = ClusterSchedulerType::kCacheAware;
     CacheAwareClusterScheduler scheduler{
-        cluster, requests, predictor, nullptr,
+        cluster,
+        requests,
+        predictor,
+        nullptr,
         frontier::config::PrefixCacheConfig{
             true, frontier::config::PrefixCachingKeyMode::kSession},
-        {}, routing};
+        {},
+        routing};
 
     scheduler.add_request(RequestId{0}, SimTime::from_seconds(0.0));
     const auto first_assignment = scheduler.schedule();
@@ -542,20 +551,17 @@ void test_actual_cache_aware_routing_waits_for_session_owner_release() {
     const auto &scheduled = decision.scheduled_requests.front();
     Batch batch{BatchId{0},
                 decision.iteration_id,
-                {RequestBatchSnapshot{scheduled.request_id,
-                                      scheduled.num_tokens,
-                                      requests[0].runtime_epoch(),
-                                      requests[0].execution_epoch(),
-                                      requests[0].num_processed_tokens(),
-                                      requests[0]
-                                          .scheduler_num_computed_tokens()}},
+                {RequestBatchSnapshot{
+                    scheduled.request_id, scheduled.num_tokens,
+                    requests[0].runtime_epoch(), requests[0].execution_epoch(),
+                    requests[0].num_processed_tokens(),
+                    requests[0].scheduler_num_computed_tokens()}},
                 decision.simulation_time,
                 Generation{1}};
     batch.set_global_id(BatchGlobalId{0});
     target.mark_batch_started(batch);
     expect(target.on_batch_completed(batch, SimTime::from_seconds(0.002)) &&
-               !target.session_has_active_kv_request(
-                   frontier::SessionId{31}),
+               !target.session_has_active_kv_request(frontier::SessionId{31}),
            "finishing the old request must release session ownership");
 
     const auto unblocked = scheduler.schedule();
@@ -578,10 +584,10 @@ void test_actual_cache_aware_routing_keeps_cpu_hit_affinity() {
         return value;
     }());
     RequestCollection requests;
-    requests.emplace_back(make_request(RequestId{0}, 8, 1,
-                                       frontier::SessionId{23}));
-    requests.emplace_back(make_request(RequestId{1}, 12, 1,
-                                       frontier::SessionId{23}));
+    requests.emplace_back(
+        make_request(RequestId{0}, 8, 1, frontier::SessionId{23}));
+    requests.emplace_back(
+        make_request(RequestId{1}, 12, 1, frontier::SessionId{23}));
     for (Request &request : requests) {
         request.on_arrival(SimTime::from_seconds(0.0));
     }
@@ -599,15 +605,18 @@ void test_actual_cache_aware_routing_keeps_cpu_hit_affinity() {
     routing.type = ClusterSchedulerType::kCacheAware;
     routing.cache_threshold = 0.5;
     CacheAwareClusterScheduler scheduler{
-        cluster, requests, predictor, nullptr,
+        cluster,
+        requests,
+        predictor,
+        nullptr,
         frontier::config::PrefixCacheConfig{
             true, frontier::config::PrefixCachingKeyMode::kSession},
-        cpu, routing};
+        cpu,
+        routing};
 
     scheduler.add_request(RequestId{0}, SimTime::from_seconds(0.0));
     const auto producer = scheduler.schedule();
-    expect(producer.size() == 1 &&
-               producer.front().replica_id == ReplicaId{0},
+    expect(producer.size() == 1 && producer.front().replica_id == ReplicaId{0},
            "first CPU-backed session turn must use stable placement");
     BaseReplicaScheduler &affinity_target =
         scheduler.get_replica_scheduler(ReplicaId{0}, DataParallelId{0});
@@ -627,8 +636,7 @@ void test_actual_cache_aware_routing_keeps_cpu_hit_affinity() {
 
     scheduler.add_request(RequestId{1}, SimTime::from_seconds(1.0));
     const auto reused = scheduler.schedule();
-    expect(reused.size() == 1 &&
-               reused.front().replica_id == ReplicaId{0},
+    expect(reused.size() == 1 && reused.front().replica_id == ReplicaId{0},
            "CPU prefix hit above threshold must preserve session affinity");
 }
 
@@ -644,10 +652,10 @@ void test_actual_cache_aware_migration_discards_old_cpu_kv() {
         return value;
     }());
     RequestCollection requests;
-    requests.emplace_back(make_request(RequestId{0}, 8, 1,
-                                       frontier::SessionId{29}));
-    requests.emplace_back(make_request(RequestId{1}, 12, 1,
-                                       frontier::SessionId{29}));
+    requests.emplace_back(
+        make_request(RequestId{0}, 8, 1, frontier::SessionId{29}));
+    requests.emplace_back(
+        make_request(RequestId{1}, 12, 1, frontier::SessionId{29}));
     for (Request &request : requests) {
         request.on_arrival(SimTime::from_seconds(0.0));
     }
@@ -665,15 +673,18 @@ void test_actual_cache_aware_migration_discards_old_cpu_kv() {
     routing.type = ClusterSchedulerType::kCacheAware;
     routing.cache_threshold = 0.8;
     CacheAwareClusterScheduler scheduler{
-        cluster, requests, predictor, nullptr,
+        cluster,
+        requests,
+        predictor,
+        nullptr,
         frontier::config::PrefixCacheConfig{
             true, frontier::config::PrefixCachingKeyMode::kSession},
-        cpu, routing};
+        cpu,
+        routing};
 
     scheduler.add_request(RequestId{0}, SimTime::from_seconds(0.0));
     const auto producer = scheduler.schedule();
-    expect(producer.size() == 1 &&
-               producer.front().replica_id == ReplicaId{0},
+    expect(producer.size() == 1 && producer.front().replica_id == ReplicaId{0},
            "CPU migration producer must start on the stable first target");
     BaseReplicaScheduler &old_target =
         scheduler.get_replica_scheduler(ReplicaId{0}, DataParallelId{0});
@@ -691,8 +702,7 @@ void test_actual_cache_aware_migration_discards_old_cpu_kv() {
 
     scheduler.add_request(RequestId{1}, SimTime::from_seconds(1.0));
     const auto migrated = scheduler.schedule();
-    expect(migrated.size() == 1 &&
-               migrated.front().replica_id == ReplicaId{1},
+    expect(migrated.size() == 1 && migrated.front().replica_id == ReplicaId{1},
            "tiered hit below threshold must migrate to the next empty target");
     expect(old_cpu->lookup(frontier::SessionId{29}, 3).hit_blocks == 0 &&
                old_cpu->diagnostics().materialized_blocks == 0,

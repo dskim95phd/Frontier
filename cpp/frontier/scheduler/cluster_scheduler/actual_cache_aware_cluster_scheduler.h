@@ -20,8 +20,7 @@ namespace frontier::scheduler {
 class CacheAwareClusterScheduler final : public BaseClusterScheduler {
   public:
     CacheAwareClusterScheduler(
-        const entities::Cluster &cluster,
-        entities::RequestCollection &requests,
+        const entities::Cluster &cluster, entities::RequestCollection &requests,
         execution_time_predictor::ExecutionTimePredictorPtr predictor,
         std::shared_ptr<const kv_cache_transfer::BaseKVCacheTransferPredictor>
             kv_cache_transfer_predictor,
@@ -34,10 +33,10 @@ class CacheAwareClusterScheduler final : public BaseClusterScheduler {
   private:
     using Target = std::pair<ReplicaId, DataParallelId>;
 
-    [[nodiscard]] Target pick_least_loaded_target(
-        const std::vector<Target> &ordered_targets) const;
-    [[nodiscard]] bool targets_are_imbalanced(
-        const std::vector<Target> &ordered_targets) const;
+    [[nodiscard]] Target
+    pick_least_loaded_target(const std::vector<Target> &ordered_targets) const;
+    [[nodiscard]] bool
+    targets_are_imbalanced(const std::vector<Target> &ordered_targets) const;
 
     config::ClusterSchedulerConfig routing_config_;
     std::uint64_t next_tie_target_ = 0;

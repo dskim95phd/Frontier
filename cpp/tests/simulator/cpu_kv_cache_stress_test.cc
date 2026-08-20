@@ -31,9 +31,8 @@ std::vector<WorkloadRequest> make_workload(std::uint64_t sessions,
             WorkloadRequest value{};
             value.request_id = RequestId{result.size()};
             if (round == 0) {
-                value.session_start_at =
-                    SimTime::from_seconds((session / 2) * 0.2 +
-                                          (session % 2) * 0.01);
+                value.session_start_at = SimTime::from_seconds(
+                    (session / 2) * 0.2 + (session % 2) * 0.01);
                 value.num_prefill_tokens = 8 + (session % 2) * 4;
             } else {
                 value.think_time = SimTime::from_seconds(0.05);
@@ -50,8 +49,8 @@ std::vector<WorkloadRequest> make_workload(std::uint64_t sessions,
 
 void test_cpu_kv_cache_pressure_reaches_quiescence() {
     const std::filesystem::path root{FRONTIER_EXAMPLE_DIR};
-    auto config = parse_simulation_config_json(read_text_file(
-        root / "configs" / "06_cpu_kv_cache_pdd_online.json"));
+    auto config = parse_simulation_config_json(
+        read_text_file(root / "configs" / "06_cpu_kv_cache_pdd_online.json"));
     config.run_id = "cpu-kv-cache-stress";
     config.pdd().clusters.prefill.scheduler.num_blocks = 5;
     const std::uint64_t bytes_per_block =
@@ -64,18 +63,17 @@ void test_cpu_kv_cache_pressure_reaches_quiescence() {
     const auto output = run_simulation(config, make_workload(sessions, rounds));
     expect(output.requests.size() == sessions * rounds,
            "CPU tier pressure workload did not drain");
-    expect(output.aggregate.cpu_kv_cache.offload_operations > sessions &&
-               output.aggregate.cpu_kv_cache.restore_operations > 0 &&
-               output.aggregate.cpu_kv_cache.hit_blocks > 0,
-           "CPU tier pressure workload did not exercise offload and restore: "
-           "offloads=" +
-               std::to_string(
-                   output.aggregate.cpu_kv_cache.offload_operations) +
-               ", restores=" +
-               std::to_string(
-                   output.aggregate.cpu_kv_cache.restore_operations) +
-               ", hit_blocks=" +
-               std::to_string(output.aggregate.cpu_kv_cache.hit_blocks));
+    expect(
+        output.aggregate.cpu_kv_cache.offload_operations > sessions &&
+            output.aggregate.cpu_kv_cache.restore_operations > 0 &&
+            output.aggregate.cpu_kv_cache.hit_blocks > 0,
+        "CPU tier pressure workload did not exercise offload and restore: "
+        "offloads=" +
+            std::to_string(output.aggregate.cpu_kv_cache.offload_operations) +
+            ", restores=" +
+            std::to_string(output.aggregate.cpu_kv_cache.restore_operations) +
+            ", hit_blocks=" +
+            std::to_string(output.aggregate.cpu_kv_cache.hit_blocks));
     expect(output.cpu_kv_cache_targets.size() == 1,
            "CPU tier stress must expose one PREFILL target");
     const auto &target = output.cpu_kv_cache_targets.front();

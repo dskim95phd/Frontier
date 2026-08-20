@@ -11,8 +11,8 @@ void handle_event(const CpuKVCacheOffloadStartPayload &payload, SimTime time,
     scheduler::BaseReplicaScheduler &scheduler =
         simulator.cluster(payload.cluster_type)
             .get_replica_scheduler(payload.replica_id, payload.dp_id);
-    scheduler.on_cpu_kv_cache_offload_start(
-        payload.transfer_id, payload.cpu_generation, time);
+    scheduler.on_cpu_kv_cache_offload_start(payload.transfer_id,
+                                            payload.cpu_generation, time);
     for (scheduler::ScheduledAuxiliaryEvent &event :
          scheduler.drain_auxiliary_events()) {
         simulator.event_queue().push(event.time, std::move(event.payload));

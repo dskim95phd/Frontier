@@ -26,59 +26,6 @@ const entities::Replica &default_replica() {
 
 } // namespace
 
-entities::TieredPrefixPlan build_contiguous_tiered_prefix_plan(
-    std::uint64_t query_blocks, std::uint64_t gpu_frontier_blocks,
-    std::uint64_t cpu_frontier_blocks, std::uint64_t block_size,
-    std::uint64_t prompt_tokens) {
-    if (block_size == 0 || query_blocks != prompt_tokens / block_size) {
-        throw SchedulerError("invalid contiguous tiered prefix dimensions");
-    }
-    entities::TieredPrefixPlan plan{};
-    plan.query_blocks = query_blocks;
-    plan.gpu_hit_frontier_blocks = std::min(gpu_frontier_blocks, query_blocks);
-    const std::uint64_t cpu_frontier =
-        std::min(cpu_frontier_blocks, query_blocks);
-    plan.cpu_query_blocks = query_blocks > plan.gpu_hit_frontier_blocks
-                                ? query_blocks - plan.gpu_hit_frontier_blocks
-                                : 0;
-    plan.hit_frontier_blocks =
-        std::max(plan.gpu_hit_frontier_blocks, cpu_frontier);
-    if (prompt_tokens % block_size == 0 &&
-        plan.hit_frontier_blocks == query_blocks && query_blocks > 0) {
-        --plan.hit_frontier_blocks;
-    }
-    plan.cpu_begin_block =
-        std::min(plan.gpu_hit_frontier_blocks, plan.hit_frontier_blocks);
-    plan.cpu_end_block = std::min(cpu_frontier, plan.hit_frontier_blocks);
-    if (plan.cpu_end_block < plan.cpu_begin_block) {
-        plan.cpu_end_block = plan.cpu_begin_block;
-    }
-    plan.block_size = block_size;
-    plan.prompt_tokens = prompt_tokens;
-    return plan;
-}
-
-std::uint64_t revalidate_contiguous_tiered_prefix_frontier(
-    std::uint64_t current_gpu_frontier_blocks,
-    const entities::StagedCpuKVCacheRestore &staged) {
-    if (staged.block_size == 0 ||
-        staged.query_blocks != staged.prompt_tokens / staged.block_size ||
-        staged.cpu_begin_block > staged.cpu_end_block) {
-        throw SchedulerError("invalid staged CPU prefix dimensions");
-    }
-    std::uint64_t reusable =
-        std::min(current_gpu_frontier_blocks, staged.query_blocks);
-    if (reusable >= staged.cpu_begin_block) {
-        reusable = std::max(
-            reusable, std::min(staged.cpu_end_block, staged.query_blocks));
-    }
-    if (staged.prompt_tokens % staged.block_size == 0 &&
-        reusable == staged.query_blocks && reusable > 0) {
-        --reusable;
-    }
-    return reusable;
-}
-
 VllmV1Scheduler::VllmV1Scheduler(config::SchedulerConfig config,
                                  entities::RequestCollection &requests)
     : VllmV1Scheduler(
@@ -600,9 +547,8 @@ entities::TieredPrefixPlan VllmV1Scheduler::build_tiered_prefix_plan(
         kv_blocks_.has_kda_snapshot(value.session_id());
     plan.restore_kda_snapshot =
         cpu_has_snapshot &&
-        (!gpu_has_snapshot ||
-         kv_blocks_.kda_snapshot_frontier_blocks(value.session_id()) <
-             plan.cpu_end_block);
+        (!gpu_has_snapshot || kv_blocks_.kda_snapshot_frontier_blocks(
+                                  value.session_id()) < plan.cpu_end_block);
     return plan;
 }
 
@@ -1057,11 +1003,12 @@ ScheduleResult VllmV1Scheduler::schedule_requests(SimTime time) {
         // prefill here instead would leave PP - 1 stages idle whenever one
         // request's chunks are the only schedulable work.
         //
-        // Multiple in-flight chunks are already representable: mark_batch_started
-        // exempts PREFILL from the single-batch check, kv_accounted_tokens
-        // reserves blocks against the optimistic scheduler frontier, and
-        // apply_batch_completion reconstructs a chunk's expected processed
-        // tokens from its own snapshot rather than the current frontier.
+        // Multiple in-flight chunks are already representable:
+        // mark_batch_started exempts PREFILL from the single-batch check,
+        // kv_accounted_tokens reserves blocks against the optimistic scheduler
+        // frontier, and apply_batch_completion reconstructs a chunk's expected
+        // processed tokens from its own snapshot rather than the current
+        // frontier.
         if (value.is_prefill_complete() && request_is_active(request_id)) {
             ++running_index;
             continue;
@@ -1281,7 +1228,8 @@ ScheduleResult VllmV1Scheduler::schedule_requests(SimTime time) {
                             cpu_used * staged.block_size);
                     if (first_cpu_admission) {
                         cpu_kv_cache_->record_successful_lookup(
-                            kv_cache::CpuPrefixLookupResult{cpu_query, cpu_used},
+                            kv_cache::CpuPrefixLookupResult{cpu_query,
+                                                            cpu_used},
                             value.session_id());
                     }
                 } else if (kv_blocks_.prefix_cache_enabled() &&
@@ -1304,8 +1252,8 @@ ScheduleResult VllmV1Scheduler::schedule_requests(SimTime time) {
                         const std::uint64_t gpu_used =
                             std::min(current_gpu, prefix_lookup.hit_blocks);
                         const bool first_cpu_admission =
-                            value.record_cpu_prefix_admission(
-                                gpu_used, cpu_query, 0, 0);
+                            value.record_cpu_prefix_admission(gpu_used,
+                                                              cpu_query, 0, 0);
                         if (first_cpu_admission) {
                             cpu_kv_cache_->record_successful_lookup(
                                 kv_cache::CpuPrefixLookupResult{cpu_query, 0},
@@ -1525,8 +1473,8 @@ bool VllmV1Scheduler::prepare_cpu_kv_cache_offload(RequestId request_id,
         retired_session_requests_.end()) {
         return false;
     }
-    const CpuOffloadGeneration generation = cpu_offload_generation_ids_.next(
-        "CPU offload generation exhausted");
+    const CpuOffloadGeneration generation =
+        cpu_offload_generation_ids_.next("CPU offload generation exhausted");
     const std::uint64_t desired =
         value.num_processed_prefill_tokens() / kv_blocks_.block_size();
     const auto reservation = cpu_kv_cache_->reserve_offload(

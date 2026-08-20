@@ -5,9 +5,9 @@ one starts from a serving question and points to the metrics that answer it.
 
 Run an example from the repository root:
 
-```powershell
-python cpp/examples/run_example.py hello `
-  --binary .build-step4/frontier_sim.exe
+```bash
+python cpp/examples/run_example.py hello \
+  --binary build/frontier_sim
 ```
 
 Use `--output-mode summary`, `requests`, or `full`. The default `requests`
