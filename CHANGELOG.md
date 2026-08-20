@@ -27,6 +27,10 @@ across executable releases.
 - The C++ core's configuration, scheduling, KV-cache, simulator, metrics, and
   test-build responsibilities are split into focused implementation modules;
   public headers and runtime/output contracts remain unchanged.
+- Analytical prediction now separates configuration validation, stage timing
+  caches, group-MoE prediction, roofline primitives, attention work, and MoE
+  communication; model registries and JSON record serializers likewise have
+  dedicated internal ownership.
 
 ## 0.2.0
 

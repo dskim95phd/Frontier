@@ -89,6 +89,7 @@ add_library(
   frontier/config/config_memory_resolution.cc
   frontier/config/config_memory_profile.cc
   frontier/config/model_config.cc
+  frontier/config/model_registry.cc
   frontier/config/config_parse.cc
   frontier/config/config_parse_cluster.cc
   frontier/config/config_parse_execution.cc
@@ -136,9 +137,16 @@ add_library(
   frontier/execution_time_predictor/execution_time_predictor_factory.cc
   frontier/execution_time_predictor/fixed_execution_time_predictor.cc
   frontier/execution_time_predictor/analytical_roofline_execution_time_predictor.cc
+  frontier/execution_time_predictor/analytical_roofline_cache.cc
+  frontier/execution_time_predictor/analytical_roofline_group_moe.cc
+  frontier/execution_time_predictor/analytical_roofline_internal.cc
+  frontier/execution_time_predictor/analytical_roofline_prediction.cc
   frontier/execution_time_predictor/analytical_dense_layer.cc
+  frontier/execution_time_predictor/analytical_attention_work.cc
+  frontier/execution_time_predictor/analytical_roofline_primitives.cc
   frontier/execution_time_predictor/analytical_expert_parallel.cc
   frontier/execution_time_predictor/analytical_moe_layer.cc
+  frontier/execution_time_predictor/analytical_moe_communication.cc
   frontier/execution_time_predictor/analytical_moe_routing.cc
   frontier/execution_time_predictor/analytical_moe_stage.cc
   frontier/execution_time_predictor/analytical_stage_diagnostics.cc
@@ -146,6 +154,7 @@ add_library(
   frontier/cpu_kv_cache_transfer/analytical_transfer.cc
   frontier/metrics/output_contract.cc
   frontier/metrics/output_json_trace.cc
+  frontier/metrics/output_json_records.cc
   frontier/metrics/output_contract_validation.cc
   frontier/metrics/output_csv.cc
   frontier/metrics/metrics_store.cc
