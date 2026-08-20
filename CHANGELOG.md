@@ -24,6 +24,9 @@ across executable releases.
 - MoE collective coordination and tiered prefix planning now have standalone,
   unit-testable ownership boundaries instead of living inside large scheduler
   implementations.
+- The C++ core's configuration, scheduling, KV-cache, simulator, metrics, and
+  test-build responsibilities are split into focused implementation modules;
+  public headers and runtime/output contracts remain unchanged.
 
 ## 0.2.0
 
