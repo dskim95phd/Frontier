@@ -1,0 +1,6 @@
+{
+  "asset_schema_version": 1,
+  "name": "ib-200g",
+  "network_bandwidth_gbps": 200.0,
+  "network_latency_ms": 0.5
+}

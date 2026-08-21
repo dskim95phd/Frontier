@@ -11,6 +11,18 @@ configuration, server commands, resume behavior, measurement horizons, and
 detailed result collector are documented in
 [`docs/experiments/tracelab-cache-aware-arrival-sweep.md`](../../../docs/experiments/tracelab-cache-aware-arrival-sweep.md).
 
+The checked-in simulator inputs use modular `schema_version: 2`. GB300 HBM
+and roofline ceilings come from `data/config/gpus/gb300.json`; the TraceLab
+GPU counts, 38.4 Tbps collective fabric, and 10% runtime HBM reservation come
+from `gb300-tracelab-*gpu` cluster profiles. PDD KV transfer uses the named
+`gb300-tracelab-kv` link. Execution precision comes from the named
+`kimi-k2-fp8` or `kimi-k2-w4a8` profile instead of being repeated per cluster.
+Generated sweep configs retain these references.
+The historical `tracelab_r0p05_p8_d24_cache_aware_0p5_16_4p0.json` lacked the
+now-required physical GPU-memory contract and its stale manual PREFILL block
+count exceeded 288 GB HBM. Its modular form therefore omits both manual block
+counts and uses the current physical auto-sizing contract.
+
 The frozen topology in `configs/base_pdd.json` is sequential online PDD:
 
 | side | GPUs | replicas | attention TP | DCP | PP | DP | MoE TP | EP |

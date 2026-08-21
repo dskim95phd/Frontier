@@ -26,25 +26,6 @@ struct InputPaths {
     std::optional<std::filesystem::path> output;
 };
 
-std::string read_text_file(const std::filesystem::path &path) {
-    std::ifstream input{path, std::ios::binary};
-    if (!input) {
-        throw std::runtime_error("failed to open input file: " + path.string());
-    }
-    input.seekg(0, std::ios::end);
-    const std::streampos end = input.tellg();
-    if (end < 0) {
-        throw std::runtime_error("failed to size input file: " + path.string());
-    }
-    std::string contents(static_cast<std::size_t>(end), '\0');
-    input.seekg(0, std::ios::beg);
-    input.read(contents.data(), static_cast<std::streamsize>(contents.size()));
-    if (input.gcount() != static_cast<std::streamsize>(contents.size())) {
-        throw std::runtime_error("failed to read input file: " + path.string());
-    }
-    return contents;
-}
-
 std::optional<InputPaths> parse_input_paths(int argc, char *argv[]) {
     if (argc != 5 && argc != 7) {
         return std::nullopt;
@@ -194,8 +175,7 @@ int main(int argc, char *argv[]) {
         }
 
         const frontier::config::SimulationConfig config =
-            frontier::config::parse_simulation_config_json(
-                read_text_file(input_paths->config));
+            frontier::config::load_simulation_config_file(input_paths->config);
         std::ifstream workload_input{input_paths->workload, std::ios::binary};
         if (!workload_input) {
             throw std::runtime_error("failed to open input file: " +

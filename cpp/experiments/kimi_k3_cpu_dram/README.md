@@ -5,6 +5,13 @@ K3-specific configuration, reporting wrapper, and tests. Shared TraceLab
 conversion and capacity-report analysis utilities remain in
 `../kimi_k2_cpu_dram/`.
 
+The checked-in simulator inputs use modular `schema_version: 2`. Rubin HBM
+and roofline ceilings come from `data/config/gpus/rubin.json`; Vera GPU counts,
+the 28.8 Tbps fabric, and the runtime HBM reservation come from the
+`rubin-vera-*gpu` cluster profiles. PDD KV transfer uses `rubin-vera-kv`.
+Both clusters reference `kimi-k3-native`, which centralizes the BF16/MXFP
+compute, FP8 KV-cache, FP32 router-compute, and BF16 KDA-snapshot policy.
+
 All Kimi K3 experiment paths use the same PREFILL batching contract:
 chunked PREFILL is enabled, each request contributes at most 512 tokens per
 scheduler iteration, and the aggregate batch token budget is 16,384. DECODE
@@ -18,7 +25,9 @@ Its default template is
 TP1/PP24/DP1 with pipeline-exclusive exact events and DECODE
 TP4/DCP4/PP1/DP8/EP32 with the exact event path. The runner derives P/D GPU
 counts from the selected JSON and records them in generated run IDs and sweep
-metadata.
+metadata. The simulator's default front-filled PP partition assigns K3's 93
+layers as 23 four-layer PREFILL stages followed by one one-layer stage, so the
+experiment JSON does not repeat an explicit per-stage layer-count array.
 
 The default capacity grid contains eight points:
 

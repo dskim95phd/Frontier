@@ -68,8 +68,10 @@ def test_capacity_contract_and_config() -> None:
         oracle_target_capacity_bytes=10_000_000_000_000,
     )
     assert config["system_architecture"] == "pd-disaggregation"
-    assert config["enable_parallel_clusters"] is False
+    assert config["schema_version"] == 2
+    assert config["model"] == "moonshotai/Kimi-K2-Instruct"
     for name in ("prefill", "decode"):
+        assert config["clusters"][name]["profile"] == "gb300-tracelab-16gpu"
         parallelism = config["clusters"][name]["parallelism"]
         assert parallelism["tensor_parallel_size"] == 4
         assert parallelism["pipeline_parallel_size"] == 1

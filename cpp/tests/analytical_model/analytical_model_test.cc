@@ -1082,10 +1082,10 @@ void test_kimi_k2_uneven_pipeline_and_lm_head() {
                stage0.moe_routing.back().model_layer_id == 15,
            "Kimi stage 0 must contain dense layer 0 followed by MoE layers "
            "1..15");
-    expect(stage1.moe_routing.size() == 15 &&
+    expect(stage1.moe_routing.size() == 16 &&
                stage1.moe_routing.front().model_layer_id == 16 &&
-               stage1.moe_routing.back().model_layer_id == 30,
-           "Kimi stage 1 must continue at global layer 16");
+               stage1.moe_routing.back().model_layer_id == 31,
+           "Kimi stage 1 must contain the next 16 front-filled layers");
     expect(stage0.execution_time.lm_head_ms == 0.0 &&
                stage1.execution_time.lm_head_ms == 0.0 &&
                stage3.execution_time.lm_head_ms > 0.0,

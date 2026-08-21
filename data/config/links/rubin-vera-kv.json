@@ -1,0 +1,6 @@
+{
+  "asset_schema_version": 1,
+  "name": "rubin-vera-kv",
+  "network_bandwidth_gbps": 28800.0,
+  "network_latency_ms": 0.02
+}

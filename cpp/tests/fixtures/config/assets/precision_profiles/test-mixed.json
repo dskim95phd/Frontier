@@ -1,0 +1,9 @@
+{
+  "asset_schema_version": 1,
+  "name": "test-mixed",
+  "precision": "fp16",
+  "operator_precisions": {
+    "moe_expert_weight": "fp4",
+    "kv_cache": "fp8"
+  }
+}

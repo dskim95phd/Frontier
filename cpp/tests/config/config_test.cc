@@ -22,6 +22,7 @@ using frontier::config::ClusterSchedulerType;
 using frontier::config::ConfigError;
 using frontier::config::ExecutionModelType;
 using frontier::config::kSchemaVersion;
+using frontier::config::load_simulation_config_file;
 using frontier::config::parse_simulation_config_json;
 using frontier::config::PddRuntimeConfig;
 using frontier::config::resolve_pdd_kda_snapshot_dtype_size_bytes;
@@ -37,6 +38,33 @@ std::filesystem::path fixture(std::string_view name) {
 
 frontier::config::SimulationConfig load(std::string_view name) {
     return parse_simulation_config_json(read_text_file(fixture(name)));
+}
+
+void test_modular_config_composition() {
+    const auto modular =
+        load_simulation_config_file(fixture("modular_analytical_colocation.json"));
+    const auto legacy = load("analytical_parallel_colocation.json");
+    expect(modular == legacy,
+           "modular GPU and cluster assets must lower to the existing runtime "
+           "contract without changing values");
+    expect(modular.schema_version == kSchemaVersion,
+           "a modular input must normalize to the standalone runtime schema");
+
+    const auto overridden = load_simulation_config_file(
+        fixture("modular_precision_profile_override.json"));
+    const auto &execution = overridden.cluster().execution_model.analytical;
+    expect(execution.precision == "fp16" &&
+               execution.operator_precisions.kv_cache == "fp8" &&
+               execution.operator_precisions.moe_expert_weight == "fp8",
+           "local operator precision values must override a named profile "
+           "without discarding its other values");
+
+    expect_throws<ConfigError>(
+        [] {
+            static_cast<void>(load_simulation_config_file(
+                fixture("modular_bad_gpu_count.json")));
+        },
+        "cluster profile GPU count must match derived parallelism demand");
 }
 
 class ScopedModelConfigDirectory {
@@ -1092,8 +1120,18 @@ void test_model_registry_and_attention_binding() {
     const auto stage3 =
         frontier::config::pipeline_stage_layer_range(kimi.num_layers, 4, 3);
     expect(stage0.begin == 0 && stage0.end == 16 && stage1.begin == 16 &&
-               stage1.end == 31 && stage3.begin == 46 && stage3.end == 61,
-           "61 Kimi K2 layers must partition over PP4 as 16/15/15/15");
+               stage1.end == 32 && stage3.begin == 48 && stage3.end == 61,
+           "61 Kimi K2 layers must partition over PP4 as 16/16/16/13");
+
+    const auto crowded_stage4 =
+        frontier::config::pipeline_stage_layer_range(10, 6, 4);
+    const auto crowded_stage5 =
+        frontier::config::pipeline_stage_layer_range(10, 6, 5);
+    expect(crowded_stage4 ==
+                   frontier::config::PipelineStageLayerRange{8, 9} &&
+               crowded_stage5 ==
+                   frontier::config::PipelineStageLayerRange{9, 10},
+           "front-filled defaults must keep every trailing PP stage nonempty");
 
     const auto step = frontier::config::load_model_config("step-moe");
     expect(step.is_moe() && step.use_mfa && step.share_q_dim == 2'048 &&
@@ -1675,8 +1713,8 @@ void test_pipeline_stage_profile_pp1_compatibility_and_uneven_ranges() {
         frontier::config::pipeline_stage_layer_range(kimi.num_layers, 4, 0);
     const auto second =
         frontier::config::pipeline_stage_layer_range(kimi.num_layers, 4, 1);
-    expect(first.size() == 16 && second.size() == 15,
-           "uneven Kimi K2 PP4 partition must preserve 16/15 stage sizes");
+    expect(first.size() == 16 && second.size() == 16,
+           "uneven Kimi K2 PP4 partition must front-fill 16-layer stages");
 }
 
 void test_k3_kernel_profile_contract() {
@@ -1827,9 +1865,7 @@ void test_explicit_pipeline_stage_layer_counts() {
     auto cluster = load("analytical_parallel_colocation.json").cluster();
     cluster.model = frontier::config::load_model_config("moonshotai/Kimi-K3");
     cluster.parallelism.pipeline_parallel_size = 24;
-    cluster.parallelism.pipeline_stage_layer_counts =
-        std::vector<std::uint64_t>(24, 4);
-    cluster.parallelism.pipeline_stage_layer_counts.back() = 1;
+    cluster.parallelism.pipeline_stage_layer_counts.clear();
     cluster.gpu_memory.capacity_bytes_per_gpu = 10'000'000'000'000'000ULL;
     const auto profiles =
         frontier::config::build_pipeline_stage_memory_profiles(cluster);
@@ -1841,7 +1877,7 @@ void test_explicit_pipeline_stage_layer_counts() {
                    frontier::config::PipelineStageLayerRange{88, 92} &&
                profiles.at(23).layers ==
                    frontier::config::PipelineStageLayerRange{92, 93},
-           "K3 PP24 must support 4, 22x4, 1 layer placement");
+           "K3 PP24 default must place 23 four-layer stages then one layer");
     const auto groups = frontier::config::build_pipeline_stage_group_catalogue(
         cluster, profiles);
     expect(groups.timing_groups.size() == 3 &&
@@ -1851,13 +1887,15 @@ void test_explicit_pipeline_stage_layer_counts() {
                groups.stage_to_timing_group.at(1) == 1 &&
                groups.stage_to_timing_group.at(22) == 1 &&
                groups.stage_to_timing_group.back() == 2,
-           "K3 explicit PP24 placement must collapse to three timing types");
+           "K3 default PP24 placement must collapse to three timing types");
 }
 
 } // namespace
 
 int main() {
     int failures = 0;
+    failures += frontier::test::run("modular config composition",
+                                    test_modular_config_composition);
     failures += frontier::test::run("co-location contract round trip",
                                     test_colocation_contract_round_trip);
     failures += frontier::test::run("PDD contract round trip",

@@ -232,6 +232,7 @@ def ensure_workload(seed: int, workload_root: Path) -> tuple[Path, Path, Path]:
 
 def _cluster_config(*, decode: bool) -> dict[str, object]:
     return {
+        "profile": "gb300-tracelab-16gpu",
         "parallelism": {
             "num_replicas": 1,
             "tensor_parallel_size": 4,
@@ -262,33 +263,9 @@ def _cluster_config(*, decode: bool) -> dict[str, object]:
         },
         "execution_model": {
             "type": "analytical",
-            "device": "gb300",
-            "precision": "fp8",
-            "network_bandwidth_gbps": 38_400.0,
-            "network_latency_us": 1.0,
-            "intra_node_bandwidth_gbps": 14_400.0,
+            "precision_profile": "kimi-k2-fp8",
             "moe_layer_event_mode": "first_layer_scaled",
-            "operator_precisions": {
-                "attention": "fp8",
-                "dense": "fp8",
-                "moe_expert": "fp8",
-                "moe_router": "fp8",
-                "kv_cache": "fp8",
-                "communication": "fp8",
-                "attention_weight": "fp8",
-                "attention_activation": "fp8",
-                "dense_weight": "fp8",
-                "dense_activation": "fp8",
-                "moe_expert_weight": "fp8",
-                "moe_expert_activation": "fp8",
-                "moe_router_weight": "fp8",
-                "moe_router_activation": "fp8",
-                "lm_head": "fp8",
-                "lm_head_weight": "fp8",
-                "lm_head_activation": "fp8",
-            },
         },
-        "model_name": "moonshotai/Kimi-K2-Instruct",
         "total_expert_num": 384,
         "router_topk": 8,
         "moe_routing": {
@@ -310,9 +287,11 @@ def build_config(
 
     config = copy.deepcopy(base)
     config["run_id"] = run_id
+    config["schema_version"] = 2
     config["simulation_mode"] = "online"
     config["system_architecture"] = "pd-disaggregation"
-    config["enable_parallel_clusters"] = False
+    config.pop("enable_parallel_clusters", None)
+    config["model"] = "moonshotai/Kimi-K2-Instruct"
     config["prefix_cache"] = {"enabled": True, "key_mode": "session"}
     config["cluster_scheduler"] = {
         "type": "sticky_round_robin",
@@ -346,9 +325,7 @@ def build_config(
         "transfer_concurrency": "full_duplex_serialized",
     }
     config["kv_cache_transfer"] = {
-        "type": "analytical",
-        "network_bandwidth_gbps": 38_400.0,
-        "network_latency_ms": 0.02,
+        "link": "gb300-tracelab-kv",
         "kv_cache_dtype_size_bytes": 1,
         "enable_compression": False,
     }

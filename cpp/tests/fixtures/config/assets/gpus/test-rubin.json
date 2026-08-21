@@ -1,0 +1,10 @@
+{
+  "asset_schema_version": 1,
+  "name": "test-rubin",
+  "memory": {
+    "capacity_bytes_per_gpu": 10000000000000000
+  },
+  "analytical": {
+    "device": "rubin"
+  }
+}

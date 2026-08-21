@@ -27,6 +27,8 @@ deterministic trace as `trace.json`.
 | `prefix-cache` | How much work is reused by later session turns? | Session cache and sticky round robin | hit rate, cached tokens, target affinity |
 | `cpu-kv-online` | Can an evicted PREFILL prefix be restored from CPU? | Online sequential PDD, four GPU blocks, finite CPU tier | CPU transferred versus consumed blocks, D2H/H2D time |
 | `cpu-kv-offline` | What CPU-tier traffic appears in an offline drain? | Offline sequential PDD with the same finite tier | offload/restore operations, occupancy, eviction |
+| `modular-pdd` | How can hardware and topology be reused across scenarios? | Schema v2 references named GPU, cluster, and link assets | resolved `config.normalized.json`, transfer latency |
+| `modular-dense` | How is analytical hardware selected by profile? | Schema v2 `rubin-16gpu` profile supplies GPU memory, device, and network | resolved execution model, throughput and latency |
 
 CPU KV-cache tiering is intentionally scoped to sequential PDD with session
 prefix caching and `sticky_round_robin`. The online recipe interposes a second

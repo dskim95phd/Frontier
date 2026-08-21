@@ -179,12 +179,145 @@ build/frontier_sim \
 
 ## Configuration contract
 
-There is one current configuration contract: `schema_version: 1`. Older
-development-step schemas are not accepted. The machine-readable contract is
-[`schema/config-v1.schema.json`](schema/config-v1.schema.json); release archives
-install the same file under `share/frontier/schema`.
+Two input contracts are accepted. `schema_version: 1` is the standalone,
+fully resolved runtime contract. `schema_version: 2` is a modular scenario
+that references named GPU, cluster, and inter-cluster link assets. The loader
+resolves v2 to v1 before constructing simulator state, so both forms have the
+same validation, normalized output, and numerical behavior. Older
+development-step schemas are not accepted.
 
-Common top-level fields are:
+The machine-readable contracts are
+[`schema/config-v1.schema.json`](schema/config-v1.schema.json),
+[`schema/config-v2.schema.json`](schema/config-v2.schema.json), and the three
+`*-asset-v1.schema.json` files in the same directory. Release archives install
+them under `share/frontier/schema`.
+
+### Modular configuration (`schema_version: 2`)
+
+A modular scenario keeps experiment-specific model, parallelism, scheduler,
+and precision choices in the main file. Physical GPU memory and analytical
+device identity come from a GPU asset. A cluster asset selects a GPU profile,
+an exact accelerator count, and the cluster-internal network. It may also set
+deployment-level `gpu_memory` defaults such as runtime reservation, while the
+GPU asset remains authoritative for physical HBM capacity. PDD transfer
+bandwidth and latency come from a link asset. The reference shape below
+abbreviates the unchanged v1 `parallelism` and `scheduler` objects; use the
+linked example for a runnable document.
+
+```jsonc
+{
+  "schema_version": 2,
+  "run_id": "modular-pdd",
+  "simulation_mode": "online",
+  "system_architecture": "pd-disaggregation",
+  "model": "meta-llama/Llama-2-7b-hf",
+  "clusters": {
+    "prefill": {
+      "profile": "gb300-1gpu",
+      "parallelism": { /* existing v1 parallelism fields */ },
+      "scheduler": { /* existing v1 scheduler fields */ },
+      "execution_model": {
+        "type": "fixed",
+        "stage_latencies_ms": [0.5]
+      }
+    },
+    "decode": {
+      "profile": "gb300-1gpu",
+      "parallelism": { /* existing v1 parallelism fields */ },
+      "scheduler": { /* existing v1 scheduler fields */ },
+      "execution_model": {
+        "type": "fixed",
+        "stage_latencies_ms": [0.8]
+      }
+    }
+  },
+  "kv_cache_transfer": {
+    "link": "ib-200g",
+    "kv_cache_dtype_size_bytes": 2,
+    "enable_compression": false
+  }
+}
+```
+
+The complete runnable form is
+[`examples/configs/08_modular_sequential_pdd.json`](examples/configs/08_modular_sequential_pdd.json).
+Optional `prefix_cache` and `cluster_scheduler` fields default to disabled
+session caching and `round_robin`; `moe_routing` defaults to balanced
+simulation with seed 42. `cpu_kv_cache` remains optional and uses the v1
+object unchanged.
+
+Analytical v2 deployments select a named execution-precision profile (or set
+`precision` directly) and specify only scenario-specific kernel policy. Device
+and network fields still come from the cluster/GPU assets:
+
+```json
+"execution_model": {
+  "type": "analytical",
+  "precision_profile": "kimi-k3-native",
+  "moe_layer_event_mode": "stage_group_scaled"
+}
+```
+
+Precision profiles live under `precision_profiles/` and contain `precision`
+plus optional `operator_precisions`. A scenario may provide either field
+locally; local values override the named profile, and local operator entries
+are merged by key rather than replacing the whole profile.
+
+Those fields are supplied by assets shaped as follows:
+
+`gpus/gb300.json`:
+
+```json
+{
+  "asset_schema_version": 1,
+  "name": "gb300",
+  "memory": {"capacity_bytes_per_gpu": 288000000000},
+  "analytical": {
+    "device": "gb300",
+    "device_overrides": {
+      "hbm_bandwidth_tbps": 8.0,
+      "fp32_tflops": 83.33333333333333,
+      "fp16_tflops": 2500.0,
+      "fp8_tflops": 5000.0,
+      "fp4_tflops": 15000.0
+    }
+  }
+}
+```
+
+`clusters/gb300-1gpu.json`:
+
+```json
+{
+  "asset_schema_version": 1,
+  "name": "gb300-1gpu",
+  "gpu": {"profile": "gb300", "count": 1},
+  "network": {
+    "network_bandwidth_gbps": 400.0,
+    "network_latency_us": 1.0,
+    "intra_node_bandwidth_gbps": 14400.0
+  }
+}
+```
+
+Asset names contain only letters, digits, `.`, `_`, and `-`. The loader looks
+first in `assets/{gpus,clusters,links,precision_profiles}` beside the scenario,
+then in nearby typed directories, `FRONTIER_CONFIG_ASSET_DIR`, installed
+assets, and the repository `data/config` catalogue. A cluster profile describes
+the exact allocation used by that simulated cluster. Its `gpu.count` must equal
+the product of `num_replicas`, `data_parallel_size`,
+`pipeline_parallel_size`, and `tensor_parallel_size`. DCP reuses TP ranks and
+MoE shares the validated parallel domain, so neither adds accelerators to this
+count.
+
+`frontier_sim --normalize-config` resolves either input version to a complete,
+self-contained schema-v1 document. Output-directory runs likewise write the
+resolved form to `config.normalized.json`, making results reproducible without
+the original asset catalogue.
+
+### Standalone configuration (`schema_version: 1`)
+
+The standalone common top-level fields are:
 
 ```json
 {
@@ -459,8 +592,10 @@ Each compute family (`attention`, `dense`, `moe_expert`, `moe_router`, and
 The unsuffixed value remains the fallback for both, so the example above
 models W4A8 experts while retaining the compact syntax elsewhere.
 
-Kimi K3 analytical configs install the model-native policy below when neither
-the new field nor its legacy family fallback is explicitly set:
+Kimi K3 analytical configs may select the bundled `kimi-k3-native` precision
+profile. The model-aware resolver also installs the same defaults for older
+standalone configs when neither the new field nor its legacy family fallback
+is explicitly set:
 
 The complete K3 design decision record is
 [`docs/design/kimi-k3-support.md`](../docs/design/kimi-k3-support.md).
@@ -556,12 +691,14 @@ latent component size and the BF16 RoPE bytes are added automatically.
 The analytical predictor derives the model and layer count from the cluster's
 `model_name`; they are not repeated in `execution_model`. TP comes from the
 cluster's `parallelism` object. The current model validates TP 1/2/4/8 and
-allows uneven contiguous PP partitions (for example, 61 layers over PP4 become
-16/15/15/15). To override that near-even partition, set the optional
+allows uneven contiguous PP partitions. By default, stages are filled from the
+front with `ceil(num_layers / PP)` layers while preserving at least one layer
+for every stage (for example, 61 layers over PP4 become 16/16/16/13, and Kimi
+K3's 93 layers over PP24 become 23 four-layer stages followed by one one-layer
+stage). To override that front-filled partition, set the optional
 `parallelism.pipeline_stage_layer_counts` array. It must contain exactly one
-positive layer count per PP stage and sum to the model layer count; for
-example, Kimi K3 over PP24 can use 23 four-layer stages followed by one
-one-layer stage. MoE assets may configure a dense prefix and shared experts;
+positive layer count per PP stage and sum to the model layer count. MoE assets
+may configure a dense prefix and shared experts;
 shared experts are replicated across EP lanes and sharded only by MoE TP. The
 last PP stage also models the vocabulary-parallel LM-head projection. Supported
 attention families include dense-KV MHA/GQA/MQA, Step3Text MFA's shared-Q path,

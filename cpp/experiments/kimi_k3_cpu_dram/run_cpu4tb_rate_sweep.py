@@ -85,6 +85,7 @@ def build_k3_config(template: dict[str, Any], rate: float) -> dict[str, Any]:
     # TP1 cache target its local GPU's 2 TB slice (32 TB over 16 targets).
     cpu["capacity_bytes"] = 4_000_000_000_000
     cpu["capacity_bytes_per_gpu"] = 2_000_000_000_000
+    config["model"] = "moonshotai/Kimi-K3"
 
     clusters = config.get("clusters")
     if not isinstance(clusters, dict):
@@ -93,7 +94,9 @@ def build_k3_config(template: dict[str, Any], rate: float) -> dict[str, Any]:
         cluster = clusters.get(role)
         if not isinstance(cluster, dict):
             raise ValueError(f"template cluster {role} must be an object")
-        cluster["model_name"] = "moonshotai/Kimi-K3"
+        cluster["profile"] = (
+            "rubin-vera-16gpu" if role == "prefill" else "rubin-vera-32gpu"
+        )
         for key in (
             "total_expert_num",
             "router_topk",
@@ -104,12 +107,11 @@ def build_k3_config(template: dict[str, Any], rate: float) -> dict[str, Any]:
         execution = cluster.get("execution_model")
         if not isinstance(execution, dict):
             raise ValueError(f"template {role}.execution_model must be an object")
-        # K2's explicit FP8/FP4 family overrides would suppress K3's native
-        # BF16/MXFP mixed-precision policy if retained.
-        execution["operator_precisions"] = {
-            "kv_cache": "fp8",
-            "kda_snapshot": "bf16",
-        }
+        # Replace any K2 template policy with K3's named native mixed-precision
+        # execution contract.
+        execution.pop("precision", None)
+        execution.pop("operator_precisions", None)
+        execution["precision_profile"] = "kimi-k3-native"
         scheduler = cluster.get("scheduler")
         if not isinstance(scheduler, dict):
             raise ValueError(f"template {role}.scheduler must be an object")
@@ -117,18 +119,14 @@ def build_k3_config(template: dict[str, Any], rate: float) -> dict[str, Any]:
             scheduler["max_tokens_in_batch"] = 16_384
             scheduler["enable_chunked_prefill"] = True
             scheduler["long_prefill_token_threshold"] = 512
-        # K2's fixed block counts encode its all-MLA FP8 byte size. Preserve
-        # the 288 GB hardware and let the K3-aware planner derive new blocks.
+        # K2's fixed block counts encode its all-MLA FP8 byte size. The named
+        # cluster profile supplies the same 288 GB hardware and lets the
+        # K3-aware planner derive new blocks.
         scheduler.pop("num_blocks", None)
-        cluster["gpu_memory"] = {
-            "capacity_bytes_per_gpu": 288_000_000_000,
-            "runtime_reserve_fraction": 0.1,
-            "runtime_reserve_bytes": 0,
-            "weight_overhead_fraction": 0.0,
-        }
         parallelism = cluster.get("parallelism")
         if not isinstance(parallelism, dict):
             raise ValueError(f"template {role}.parallelism must be an object")
+        parallelism.pop("pipeline_stage_layer_counts", None)
         if role == "prefill":
             parallelism.update(
                 {

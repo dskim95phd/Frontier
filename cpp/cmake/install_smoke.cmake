@@ -65,3 +65,20 @@ if(NOT EXISTS
    "${FRONTIER_INSTALL_DIR}/share/frontier/schema/config-v1.schema.json")
   message(FATAL_ERROR "installed Frontier config schema is missing")
 endif()
+if(NOT EXISTS
+   "${FRONTIER_INSTALL_DIR}/share/frontier/schema/config-v2.schema.json")
+  message(FATAL_ERROR "installed Frontier modular config schema is missing")
+endif()
+if(NOT EXISTS
+   "${FRONTIER_INSTALL_DIR}/share/frontier/schema/precision-profile-asset-v1.schema.json")
+  message(FATAL_ERROR "installed Frontier precision profile schema is missing")
+endif()
+if(NOT EXISTS
+   "${FRONTIER_INSTALL_DIR}/share/frontier/gpus/gb300.json" OR
+   NOT EXISTS
+   "${FRONTIER_INSTALL_DIR}/share/frontier/clusters/gb300-1gpu.json" OR
+   NOT EXISTS "${FRONTIER_INSTALL_DIR}/share/frontier/links/ib-200g.json" OR
+   NOT EXISTS
+   "${FRONTIER_INSTALL_DIR}/share/frontier/precision_profiles/kimi-k3-native.json")
+  message(FATAL_ERROR "installed Frontier modular config assets are missing")
+endif()

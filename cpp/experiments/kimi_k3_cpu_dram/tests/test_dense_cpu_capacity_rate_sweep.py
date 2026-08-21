@@ -302,7 +302,6 @@ def test_k3_config_uses_static_per_gpu_capacity_and_off_baseline() -> None:
         "tensor_parallel_size": 1,
         "decode_context_parallel_size": 1,
         "pipeline_parallel_size": 24,
-        "pipeline_stage_layer_counts": [4] * 23 + [1],
         "data_parallel_size": 1,
         "moe_tensor_parallel_size": 1,
         "moe_expert_parallel_size": 1,

@@ -1,0 +1,5 @@
+{
+  "asset_schema_version": 1,
+  "name": "kimi-k2-fp8",
+  "precision": "fp8"
+}

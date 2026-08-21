@@ -306,11 +306,32 @@ pipeline_stage_layer_range(std::uint64_t num_layers,
         stage >= pipeline_parallel_size) {
         throw std::invalid_argument("invalid pipeline layer partition");
     }
-    const std::uint64_t base = num_layers / pipeline_parallel_size;
-    const std::uint64_t remainder = num_layers % pipeline_parallel_size;
+    const std::uint64_t target_size =
+        num_layers / pipeline_parallel_size +
+        static_cast<std::uint64_t>(num_layers % pipeline_parallel_size != 0);
+    if (target_size == 1) {
+        return PipelineStageLayerRange{stage, stage + 1};
+    }
+
+    // Give every stage one layer, then spend the remaining layers from the
+    // front until stages reach the ceiling-sized target. This is equivalent
+    // to front-filling while guaranteeing that no trailing stage is empty.
+    const std::uint64_t extra_capacity = target_size - 1;
+    const std::uint64_t extra_layers =
+        num_layers - pipeline_parallel_size;
+    const std::uint64_t full_stages = extra_layers / extra_capacity;
+    const std::uint64_t partial_extra = extra_layers % extra_capacity;
+    if (stage < full_stages) {
+        const std::uint64_t begin = stage * target_size;
+        return PipelineStageLayerRange{begin, begin + target_size};
+    }
+
+    const std::uint64_t trailing_stage = stage - full_stages;
     const std::uint64_t begin =
-        stage * base + (stage < remainder ? stage : remainder);
-    const std::uint64_t size = base + (stage < remainder ? 1 : 0);
+        full_stages * target_size + trailing_stage +
+        (trailing_stage == 0 ? 0 : partial_extra);
+    const std::uint64_t size =
+        1 + (trailing_stage == 0 ? partial_extra : 0);
     return PipelineStageLayerRange{begin, begin + size};
 }
 
@@ -520,9 +541,10 @@ struct ParallelismConfig {
     // legacy parallelism behavior unchanged.
     bool pipeline_exclusive = false;
     // Optional exact number of transformer layers assigned to each physical
-    // pipeline stage. An empty vector keeps the legacy near-even contiguous
-    // partition. When set, it must contain pipeline_parallel_size positive
-    // entries whose sum equals the model layer count.
+    // pipeline stage. An empty vector uses a front-filled contiguous partition
+    // with ceil(num_layers / PP) layers per stage and any final remainder on
+    // the trailing stages. When set, it must contain pipeline_parallel_size
+    // positive entries whose sum equals the model layer count.
     std::vector<std::uint64_t> pipeline_stage_layer_counts;
 
     [[nodiscard]] std::uint64_t attention_parallel_size() const noexcept {

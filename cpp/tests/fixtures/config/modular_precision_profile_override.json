@@ -1,0 +1,40 @@
+{
+  "schema_version": 2,
+  "run_id": "modular-precision-profile-override",
+  "simulation_mode": "offline",
+  "system_architecture": "co-location",
+  "model": "meta-llama/Llama-2-7b-hf",
+  "clusters": {
+    "monolithic": {
+      "profile": "test-rubin-16gpu",
+      "parallelism": {
+        "num_replicas": 1,
+        "tensor_parallel_size": 4,
+        "pipeline_parallel_size": 2,
+        "data_parallel_size": 2,
+        "moe_tensor_parallel_size": 1,
+        "moe_expert_parallel_size": 1
+      },
+      "scheduler": {
+        "type": "vllm_v1",
+        "scheduling_policy": "fcfs",
+        "batch_size_cap": 4,
+        "max_tokens_in_batch": 16,
+        "enable_preemption": true,
+        "enable_chunked_prefill": true,
+        "long_prefill_token_threshold": 0,
+        "block_size": 16,
+        "num_blocks": 64,
+        "watermark_blocks_fraction": 0.0,
+        "num_preallocate_tokens": 0
+      },
+      "execution_model": {
+        "type": "analytical",
+        "precision_profile": "test-mixed",
+        "operator_precisions": {
+          "moe_expert_weight": "fp8"
+        }
+      }
+    }
+  }
+}

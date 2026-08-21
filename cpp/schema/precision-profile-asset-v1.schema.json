@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frontier-simulator.dev/schema/precision-profile-asset-v1.schema.json",
+  "title": "Frontier execution precision profile asset",
+  "type": "object",
+  "required": ["asset_schema_version", "name", "precision"],
+  "properties": {
+    "asset_schema_version": { "const": 1 },
+    "name": { "type": "string", "pattern": "^[A-Za-z0-9._-]+$" },
+    "precision": { "$ref": "config-v1.schema.json#/$defs/precision" },
+    "operator_precisions": { "$ref": "config-v1.schema.json#/$defs/operatorPrecisions" }
+  },
+  "additionalProperties": false
+}

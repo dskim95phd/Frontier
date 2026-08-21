@@ -1,0 +1,15 @@
+{
+  "asset_schema_version": 1,
+  "name": "gb300-tracelab-16gpu",
+  "gpu": {"profile": "gb300", "count": 16},
+  "gpu_memory": {
+    "runtime_reserve_fraction": 0.1,
+    "runtime_reserve_bytes": 0,
+    "weight_overhead_fraction": 0.0
+  },
+  "network": {
+    "network_bandwidth_gbps": 38400.0,
+    "network_latency_us": 1.0,
+    "intra_node_bandwidth_gbps": 14400.0
+  }
+}

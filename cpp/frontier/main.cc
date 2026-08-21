@@ -64,25 +64,6 @@ void print_usage(std::ostream &stream) {
            "trace.json.\n";
 }
 
-std::string read_text_file(const std::filesystem::path &path) {
-    std::ifstream input{path, std::ios::binary};
-    if (!input) {
-        throw std::runtime_error("failed to open input file: " + path.string());
-    }
-    input.seekg(0, std::ios::end);
-    const std::streampos end = input.tellg();
-    if (end < 0) {
-        throw std::runtime_error("failed to size input file: " + path.string());
-    }
-    std::string contents(static_cast<std::size_t>(end), '\0');
-    input.seekg(0, std::ios::beg);
-    input.read(contents.data(), static_cast<std::streamsize>(contents.size()));
-    if (input.gcount() != static_cast<std::streamsize>(contents.size())) {
-        throw std::runtime_error("failed to read input file: " + path.string());
-    }
-    return contents;
-}
-
 std::vector<frontier::request_generator::WorkloadRequest>
 read_workload_file(const std::filesystem::path &path) {
     std::ifstream input{path, std::ios::binary};
@@ -303,8 +284,7 @@ int main(int argc, char *argv[]) {
     try {
         if (argc == 3 && std::string_view{argv[1]} == "--normalize-config") {
             const frontier::config::SimulationConfig config =
-                frontier::config::parse_simulation_config_json(
-                    read_text_file(argv[2]));
+                frontier::config::load_simulation_config_file(argv[2]);
             std::cout << frontier::config::serialize_simulation_config_json(
                 config);
             return 0;
@@ -323,8 +303,7 @@ int main(int argc, char *argv[]) {
         }
 
         const frontier::config::SimulationConfig config =
-            frontier::config::parse_simulation_config_json(
-                read_text_file(options->config));
+            frontier::config::load_simulation_config_file(options->config);
         auto workload = read_workload_file(options->workload);
         if (options->output_dir.has_value()) {
             write_normalized_inputs(options.value(), config, workload);

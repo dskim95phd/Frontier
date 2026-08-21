@@ -1,0 +1,104 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frontier-simulator.dev/schema/config-v2.schema.json",
+  "title": "Frontier modular simulator scenario",
+  "description": "Schema-v2 composes named GPU, cluster, execution-precision, and link assets and normalizes to the standalone schema-v1 runtime contract.",
+  "type": "object",
+  "required": ["schema_version", "run_id", "simulation_mode", "system_architecture", "model", "clusters"],
+  "properties": {
+    "schema_version": { "const": 2 },
+    "run_id": { "type": "string", "pattern": "\\S" },
+    "simulation_mode": { "enum": ["offline", "online"] },
+    "system_architecture": { "enum": ["co-location", "pd-disaggregation"] },
+    "model": { "type": "string", "minLength": 1 },
+    "prefix_cache": { "$ref": "config-v1.schema.json#/$defs/prefixCache" },
+    "cpu_kv_cache": { "$ref": "config-v1.schema.json#/$defs/cpuKvCache" },
+    "cluster_scheduler": { "$ref": "config-v1.schema.json#/$defs/clusterScheduler" },
+    "clusters": { "type": "object" },
+    "kv_cache_transfer": { "$ref": "#/$defs/kvCacheTransfer" }
+  },
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": { "properties": { "system_architecture": { "const": "co-location" } }, "required": ["system_architecture"] },
+      "then": {
+        "properties": {
+          "clusters": {
+            "required": ["monolithic"],
+            "properties": { "monolithic": { "$ref": "#/$defs/clusterDeployment" } },
+            "additionalProperties": false
+          },
+          "kv_cache_transfer": false
+        }
+      },
+      "else": {
+        "required": ["kv_cache_transfer"],
+        "properties": {
+          "clusters": {
+            "required": ["prefill", "decode"],
+            "properties": {
+              "prefill": { "$ref": "#/$defs/clusterDeployment" },
+              "decode": { "$ref": "#/$defs/clusterDeployment" }
+            },
+            "additionalProperties": false
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "clusterDeployment": {
+      "type": "object",
+      "required": ["profile", "parallelism", "scheduler", "execution_model"],
+      "properties": {
+        "profile": { "type": "string", "pattern": "^[A-Za-z0-9._-]+$" },
+        "parallelism": { "$ref": "config-v1.schema.json#/$defs/parallelism" },
+        "scheduler": { "$ref": "config-v1.schema.json#/$defs/scheduler" },
+        "execution_model": { "$ref": "#/$defs/executionModel" },
+        "moe_routing": { "$ref": "config-v1.schema.json#/$defs/moeRouting" },
+        "total_expert_num": { "$ref": "config-v1.schema.json#/$defs/uint64" },
+        "router_topk": { "$ref": "config-v1.schema.json#/$defs/uint64" },
+        "first_k_dense_replace": { "$ref": "config-v1.schema.json#/$defs/uint64" },
+        "num_shared_experts": { "$ref": "config-v1.schema.json#/$defs/uint64" }
+      },
+      "additionalProperties": false
+    },
+    "executionModel": {
+      "oneOf": [
+        { "$ref": "config-v1.schema.json#/$defs/fixedExecutionModel" },
+        { "$ref": "#/$defs/analyticalExecutionModel" }
+      ]
+    },
+    "analyticalExecutionModel": {
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "type": { "const": "analytical" },
+        "precision_profile": { "type": "string", "pattern": "^[A-Za-z0-9._-]+$" },
+        "precision": { "$ref": "config-v1.schema.json#/$defs/precision" },
+        "operator_precisions": { "$ref": "config-v1.schema.json#/$defs/operatorPrecisions" },
+        "kernel_profile": { "enum": ["generic", "k3_sglang_mxfp4", "k3_deepgemm_megamoe"] },
+        "moe_layer_event_mode": { "enum": ["detailed", "first_layer_scaled", "stage_group_scaled"] },
+        "moe_communication_backend": { "enum": ["generic", "sm100_megamoe_public"] },
+        "mega_moe_tail_io_fraction": { "$ref": "config-v1.schema.json#/$defs/fraction" },
+        "mega_moe_wave_exposure": { "$ref": "config-v1.schema.json#/$defs/fraction" },
+        "mega_moe_cluster_task_latency_us": { "$ref": "config-v1.schema.json#/$defs/nonnegativeNumber" }
+      },
+      "additionalProperties": false,
+      "anyOf": [
+        { "required": ["precision_profile"] },
+        { "required": ["precision"] }
+      ]
+    },
+    "kvCacheTransfer": {
+      "type": "object",
+      "required": ["link", "kv_cache_dtype_size_bytes", "enable_compression"],
+      "properties": {
+        "link": { "type": "string", "pattern": "^[A-Za-z0-9._-]+$" },
+        "kv_cache_dtype_size_bytes": { "$ref": "config-v1.schema.json#/$defs/positiveNumber" },
+        "enable_compression": { "const": false }
+      },
+      "additionalProperties": false
+    }
+  }
+}

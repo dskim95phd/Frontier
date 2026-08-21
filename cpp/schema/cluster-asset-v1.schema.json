@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frontier-simulator.dev/schema/cluster-asset-v1.schema.json",
+  "title": "Frontier cluster profile asset",
+  "type": "object",
+  "required": ["asset_schema_version", "name", "gpu", "network"],
+  "properties": {
+    "asset_schema_version": { "const": 1 },
+    "name": { "type": "string", "pattern": "^[A-Za-z0-9._-]+$" },
+    "gpu": {
+      "type": "object",
+      "required": ["profile", "count"],
+      "properties": {
+        "profile": { "type": "string", "pattern": "^[A-Za-z0-9._-]+$" },
+        "count": { "$ref": "config-v1.schema.json#/$defs/positiveUint64" }
+      },
+      "additionalProperties": false
+    },
+    "network": {
+      "type": "object",
+      "required": ["network_bandwidth_gbps", "network_latency_us", "intra_node_bandwidth_gbps"],
+      "properties": {
+        "network_bandwidth_gbps": { "$ref": "config-v1.schema.json#/$defs/positiveNumber" },
+        "network_latency_us": { "$ref": "config-v1.schema.json#/$defs/nonnegativeNumber" },
+        "intra_node_bandwidth_gbps": { "$ref": "config-v1.schema.json#/$defs/positiveNumber" }
+      },
+      "additionalProperties": false
+    },
+    "gpu_memory": {
+      "type": "object",
+      "properties": {
+        "auto_calculate_num_blocks": { "type": "boolean" },
+        "runtime_reserve_fraction": { "type": "number", "minimum": 0, "exclusiveMaximum": 1 },
+        "runtime_reserve_bytes": { "$ref": "config-v1.schema.json#/$defs/uint64" },
+        "weight_overhead_fraction": { "$ref": "config-v1.schema.json#/$defs/nonnegativeNumber" }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

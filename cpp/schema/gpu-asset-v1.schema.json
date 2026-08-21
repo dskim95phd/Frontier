@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frontier-simulator.dev/schema/gpu-asset-v1.schema.json",
+  "title": "Frontier GPU profile asset",
+  "type": "object",
+  "required": ["asset_schema_version", "name", "memory"],
+  "properties": {
+    "asset_schema_version": { "const": 1 },
+    "name": { "type": "string", "pattern": "^[A-Za-z0-9._-]+$" },
+    "memory": {
+      "allOf": [{ "$ref": "config-v1.schema.json#/$defs/gpuMemory" }],
+      "properties": {
+        "model_weight_bytes_per_gpu": false,
+        "kv_cache_budget_bytes_per_gpu": false,
+        "kv_cache_bytes_per_block": false
+      }
+    },
+    "analytical": {
+      "type": "object",
+      "required": ["device"],
+      "properties": {
+        "device": { "enum": ["rubin", "gb300", "custom"] },
+        "device_overrides": { "$ref": "config-v1.schema.json#/$defs/deviceOverrides" }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

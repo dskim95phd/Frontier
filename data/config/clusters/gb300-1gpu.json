@@ -1,0 +1,13 @@
+{
+  "asset_schema_version": 1,
+  "name": "gb300-1gpu",
+  "gpu": {
+    "profile": "gb300",
+    "count": 1
+  },
+  "network": {
+    "network_bandwidth_gbps": 400.0,
+    "network_latency_us": 1.0,
+    "intra_node_bandwidth_gbps": 14400.0
+  }
+}

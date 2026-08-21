@@ -86,6 +86,7 @@ add_library(
   frontier/attention/mla.cc
   frontier/attention/model_binding.cc
   frontier/config/config.cc
+  frontier/config/config_compose.cc
   frontier/config/config_memory_resolution.cc
   frontier/config/config_memory_profile.cc
   frontier/config/model_config.cc
@@ -191,14 +192,30 @@ add_library(
 target_include_directories(frontier_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(frontier_core PRIVATE nlohmann_json::nlohmann_json)
 add_custom_target(
-  frontier_model_assets ALL
+  frontier_config_assets ALL
   COMMAND
     ${CMAKE_COMMAND} -E copy_directory
     "${CMAKE_CURRENT_SOURCE_DIR}/../data/config/models"
     "${CMAKE_CURRENT_BINARY_DIR}/share/frontier/models"
-  COMMENT "Copying Frontier model assets"
+  COMMAND
+    ${CMAKE_COMMAND} -E copy_directory
+    "${CMAKE_CURRENT_SOURCE_DIR}/../data/config/gpus"
+    "${CMAKE_CURRENT_BINARY_DIR}/share/frontier/gpus"
+  COMMAND
+    ${CMAKE_COMMAND} -E copy_directory
+    "${CMAKE_CURRENT_SOURCE_DIR}/../data/config/clusters"
+    "${CMAKE_CURRENT_BINARY_DIR}/share/frontier/clusters"
+  COMMAND
+    ${CMAKE_COMMAND} -E copy_directory
+    "${CMAKE_CURRENT_SOURCE_DIR}/../data/config/links"
+    "${CMAKE_CURRENT_BINARY_DIR}/share/frontier/links"
+  COMMAND
+    ${CMAKE_COMMAND} -E copy_directory
+    "${CMAKE_CURRENT_SOURCE_DIR}/../data/config/precision_profiles"
+    "${CMAKE_CURRENT_BINARY_DIR}/share/frontier/precision_profiles"
+  COMMENT "Copying Frontier configuration assets"
 )
-add_dependencies(frontier_core frontier_model_assets)
+add_dependencies(frontier_core frontier_config_assets)
 frontier_enable_warnings(frontier_core)
 
 add_executable(frontier_sim frontier/main.cc)
@@ -231,8 +248,29 @@ install(
   FILES_MATCHING PATTERN "*.json"
 )
 install(
-  FILES "${CMAKE_CURRENT_SOURCE_DIR}/schema/config-v1.schema.json"
+  DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../data/config/gpus/"
+  DESTINATION "${CMAKE_INSTALL_DATADIR}/frontier/gpus"
+  FILES_MATCHING PATTERN "*.json"
+)
+install(
+  DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../data/config/clusters/"
+  DESTINATION "${CMAKE_INSTALL_DATADIR}/frontier/clusters"
+  FILES_MATCHING PATTERN "*.json"
+)
+install(
+  DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../data/config/links/"
+  DESTINATION "${CMAKE_INSTALL_DATADIR}/frontier/links"
+  FILES_MATCHING PATTERN "*.json"
+)
+install(
+  DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../data/config/precision_profiles/"
+  DESTINATION "${CMAKE_INSTALL_DATADIR}/frontier/precision_profiles"
+  FILES_MATCHING PATTERN "*.json"
+)
+install(
+  DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/schema/"
   DESTINATION "${CMAKE_INSTALL_DATADIR}/frontier/schema"
+  FILES_MATCHING PATTERN "*.schema.json"
 )
 
 set(CPACK_PACKAGE_NAME "frontier-simulator")

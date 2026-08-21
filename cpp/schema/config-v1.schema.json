@@ -162,6 +162,7 @@
         "pipeline_parallel_size": { "$ref": "#/$defs/positiveUint64" },
         "pipeline_exclusive": { "type": "boolean" },
         "pipeline_stage_layer_counts": {
+          "description": "Optional exact per-stage override. When omitted, stages are front-filled with ceil(num_layers / pipeline_parallel_size) layers while preserving at least one layer per stage.",
           "type": "array",
           "minItems": 1,
           "items": { "$ref": "#/$defs/positiveUint64" }

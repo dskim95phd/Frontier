@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frontier-simulator.dev/schema/link-asset-v1.schema.json",
+  "title": "Frontier inter-cluster link profile asset",
+  "type": "object",
+  "required": ["asset_schema_version", "name", "network_bandwidth_gbps", "network_latency_ms"],
+  "properties": {
+    "asset_schema_version": { "const": 1 },
+    "name": { "type": "string", "pattern": "^[A-Za-z0-9._-]+$" },
+    "network_bandwidth_gbps": { "$ref": "config-v1.schema.json#/$defs/positiveNumber" },
+    "network_latency_ms": { "$ref": "config-v1.schema.json#/$defs/nonnegativeNumber" }
+  },
+  "additionalProperties": false
+}

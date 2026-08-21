@@ -1,0 +1,17 @@
+{
+  "asset_schema_version": 1,
+  "name": "gb300",
+  "memory": {
+    "capacity_bytes_per_gpu": 288000000000
+  },
+  "analytical": {
+    "device": "gb300",
+    "device_overrides": {
+      "hbm_bandwidth_tbps": 8.0,
+      "fp32_tflops": 83.33333333333333,
+      "fp16_tflops": 2500.0,
+      "fp8_tflops": 5000.0,
+      "fp4_tflops": 15000.0
+    }
+  }
+}

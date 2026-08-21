@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <filesystem>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -98,6 +99,14 @@ void resolve_gpu_memory_config(
 
 [[nodiscard]] SimulationConfig
 parse_simulation_config_json(std::string_view json_text);
+
+// Load either a self-contained schema-v1 config or a modular schema-v2
+// scenario.  V2 assets are resolved relative to the scenario and from the
+// installed Frontier asset catalogue, then lowered to the existing strict v1
+// runtime contract before parsing.  Keeping composition outside the runtime
+// types preserves simulator behavior and makes normalized output standalone.
+[[nodiscard]] SimulationConfig
+load_simulation_config_file(const std::filesystem::path &path);
 
 [[nodiscard]] ModelConfig load_model_config(std::string_view model_name);
 [[nodiscard]] std::string

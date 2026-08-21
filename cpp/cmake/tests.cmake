@@ -115,6 +115,27 @@ set_tests_properties(
   frontier_sim.normalize_workload
   PROPERTIES PASS_REGULAR_EXPRESSION "session_turn_index"
 )
+add_test(
+  NAME frontier_sim.normalize_modular_config
+  COMMAND
+    $<TARGET_FILE:frontier_sim>
+    --normalize-config
+    "${CMAKE_CURRENT_SOURCE_DIR}/examples/configs/08_modular_sequential_pdd.json"
+)
+set_tests_properties(
+  frontier_sim.normalize_modular_config
+  PROPERTIES
+    PASS_REGULAR_EXPRESSION "\"network_bandwidth_gbps\": 200\\.0"
+)
+add_test(
+  NAME frontier_sim.normalize_kimi_experiment_configs
+  COMMAND
+    ${CMAKE_COMMAND}
+    "-DFRONTIER_BINARY=$<TARGET_FILE:frontier_sim>"
+    "-DFRONTIER_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+    -P
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/normalize_kimi_experiment_configs.cmake"
+)
 
 add_executable(
   frontier_event_queue_test

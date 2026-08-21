@@ -1,0 +1,8 @@
+{
+  "asset_schema_version": 1,
+  "name": "kimi-k2-w4a8",
+  "precision": "fp8",
+  "operator_precisions": {
+    "moe_expert_weight": "fp4"
+  }
+}

@@ -376,7 +376,13 @@ def _flatten_batches(summary: Mapping[str, Any], row: dict[str, Any]) -> None:
 
 
 def _flatten_config(config: Mapping[str, Any], row: dict[str, Any]) -> None:
-    for key in ("simulation_mode", "system_architecture", "enable_parallel_clusters"):
+    for key in (
+        "schema_version",
+        "simulation_mode",
+        "system_architecture",
+        "enable_parallel_clusters",
+        "model",
+    ):
         if key in config:
             row[f"config_{key}"] = config[key]
     for section, prefix in (("prefix_cache", "config_prefix_cache"), ("cpu_kv_cache", "config_cpu_kv_cache"), ("cluster_scheduler", "config_cluster_scheduler")):
@@ -392,6 +398,8 @@ def _flatten_config(config: Mapping[str, Any], row: dict[str, Any]) -> None:
         value = clusters.get(phase)
         if not isinstance(value, Mapping):
             continue
+        if isinstance(value.get("profile"), str):
+            row[f"config_{phase}_profile"] = value["profile"]
         for section in ("parallelism", "scheduler"):
             nested = value.get(section)
             if not isinstance(nested, Mapping):
