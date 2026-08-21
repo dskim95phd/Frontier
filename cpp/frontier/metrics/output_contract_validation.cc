@@ -87,15 +87,22 @@ void validate_request_metrics(const std::vector<RequestMetricsRecord> &requests,
         }
         if (is_pdd(architecture)) {
             if (!request.prefill_replica_id.valid() ||
-                !request.prefill_dp_id.valid() ||
-                !request.decode_replica_id.valid() ||
-                !request.decode_dp_id.valid() || !request.transfer_id.valid() ||
+                !request.prefill_dp_id.valid() || !request.transfer_id.valid() ||
                 !request.kv_cache_transfer_start_time.valid() ||
                 !request.kv_cache_transfer_end_time.valid() ||
                 !request.decode_arrived_at.valid() ||
                 request.kv_cache_transfer_size_bytes == 0) {
                 throw std::invalid_argument(
                     "PDD request metrics require complete ownership");
+            }
+            if ((!request.prefill_only &&
+                 (!request.decode_replica_id.valid() ||
+                  !request.decode_dp_id.valid())) ||
+                (request.prefill_only &&
+                 (request.decode_replica_id.valid() ||
+                  request.decode_dp_id.valid()))) {
+                throw std::invalid_argument(
+                    "PDD decode ownership disagrees with PREFILL-only mode");
             }
             const SimTime transfer_start = request.kv_cache_transfer_start_time;
             const SimTime transfer_end = request.kv_cache_transfer_end_time;

@@ -29,6 +29,7 @@ deterministic trace as `trace.json`.
 | `cpu-kv-offline` | What CPU-tier traffic appears in an offline drain? | Offline sequential PDD with the same finite tier | offload/restore operations, occupancy, eviction |
 | `modular-pdd` | How can hardware and topology be reused across scenarios? | Schema v2 references named GPU, cluster, and link assets | resolved `config.normalized.json`, transfer latency |
 | `modular-dense` | How is analytical hardware selected by profile? | Schema v2 `rubin-16gpu` profile supplies GPU memory, device, and network | resolved execution model, throughput and latency |
+| `prefill-only` | What PREFILL capacity is needed when DECODE is external? | Sequential PDD transfer plus independent synthetic 50 TPS output | PREFILL latency/throughput, absence of DECODE batches |
 
 CPU KV-cache tiering is intentionally scoped to sequential PDD with session
 prefix caching and `sticky_round_robin`. The online recipe interposes a second

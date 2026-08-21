@@ -239,6 +239,98 @@ void test_session_successors_arrive_after_completion_and_think_time() {
            "recorded think time");
 }
 
+void test_prefill_only_uses_synthetic_decode_and_turn_gap() {
+    SimulationConfig config = load_config();
+    config.prefill_only = frontier::config::PrefillOnlyConfig{50.0};
+    const auto output = run_simulation(
+        config,
+        parse_workload_csv(
+            "session_start_at,think_time,num_prefill_tokens,num_decode_tokens,"
+            "session_id,session_turn_index\n"
+            "0,0,4,3,7,0\n"
+            ",0.75,6,2,7,1\n"));
+
+    expect(output.run.prefill_only &&
+               output.run.synthetic_decode_tokens_per_second == 50.0 &&
+               output.requests.size() == 2 &&
+               output.kv_cache_transfers.size() == 2,
+           "PREFILL-only run metadata and transfer count must be complete");
+
+    std::vector<const frontier::metrics::RequestMetricsRecord *> requests;
+    for (const auto &request : output.requests) {
+        requests.push_back(&request);
+    }
+    std::sort(requests.begin(), requests.end(),
+              [](const auto *left, const auto *right) {
+                  return left->request_id.value() < right->request_id.value();
+              });
+    for (const auto *request : requests) {
+        const double decode_start = request->decode_arrived_at.seconds();
+        const double first_token =
+            request->first_token_completed_at.seconds();
+        const double completed = request->completed_at.seconds();
+        expect(request->prefill_only &&
+                   request->prefill_replica_id.valid() &&
+                   request->prefill_dp_id.valid() &&
+                   !request->decode_replica_id.valid() &&
+                   !request->decode_dp_id.valid() &&
+                   first_token == decode_start + 1.0 / 50.0 &&
+                   completed ==
+                       decode_start +
+                           static_cast<double>(request->num_decode_tokens) /
+                               50.0,
+               "PREFILL-only request must use the configured synthetic rate "
+               "without a DECODE owner");
+    }
+    expect(requests.at(1)->arrived_at.seconds() ==
+               requests.at(0)->completed_at.seconds() + 0.75,
+           "PREFILL-only successor must wait for synthetic decode completion "
+           "and think time");
+
+    const std::size_t synthetic_events = static_cast<std::size_t>(std::count_if(
+        output.event_trace.begin(), output.event_trace.end(),
+        [](const auto &event) {
+            return event.type() == EventType::kSyntheticDecodeEnd;
+        }));
+    const bool saw_decode_batch = std::any_of(
+        output.batches.begin(), output.batches.end(), [](const auto &batch) {
+            return batch.cluster_type == ClusterType::kDecode;
+        });
+    expect(synthetic_events == output.requests.size() && !saw_decode_batch,
+           "PREFILL-only mode must emit one synthetic event and no DECODE "
+           "batches per request");
+
+    const std::string json = serialize_simulation_output_json(output);
+    expect(json.find("\"decode_replica_id\": null") != std::string::npos &&
+               json.find("\"prefill_only\": true") != std::string::npos,
+           "PREFILL-only output must expose synthetic ownership semantics");
+}
+
+void test_bounded_prefill_only_retains_prefill_completion() {
+    SimulationConfig config = load_config();
+    config.prefill_only = frontier::config::PrefillOnlyConfig{1.0};
+    const auto workload = parse_workload_csv(
+        "session_start_at,think_time,num_prefill_tokens,num_decode_tokens\n"
+        "0,0,4,10\n");
+    const frontier::SimTime horizon =
+        frontier::SimTime::from_seconds(0.1);
+    frontier::simulator::Simulator simulator{
+        config, workload,
+        frontier::simulator::SimulatorOptions{true, horizon}};
+    const auto output = simulator.run_until(horizon);
+
+    expect(output.requests.empty() && output.prefill_completions.size() == 1 &&
+               output.prefill_completions.front().request_id.value() == 0 &&
+               output.prefill_completions.front().completed_at < horizon,
+           "bounded PREFILL-only output must retain PREFILL completion while "
+           "synthetic decode remains in flight");
+    const std::string summary =
+        frontier::metrics::serialize_simulation_summary_json(output, 0.0);
+    expect(summary.find("\"prefill_completions\": 1") !=
+               std::string::npos,
+           "bounded PREFILL-only summary must count completed PREFILL work");
+}
+
 void test_gpu_kv_occupancy_change_stream() {
     const SimulationConfig config = load_config();
     const auto output =
@@ -312,6 +404,12 @@ int main() {
     failures += frontier::test::run(
         "session completion plus think-time injection",
         test_session_successors_arrive_after_completion_and_think_time);
+    failures += frontier::test::run(
+        "PDD PREFILL-only synthetic decode lifecycle",
+        test_prefill_only_uses_synthetic_decode_and_turn_gap);
+    failures += frontier::test::run(
+        "bounded PDD PREFILL-only completion metrics",
+        test_bounded_prefill_only_retains_prefill_completion);
     failures += frontier::test::run("GPU KV occupancy change stream",
                                     test_gpu_kv_occupancy_change_stream);
     return failures == 0 ? 0 : 1;

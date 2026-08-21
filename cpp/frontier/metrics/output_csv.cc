@@ -127,10 +127,15 @@ void serialize_request_metrics_csv(
                    << request.preemption_recomputed_prefill_tokens;
         } else {
             output << ',' << request.prefill_replica_id.value() << ','
-                   << request.prefill_dp_id.value() << ','
-                   << request.decode_replica_id.value() << ','
-                   << request.decode_dp_id.value() << ','
-                   << request.transfer_id.value() << ','
+                   << request.prefill_dp_id.value() << ',';
+            if (request.decode_replica_id.valid()) {
+                output << request.decode_replica_id.value();
+            }
+            output << ',';
+            if (request.decode_dp_id.valid()) {
+                output << request.decode_dp_id.value();
+            }
+            output << ',' << request.transfer_id.value() << ','
                    << request.kv_cache_transfer_start_time.seconds() << ','
                    << request.kv_cache_transfer_end_time.seconds() << ','
                    << (request.kv_cache_transfer_end_time.seconds() -

@@ -176,6 +176,19 @@ struct PddRuntimeConfig {
     }
 };
 
+// Optional PDD-only lifecycle shortcut for experiments that analyze PREFILL
+// capacity while treating DECODE as an external, unconstrained service.  KV
+// transfer remains modeled; after it completes, each request generates output
+// independently at this fixed rate without entering the DECODE schedulers.
+struct PrefillOnlyConfig {
+    double decode_tokens_per_second = 50.0;
+
+    friend bool operator==(const PrefillOnlyConfig &lhs,
+                           const PrefillOnlyConfig &rhs) {
+        return lhs.decode_tokens_per_second == rhs.decode_tokens_per_second;
+    }
+};
+
 using RuntimeConfig = std::variant<ClusterRuntimeConfig, PddRuntimeConfig>;
 
 class ConfigError : public std::runtime_error {
@@ -193,6 +206,7 @@ struct SimulationConfig {
     CpuKVCacheConfig cpu_kv_cache;
     ClusterSchedulerConfig cluster_scheduler;
     RuntimeConfig runtime;
+    std::optional<PrefillOnlyConfig> prefill_only;
 
     [[nodiscard]] ClusterRuntimeConfig &cluster();
     [[nodiscard]] const ClusterRuntimeConfig &cluster() const;
@@ -204,11 +218,13 @@ struct SimulationConfig {
         return std::tie(lhs.schema_version, lhs.run_id, lhs.simulation_mode,
                         lhs.system_architecture, lhs.enable_parallel_clusters,
                         lhs.prefix_cache, lhs.cpu_kv_cache,
-                        lhs.cluster_scheduler, lhs.runtime) ==
+                        lhs.cluster_scheduler, lhs.runtime,
+                        lhs.prefill_only) ==
                std::tie(rhs.schema_version, rhs.run_id, rhs.simulation_mode,
                         rhs.system_architecture, rhs.enable_parallel_clusters,
                         rhs.prefix_cache, rhs.cpu_kv_cache,
-                        rhs.cluster_scheduler, rhs.runtime);
+                        rhs.cluster_scheduler, rhs.runtime,
+                        rhs.prefill_only);
     }
 };
 

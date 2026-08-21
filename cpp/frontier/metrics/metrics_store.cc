@@ -167,6 +167,11 @@ MetricsStore::MetricsStore(const config::SimulationConfig &config,
               value.run_id = config.run_id;
               value.simulation_mode = config.simulation_mode;
               value.system_architecture = config.system_architecture;
+              value.prefill_only = config.prefill_only.has_value();
+              value.synthetic_decode_tokens_per_second =
+                  config.prefill_only.has_value()
+                      ? config.prefill_only->decode_tokens_per_second
+                      : 0.0;
               return value;
           }();
           return value;
@@ -193,6 +198,30 @@ void MetricsStore::record_event(Event event) {
     if (detailed_traces_enabled_) {
         output_.event_trace.push_back(std::move(event));
     }
+}
+
+void MetricsStore::record_prefill_completion(
+    const entities::Request &request, scheduler::ReplicaTarget target) {
+    if (!output_.run.prefill_only) {
+        return;
+    }
+    if (!request.is_prefill_complete() ||
+        !request.prefill_completed_at().valid() || !target.replica_id.valid() ||
+        !target.dp_id.valid()) {
+        throw std::logic_error(
+            "PREFILL completion metrics require a completed owned PREFILL");
+    }
+    PrefillCompletionMetricsRecord record{};
+    record.request_id = request.id();
+    record.num_prefill_tokens = request.initial_num_prefill_tokens();
+    record.scheduled_prefill_tokens = request.scheduled_prefill_tokens();
+    record.preemption_recomputed_prefill_tokens =
+        request.preemption_recomputed_prefill_tokens();
+    record.arrived_at = request.arrived_at();
+    record.completed_at = request.prefill_completed_at();
+    record.replica_id = target.replica_id;
+    record.dp_id = target.dp_id;
+    output_.prefill_completions.push_back(record);
 }
 
 void MetricsStore::record_request(RequestMetricsRecord record) {
@@ -538,12 +567,15 @@ void MetricsStore::collect_completed_requests(
                 "completed request is missing canonical metrics");
         }
         const scheduler::ReplicaTarget target = entities.request_target(
-            request_id,
-            is_pdd ? ClusterType::kDecode : ClusterType::kMonolithic);
+            request_id, is_pdd && !config.prefill_only.has_value()
+                            ? ClusterType::kDecode
+                            : (is_pdd ? ClusterType::kPrefill
+                                      : ClusterType::kMonolithic));
         RequestMetricsRecord record = [&]() {
             RequestMetricsRecord value{};
             value.request_id = request_id;
             value.session_id = request.session_id();
+            value.prefill_only = config.prefill_only.has_value();
             value.num_prefill_tokens = request.initial_num_prefill_tokens();
             value.num_decode_tokens = request.initial_num_decode_tokens();
             value.scheduled_prefill_tokens = request.scheduled_prefill_tokens();
@@ -600,8 +632,10 @@ void MetricsStore::collect_completed_requests(
                 entities.request_transfer_id(request_id);
             record.prefill_replica_id = prefill.replica_id;
             record.prefill_dp_id = prefill.dp_id;
-            record.decode_replica_id = target.replica_id;
-            record.decode_dp_id = target.dp_id;
+            if (!config.prefill_only.has_value()) {
+                record.decode_replica_id = target.replica_id;
+                record.decode_dp_id = target.dp_id;
+            }
             record.transfer_id = transfer_id;
             record.kv_cache_transfer_start_time =
                 request.kv_cache_transfer_start_time();

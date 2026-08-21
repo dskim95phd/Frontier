@@ -1890,6 +1890,32 @@ void test_explicit_pipeline_stage_layer_counts() {
            "K3 default PP24 placement must collapse to three timing types");
 }
 
+void test_pdd_prefill_only_contract() {
+    auto pdd = load("fixed_sequential_pdd.json");
+    pdd.prefill_only = frontier::config::PrefillOnlyConfig{37.5};
+    const std::string serialized = serialize_simulation_config_json(pdd);
+    const auto round_trip = parse_simulation_config_json(serialized);
+    expect(round_trip.prefill_only.has_value() &&
+               round_trip.prefill_only->decode_tokens_per_second == 37.5 &&
+               round_trip == pdd,
+           "PDD PREFILL-only fixed decode rate must parse and round-trip");
+
+    pdd.prefill_only->decode_tokens_per_second = 0.0;
+    expect_throws<ConfigError>(
+        [&pdd] {
+            static_cast<void>(serialize_simulation_config_json(pdd));
+        },
+        "PREFILL-only decode rate must be positive");
+
+    auto colocation = load("fixed_parallel_colocation.json");
+    colocation.prefill_only = frontier::config::PrefillOnlyConfig{50.0};
+    expect_throws<ConfigError>(
+        [&colocation] {
+            static_cast<void>(serialize_simulation_config_json(colocation));
+        },
+        "PREFILL-only mode must reject co-location");
+}
+
 } // namespace
 
 int main() {
@@ -1972,5 +1998,7 @@ int main() {
         test_pipeline_stage_profile_pp1_compatibility_and_uneven_ranges);
     failures += frontier::test::run("explicit PP stage layer counts",
                                     test_explicit_pipeline_stage_layer_counts);
+    failures += frontier::test::run("PDD PREFILL-only contract",
+                                    test_pdd_prefill_only_contract);
     return failures == 0 ? 0 : 1;
 }

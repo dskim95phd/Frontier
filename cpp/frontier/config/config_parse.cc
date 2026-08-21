@@ -126,6 +126,23 @@ KvCacheTransferConfig parse_kv_cache_transfer(const Json &root) {
     return parsed;
 }
 
+std::optional<PrefillOnlyConfig> parse_prefill_only(const Json &root) {
+    if (!root.contains("prefill_only")) {
+        return std::nullopt;
+    }
+    const Json &prefill_only = root.at("prefill_only");
+    require_exact_keys(prefill_only, {"decode_tokens_per_second"},
+                       "config.prefill_only");
+    PrefillOnlyConfig parsed{};
+    parsed.decode_tokens_per_second = require_finite_number(
+        prefill_only, "decode_tokens_per_second", "config.prefill_only");
+    if (parsed.decode_tokens_per_second <= 0.0) {
+        throw ConfigError(
+            "config.prefill_only.decode_tokens_per_second must be positive");
+    }
+    return parsed;
+}
+
 struct CommonConfigFields {
     int schema_version;
     std::string run_id;
@@ -204,7 +221,7 @@ SimulationConfig make_pdd_config(const Json &root, CommonConfigFields common) {
                      "clusters",
                      "kv_cache_transfer",
                  },
-                 {"cpu_kv_cache"}, "config");
+                 {"cpu_kv_cache", "prefill_only"}, "config");
     if (common.system_architecture != SystemArchitecture::kPdDisaggregation) {
         throw ConfigError(
             "PDD config requires system_architecture='pd-disaggregation'");
@@ -251,6 +268,7 @@ SimulationConfig make_pdd_config(const Json &root, CommonConfigFields common) {
         value.cpu_kv_cache = common.cpu_kv_cache;
         value.cluster_scheduler = parse_cluster_scheduler(root);
         value.runtime = std::move(runtime);
+        value.prefill_only = parse_prefill_only(root);
         validate_kda_prefix_capacity(value.pdd().clusters.prefill,
                                      value.prefix_cache.enabled,
                                      "config.clusters.prefill");
@@ -286,10 +304,14 @@ SimulationConfig make_single_cluster_config(const Json &root,
                      "cluster_scheduler",
                      "clusters",
                  },
-                 {"cpu_kv_cache"}, "config");
+                 {"cpu_kv_cache", "prefill_only"}, "config");
     if (common.system_architecture != SystemArchitecture::kCoLocation) {
         throw ConfigError("single-cluster config requires "
                           "system_architecture='co-location'");
+    }
+    if (root.contains("prefill_only")) {
+        throw ConfigError(
+            "config.prefill_only is supported only for pd-disaggregation");
     }
     const Json &clusters = root.at("clusters");
     require_exact_keys(clusters, {"monolithic"}, "config.clusters");

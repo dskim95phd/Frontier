@@ -34,6 +34,8 @@ void handle_event(const ClusterBatchEndPayload &payload, SimTime time,
                         entities::RequestState::kTransferPending) {
                     continue;
                 }
+                simulator.metrics().record_prefill_completion(request,
+                                                               target);
                 static_cast<void>(replica.prepare_cpu_kv_cache_offload(
                     snapshot.request_id, time));
                 for (scheduler::ScheduledAuxiliaryEvent &auxiliary :

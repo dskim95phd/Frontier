@@ -35,6 +35,18 @@ void validate_inputs(
     }
     const bool is_pdd = config.system_architecture ==
                         config::SystemArchitecture::kPdDisaggregation;
+    if (config.prefill_only.has_value() && !is_pdd) {
+        throw SimulationError(
+            "PREFILL-only mode is supported only for pd-disaggregation");
+    }
+    if (config.prefill_only.has_value() &&
+        (!std::isfinite(
+             config.prefill_only->decode_tokens_per_second) ||
+         config.prefill_only->decode_tokens_per_second <= 0.0)) {
+        throw SimulationError(
+            "PREFILL-only decode_tokens_per_second must be finite and "
+            "positive");
+    }
     if (config.enable_parallel_clusters) {
         throw SimulationError(
             "scheduler runtime requires sequential cluster execution");

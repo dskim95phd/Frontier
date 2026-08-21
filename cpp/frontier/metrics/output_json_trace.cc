@@ -94,6 +94,11 @@ std::string serialize_simulation_output_json(const SimulationOutput &output) {
             "canonical",
         },
     });
+    if (output.run.prefill_only) {
+        root["run"]["prefill_only"] = true;
+        root["run"]["synthetic_decode_tokens_per_second"] =
+            output.run.synthetic_decode_tokens_per_second;
+    }
 
     root["completed_request_ids"] = OrderedJson::array();
     root["requests"] = OrderedJson::array();
@@ -101,6 +106,36 @@ std::string serialize_simulation_output_json(const SimulationOutput &output) {
         root["completed_request_ids"].push_back(request.request_id.value());
         root["requests"].push_back(
             serialize_request(request, output.run.system_architecture));
+    }
+    if (output.run.prefill_only) {
+        root["prefill_completions"] = OrderedJson::array();
+        for (const PrefillCompletionMetricsRecord &prefill :
+             output.prefill_completions) {
+            if (!prefill.request_id.valid() ||
+                !prefill.arrived_at.valid() ||
+                !prefill.completed_at.valid() ||
+                prefill.completed_at < prefill.arrived_at ||
+                !prefill.replica_id.valid() || !prefill.dp_id.valid()) {
+                throw std::invalid_argument(
+                    "invalid PREFILL completion metrics record");
+            }
+            root["prefill_completions"].push_back(OrderedJson::object({
+                {"request_id", prefill.request_id.value()},
+                {"num_prefill_tokens", prefill.num_prefill_tokens},
+                {"scheduled_prefill_tokens",
+                 prefill.scheduled_prefill_tokens},
+                {"preemption_recomputed_prefill_tokens",
+                 prefill.preemption_recomputed_prefill_tokens},
+                {"arrived_at_s", prefill.arrived_at.seconds()},
+                {"completed_at_s", prefill.completed_at.seconds()},
+                {"prefill_latency_ms",
+                 (prefill.completed_at.seconds() -
+                  prefill.arrived_at.seconds()) *
+                     1e3},
+                {"replica_id", prefill.replica_id.value()},
+                {"dp_id", prefill.dp_id.value()},
+            }));
+        }
     }
 
     root["batches"] = OrderedJson::array();

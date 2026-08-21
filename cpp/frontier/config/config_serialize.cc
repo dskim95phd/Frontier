@@ -1,5 +1,6 @@
 #include "frontier/config/config.h"
 
+#include <cmath>
 #include <string>
 
 #include <nlohmann/json.hpp>
@@ -25,6 +26,18 @@ void validate_common_for_serialization(const SimulationConfig &config) {
     if (config.enable_parallel_clusters) {
         throw ConfigError(
             "config.enable_parallel_clusters=true is outside the C++ port");
+    }
+    if (config.prefill_only.has_value() &&
+        config.system_architecture != SystemArchitecture::kPdDisaggregation) {
+        throw ConfigError(
+            "config.prefill_only is supported only for pd-disaggregation");
+    }
+    if (config.prefill_only.has_value() &&
+        (!std::isfinite(config.prefill_only->decode_tokens_per_second) ||
+         config.prefill_only->decode_tokens_per_second <= 0.0)) {
+        throw ConfigError(
+            "config.prefill_only.decode_tokens_per_second must be finite "
+            "and positive");
     }
 }
 
@@ -324,6 +337,12 @@ std::string serialize_simulation_config_json(const SimulationConfig &config) {
         root["clusters"] = serialize_pdd_clusters(runtime.clusters);
         root["kv_cache_transfer"] =
             serialize_kv_cache_transfer(runtime.kv_cache_transfer);
+        if (config.prefill_only.has_value()) {
+            root["prefill_only"] = OrderedJson::object({
+                {"decode_tokens_per_second",
+                 config.prefill_only->decode_tokens_per_second},
+            });
+        }
         return root.dump(2) + '\n';
     }
     if (!std::holds_alternative<ClusterRuntimeConfig>(config.runtime)) {

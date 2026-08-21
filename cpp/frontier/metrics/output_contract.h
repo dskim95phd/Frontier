@@ -22,11 +22,14 @@ struct RunMetadata {
     std::string run_id;
     config::SimulationMode simulation_mode;
     config::SystemArchitecture system_architecture;
+    bool prefill_only = false;
+    double synthetic_decode_tokens_per_second = 0.0;
 };
 
 struct RequestMetricsRecord {
     RequestId request_id;
     SessionId session_id;
+    bool prefill_only = false;
     std::uint64_t num_prefill_tokens = 0;
     std::uint64_t num_decode_tokens = 0;
     // Actual prompt tokens executed by completed PREFILL batches.  Prefix
@@ -71,6 +74,20 @@ struct RequestMetricsRecord {
     SimTime kv_cache_transfer_end_time;
     SimTime decode_arrived_at;
     std::uint64_t kv_cache_transfer_size_bytes = 0;
+};
+
+// PREFILL-only PDD records this boundary independently from terminal request
+// completion so bounded online runs retain completed PREFILL work even when
+// synthetic output generation extends beyond the observation horizon.
+struct PrefillCompletionMetricsRecord {
+    RequestId request_id;
+    std::uint64_t num_prefill_tokens = 0;
+    std::uint64_t scheduled_prefill_tokens = 0;
+    std::uint64_t preemption_recomputed_prefill_tokens = 0;
+    SimTime arrived_at;
+    SimTime completed_at;
+    ReplicaId replica_id;
+    DataParallelId dp_id;
 };
 
 struct BatchMetricsRecord {
@@ -467,6 +484,7 @@ struct SimulationOutput {
     // window derivation used by the summary contract.
     std::optional<double> observation_window_seconds;
     std::vector<RequestMetricsRecord> requests;
+    std::vector<PrefillCompletionMetricsRecord> prefill_completions;
     std::vector<BatchMetricsRecord> batches;
     std::vector<BatchStageMetricsRecord> batch_stages;
     std::vector<SchedulerTraceRecord> scheduler_trace;

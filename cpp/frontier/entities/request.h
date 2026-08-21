@@ -21,6 +21,7 @@ enum class RequestState : std::uint8_t {
     kRunning,
     kTransferPending,
     kTransferInFlight,
+    kSyntheticDecoding,
     kCompleted,
 };
 
@@ -221,6 +222,9 @@ class Request {
     void mark_prefill_transfer_pending();
     void on_kv_cache_transfer_start(SimTime time);
     void on_kv_cache_transfer_complete(SimTime time, std::uint64_t size_bytes);
+    void on_synthetic_decode_start(SimTime time);
+    void on_synthetic_decode_complete(SimTime first_token_time,
+                                      SimTime completion_time);
 
   private:
     void enter_waiting(SimTime time);

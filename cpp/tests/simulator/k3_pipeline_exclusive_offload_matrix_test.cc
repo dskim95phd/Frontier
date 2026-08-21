@@ -24,6 +24,7 @@ using frontier::EventType;
 using frontier::RequestId;
 using frontier::SimTime;
 using frontier::config::ClusterRuntimeConfig;
+using frontier::config::PrefillOnlyConfig;
 using frontier::config::parse_simulation_config_json;
 using frontier::config::SimulationConfig;
 using frontier::metrics::CpuKVCacheTransferKind;
@@ -269,6 +270,43 @@ void compare_request_and_offload_contract(const SimulationOutput &exact,
            "exact and collapsed CPU transfer aggregates must match");
 }
 
+void check_prefill_only_contract(const SimulationOutput &output,
+                                 std::size_t request_count,
+                                 double decode_tokens_per_second) {
+    expect(output.run.prefill_only &&
+               output.run.synthetic_decode_tokens_per_second ==
+                   decode_tokens_per_second &&
+               output.requests.size() == request_count &&
+               output.prefill_completions.size() == request_count,
+           "K3 PREFILL-only run must complete every PREFILL and synthetic "
+           "output interval");
+    const bool has_decode_batch = std::any_of(
+        output.batches.begin(), output.batches.end(), [](const auto &batch) {
+            return batch.cluster_type == ClusterType::kDecode;
+        });
+    const std::size_t synthetic_events = static_cast<std::size_t>(std::count_if(
+        output.event_trace.begin(), output.event_trace.end(),
+        [](const auto &event) {
+            return event.type() == EventType::kSyntheticDecodeEnd;
+        }));
+    expect(!has_decode_batch && synthetic_events == request_count,
+           "K3 PREFILL-only run must bypass DECODE scheduling exactly once "
+           "per request");
+    for (const auto &record : output.requests) {
+        expect(record.prefill_only && record.prefill_replica_id.valid() &&
+                   !record.decode_replica_id.valid() &&
+                   record.first_token_completed_at.seconds() ==
+                       record.decode_arrived_at.seconds() +
+                           1.0 / decode_tokens_per_second &&
+                   record.completed_at.seconds() ==
+                       record.decode_arrived_at.seconds() +
+                           static_cast<double>(record.num_decode_tokens) /
+                               decode_tokens_per_second,
+               "K3 PREFILL-only request must retain PREFILL ownership and "
+               "use the configured synthetic token rate");
+    }
+}
+
 void test_k3_pipeline_exclusive_offload_matrix() {
     for (const std::uint64_t pp : {2ULL, 4ULL, 8ULL}) {
         const auto workload = pdd_workload();
@@ -290,11 +328,44 @@ void test_k3_pipeline_exclusive_offload_matrix() {
     }
 }
 
+void test_k3_prefill_only_pipeline_exclusive_offload_matrix() {
+    for (const std::uint64_t pp : {2ULL, 4ULL, 8ULL}) {
+        for (const double decode_tokens_per_second : {12.5, 50.0, 200.0}) {
+            const auto workload = pdd_workload();
+            auto exact_config = make_config(pp, "exact");
+            auto collapsed_config = make_config(pp, "collapsed");
+            exact_config.prefill_only =
+                PrefillOnlyConfig{decode_tokens_per_second};
+            collapsed_config.prefill_only =
+                PrefillOnlyConfig{decode_tokens_per_second};
+
+            const auto exact = run_simulation(exact_config, workload);
+            const auto collapsed = run_simulation(collapsed_config, workload);
+
+            check_prefill_only_contract(exact, workload.size(),
+                                        decode_tokens_per_second);
+            check_prefill_only_contract(collapsed, workload.size(),
+                                        decode_tokens_per_second);
+            check_stage_local_profiles(exact, pp);
+            check_stage_local_profiles(collapsed, pp);
+            check_offload_boundaries(exact, pp);
+            check_offload_boundaries(collapsed, pp);
+            check_collapsed_calendar(exact, false);
+            check_collapsed_calendar(collapsed, true);
+            compare_request_and_offload_contract(exact, collapsed);
+        }
+    }
+}
+
 } // namespace
 
 int main() {
-    return frontier::test::run("K3 pipeline-exclusive PDD CPU offload matrix",
-                               test_k3_pipeline_exclusive_offload_matrix) == 0
-               ? 0
-               : 1;
+    int failures = 0;
+    failures += frontier::test::run(
+        "K3 pipeline-exclusive PDD CPU offload matrix",
+        test_k3_pipeline_exclusive_offload_matrix);
+    failures += frontier::test::run(
+        "K3 PREFILL-only pipeline-exclusive PDD CPU offload matrix",
+        test_k3_prefill_only_pipeline_exclusive_offload_matrix);
+    return failures == 0 ? 0 : 1;
 }

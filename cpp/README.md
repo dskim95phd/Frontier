@@ -529,6 +529,46 @@ model:
 The abbreviated cluster objects above indicate shape only; every field shown
 in the co-location cluster example remains required.
 
+#### PREFILL-only PDD
+
+PDD experiments that analyze PREFILL capacity can replace DECODE scheduling
+with an external fixed-rate lifecycle:
+
+```json
+"prefill_only": {
+  "decode_tokens_per_second": 50.0
+}
+```
+
+This optional top-level object is valid only with
+`system_architecture="pd-disaggregation"`. PREFILL execution and the
+analytical KV-cache transfer remain fully simulated. When the transfer ends,
+the request generates output independently at the configured per-request
+rate; it never enters a DECODE replica scheduler. Consequently, the mode
+emits no DECODE batches or batch stages and assumes unlimited aggregate
+external DECODE capacity.
+
+For a transfer ending at `decode_start`, the first generated token completes
+at `decode_start + 1 / decode_tokens_per_second`, and terminal completion is
+`decode_start + num_decode_tokens / decode_tokens_per_second`. In online
+session workloads, the next turn then arrives at terminal completion plus its
+recorded `think_time`. PDD request records retain PREFILL ownership and
+transfer fields, while `decode_replica_id` and `decode_dp_id` are `null` in
+JSON (empty in CSV). Summary TTFT, TPOT, E2E, and decode-token throughput
+therefore include the configured synthetic assumption rather than measured
+DECODE capacity. Full JSON output also includes `prefill_completions`; bounded
+online summaries use those boundary records for PREFILL counts, prompt-token
+throughput, and PREFILL latency even when synthetic output remains in flight
+at the observation horizon.
+
+Run the included example with:
+
+```bash
+build/frontier_sim \
+  --config cpp/examples/configs/07_prefill_only_pdd.json \
+  --workload cpp/examples/workloads/00_tiny.csv
+```
+
 ### Analytical execution
 
 An analytical cluster replaces its fixed execution model with:

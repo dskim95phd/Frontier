@@ -398,4 +398,37 @@ void Request::on_kv_cache_transfer_complete(SimTime time,
         time.seconds() - kv_cache_transfer_start_time_.seconds();
 }
 
+void Request::on_synthetic_decode_start(SimTime time) {
+    validate_time(time, "synthetic-decode-start");
+    if (state_ != RequestState::kTransferInFlight ||
+        !kv_cache_transfer_end_time_.valid() ||
+        time != kv_cache_transfer_end_time_ || decode_arrived_at_.valid()) {
+        throw RequestError(
+            "synthetic decode requires a completed PDD KV transfer");
+    }
+    decode_arrived_at_ = time;
+    state_ = RequestState::kSyntheticDecoding;
+}
+
+void Request::on_synthetic_decode_complete(SimTime first_token_time,
+                                           SimTime completion_time) {
+    validate_time(first_token_time, "synthetic-first-token");
+    validate_time(completion_time, "synthetic-decode-completion");
+    if (state_ != RequestState::kSyntheticDecoding ||
+        !decode_arrived_at_.valid() || first_token_completed_at_.valid() ||
+        completed_at_.valid()) {
+        throw RequestError(
+            "synthetic decode completion requires one active decode");
+    }
+    if (first_token_time < decode_arrived_at_ ||
+        completion_time < first_token_time) {
+        throw RequestError("synthetic decode timestamps are out of order");
+    }
+    first_token_completed_at_ = first_token_time;
+    num_processed_tokens_ = total_tokens();
+    state_ = RequestState::kCompleted;
+    completed_at_ = completion_time;
+    validate_progress();
+}
+
 } // namespace frontier::entities

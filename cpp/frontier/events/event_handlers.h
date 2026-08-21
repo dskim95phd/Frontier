@@ -48,5 +48,7 @@ void handle_event(const CpuKVCacheRestoreStartPayload &payload, SimTime time,
                   simulator::Simulator &simulator);
 void handle_event(const CpuKVCacheRestoreEndPayload &payload, SimTime time,
                   simulator::Simulator &simulator);
+void handle_event(const SyntheticDecodeEndPayload &payload, SimTime time,
+                  simulator::Simulator &simulator);
 
 } // namespace frontier::events

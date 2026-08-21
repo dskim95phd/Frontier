@@ -64,6 +64,8 @@ std::string_view to_string(EventType event_type) noexcept {
         return "cpu_kv_cache_restore_start";
     case EventType::kCpuKvCacheRestoreEnd:
         return "cpu_kv_cache_restore_end";
+    case EventType::kSyntheticDecodeEnd:
+        return "synthetic_decode_end";
     }
     return "unknown";
 }
@@ -121,23 +123,29 @@ std::string serialize_simulation_summary_json(const SimulationOutput &output,
     std::uint64_t total_scheduled_prefill_tokens = 0;
     std::uint64_t total_recomputed_prefill_tokens = 0;
     std::uint64_t total_preemptions = 0;
+    const bool use_prefill_boundary_records = output.run.prefill_only;
     for (const RequestMetricsRecord &request : output.requests) {
         first_arrival_s =
             std::min(first_arrival_s, request.arrived_at.seconds());
         last_completion_s =
             std::max(last_completion_s, request.completed_at.seconds());
-        total_prefill_tokens += request.num_prefill_tokens;
         total_decode_tokens += request.num_decode_tokens;
-        total_scheduled_prefill_tokens += request.scheduled_prefill_tokens;
-        total_recomputed_prefill_tokens +=
-            request.preemption_recomputed_prefill_tokens;
+        if (!use_prefill_boundary_records) {
+            total_prefill_tokens += request.num_prefill_tokens;
+            total_scheduled_prefill_tokens +=
+                request.scheduled_prefill_tokens;
+            total_recomputed_prefill_tokens +=
+                request.preemption_recomputed_prefill_tokens;
+        }
         total_preemptions += request.preemption_count;
         scheduling_delay_ms.push_back(
             milliseconds_between(request.first_scheduled_at, request.arrived_at,
                                  "first_scheduled_at"));
-        prefill_latency_ms.push_back(
-            milliseconds_between(request.prefill_completed_at,
-                                 request.arrived_at, "prefill_completed_at"));
+        if (!use_prefill_boundary_records) {
+            prefill_latency_ms.push_back(milliseconds_between(
+                request.prefill_completed_at, request.arrived_at,
+                "prefill_completed_at"));
+        }
         ttft_ms.push_back(milliseconds_between(request.first_token_completed_at,
                                                request.arrived_at,
                                                "first_token_completed_at"));
@@ -149,6 +157,19 @@ std::string serialize_simulation_summary_json(const SimulationOutput &output,
                                      request.first_token_completed_at,
                                      "completed_at") /
                 static_cast<double>(request.num_decode_tokens - 1));
+        }
+    }
+    if (use_prefill_boundary_records) {
+        for (const PrefillCompletionMetricsRecord &prefill :
+             output.prefill_completions) {
+            total_prefill_tokens += prefill.num_prefill_tokens;
+            total_scheduled_prefill_tokens +=
+                prefill.scheduled_prefill_tokens;
+            total_recomputed_prefill_tokens +=
+                prefill.preemption_recomputed_prefill_tokens;
+            prefill_latency_ms.push_back(milliseconds_between(
+                prefill.completed_at, prefill.arrived_at,
+                "prefill_completed_at"));
         }
     }
 
@@ -188,6 +209,11 @@ std::string serialize_simulation_summary_json(const SimulationOutput &output,
         {"system_architecture",
          std::string{config::to_string(output.run.system_architecture)}},
     });
+    if (output.run.prefill_only) {
+        root["run"]["prefill_only"] = true;
+        root["run"]["synthetic_decode_tokens_per_second"] =
+            output.run.synthetic_decode_tokens_per_second;
+    }
     root["wall_clock_seconds"] = wall_clock_seconds;
     root["simulation_window_seconds"] = simulation_window_s;
     root["counts"] = OrderedJson::object({
@@ -200,6 +226,10 @@ std::string serialize_simulation_summary_json(const SimulationOutput &output,
         {"preemptions", total_preemptions},
         {"prefill_scheduled_tokens", aggregate_prefill_scheduled_tokens},
     });
+    if (output.run.prefill_only) {
+        root["counts"]["prefill_completions"] =
+            output.prefill_completions.size();
+    }
     root["prefill_work"] = OrderedJson::object({
         {"scheduled_prefill_tokens", total_scheduled_prefill_tokens},
         {"preemption_recomputed_prefill_tokens",

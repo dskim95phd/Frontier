@@ -72,6 +72,8 @@ class MetricsStore {
                                 ClusterType cluster_type);
     void
     record_kv_cache_transfer(const entities::KVCacheTransferInfo &transfer);
+    void record_prefill_completion(const entities::Request &request,
+                                   scheduler::ReplicaTarget target);
     void record_analytical_diagnostic(
         std::string name, std::vector<std::pair<std::string, double>> values);
     void record_moe_routing(

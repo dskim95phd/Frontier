@@ -135,6 +135,7 @@ add_library(
   frontier/events/prefill_sync_collective_event.cc
   frontier/events/decode_sync_event.cc
   frontier/events/decode_sync_collective_event.cc
+  frontier/events/synthetic_decode_end_event.cc
   frontier/execution_time_predictor/execution_time_predictor_factory.cc
   frontier/execution_time_predictor/fixed_execution_time_predictor.cc
   frontier/execution_time_predictor/analytical_roofline_execution_time_predictor.cc

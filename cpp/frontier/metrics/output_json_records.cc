@@ -16,6 +16,9 @@ OrderedJson serialize_request(const RequestMetricsRecord &request,
                               config::SystemArchitecture architecture) {
     OrderedJson json = OrderedJson::object();
     json["request_id"] = request.request_id.value();
+    if (request.prefill_only) {
+        json["prefill_only"] = true;
+    }
     if (request.session_id.valid()) {
         json["session_id"] = request.session_id.value();
     } else {
@@ -71,9 +74,7 @@ OrderedJson serialize_request(const RequestMetricsRecord &request,
         json["dp_id"] = request.dp_id.value();
     } else {
         if (!request.prefill_replica_id.valid() ||
-            !request.prefill_dp_id.valid() ||
-            !request.decode_replica_id.valid() ||
-            !request.decode_dp_id.valid() || !request.transfer_id.valid() ||
+            !request.prefill_dp_id.valid() || !request.transfer_id.valid() ||
             !request.kv_cache_transfer_start_time.valid() ||
             !request.kv_cache_transfer_end_time.valid() ||
             !request.decode_arrived_at.valid() ||
@@ -83,8 +84,23 @@ OrderedJson serialize_request(const RequestMetricsRecord &request,
         }
         json["prefill_replica_id"] = request.prefill_replica_id.value();
         json["prefill_dp_id"] = request.prefill_dp_id.value();
-        json["decode_replica_id"] = request.decode_replica_id.value();
-        json["decode_dp_id"] = request.decode_dp_id.value();
+        if (request.prefill_only) {
+            if (request.decode_replica_id.valid() ||
+                request.decode_dp_id.valid()) {
+                throw std::invalid_argument(
+                    "PREFILL-only request must not report a DECODE owner");
+            }
+            json["decode_replica_id"] = nullptr;
+            json["decode_dp_id"] = nullptr;
+        } else {
+            if (!request.decode_replica_id.valid() ||
+                !request.decode_dp_id.valid()) {
+                throw std::invalid_argument(
+                    "simulated PDD request requires a DECODE owner");
+            }
+            json["decode_replica_id"] = request.decode_replica_id.value();
+            json["decode_dp_id"] = request.decode_dp_id.value();
+        }
         json["transfer_id"] = request.transfer_id.value();
         json["kv_cache_transfer_start_time_s"] =
             request.kv_cache_transfer_start_time.seconds();

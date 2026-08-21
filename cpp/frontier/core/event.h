@@ -75,6 +75,9 @@ enum class EventType : std::uint8_t {
     // this event.  Keep it appended so legacy event numeric values remain
     // stable for exact-mode traces.
     kBatchPipelineEnd,
+    // PDD PREFILL-only mode replaces all DECODE scheduler work with one
+    // terminal event per request after its KV transfer.
+    kSyntheticDecodeEnd,
 };
 
 enum class MoESyncPhase : std::uint8_t {
@@ -278,6 +281,11 @@ struct CpuKVCacheRestoreEndPayload {
     ClusterType cluster_type;
 };
 
+struct SyntheticDecodeEndPayload {
+    static constexpr EventType kType = EventType::kSyntheticDecodeEnd;
+    RequestId request_id;
+};
+
 using EventPayload = std::variant<
     RequestArrivalPayload, GlobalSchedulePayload, ClusterSchedulePayload,
     ReplicaSchedulePayload, BatchStageArrivalPayload,
@@ -286,7 +294,8 @@ using EventPayload = std::variant<
     KVCacheTransferEndPayload, PrefillSyncPayload, PrefillSyncCollectivePayload,
     DecodeSyncPayload, DecodeSyncCollectivePayload,
     CpuKVCacheOffloadStartPayload, CpuKVCacheOffloadEndPayload,
-    CpuKVCacheRestoreStartPayload, CpuKVCacheRestoreEndPayload>;
+    CpuKVCacheRestoreStartPayload, CpuKVCacheRestoreEndPayload,
+    SyntheticDecodeEndPayload>;
 
 namespace detail {
 

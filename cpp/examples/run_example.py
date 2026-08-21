@@ -20,6 +20,7 @@ EXAMPLES = {
     "cpu-kv-offline": ("07_cpu_kv_cache_pdd_offline.json", "06_cpu_kv_cache_sessions.csv"),
     "modular-pdd": ("08_modular_sequential_pdd.json", "00_tiny.csv"),
     "modular-dense": ("09_modular_dense_analytical.json", "01_online.csv"),
+    "prefill-only": ("07_prefill_only_pdd.json", "00_tiny.csv"),
 }
 
 

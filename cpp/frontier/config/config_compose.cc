@@ -520,7 +520,7 @@ Json compose_v2(const Json &scenario,
                  {"schema_version", "run_id", "simulation_mode",
                   "system_architecture", "model", "clusters"},
                  {"prefix_cache", "cpu_kv_cache", "cluster_scheduler",
-                  "kv_cache_transfer"},
+                  "kv_cache_transfer", "prefill_only"},
                  "config");
     const int version = require_int(scenario, "schema_version", "config");
     if (version != kModularSchemaVersion) {
@@ -556,6 +556,11 @@ Json compose_v2(const Json &scenario,
             throw ConfigError(
                 "co-location config must not contain kv_cache_transfer");
         }
+        if (scenario.contains("prefill_only")) {
+            throw ConfigError(
+                "config.prefill_only is supported only for "
+                "pd-disaggregation");
+        }
         result["clusters"] =
             Json{{"monolithic",
                   compose_cluster_runtime(clusters.at("monolithic"),
@@ -577,6 +582,9 @@ Json compose_v2(const Json &scenario,
         result["kv_cache_transfer"] =
             compose_kv_cache_transfer(scenario.at("kv_cache_transfer"),
                                       roots);
+        if (scenario.contains("prefill_only")) {
+            result["prefill_only"] = scenario.at("prefill_only");
+        }
     } else {
         throw ConfigError("config.system_architecture must be 'co-location' "
                           "or 'pd-disaggregation'");
