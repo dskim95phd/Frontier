@@ -53,8 +53,7 @@ End Step 3 with deterministic dense PDD runs in which:
 8. event, routing, scheduler, stage, transfer, request-metric, and final-state
    outputs match Python.
 
-“Sequential” means that C++ uses one deterministic discrete-event queue, as
-the release-supported Python path does when `enable_parallel_clusters=False`.
+“Sequential” means that C++ uses one deterministic discrete-event queue.
 It does not mean that all prefill work must finish before all decode work in
 online mode. Events from both clusters may be interleaved on the simulated
 timeline; they are processed serially in `(time, creation_sequence)` order.
@@ -64,7 +63,6 @@ timeline; they are processed serially in `(time, creation_sequence)` order.
 ### Included
 
 - `system_architecture=pd-disaggregation`;
-- `enable_parallel_clusters=false`;
 - dense Llama-2-7B;
 - FP16;
 - vLLM V1 replica scheduling;
@@ -90,7 +88,6 @@ timeline; they are processed serially in `(time, creation_sequence)` order.
 
 ### Explicitly Deferred
 
-- parallel cluster threads;
 - `pd-af-disaggregation`;
 - M2N transfers;
 - prefix caching of any kind;
@@ -263,7 +260,6 @@ An illustrative schema v4 configuration is:
   "run_id": "step3-dense-pdd",
   "simulation_mode": "online",
   "system_architecture": "pd-disaggregation",
-  "enable_parallel_clusters": false,
   "prefix_cache": {
     "enabled": false,
     "key_mode": "session"
@@ -340,7 +336,6 @@ for its stage predictor.
 ### Validation
 
 - schema v4 requires `system_architecture=pd-disaggregation`;
-- `enable_parallel_clusters` must be false;
 - exactly `prefill` and `decode` clusters must exist;
 - all parallelism dimensions must be positive;
 - each cluster independently satisfies layer/TP/PP topology rules;

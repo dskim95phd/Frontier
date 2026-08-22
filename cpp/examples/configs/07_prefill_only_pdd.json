@@ -3,7 +3,6 @@
   "run_id": "example-prefill-only-pdd",
   "simulation_mode": "online",
   "system_architecture": "pd-disaggregation",
-  "enable_parallel_clusters": false,
   "prefix_cache": {"enabled": false, "key_mode": "session"},
   "cluster_scheduler": {"type": "round_robin"},
   "prefill_only": {"decode_tokens_per_second": 50.0},

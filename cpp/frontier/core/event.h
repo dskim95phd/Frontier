@@ -70,11 +70,6 @@ enum class EventType : std::uint8_t {
     kCpuKvCacheOffloadEnd,
     kCpuKvCacheRestoreStart,
     kCpuKvCacheRestoreEnd,
-    // Collapsed PP mode reserves all stage intervals up front and emits one
-    // terminal event after the final reserved stage.  Exact mode never emits
-    // this event.  Keep it appended so legacy event numeric values remain
-    // stable for exact-mode traces.
-    kBatchPipelineEnd,
     // PDD PREFILL-only mode replaces all DECODE scheduler work with one
     // terminal event per request after its KV transfer.
     kSyntheticDecodeEnd,
@@ -132,15 +127,6 @@ struct BatchStageEndPayload {
     ReplicaId replica_id;
     DataParallelId dp_id;
     StageId stage_id;
-    Generation generation;
-    ClusterType cluster_type;
-};
-
-struct BatchPipelineEndPayload {
-    static constexpr EventType kType = EventType::kBatchPipelineEnd;
-    BatchId batch_id;
-    ReplicaId replica_id;
-    DataParallelId dp_id;
     Generation generation;
     ClusterType cluster_type;
 };
@@ -289,8 +275,8 @@ struct SyntheticDecodeEndPayload {
 using EventPayload = std::variant<
     RequestArrivalPayload, GlobalSchedulePayload, ClusterSchedulePayload,
     ReplicaSchedulePayload, BatchStageArrivalPayload,
-    ReplicaStageSchedulePayload, BatchStageEndPayload, BatchPipelineEndPayload,
-    ClusterBatchEndPayload, GlobalBatchEndPayload, KVCacheTransferStartPayload,
+    ReplicaStageSchedulePayload, BatchStageEndPayload, ClusterBatchEndPayload,
+    GlobalBatchEndPayload, KVCacheTransferStartPayload,
     KVCacheTransferEndPayload, PrefillSyncPayload, PrefillSyncCollectivePayload,
     DecodeSyncPayload, DecodeSyncCollectivePayload,
     CpuKVCacheOffloadStartPayload, CpuKVCacheOffloadEndPayload,

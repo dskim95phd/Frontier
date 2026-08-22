@@ -167,7 +167,6 @@ The initial fixed-timing shape is:
   "run_id": "step2-single-request",
   "simulation_mode": "offline",
   "system_architecture": "co-location",
-  "enable_parallel_clusters": false,
   "prefix_cache": {
     "enabled": false,
     "key_mode": "session"

@@ -38,8 +38,6 @@ std::string_view to_string(EventType event_type) noexcept {
         return "replica_stage_schedule";
     case EventType::kBatchStageEnd:
         return "batch_stage_end";
-    case EventType::kBatchPipelineEnd:
-        return "batch_pipeline_end";
     case EventType::kClusterBatchEnd:
         return "cluster_batch_end";
     case EventType::kGlobalBatchEnd:

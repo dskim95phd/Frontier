@@ -18,11 +18,9 @@ Implemented:
   group and released with the batch entity;
 - mandatory positive per-GPU HBM capacity for manual and automatic configs;
 - exact physical validation of manually configured logical block counts; and
-- an opt-in PP collapsed calendar that preserves stage-local reservations and
-  falls back to the causal event chain for synchronized MoE execution; and
 - an opt-in pipeline-exclusive K3 experiment contract (`PP>1`, `DP=1`,
-  `MoE EP=1`, `MoE TP=attention TP`) that makes the collapsed path eligible
-  without changing the general hybrid PP+DP+EP surface.
+  `MoE EP=1`, `MoE TP=attention TP`) without changing the general hybrid
+  PP+DP+EP surface.
 
 The following observability work is now implemented:
 
@@ -56,14 +54,6 @@ only and are not release thresholds:
 | 4 | 47.172 | 1,488 | 168 | 3 | 111 / 57 | 17 |
 | 24 | 241.273 | 8,175 | 1,008 | 4 | 932 / 76 | 17 |
 
-The original benchmark justified retaining `exact` as the default. A later
-opt-in `collapsed` implementation was added without changing that default. On
-the current dense Debug fixture it reduces PP4 events from 642 to 286 and PP24
-events from 3,207 to 331 while producing identical request, batch, and
-per-stage timing output. This fixture remains diagnostic rather than a release
-performance threshold; predictor work can still dominate wall time even after
-event collapse.
-
 ## Pipeline-Exclusive K3 Validation Matrix
 
 The pipeline-exclusive path is covered by a bounded pairwise matrix rather
@@ -74,13 +64,12 @@ than only one uniform PP layout:
 | topology | `(TP,PP,DCP) = (1,2,1), (2,3,1), (4,4,1), (8,8,1), (8,24,8)` |
 | execution model | fixed and analytical `stage_group_scaled` |
 | workload shape | prefill-heavy, decode-heavy, concurrent batches, staggered arrivals |
-| calendar parity | analytical exact versus collapsed at PP3, PP8, and PP24 |
-| PDD/offload | K3 PP2, PP4, and PP8; exact and collapsed; concurrent/staggered multi-turn sessions |
+| stage causality | analytical PP3, PP8, and PP24 timelines |
+| PDD/offload | K3 PP2, PP4, and PP8; concurrent/staggered multi-turn sessions |
 
 The matrix asserts that every batch visits every physical stage, intervals on
-one stage never overlap, pipeline-exclusive runs emit no EP/MoE synchronization
-events, and exact/collapsed calendars produce identical request, batch, and
-stage results. It also verifies positive stage-aggregate KV footprints and
+one stage never overlap, and pipeline-exclusive runs emit no EP/MoE
+synchronization events. It also verifies positive stage-aggregate KV footprints and
 stage-local HBM/snapshot constraints. With DCP, an individual rank may own
 zero tokens for a small logical block, so non-zero KV is intentionally checked
 at the stage aggregate rather than incorrectly required on every rank.
@@ -495,13 +484,8 @@ finish[b, s] = start[b, s] + predicted_stage_time[b, s]
 There is no all-stage barrier after every local layer. MoE synchronization is
 local to the participating physical domain for the same aligned layer.
 
-The default `scheduler.pipeline_event_mode = exact` keeps
-`BatchStageArrivalEvent` and `BatchStageEndEvent` for every visited PP stage.
-The opt-in `collapsed` mode reserves safe stage intervals against each
-stage-local calendar and emits one final pipeline-completion event instead of
-the intermediate arrival/schedule/end chain. Runtime-synchronized MoE stages
-fall back to the exact path; their aligned barrier outcome is not known when a
-batch first enters the pipeline.
+`BatchStageArrivalEvent` and `BatchStageEndEvent` preserve this causal flow for
+every visited PP stage.
 
 ## Proposed Implementation Areas
 
@@ -655,10 +639,6 @@ count. Record:
 - simulator wall time; and
 - peak event-queue size.
 
-Compare `exact` and `collapsed` PP calendars in the benchmark. The collapsed
-mode must preserve batch/stage timestamps and request results while materially
-reducing processed DES events for non-synchronized pipelines.
-
 ## Implementation Phases
 
 ### Phase 1: Static stage profiles and groups
@@ -701,10 +681,8 @@ incompatible routing never silently reuses a representative allocation.
 
 ### Phase 5: Performance decision
 
-- benchmark PP1/PP4/PP24 event and predictor overhead;
-- optimize signature/template caching if predictor work dominates; and
-- consider a collapsed pipeline calendar only if stage-event overhead remains
-  material after caching.
+- benchmark PP1/PP4/PP24 event and predictor overhead; and
+- optimize signature/template caching if predictor work dominates.
 
 ## Completion Criteria
 
@@ -726,4 +704,4 @@ The implementation is complete when:
 8. Metrics identify the actual limiting stage/group for ordinary KV and KDA
    snapshot pressure.
 9. PP1, PP4, and PP24 correctness tests pass, and simulator wall-time results
-   are recorded before any event-collapsing optimization is selected.
+   are recorded.

@@ -3,7 +3,6 @@
   "run_id": "example-session-prefix-cache",
   "simulation_mode": "online",
   "system_architecture": "co-location",
-  "enable_parallel_clusters": false,
   "prefix_cache": {"enabled": true, "key_mode": "session"},
   "cluster_scheduler": {"type": "sticky_round_robin"},
   "clusters": {

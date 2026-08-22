@@ -159,7 +159,6 @@ TP1 결과와 기존 dense model 결과가 변하지 않는 회귀 테스트도 
 
 ```text
 system_architecture       = pd-disaggregation
-enable_parallel_clusters = false
 cluster_scheduler.type                 = sticky_round_robin  # fallback
 cluster_scheduler.prefill_type         = cache_aware
 cluster_scheduler.decode_type          = vllm_queue_aware
@@ -939,7 +938,6 @@ trace 크기에 의해 지배되지 않도록 한다.
 다음은 본 실험 결과의 해석 범위에 포함하지 않는다.
 
 - DECODE KV의 CPU/PREFILL 반환
-- parallel PDD cluster execution
 - shared Grace CPU/NUMA/memory-controller contention의 상세 모델
 - CPU KV compression 또는 dtype conversion
 - NVMe tier

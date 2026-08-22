@@ -9,7 +9,6 @@
     "run_id",
     "simulation_mode",
     "system_architecture",
-    "enable_parallel_clusters",
     "prefix_cache",
     "cluster_scheduler",
     "clusters"
@@ -19,7 +18,6 @@
     "run_id": { "type": "string", "pattern": "\\S" },
     "simulation_mode": { "enum": ["offline", "online"] },
     "system_architecture": { "enum": ["co-location", "pd-disaggregation"] },
-    "enable_parallel_clusters": { "const": false },
     "prefix_cache": { "$ref": "#/$defs/prefixCache" },
     "cpu_kv_cache": { "$ref": "#/$defs/cpuKvCache" },
     "cluster_scheduler": { "$ref": "#/$defs/clusterScheduler" },
@@ -198,8 +196,7 @@
         "block_size": { "$ref": "#/$defs/positiveUint64" },
         "num_blocks": { "$ref": "#/$defs/positiveUint64" },
         "watermark_blocks_fraction": { "type": "number", "minimum": 0, "exclusiveMaximum": 1 },
-        "num_preallocate_tokens": { "$ref": "#/$defs/uint64" },
-        "pipeline_event_mode": { "enum": ["exact", "collapsed"] }
+        "num_preallocate_tokens": { "$ref": "#/$defs/uint64" }
       },
       "additionalProperties": false
     },

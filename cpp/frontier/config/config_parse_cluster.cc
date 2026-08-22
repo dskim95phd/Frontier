@@ -195,7 +195,7 @@ SchedulerConfig parse_scheduler(const Json &root) {
                      "watermark_blocks_fraction",
                      "num_preallocate_tokens",
                  },
-                 {"num_blocks", "pipeline_event_mode"}, "config.scheduler");
+                 {"num_blocks"}, "config.scheduler");
 
     SchedulerConfig parsed = [&]() {
         SchedulerConfig value{};
@@ -223,10 +223,6 @@ SchedulerConfig parse_scheduler(const Json &root) {
             scheduler, "watermark_blocks_fraction", "config.scheduler");
         value.num_preallocate_tokens = require_uint64(
             scheduler, "num_preallocate_tokens", "config.scheduler");
-        if (scheduler.contains("pipeline_event_mode")) {
-            value.pipeline_event_mode = require_string(
-                scheduler, "pipeline_event_mode", "config.scheduler");
-        }
         return value;
     }();
 
@@ -253,12 +249,6 @@ SchedulerConfig parse_scheduler(const Json &root) {
         throw ConfigError(
             "config.scheduler.long_prefill_token_threshold > 0 requires "
             "enable_chunked_prefill=true");
-    }
-    if (parsed.pipeline_event_mode != "exact" &&
-        parsed.pipeline_event_mode != "collapsed") {
-        throw ConfigError(
-            "config.scheduler.pipeline_event_mode must be 'exact' or "
-            "'collapsed'");
     }
     return parsed;
 }

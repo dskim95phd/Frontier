@@ -536,7 +536,6 @@ Json compose_v2(const Json &scenario,
                 {"run_id", scenario.at("run_id")},
                 {"simulation_mode", scenario.at("simulation_mode")},
                 {"system_architecture", architecture},
-                {"enable_parallel_clusters", false},
                 {"prefix_cache",
                  scenario.contains("prefix_cache")
                      ? scenario.at("prefix_cache")

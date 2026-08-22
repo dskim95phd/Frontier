@@ -57,10 +57,9 @@ build_stage_batch_info(const entities::Batch &batch,
         // chunks at once, and its live frontier then advances while an earlier
         // chunk is still traversing the pipeline, so reading it here would make
         // a stage's predicted work depend on when that stage happened to run.
-        // That is what made "collapsed" and "exact" pipeline event modes
-        // disagree, and it understated attention under both: the live counter
-        // only reaches this chunk's true offset once every earlier chunk has
-        // retired, which may be after the chunk has already left the pipeline.
+        // Reading the live counter here understated attention: it reaches this
+        // chunk's true offset only after every earlier chunk has retired,
+        // which may be after the chunk has already left the pipeline.
         const detail::AttentionRequestSlice slice =
             make_attention_request_slice(snapshot);
         if (slice.past_context < request.num_prefill_tokens()) {

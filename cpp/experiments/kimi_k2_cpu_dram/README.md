@@ -31,9 +31,8 @@ The frozen topology in `configs/base_pdd.json` is sequential online PDD:
 | DECODE | 16 | 1 | 4 | 4 | 1 | 4 | 1 | 16 |
 
 It uses `moonshotai/Kimi-K2-Instruct`, analytical `gb300`, FP8 KV, balanced
-MoE routing, `first_layer_scaled`, actual-GPU-cache-aware PREFILL routing,
-vLLM-like least-outstanding DECODE routing, and
-`enable_parallel_clusters=false`. PREFILL retains session affinity while its
+MoE routing, `first_layer_scaled`, actual-GPU-cache-aware PREFILL routing, and
+vLLM-like least-outstanding DECODE routing. PREFILL retains session affinity while its
 actual GPU-prefix hit ratio is at least 0.5 and the target loads are balanced.
 It switches to the least-loaded target when both the absolute load gap exceeds
 32 and the relative gap exceeds 1.1, or when the GPU hit ratio is below 0.5.

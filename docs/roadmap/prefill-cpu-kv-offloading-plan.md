@@ -653,7 +653,7 @@ Validation:
 - CPU offloading requires a supported vLLM V1 prefill scheduler; and
 - CPU offloading rejects Thinking Mode until export barriers and GPU
   allocations are scoped by request execution epoch; and
-- CPU offloading fails fast for guarded or parallel-cluster paths.
+- CPU offloading fails fast for guarded paths.
 
 Illustrative CLI:
 
@@ -938,8 +938,8 @@ Changes:
 - Negative latency is rejected.
 - Non-session key mode is rejected.
 - Non-sticky multi-target routing is rejected.
-- `sticky_lor`, parallel PDD, co-location MVP opt-in, and guarded AFD paths fail
-  with focused errors.
+- `sticky_lor`, co-location MVP opt-in, and guarded AFD paths fail with focused
+  errors.
 
 ### CPU manager unit tests
 

@@ -55,12 +55,6 @@ class ReplicaStageScheduler {
     execution_time_predictor::ExecutionTimePrediction
     predict(const entities::Batch &batch,
             const entities::RequestCollection &requests) const;
-    // Collapsed PP calendars predict a stage before claiming a stage-local
-    // active ticket.  Exact mode never calls this method.
-    [[nodiscard]]
-    execution_time_predictor::ExecutionTimePrediction
-    predict_collapsed(const entities::Batch &batch,
-                      const entities::RequestCollection &requests) const;
     [[nodiscard]] bool supports_lazy_moe_prediction() const noexcept;
     [[nodiscard]] execution_time_predictor::ExecutionTimePrediction
     prepare_moe_stage(const entities::Batch &batch,
@@ -74,16 +68,6 @@ class ReplicaStageScheduler {
         const execution_time_predictor::MoEGroupLayerInput &input) const;
     void on_stage_end(BatchId batch_id);
 
-    // Optional half-open interval calendar used only by the opt-in collapsed
-    // PP event path.  The exact queue/active state machine does not call these
-    // methods and therefore retains its existing behavior.
-    [[nodiscard]] SimTime collapsed_start_time(SimTime requested,
-                                               double duration_ms);
-    void reserve_collapsed_interval(BatchId batch_id, SimTime start,
-                                    SimTime end);
-    void release_collapsed_stage_if_due(SimTime time);
-    void release_collapsed_reservation(BatchId batch_id);
-
     [[nodiscard]] ReplicaId replica_id() const noexcept { return replica_id_; }
     [[nodiscard]] DataParallelId dp_id() const noexcept { return dp_id_; }
     [[nodiscard]] StageId stage_id() const noexcept { return stage_id_; }
@@ -94,14 +78,6 @@ class ReplicaStageScheduler {
     [[nodiscard]] bool empty() const noexcept { return queue_.empty(); }
 
   private:
-    struct CollapsedReservation {
-        BatchId batch_id;
-        SimTime start;
-        SimTime end;
-    };
-
-    void prune_collapsed_reservations(SimTime time);
-
     ReplicaId replica_id_;
     DataParallelId dp_id_;
     StageId stage_id_;
@@ -111,11 +87,8 @@ class ReplicaStageScheduler {
                         StageBatchTicketPriority>
         queue_;
     std::unordered_set<BatchId, StrongIdHash<BatchId>> queued_batch_ids_;
-    std::vector<CollapsedReservation> collapsed_reservations_;
     std::uint64_t next_insertion_order_ = 0;
     BatchId active_batch_id_;
-    BatchId collapsed_stage_batch_id_;
-    SimTime collapsed_stage_release_at_;
 };
 
 } // namespace frontier::scheduler

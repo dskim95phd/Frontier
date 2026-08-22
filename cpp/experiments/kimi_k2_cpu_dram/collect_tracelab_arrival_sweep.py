@@ -380,7 +380,6 @@ def _flatten_config(config: Mapping[str, Any], row: dict[str, Any]) -> None:
         "schema_version",
         "simulation_mode",
         "system_architecture",
-        "enable_parallel_clusters",
         "model",
     ):
         if key in config:

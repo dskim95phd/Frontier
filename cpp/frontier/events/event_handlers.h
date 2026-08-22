@@ -22,8 +22,6 @@ void handle_event(const ReplicaStageSchedulePayload &payload, SimTime time,
                   simulator::Simulator &simulator);
 void handle_event(const BatchStageEndPayload &payload, SimTime time,
                   simulator::Simulator &simulator);
-void handle_event(const BatchPipelineEndPayload &payload, SimTime time,
-                  simulator::Simulator &simulator);
 void handle_event(const ClusterBatchEndPayload &payload, SimTime time,
                   simulator::Simulator &simulator);
 void handle_event(const GlobalBatchEndPayload &payload, SimTime time,

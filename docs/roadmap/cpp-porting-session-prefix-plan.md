@@ -65,7 +65,7 @@ is observable; large logical KV ranges remain compact counts.
 - Profile-trained execution-time predictors, predictor training, and runtime
   profiling. Profiling remains Python-only.
 - Other replica schedulers (SGLang, Sarathi, Orca, SJ2Q, etc.), other
-  communication backends, parallel-cluster execution, and W&B/plot export.
+  communication backends, and W&B/plot export.
 - `prefix_caching_key_mode=block_hash` and explicit request
   `block_hash_ids`. The C++ MVP supports only session-derived prefix keys.
 
@@ -236,9 +236,7 @@ sequential PDD:
           -> request completion
 ```
 
-Do not reproduce `ClusterSimulator` threads or Python's parallel-cluster
-control path. Public PDD already requires sequential execution, so a single
-queue both matches the release contract and removes synchronization overhead.
+PDD uses the same single deterministic event queue as co-location.
 
 ## Implementation Milestones
 

@@ -556,10 +556,8 @@ then always equalled the snapshot's offset. Once a prefill pipelines its chunks
 (section 12.2), it stops being true: `num_processed_tokens` only advances as
 chunks *retire*, so a chunk issued at offset 8 reads 0, then 4, then 8 as its
 predecessors land -- possibly after it has already left the pipeline. The live
-read therefore understated attention, and it made a stage's predicted work
-depend on when that stage happened to run, which is what made `collapsed` and
-`exact` disagree: collapsed predicts every stage at stage-zero entry, the
-earliest and lowest reading.
+read therefore understated attention and made a stage's predicted work depend
+on when that stage happened to run.
 
 The scheduler advances the optimistic frontier (`advance_scheduler_frontier`,
 vLLM V1's `_update_after_schedule`) *before* it snapshots a request, so the
@@ -576,14 +574,6 @@ prefill/decode split is derived from it instead of the live
 `snapshot.scheduler_frontier` rather than the lagging `snapshot.processed_tokens`
 so the chunk that finishes a prompt is still credited with sampling its first
 token.
-
-Nothing mutable is read, so the two pipeline event modes agree by construction.
-Measured on the K3 P24 / D(TP4 DCP4 DP8 EP32) tracelab workload at 0.50
-sessions/s, collapsed versus exact: requests, batches, batch stages, scheduler
-iterations, scheduled prefill tokens, all latency percentiles and
-`prefill_attention_token_pairs` are identical; PREFILL total predicted work
-differs by 4.6e-16 relative (one ulp of summation order); only the event count
-differs, 3,523,848 versus 4,828,827.
 
 Correcting the understatement raises PREFILL predicted work by 1.22% and leaves
 DECODE within 0.08%, as expected -- a decode step never holds more than one

@@ -201,7 +201,6 @@ struct SimulationConfig {
     std::string run_id;
     SimulationMode simulation_mode;
     SystemArchitecture system_architecture;
-    bool enable_parallel_clusters;
     PrefixCacheConfig prefix_cache;
     CpuKVCacheConfig cpu_kv_cache;
     ClusterSchedulerConfig cluster_scheduler;
@@ -216,13 +215,13 @@ struct SimulationConfig {
     friend bool operator==(const SimulationConfig &lhs,
                            const SimulationConfig &rhs) {
         return std::tie(lhs.schema_version, lhs.run_id, lhs.simulation_mode,
-                        lhs.system_architecture, lhs.enable_parallel_clusters,
-                        lhs.prefix_cache, lhs.cpu_kv_cache,
+                        lhs.system_architecture, lhs.prefix_cache,
+                        lhs.cpu_kv_cache,
                         lhs.cluster_scheduler, lhs.runtime,
                         lhs.prefill_only) ==
                std::tie(rhs.schema_version, rhs.run_id, rhs.simulation_mode,
-                        rhs.system_architecture, rhs.enable_parallel_clusters,
-                        rhs.prefix_cache, rhs.cpu_kv_cache,
+                        rhs.system_architecture, rhs.prefix_cache,
+                        rhs.cpu_kv_cache,
                         rhs.cluster_scheduler, rhs.runtime,
                         rhs.prefill_only);
     }

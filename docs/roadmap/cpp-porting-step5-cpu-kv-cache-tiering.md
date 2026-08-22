@@ -157,7 +157,6 @@ CPU KV-cache tiering is enabled only when all of the following are true:
 
 ```text
 system_architecture = pd-disaggregation
-enable_parallel_clusters = false
 cluster_scheduler.type = sticky_round_robin
 prefix_cache.enabled = true
 prefix_cache.key_mode = session
@@ -180,7 +179,6 @@ The feature remains disabled by default.
 ### Explicitly excluded
 
 - co-location CPU KV-cache tiering;
-- parallel PDD clusters;
 - decode-to-CPU offload;
 - decode-to-PREFILL KV return;
 - decode-created KV reuse before a later PREFILL recomputes it;

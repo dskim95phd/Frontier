@@ -38,7 +38,6 @@ std::string read_file(const std::string &path) {
 }
 
 struct BenchmarkResult {
-    std::string pipeline_event_mode;
     std::uint64_t pp = 0;
     double wall_clock_ms = 0.0;
     std::uint64_t events = 0;
@@ -52,7 +51,6 @@ struct BenchmarkResult {
 };
 
 frontier::config::SimulationConfig make_config(std::uint64_t pp,
-                                               std::string event_mode,
                                                const std::string &fixture) {
     Json root = Json::parse(fixture);
     Json &cluster = root.at("clusters").at("monolithic");
@@ -60,7 +58,6 @@ frontier::config::SimulationConfig make_config(std::uint64_t pp,
     // Keep a loaded DP pipeline while varying only PP.
     cluster.at("parallelism").at("data_parallel_size") = 2;
     cluster.at("scheduler").erase("num_blocks");
-    cluster.at("scheduler")["pipeline_event_mode"] = event_mode;
     cluster.at("execution_model")["moe_layer_event_mode"] =
         "stage_group_scaled";
     // The benchmark deliberately supplies HBM capacity and lets the resolver
@@ -74,9 +71,9 @@ frontier::config::SimulationConfig make_config(std::uint64_t pp,
 }
 
 BenchmarkResult run_once(
-    std::uint64_t pp, std::string event_mode, const std::string &fixture,
+    std::uint64_t pp, const std::string &fixture,
     const std::vector<frontier::request_generator::WorkloadRequest> &workload) {
-    auto config = make_config(pp, event_mode, fixture);
+    auto config = make_config(pp, fixture);
     frontier::simulator::Simulator simulator(config, workload);
     const auto start = std::chrono::steady_clock::now();
     const frontier::metrics::SimulationOutput output = simulator.run();
@@ -109,7 +106,6 @@ BenchmarkResult run_once(
     const double wall_clock_ms =
         std::chrono::duration<double, std::milli>(end - start).count();
     return BenchmarkResult{
-        std::move(event_mode),
         pp,
         wall_clock_ms,
         output.aggregate.event_count,
@@ -124,7 +120,7 @@ BenchmarkResult run_once(
 }
 
 void print_result(const BenchmarkResult &result) {
-    std::cout << "mode=" << result.pipeline_event_mode << " pp=" << result.pp
+    std::cout << "pp=" << result.pp
               << " wall_clock_ms=" << std::fixed << std::setprecision(3)
               << result.wall_clock_ms << " events=" << result.events
               << " batch_stages=" << result.batch_stages
@@ -166,20 +162,17 @@ int main(int argc, char **argv) {
 
         std::cout << "# PP stage-group benchmark (iterations=" << iterations
                   << ")\n";
-        for (const std::string event_mode : {"exact", "collapsed"}) {
-            for (const std::uint64_t pp : {1ULL, 4ULL, 24ULL}) {
-                BenchmarkResult selected{};
-                for (std::uint64_t iteration = 0; iteration < iterations;
-                     ++iteration) {
-                    const BenchmarkResult result =
-                        run_once(pp, event_mode, fixture, workload);
-                    // Report the last sample for deterministic machine
-                    // parsing; callers can request multiple iterations to
-                    // inspect noise.
-                    selected = result;
-                }
-                print_result(selected);
+        for (const std::uint64_t pp : {1ULL, 4ULL, 24ULL}) {
+            BenchmarkResult selected{};
+            for (std::uint64_t iteration = 0; iteration < iterations;
+                 ++iteration) {
+                const BenchmarkResult result =
+                    run_once(pp, fixture, workload);
+                // Report the last sample for deterministic machine parsing;
+                // callers can request multiple iterations to inspect noise.
+                selected = result;
             }
+            print_result(selected);
         }
         return 0;
     } catch (const std::exception &error) {

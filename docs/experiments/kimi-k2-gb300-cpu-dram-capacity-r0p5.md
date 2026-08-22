@@ -75,7 +75,6 @@ context 중복량이다. 실제 CPU-OFF 실행에서는 GPU cache가 약 53%를 
 | --- | --- |
 | Simulation mode | `online` |
 | System architecture | `pd-disaggregation` |
-| Parallel cluster execution | 비활성화, sequential PDD |
 | PREFILL cluster | 16 × GB300 |
 | DECODE cluster | 16 × GB300 |
 | Replica | cluster당 1개 |
@@ -97,8 +96,6 @@ MoE TP × EP       = 1 × 16 = 16
 ```
 
 PREFILL과 DECODE는 별도의 16-GPU cluster이므로 총 32 GPU를 모델링한다.
-parallel cluster execution은 사용하지 않았으며 PREFILL cluster simulation 뒤에
-DECODE cluster simulation을 수행하는 공개 C++ sequential PDD 경로를 사용했다.
 
 ### 3.2 Scheduler 설정
 

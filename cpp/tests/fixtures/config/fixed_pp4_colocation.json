@@ -3,7 +3,6 @@
   "run_id": "fixed-pp4-colocation",
   "simulation_mode": "offline",
   "system_architecture": "co-location",
-  "enable_parallel_clusters": false,
   "cluster_scheduler": {
     "type": "round_robin"
   },

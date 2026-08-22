@@ -3,7 +3,6 @@
   "run_id": "example-cpu-kv-cache-pdd-online",
   "simulation_mode": "online",
   "system_architecture": "pd-disaggregation",
-  "enable_parallel_clusters": false,
   "prefix_cache": {"enabled": true, "key_mode": "session"},
   "cpu_kv_cache": {
     "enabled": true,

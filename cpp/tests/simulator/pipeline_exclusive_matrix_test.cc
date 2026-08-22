@@ -1,6 +1,5 @@
 #include "frontier/config/config.h"
 #include "frontier/core/event.h"
-#include "frontier/metrics/output_contract.h"
 #include "frontier/request_generator/workload.h"
 #include "frontier/simulator/simulator.h"
 #include "tests/test_support.h"
@@ -16,8 +15,6 @@
 #include <tuple>
 #include <utility>
 #include <vector>
-
-#include <nlohmann/json.hpp>
 
 #ifndef FRONTIER_EXAMPLE_DIR
 #error "FRONTIER_EXAMPLE_DIR must be defined for pipeline-exclusive tests"
@@ -38,7 +35,6 @@ using frontier::simulator::run_simulation;
 using frontier::test::expect;
 using frontier::test::expect_throws;
 using frontier::test::read_text_file;
-using Json = nlohmann::json;
 
 const std::filesystem::path kExampleRoot{FRONTIER_EXAMPLE_DIR};
 
@@ -63,7 +59,6 @@ void replace_all(std::string &text, std::string_view from,
 }
 
 SimulationConfig make_k3_config(ExecutionFlavor flavor, Topology topology,
-                                std::string_view pipeline_event_mode,
                                 std::uint64_t batch_size_cap = 2) {
     // Parse the checked-in example first so model loading and all ordinary
     // scheduler defaults remain covered by the public configuration path.
@@ -87,7 +82,6 @@ SimulationConfig make_k3_config(ExecutionFlavor flavor, Topology topology,
     cluster.scheduler.batch_size_cap = batch_size_cap;
     cluster.scheduler.max_tokens_in_batch = 256;
     cluster.scheduler.enable_chunked_prefill = true;
-    cluster.scheduler.pipeline_event_mode = std::string{pipeline_event_mode};
     cluster.scheduler.num_blocks = 50'000;
     cluster.scheduler.block_size = 16;
 
@@ -232,39 +226,6 @@ void expect_stage_serialization(const SimulationOutput &output) {
     }
 }
 
-Json sorted_stage_json(const SimulationOutput &output) {
-    const Json root = Json::parse(
-        frontier::metrics::serialize_simulation_output_json(output));
-    Json stages = root.at("batch_stages");
-    std::sort(stages.begin(), stages.end(),
-              [](const Json &left, const Json &right) {
-                  if (left.at("batch_id") != right.at("batch_id")) {
-                      return left.at("batch_id") < right.at("batch_id");
-                  }
-                  return left.at("stage_id") < right.at("stage_id");
-              });
-    return stages;
-}
-
-void expect_exact_collapsed_parity(const SimulationOutput &exact,
-                                   const SimulationOutput &collapsed) {
-    const Json exact_json =
-        Json::parse(frontier::metrics::serialize_simulation_output_json(exact));
-    const Json collapsed_json = Json::parse(
-        frontier::metrics::serialize_simulation_output_json(collapsed));
-    expect(exact_json.at("requests") == collapsed_json.at("requests") &&
-               exact_json.at("batches") == collapsed_json.at("batches"),
-           "collapsed K3 PP must preserve requests and batches exactly");
-    expect(sorted_stage_json(exact) == sorted_stage_json(collapsed),
-           "collapsed K3 PP must preserve every stage timestamp and duration");
-    expect(count_events(collapsed, EventType::kBatchPipelineEnd) ==
-                   collapsed.batches.size() &&
-               count_events(collapsed, EventType::kBatchStageEnd) == 0 &&
-               collapsed.aggregate.event_count < exact.aggregate.event_count &&
-               count_events(exact, EventType::kBatchStageEnd) > 0,
-           "collapsed K3 PP must reduce intermediate stage events");
-}
-
 const std::string kPrefillHeavy =
     "session_start_at,think_time,num_prefill_tokens,num_decode_tokens\n"
     "0,0,96,1\n";
@@ -281,22 +242,6 @@ const std::string kStaggered =
     "0,0,32,3\n"
     "0.0001,0,12,5\n"
     "0.0002,0,8,4\n";
-// Enough staggered arrivals, and enough spread in prefill length, that the
-// pipeline holds three or more batches with visibly different stage durations
-// at the same time.  That combination is what lets a stage's reservation list
-// develop an interior hole, so it is the workload the collapsed calendar has
-// to be checked against; the smaller fixtures above never produce one.
-const std::string kPipelined =
-    "session_start_at,think_time,num_prefill_tokens,num_decode_tokens\n"
-    "0,0,32,8\n"
-    "0.002,0,64,16\n"
-    "0.003,0,48,12\n"
-    "0.006,0,96,8\n"
-    "0.008,0,40,20\n"
-    "0.011,0,80,12\n"
-    "0.014,0,24,8\n"
-    "0.018,0,128,16\n";
-
 void test_k3_pipeline_exclusive_topology_matrix() {
     // Keep this a release smoke matrix rather than a Cartesian explosion.
     // These five pairwise points cover TP1/2/4/8, PP2/3/4/8/24, an uneven
@@ -305,7 +250,7 @@ void test_k3_pipeline_exclusive_topology_matrix() {
         {1, 2, 1}, {2, 3, 1}, {4, 4, 1}, {8, 8, 1}, {8, 24, 8}};
     for (const Topology topology : topologies) {
         const auto config =
-            make_k3_config(ExecutionFlavor::kAnalytical, topology, "collapsed");
+            make_k3_config(ExecutionFlavor::kAnalytical, topology);
         const SimulationOutput output =
             run_simulation(config, workload(kPrefillHeavy));
         expect_all_stages_visited(output, topology);
@@ -345,8 +290,8 @@ void test_k3_fixed_and_analytical_workload_matrix() {
         };
     for (const auto &[name, csv, flavor, topology] : cases) {
         static_cast<void>(name);
-        const auto config = make_k3_config(flavor, topology, "exact",
-                                           /*batch_size_cap=*/1);
+        const auto config =
+            make_k3_config(flavor, topology, /*batch_size_cap=*/1);
         const SimulationOutput output = run_simulation(config, workload(csv));
         expect_all_stages_visited(output, topology);
         expect_stage_serialization(output);
@@ -355,51 +300,9 @@ void test_k3_fixed_and_analytical_workload_matrix() {
     }
 }
 
-void test_k3_exact_collapsed_parity_and_event_reduction() {
-    // PP3/PP8/PP24 cover exact uneven partitions and the DCP-sharded endpoint.
-    // Analytical stage_group_scaled is the path that benefits from collapsed
-    // event reduction; fixed timing is covered by the exact workload matrix.
-    //
-    // The batch size cap is varied deliberately.  A cap of one keeps a single
-    // batch in the pipeline, where the collapsed calendar holds at most one
-    // reservation per stage and can never disagree with the exact chain.  The
-    // larger caps put three or more batches in flight simultaneously, which is
-    // the only regime that exercises how the calendar orders competing batches
-    // on one stage; parity there is the property that actually needs guarding.
-    struct Case {
-        Topology topology;
-        std::uint64_t batch_size_cap;
-        const std::string &csv;
-    };
-    const std::vector<Case> cases{
-        {{2, 3, 1}, 1, kConcurrent},  {{4, 8, 4}, 1, kConcurrent},
-        {{8, 24, 8}, 1, kConcurrent}, {{2, 3, 1}, 4, kPipelined},
-        {{4, 8, 4}, 4, kPipelined},   {{4, 8, 4}, 16, kPipelined},
-        {{8, 24, 8}, 8, kPipelined},
-    };
-    for (const auto &[topology, batch_size_cap, csv] : cases) {
-        const auto exact_config = make_k3_config(
-            ExecutionFlavor::kAnalytical, topology, "exact", batch_size_cap);
-        auto collapsed_config = exact_config;
-        collapsed_config.cluster().scheduler.pipeline_event_mode = "collapsed";
-        const auto requests = workload(csv);
-        const SimulationOutput exact = run_simulation(exact_config, requests);
-        const SimulationOutput collapsed =
-            run_simulation(collapsed_config, requests);
-        expect_all_stages_visited(exact, topology);
-        expect_all_stages_visited(collapsed, topology);
-        expect_stage_serialization(exact);
-        expect_stage_serialization(collapsed);
-        expect_no_moe_sync_events(exact);
-        expect_no_moe_sync_events(collapsed);
-        expect_exact_collapsed_parity(exact, collapsed);
-    }
-}
-
 void test_k3_pipeline_exclusive_rejects_invalid_matrix_points() {
     const Topology topology{4, 4, 1};
-    const auto valid =
-        make_k3_config(ExecutionFlavor::kFixed, topology, "exact");
+    const auto valid = make_k3_config(ExecutionFlavor::kFixed, topology);
     {
         auto invalid = valid;
         invalid.cluster().parallelism.data_parallel_size = 2;
@@ -434,9 +337,6 @@ int main() {
     failures += frontier::test::run(
         "K3 pipeline-exclusive fixed/analytical workload matrix",
         test_k3_fixed_and_analytical_workload_matrix);
-    failures +=
-        frontier::test::run("K3 exact/collapsed parity and event reduction",
-                            test_k3_exact_collapsed_parity_and_event_reduction);
     failures += frontier::test::run(
         "K3 pipeline-exclusive invalid matrix points",
         test_k3_pipeline_exclusive_rejects_invalid_matrix_points);

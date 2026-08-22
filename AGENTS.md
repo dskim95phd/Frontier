@@ -23,8 +23,7 @@ The C++ core began as a port of the Python simulator. That port is complete,
 and the C++ surface has since moved ahead of it. Features that exist only in
 C++ include Kimi K3 / KDA support, MLA with decode context parallelism,
 tiered CPU KV-cache offload, MXFP4/MXFP8 operator precisions, automatic KV
-block sizing from physical HBM, the collapsed pipeline-parallel event
-calendar, and the pipeline-exclusive topology contract.
+block sizing from physical HBM, and the pipeline-exclusive topology contract.
 
 Because the port goal is met, **do not add code to the C++ core whose only
 purpose is to reproduce Python behavior.** Match Python only where its
@@ -53,8 +52,7 @@ SGLang-style replica scheduler, and Thinking Mode.
 - Caching: session prefix caching, and finite CPU KV-cache offload/restore
   for sequential PDD.
 
-Not implemented in C++: `pd-af-disaggregation`, parallel PDD clusters
-(`enable_parallel_clusters` must be `false`), and block-hash prefix caching.
+Not implemented in C++: `pd-af-disaggregation` and block-hash prefix caching.
 
 ### Build and test
 
@@ -187,9 +185,8 @@ Configuration is nested dataclasses (`frontier/config/config.py`) flattened
 into a large `--<field>` CLI surface, so the reliable workflow is to start
 from a script in `examples/` and change only what you need. The example
 suites default to `--cc_backend_config_type analytical` and do not require
-the optional `collective_sim` submodule; sequential PDD additionally
-requires `--no-enable_parallel_clusters`. `pd-af-disaggregation` fails fast
-with the guarded disaggregation error.
+the optional `collective_sim` submodule. `pd-af-disaggregation` fails fast with
+the guarded disaggregation error.
 
 Metrics land under `outputs/metrics/<model_type>/<workload_type>/<run_id>/`
 as `request_metrics.csv` and `system_metrics.json`. Latency fields are in

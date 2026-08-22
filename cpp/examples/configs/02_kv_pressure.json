@@ -3,7 +3,6 @@
   "run_id": "example-kv-pressure",
   "simulation_mode": "offline",
   "system_architecture": "co-location",
-  "enable_parallel_clusters": false,
   "prefix_cache": {"enabled": false, "key_mode": "session"},
   "cluster_scheduler": {"type": "round_robin"},
   "clusters": {

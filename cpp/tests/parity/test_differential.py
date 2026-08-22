@@ -811,10 +811,6 @@ def test_config_acceptance_and_normalization_match(
     [
         ("config_unknown_field", {"unexpected": 1}),
         (
-            "config_parallel_clusters",
-            {"enable_parallel_clusters": True},
-        ),
-        (
             "config_block_hash",
             {"prefix_cache": {"enabled": True, "key_mode": "block_hash"}},
         ),

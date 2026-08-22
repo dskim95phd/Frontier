@@ -290,7 +290,6 @@ def build_config(
     config["schema_version"] = 2
     config["simulation_mode"] = "online"
     config["system_architecture"] = "pd-disaggregation"
-    config.pop("enable_parallel_clusters", None)
     config["model"] = "moonshotai/Kimi-K2-Instruct"
     config["prefix_cache"] = {"enabled": True, "key_mode": "session"}
     config["cluster_scheduler"] = {
@@ -479,7 +478,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         "requires_full_trace": False,
         "topology": {
             "system_architecture": "pd-disaggregation",
-            "enable_parallel_clusters": False,
             "prefill_gpus": 16,
             "decode_gpus": 16,
             "attention_tensor_parallel": 4,

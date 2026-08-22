@@ -86,8 +86,6 @@ def _read_config(path: Path) -> dict[str, Any]:
         raise Step3OracleError("schema_version=1 is required")
     if config.get("system_architecture") != "pd-disaggregation":
         raise Step3OracleError("pd-disaggregation is required")
-    if config.get("enable_parallel_clusters") is not False:
-        raise Step3OracleError("parallel clusters must remain disabled")
     return config
 
 

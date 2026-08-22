@@ -652,20 +652,6 @@ struct SchedulerConfig {
     std::uint64_t num_blocks = 1;
     double watermark_blocks_fraction = 0.0;
     std::uint64_t num_preallocate_tokens = 0;
-    // Controls how pipeline-stage causality is represented in the DES.
-    // "exact" retains one arrival/schedule/end chain per stage;
-    // "collapsed" fuses safe pipeline transitions while preserving the
-    // stage-local resource calendar. Unsupported synchronized paths fall
-    // back to the exact chain.
-    //
-    // The two modes produce identical timings and identical request and batch
-    // records; only the event count differs. That holds because the analytical
-    // model derives a batch's attention inputs entirely from the batch's own
-    // RequestBatchSnapshot, so a stage's predicted work does not depend on when
-    // the stage runs. Collapsed mode predicts every stage at stage-zero entry
-    // and therefore relies on exactly that property; see
-    // docs/design/kimi-k3-support.md 12.3 for the divergence this replaced.
-    std::string pipeline_event_mode = "exact";
     // Derived per-session KDA recurrent-state footprint, expressed in GPU
     // scheduler blocks.  It is populated by memory resolution and omitted
     // from user-authored JSON unless a caller explicitly normalizes it.
@@ -678,14 +664,14 @@ struct SchedulerConfig {
                         lhs.enable_chunked_prefill,
                         lhs.long_prefill_token_threshold, lhs.block_size,
                         lhs.num_blocks, lhs.watermark_blocks_fraction,
-                        lhs.num_preallocate_tokens, lhs.pipeline_event_mode,
+                        lhs.num_preallocate_tokens,
                         lhs.kda_snapshot_blocks_per_session) ==
                std::tie(rhs.type, rhs.scheduling_policy, rhs.batch_size_cap,
                         rhs.max_tokens_in_batch, rhs.enable_preemption,
                         rhs.enable_chunked_prefill,
                         rhs.long_prefill_token_threshold, rhs.block_size,
                         rhs.num_blocks, rhs.watermark_blocks_fraction,
-                        rhs.num_preallocate_tokens, rhs.pipeline_event_mode,
+                        rhs.num_preallocate_tokens,
                         rhs.kda_snapshot_blocks_per_session);
     }
 };

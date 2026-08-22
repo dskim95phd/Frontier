@@ -47,10 +47,6 @@ void validate_inputs(
             "PREFILL-only decode_tokens_per_second must be finite and "
             "positive");
     }
-    if (config.enable_parallel_clusters) {
-        throw SimulationError(
-            "scheduler runtime requires sequential cluster execution");
-    }
     if ((!is_pdd && !std::holds_alternative<config::ClusterRuntimeConfig>(
                         config.runtime)) ||
         (is_pdd &&

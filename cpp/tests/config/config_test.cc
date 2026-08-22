@@ -139,25 +139,6 @@ void test_colocation_contract_round_trip() {
                serialize_simulation_config_json(config)) == config,
            "co-location config must round-trip deterministically");
 
-    config.cluster().scheduler.pipeline_event_mode = "collapsed";
-    const auto collapsed =
-        parse_simulation_config_json(serialize_simulation_config_json(config));
-    expect(collapsed.cluster().scheduler.pipeline_event_mode == "collapsed" &&
-               collapsed == config,
-           "collapsed pipeline event mode must round-trip");
-
-    std::string invalid = serialize_simulation_config_json(config);
-    const std::string valid_mode = "\"pipeline_event_mode\": \"collapsed\"";
-    const auto position = invalid.find(valid_mode);
-    expect(position != std::string::npos,
-           "serialized scheduler must expose pipeline_event_mode");
-    invalid.replace(position, valid_mode.size(),
-                    "\"pipeline_event_mode\": \"invalid\"");
-    expect_throws<ConfigError>(
-        [&invalid] {
-            static_cast<void>(parse_simulation_config_json(invalid));
-        },
-        "invalid pipeline event mode must fail fast");
 }
 
 void test_moe_routing_layer_scope_contract() {
@@ -915,7 +896,6 @@ void test_legacy_schemas_and_shapes_are_rejected() {
     "run_id": "legacy",
     "simulation_mode": "offline",
     "system_architecture": "co-location",
-    "enable_parallel_clusters": false,
     "prefix_cache": {"enabled": false, "key_mode": "session"}
   })json";
     expect_throws<ConfigError>(
@@ -926,12 +906,6 @@ void test_legacy_schemas_and_shapes_are_rejected() {
 }
 
 void test_invalid_surfaces_are_rejected() {
-    auto pdd = load("fixed_sequential_pdd.json");
-    pdd.enable_parallel_clusters = true;
-    expect_throws<ConfigError>(
-        [&pdd] { static_cast<void>(serialize_simulation_config_json(pdd)); },
-        "parallel PDD clusters must be rejected");
-
     auto colocation = load("fixed_parallel_colocation.json");
     colocation.prefix_cache.enabled = true;
     colocation.cluster_scheduler.type =

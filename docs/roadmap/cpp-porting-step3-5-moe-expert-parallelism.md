@@ -228,7 +228,7 @@ details are non-obvious:
 ### Included
 
 - `co-location`;
-- sequential `pd-disaggregation` with `enable_parallel_clusters=false`;
+- sequential `pd-disaggregation`;
 - offline and online simulation modes;
 - `Phi-tiny-MoE-instruct` as the reference MoE model:
   - 32 transformer layers,
@@ -266,7 +266,6 @@ details are non-obvious:
 
 - `pd-af-disaggregation`, `DECODE_ATTN`, and `DECODE_FFN`;
 - `EPBatchGroup`, M2N transfer, and AFD-specific expert regrouping;
-- parallel cluster threads;
 - profile-trained sklearn execution predictors;
 - collective-sim and ASTRA-Sim integration;
 - mixed dense/MoE-layer models;
@@ -361,7 +360,6 @@ Reject a configuration before constructing runtime state when:
 - a routing mode or distribution is unknown;
 - the fixed per-lane timing vector does not match the required lane domain;
 - PDD PREFILL and DECODE model/expert contracts differ;
-- parallel PDD is selected; or
 - any explicitly deferred model/runtime capability is requested.
 
 All integer parsing must retain the existing checked-range behavior before

@@ -136,7 +136,6 @@ This change will not:
 - make PDD transfers reserve decode GPU memory;
 - implement a general vLLM scheduler liveness redesign;
 - solve same-session generation races that are independent of GPU reservation;
-- enable parallel PDD clusters; or
 - change the release-supported architecture and scheduler matrix.
 
 ## Required Scheduler Invariants

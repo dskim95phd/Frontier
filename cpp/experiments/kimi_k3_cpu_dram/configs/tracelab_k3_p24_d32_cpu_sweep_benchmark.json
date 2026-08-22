@@ -1,20 +1,17 @@
 {
   "schema_version": 2,
-  "run_id": "kimi-k3-tracelab-p24-d64-prefill-only-exact-cpu-per-gpu",
+  "run_id": "kimi-k3-tracelab-p24-d32-cpu-sweep-benchmark-template",
   "simulation_mode": "online",
   "system_architecture": "pd-disaggregation",
-  "prefill_only": {
-    "decode_tokens_per_second": 50.0
-  },
   "prefix_cache": {
     "enabled": true,
     "key_mode": "session"
   },
   "cpu_kv_cache": {
     "enabled": true,
-    "capacity_bytes": 6000000000000,
+    "capacity_bytes": 24000000000000,
     "static_slice_per_gpu": true,
-    "capacity_bytes_per_gpu": 250000000000,
+    "capacity_bytes_per_gpu": 1000000000000,
     "dram_bandwidth_gbps_per_gpu": 4800.0,
     "c2c_bandwidth_gbps_per_gpu": 7200.0,
     "write_bandwidth_gbps": 9600.0,
@@ -57,8 +54,7 @@
         "long_prefill_token_threshold": 512,
         "block_size": 16,
         "watermark_blocks_fraction": 0.0,
-        "num_preallocate_tokens": 0,
-        "pipeline_event_mode": "exact"
+        "num_preallocate_tokens": 0
       },
       "execution_model": {
         "type": "analytical",
@@ -93,8 +89,7 @@
         "long_prefill_token_threshold": 0,
         "block_size": 16,
         "watermark_blocks_fraction": 0.0,
-        "num_preallocate_tokens": 0,
-        "pipeline_event_mode": "exact"
+        "num_preallocate_tokens": 0
       },
       "execution_model": {
         "type": "analytical",

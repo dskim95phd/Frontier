@@ -174,7 +174,6 @@ num_replicas x data_parallel_size
 ### Excluded
 
 - PDD and every AFD surface;
-- parallel-cluster threads or multiple cluster event queues;
 - MoE, EP, expert imbalance, idle synchronization batches, and MoE DP
   collectives;
 - prefix caching, sticky routing, block hashes, and CPU KV-cache tiering;
@@ -203,7 +202,6 @@ Schema v3 adds one source of truth for topology:
   "run_id": "step2-5-dense-parallel",
   "simulation_mode": "offline",
   "system_architecture": "co-location",
-  "enable_parallel_clusters": false,
   "parallelism": {
     "num_replicas": 1,
     "tensor_parallel_size": 8,
@@ -268,8 +266,6 @@ Validation:
 - `num_replicas * DP * PP * TP` fits the supported single Rubin NVL72 domain;
 - scheduler and KV capacity values apply independently to every
   `(replica_id, dp_id)` target;
-- `enable_parallel_clusters` remains false because model parallelism is not
-  Python's parallel-cluster execution mode;
 - prefix caching remains disabled; and
 - unsupported models, placements, policies, and feature combinations fail
   before simulator construction.

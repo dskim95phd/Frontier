@@ -16,7 +16,7 @@ TTFT 효과를 제한한다.
 ## 실행 구성
 
 - Model/device: `moonshotai/Kimi-K2-Instruct`, GB300 analytical model
-- Architecture: sequential online PDD, parallel clusters disabled
+- Architecture: sequential online PDD
 - PREFILL/DECODE: 각각 16 GPUs, 1 replica, TP4/PP1/DP4/MoE-TP1/EP16
 - KV: FP8 MLA, 각 attention TP가 전체 KV 저장
 - Decode KV 반환: 없음

@@ -148,7 +148,6 @@ struct CommonConfigFields {
     std::string run_id;
     SimulationMode simulation_mode;
     SystemArchitecture system_architecture;
-    bool enable_parallel_clusters;
     PrefixCacheConfig prefix_cache;
     CpuKVCacheConfig cpu_kv_cache;
 };
@@ -172,12 +171,6 @@ CommonConfigFields parse_common_fields(const Json &root) {
     if (run_id.empty() || is_blank(run_id)) {
         throw ConfigError("config.run_id must not be empty");
     }
-    const bool enable_parallel_clusters =
-        require_bool(root, "enable_parallel_clusters", "config");
-    if (enable_parallel_clusters) {
-        throw ConfigError(
-            "config.enable_parallel_clusters=true is outside the C++ port");
-    }
     const SimulationMode simulation_mode = parse_simulation_mode(
         require_string(root, "simulation_mode", "config"));
     return [&]() {
@@ -187,7 +180,6 @@ CommonConfigFields parse_common_fields(const Json &root) {
         value.simulation_mode = simulation_mode;
         value.system_architecture = parse_system_architecture(
             require_string(root, "system_architecture", "config"));
-        value.enable_parallel_clusters = enable_parallel_clusters;
         value.prefix_cache = parse_prefix_cache(root);
         value.cpu_kv_cache = parse_cpu_kv_cache(root);
         return value;
@@ -215,7 +207,6 @@ SimulationConfig make_pdd_config(const Json &root, CommonConfigFields common) {
                      "run_id",
                      "simulation_mode",
                      "system_architecture",
-                     "enable_parallel_clusters",
                      "prefix_cache",
                      "cluster_scheduler",
                      "clusters",
@@ -263,7 +254,6 @@ SimulationConfig make_pdd_config(const Json &root, CommonConfigFields common) {
         value.run_id = std::move(common.run_id);
         value.simulation_mode = common.simulation_mode;
         value.system_architecture = common.system_architecture;
-        value.enable_parallel_clusters = common.enable_parallel_clusters;
         value.prefix_cache = common.prefix_cache;
         value.cpu_kv_cache = common.cpu_kv_cache;
         value.cluster_scheduler = parse_cluster_scheduler(root);
@@ -299,7 +289,6 @@ SimulationConfig make_single_cluster_config(const Json &root,
                      "run_id",
                      "simulation_mode",
                      "system_architecture",
-                     "enable_parallel_clusters",
                      "prefix_cache",
                      "cluster_scheduler",
                      "clusters",
@@ -322,7 +311,6 @@ SimulationConfig make_single_cluster_config(const Json &root,
         value.run_id = std::move(common.run_id);
         value.simulation_mode = common.simulation_mode;
         value.system_architecture = common.system_architecture;
-        value.enable_parallel_clusters = common.enable_parallel_clusters;
         value.prefix_cache = common.prefix_cache;
         value.cpu_kv_cache = common.cpu_kv_cache;
         value.cluster_scheduler = parse_cluster_scheduler(root);

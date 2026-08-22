@@ -23,10 +23,6 @@ void validate_common_for_serialization(const SimulationConfig &config) {
     if (config.run_id.empty() || is_blank(config.run_id)) {
         throw ConfigError("config.run_id must not be empty");
     }
-    if (config.enable_parallel_clusters) {
-        throw ConfigError(
-            "config.enable_parallel_clusters=true is outside the C++ port");
-    }
     if (config.prefill_only.has_value() &&
         config.system_architecture != SystemArchitecture::kPdDisaggregation) {
         throw ConfigError(
@@ -86,7 +82,6 @@ OrderedJson serialize_scheduler(const SchedulerConfig &scheduler) {
             scheduler.watermark_blocks_fraction,
         },
         {"num_preallocate_tokens", scheduler.num_preallocate_tokens},
-        {"pipeline_event_mode", scheduler.pipeline_event_mode},
     });
 }
 
@@ -320,7 +315,6 @@ std::string serialize_simulation_config_json(const SimulationConfig &config) {
     root["run_id"] = config.run_id;
     root["simulation_mode"] = to_string(config.simulation_mode);
     root["system_architecture"] = to_string(config.system_architecture);
-    root["enable_parallel_clusters"] = config.enable_parallel_clusters;
     root["prefix_cache"] = serialize_prefix_cache(config.prefix_cache);
     root["cpu_kv_cache"] = serialize_cpu_kv_cache(config.cpu_kv_cache);
     root["cluster_scheduler"] =

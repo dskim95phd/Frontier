@@ -23,8 +23,8 @@ Implemented behavior includes:
 - automatic KV block sizing from physical per-GPU HBM; and
 - strict JSON configuration and CSV workload contracts.
 
-Block-hash prefix caching, parallel PDD clusters, `pd-af-disaggregation`, and
-topology-aware communication backends remain outside the C++ surface.
+Block-hash prefix caching, `pd-af-disaggregation`, and topology-aware
+communication backends remain outside the C++ surface.
 
 ## Build
 
@@ -325,7 +325,6 @@ The standalone common top-level fields are:
   "run_id": "example",
   "simulation_mode": "online",
   "system_architecture": "co-location",
-  "enable_parallel_clusters": false,
   "prefix_cache": {
     "enabled": false,
     "key_mode": "session"
@@ -340,7 +339,6 @@ The standalone common top-level fields are:
 The fields shown above are required. The additional top-level `cpu_kv_cache`
 object may be omitted and then normalizes to the disabled default. Unknown
 fields and unsupported values are rejected.
-`enable_parallel_clusters` must currently be `false`.
 
 `cluster_scheduler.type` selects how requests are routed to a
 `(replica_id, dp_id)` target:
@@ -400,10 +398,9 @@ must use manual sizing because they do not carry a weight-precision contract.
 ### CPU KV-cache tiering
 
 CPU tiering is an opt-in sequential-PDD feature. It requires session prefix
-caching, `sticky_round_robin` or `cache_aware`, a PREFILL `vllm_v1` scheduler,
-and `enable_parallel_clusters=false`. Each PREFILL `(replica_id, dp_id)` target
-owns an independent finite store and one serialized queue per transfer
-direction; D2H and H2D may overlap.
+caching, `sticky_round_robin` or `cache_aware`, and a PREFILL `vllm_v1`
+scheduler. Each PREFILL `(replica_id, dp_id)` target owns an independent finite
+store and one serialized queue per transfer direction; D2H and H2D may overlap.
 
 Start from
 `cpp/examples/configs/06_cpu_kv_cache_pdd_online.json` or the matching offline
@@ -442,8 +439,7 @@ Co-location has exactly one `monolithic` cluster:
         "block_size": 4,
         "num_blocks": 16,
         "watermark_blocks_fraction": 0.0,
-        "num_preallocate_tokens": 0,
-        "pipeline_event_mode": "exact"
+        "num_preallocate_tokens": 0
       },
       "gpu_memory": {"capacity_bytes_per_gpu": 288000000000},
       "execution_model": {
@@ -884,27 +880,13 @@ of that batch share one template per timing group. Different batches never
 share templates, even when their token and context shapes match, and all
 templates are released when the batch entity leaves the simulator.
 
-`scheduler.pipeline_event_mode` independently controls the DES pipeline
-calendar. It defaults to `exact`. Setting it to `collapsed` reserves safe
-stage-local execution intervals for a batch and replaces intermediate PP
-arrival/schedule/end transitions with one pipeline-completion event. This
-reduces event overhead without treating all PP HBM or compute resources as one
-device: each stage still serializes against its own reservation calendar.
-Stages that require runtime MoE synchronization automatically retain the exact
-event path because their completion cannot be reserved before the aligned
-participants reach the synchronization point.
-For PP1, `collapsed` is intentionally a no-op because there are no intermediate
-pipeline transitions to remove.
-
 For experiments that use PP specifically to partition large layer-resident
 weights such as Kimi K3 KDA, set `parallelism.pipeline_exclusive=true`. This
 mode requires `PP > 1`, `DP = 1`, `MoE EP = 1`, and `MoE TP = attention TP`.
 It intentionally removes DP/EP MoE barriers while retaining TP collectives,
 PP activation transfers, stage-local HBM/KV/snapshot accounting, and optional
-DCP inside the attention TP group. Combine it with
-`scheduler.pipeline_event_mode="collapsed"` to use the full collapsed PP
-calendar for K3/MoE batches. The flag is opt-in; hybrid PP+DP+EP configurations
-remain supported when it is false.
+DCP inside the attention TP group. The flag is opt-in; hybrid PP+DP+EP
+configurations remain supported when it is false.
 
 ## Workload contract
 

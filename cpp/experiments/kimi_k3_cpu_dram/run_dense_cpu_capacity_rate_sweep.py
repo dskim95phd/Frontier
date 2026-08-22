@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the Kimi K3 P24/D32 exact CPU-capacity sweep.
+"""Run the Kimi K3 P24/D32 CPU-capacity sweep.
 
 Edit ``SESSION_RATE_CAPACITIES_GB`` and ``MAX_CONCURRENT_SIMULATIONS`` below
 for the server.  Each session-injection rate has its own explicit list of CPU
@@ -72,7 +72,7 @@ SEED = 20260803
 
 
 DEFAULT_CONFIG = (
-    HERE / "configs" / "tracelab_k3_p24_d32_cpu_sweep_exact_benchmark.json"
+    HERE / "configs" / "tracelab_k3_p24_d32_cpu_sweep_benchmark.json"
 )
 DEFAULT_TRACELAB_DB = (
     REPO_ROOT / "outputs" / "datasets" / "tracelab" / "v0.0.2" / "syfi_coding_trace.duckdb"

@@ -52,7 +52,6 @@ void run_k3_cpu_snapshot_offload_and_restore(std::uint64_t pp_size) {
         cluster->parallelism.pipeline_parallel_size = pp_size;
         if (pp_size > 1) {
             cluster->parallelism.pipeline_exclusive = true;
-            cluster->scheduler.pipeline_event_mode = "collapsed";
         }
         const double stage_latency =
             cluster->execution_model.fixed.stage_latencies_ms.front();
@@ -92,19 +91,14 @@ void run_k3_cpu_snapshot_offload_and_restore(std::uint64_t pp_size) {
     const auto output = run_simulation(config, workload);
 
     if (pp_size > 1) {
-        expect(std::any_of(output.event_trace.begin(), output.event_trace.end(),
-                           [](const auto &event) {
-                               return event.type() ==
-                                      EventType::kBatchPipelineEnd;
-                           }) &&
-                   std::none_of(
+        expect(std::none_of(
                        output.event_trace.begin(), output.event_trace.end(),
                        [](const auto &event) {
                            return event.type() == EventType::kPrefillSync ||
                                   event.type() == EventType::kDecodeSync;
                        }),
-               "K3 pipeline-exclusive PP must use the collapsed calendar "
-               "without DP/EP synchronization events");
+               "K3 pipeline-exclusive PP must not emit DP/EP synchronization "
+               "events");
     }
 
     expect(output.requests.size() == 3,
@@ -223,7 +217,6 @@ void test_k3_pdd_tp8_dcp8_analytical_decode() {
         cluster->parallelism.moe_tensor_parallel_size = 8;
         cluster->parallelism.moe_expert_parallel_size = 1;
         cluster->parallelism.pipeline_exclusive = true;
-        cluster->scheduler.pipeline_event_mode = "collapsed";
         cluster->scheduler.num_blocks = 5'000;
         cluster->execution_model.type =
             frontier::config::ExecutionModelType::kAnalytical;
@@ -260,17 +253,13 @@ void test_k3_pdd_tp8_dcp8_analytical_decode() {
            "K3 decode stage must execute analytical TP8/DCP8 compute and "
            "collectives");
     expect(
-        std::any_of(output.event_trace.begin(), output.event_trace.end(),
-                    [](const auto &event) {
-                        return event.type() == EventType::kBatchPipelineEnd;
-                    }) &&
-            std::none_of(output.event_trace.begin(), output.event_trace.end(),
+        std::none_of(output.event_trace.begin(), output.event_trace.end(),
                          [](const auto &event) {
                              return event.type() == EventType::kPrefillSync ||
                                     event.type() == EventType::kDecodeSync;
                          }),
-        "K3 TP8 pipeline-exclusive analytical run must collapse PP "
-        "without DP/EP synchronization");
+        "K3 TP8 pipeline-exclusive analytical run must not use DP/EP "
+        "synchronization");
     expect(output.kv_cache_transfers.front().size_bytes > 232'316'928ULL,
            "K3 PDD transfer must include MLA KV and the full KDA snapshot");
 }

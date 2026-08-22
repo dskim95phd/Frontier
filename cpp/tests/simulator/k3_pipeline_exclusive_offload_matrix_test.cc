@@ -29,7 +29,6 @@ using frontier::config::parse_simulation_config_json;
 using frontier::config::SimulationConfig;
 using frontier::metrics::CpuKVCacheTransferKind;
 using frontier::metrics::CpuKVCacheTransferMetricsRecord;
-using frontier::metrics::RequestMetricsRecord;
 using frontier::metrics::SimulationOutput;
 using frontier::request_generator::WorkloadRequest;
 using frontier::simulator::run_simulation;
@@ -64,7 +63,7 @@ std::vector<WorkloadRequest> pdd_workload() {
         ",0.05,4,2,701,1\n");
 }
 
-SimulationConfig make_config(std::uint64_t pp, const char *event_mode) {
+SimulationConfig make_config(std::uint64_t pp) {
     std::string config_text = read_text_file(kExamples / "configs" /
                                              "06_cpu_kv_cache_pdd_online.json");
     replace_all(config_text, "meta-llama/Llama-2-7b-hf", "moonshotai/Kimi-K3");
@@ -77,13 +76,11 @@ SimulationConfig make_config(std::uint64_t pp, const char *event_mode) {
     replace_all(config_text, "\"num_blocks\": 32", "\"num_blocks\": 16");
 
     auto config = parse_simulation_config_json(config_text);
-    config.run_id = std::string{"k3-pp-exclusive-"} + event_mode + "-pp" +
-                    std::to_string(pp);
+    config.run_id = "k3-pp-exclusive-pp" + std::to_string(pp);
 
-    auto configure_cluster = [pp, event_mode](ClusterRuntimeConfig &cluster) {
+    auto configure_cluster = [pp](ClusterRuntimeConfig &cluster) {
         cluster.parallelism.pipeline_parallel_size = pp;
         cluster.parallelism.pipeline_exclusive = pp > 1;
-        cluster.scheduler.pipeline_event_mode = event_mode;
         const double stage_latency =
             cluster.execution_model.fixed.stage_latencies_ms.front();
         cluster.execution_model.fixed.stage_latencies_ms.assign(
@@ -112,19 +109,6 @@ SimulationConfig make_config(std::uint64_t pp, const char *event_mode) {
     configure_cluster(config.pdd().clusters.prefill);
     configure_cluster(config.pdd().clusters.decode);
     return config;
-}
-
-const RequestMetricsRecord &request(const SimulationOutput &output,
-                                    RequestId id) {
-    const auto position =
-        std::find_if(output.requests.begin(), output.requests.end(),
-                     [id](const RequestMetricsRecord &value) {
-                         return value.request_id == id;
-                     });
-    if (position == output.requests.end()) {
-        throw std::runtime_error("missing request metrics");
-    }
-    return *position;
 }
 
 bool batch_contains_request(const SimulationOutput &output, BatchId batch_id,
@@ -223,51 +207,16 @@ void check_offload_boundaries(const SimulationOutput &output,
     }
 }
 
-void check_collapsed_calendar(const SimulationOutput &output, bool collapsed) {
-    const bool has_pipeline_end = std::any_of(
-        output.event_trace.begin(), output.event_trace.end(),
-        [](const auto &e) { return e.type() == EventType::kBatchPipelineEnd; });
+void check_pipeline_exclusive_events(const SimulationOutput &output) {
     const bool has_sync =
         std::any_of(output.event_trace.begin(), output.event_trace.end(),
                     [](const auto &e) {
                         return e.type() == EventType::kPrefillSync ||
                                e.type() == EventType::kDecodeSync;
                     });
-    expect(has_pipeline_end == collapsed && !has_sync,
-           "pipeline-exclusive PDD must use one collapsed calendar without "
-           "DP/EP synchronization events");
-}
-
-void compare_request_and_offload_contract(const SimulationOutput &exact,
-                                          const SimulationOutput &collapsed) {
-    expect(exact.requests.size() == collapsed.requests.size() &&
-               exact.cpu_kv_cache_transfers.size() ==
-                   collapsed.cpu_kv_cache_transfers.size(),
-           "exact and collapsed runs must complete the same request/transfer "
-           "count");
-    for (const auto &record : exact.requests) {
-        const auto &other = request(collapsed, record.request_id);
-        expect(
-            record.cpu_prefix_query_blocks == other.cpu_prefix_query_blocks &&
-                record.cpu_prefix_hit_blocks == other.cpu_prefix_hit_blocks &&
-                record.cpu_restore_transferred_blocks ==
-                    other.cpu_restore_transferred_blocks &&
-                record.cpu_restore_consumed_blocks ==
-                    other.cpu_restore_consumed_blocks &&
-                record.cpu_restore_bytes == other.cpu_restore_bytes &&
-                record.cpu_offload_bytes == other.cpu_offload_bytes &&
-                record.cached_prefill_tokens == other.cached_prefill_tokens,
-            "exact and collapsed CPU/prefix request metrics must match");
-    }
-    expect(exact.aggregate.cpu_kv_cache.offload_operations ==
-                   collapsed.aggregate.cpu_kv_cache.offload_operations &&
-               exact.aggregate.cpu_kv_cache.restore_operations ==
-                   collapsed.aggregate.cpu_kv_cache.restore_operations &&
-               exact.aggregate.cpu_kv_cache.offload_bytes ==
-                   collapsed.aggregate.cpu_kv_cache.offload_bytes &&
-               exact.aggregate.cpu_kv_cache.restore_bytes ==
-                   collapsed.aggregate.cpu_kv_cache.restore_bytes,
-           "exact and collapsed CPU transfer aggregates must match");
+    expect(!has_sync,
+           "pipeline-exclusive PDD must not emit DP/EP synchronization "
+           "events");
 }
 
 void check_prefill_only_contract(const SimulationOutput &output,
@@ -310,21 +259,14 @@ void check_prefill_only_contract(const SimulationOutput &output,
 void test_k3_pipeline_exclusive_offload_matrix() {
     for (const std::uint64_t pp : {2ULL, 4ULL, 8ULL}) {
         const auto workload = pdd_workload();
-        auto exact_config = make_config(pp, "exact");
-        auto collapsed_config = make_config(pp, "collapsed");
-        const auto exact = run_simulation(exact_config, workload);
-        const auto collapsed = run_simulation(collapsed_config, workload);
+        auto config = make_config(pp);
+        const auto output = run_simulation(config, workload);
 
-        expect(exact.requests.size() == workload.size() &&
-                   collapsed.requests.size() == workload.size(),
+        expect(output.requests.size() == workload.size(),
                "all K3 PDD multiturn requests must complete");
-        check_stage_local_profiles(exact, pp);
-        check_stage_local_profiles(collapsed, pp);
-        check_offload_boundaries(exact, pp);
-        check_offload_boundaries(collapsed, pp);
-        check_collapsed_calendar(exact, false);
-        check_collapsed_calendar(collapsed, true);
-        compare_request_and_offload_contract(exact, collapsed);
+        check_stage_local_profiles(output, pp);
+        check_offload_boundaries(output, pp);
+        check_pipeline_exclusive_events(output);
     }
 }
 
@@ -332,27 +274,17 @@ void test_k3_prefill_only_pipeline_exclusive_offload_matrix() {
     for (const std::uint64_t pp : {2ULL, 4ULL, 8ULL}) {
         for (const double decode_tokens_per_second : {12.5, 50.0, 200.0}) {
             const auto workload = pdd_workload();
-            auto exact_config = make_config(pp, "exact");
-            auto collapsed_config = make_config(pp, "collapsed");
-            exact_config.prefill_only =
-                PrefillOnlyConfig{decode_tokens_per_second};
-            collapsed_config.prefill_only =
+            auto config = make_config(pp);
+            config.prefill_only =
                 PrefillOnlyConfig{decode_tokens_per_second};
 
-            const auto exact = run_simulation(exact_config, workload);
-            const auto collapsed = run_simulation(collapsed_config, workload);
+            const auto output = run_simulation(config, workload);
 
-            check_prefill_only_contract(exact, workload.size(),
+            check_prefill_only_contract(output, workload.size(),
                                         decode_tokens_per_second);
-            check_prefill_only_contract(collapsed, workload.size(),
-                                        decode_tokens_per_second);
-            check_stage_local_profiles(exact, pp);
-            check_stage_local_profiles(collapsed, pp);
-            check_offload_boundaries(exact, pp);
-            check_offload_boundaries(collapsed, pp);
-            check_collapsed_calendar(exact, false);
-            check_collapsed_calendar(collapsed, true);
-            compare_request_and_offload_contract(exact, collapsed);
+            check_stage_local_profiles(output, pp);
+            check_offload_boundaries(output, pp);
+            check_pipeline_exclusive_events(output);
         }
     }
 }

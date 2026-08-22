@@ -89,8 +89,6 @@ def _read_config(path: Path) -> dict[str, Any]:
         raise Step25OracleError("schema_version=1 is required")
     if config.get("system_architecture") != "co-location":
         raise Step25OracleError("co-location is required")
-    if config.get("enable_parallel_clusters") is not False:
-        raise Step25OracleError("parallel clusters must remain disabled")
     if config.get("cluster_scheduler") != {"type": "round_robin"}:
         raise Step25OracleError("round_robin cluster scheduling is required")
     return config

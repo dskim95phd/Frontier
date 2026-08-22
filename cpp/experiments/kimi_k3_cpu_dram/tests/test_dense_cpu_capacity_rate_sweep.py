@@ -268,7 +268,7 @@ def test_case_start_message_prints_complete_experiment_condition(tmp_path: Path)
 
 def test_k3_config_uses_static_per_gpu_capacity_and_off_baseline() -> None:
     assert runner.DEFAULT_CONFIG.name == (
-        "tracelab_k3_p24_d32_cpu_sweep_exact_benchmark.json"
+        "tracelab_k3_p24_d32_cpu_sweep_benchmark.json"
     )
     template = json.loads(runner.DEFAULT_CONFIG.read_text(encoding="utf-8"))
     cases = runner.build_matrix(

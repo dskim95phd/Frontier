@@ -135,7 +135,7 @@ References:
 
 ### Required in the first implementation
 
-- sequential PDD with `enable_parallel_clusters=false`;
+- sequential PDD;
 - unified `DECODE` clusters;
 - MoE models with `attention_dp > 1` and `moe_ep > 1`;
 - offline and online admission;
@@ -165,7 +165,6 @@ really differs.
 
 - Dual Batch Overlap or any attention/FFN microbatch overlap;
 - `pd-af-disaggregation`, `DECODE_ATTN`, and `DECODE_FFN`;
-- parallel PDD cluster execution;
 - changes to request routing, batching policy, KV-transfer policy, cache
   affinity, or preemption policy except where needed to preserve the shared
   domain reservation;

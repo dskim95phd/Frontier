@@ -54,8 +54,7 @@
         "long_prefill_token_threshold": 512,
         "block_size": 16,
         "watermark_blocks_fraction": 0.0,
-        "num_preallocate_tokens": 0,
-        "pipeline_event_mode": "collapsed"
+        "num_preallocate_tokens": 0
       },
       "execution_model": {
         "type": "analytical",
@@ -90,8 +89,7 @@
         "long_prefill_token_threshold": 0,
         "block_size": 16,
         "watermark_blocks_fraction": 0.0,
-        "num_preallocate_tokens": 0,
-        "pipeline_event_mode": "exact"
+        "num_preallocate_tokens": 0
       },
       "execution_model": {
         "type": "analytical",
