@@ -637,6 +637,12 @@ profile. The model-aware resolver also installs the same defaults for older
 standalone configs when neither the new field nor its legacy family fallback
 is explicitly set:
 
+The bundled `kimi-k3-lmsys-day0` profile reproduces the 2026 LMSYS serving
+experiment instead: BF16 MLA KV, BF16 hidden-state collectives and combine,
+and FP32 KDA recurrent state, while retaining native MXFP4/MXFP8 routed
+experts. The public MegaMoE backend uses that routed activation dtype for
+post-quant dispatch independently of the BF16 communication/combine dtype.
+
 The complete K3 design decision record is
 [`docs/design/kimi-k3-support.md`](../docs/design/kimi-k3-support.md).
 
@@ -668,12 +674,28 @@ MoE configs that omit them inherit `routed_expert_weight` and
 `routed_expert_activation`, so their prior memory and latency behavior is
 unchanged; Kimi K3 installs BF16/BF16 explicitly.
 
-Router weight/input storage and compute are separate. K3 reads BF16 resident
-router weights and BF16 hidden-state inputs, produces FP32 logits, and uses the
-FP32 roofline ceiling for routing. BF16-to-FP32 conversion is assumed fused
-into the router kernel, so no separate cast buffer or cast time is charged.
+Router weight/input storage and logits are separate. K3 reads BF16 resident
+router weights and BF16 hidden-state inputs on the BF16 Tensor Core GEMM
+roofline, accumulates and writes FP32 logits, and performs Top-K over those
+FP32 logits. BF16-to-FP32 conversion is assumed fused into the router kernel,
+so no separate cast buffer or cast time is charged.
 `moe_router_weight` remains a legacy fallback for
 `router_weight_storage`.
+
+The K3 kernel profiles also reproduce SGLang's fused LatentMoE front. EP paths
+merge the 896-column router gate and 3584-column latent down projection into
+one BF16 `[M,7168] x [7168,4480]` GEMM. Plain TP additionally folds in the
+TP-local shared-expert gate/up projection. A front-specific TGV efficiency
+applies only below the existing small-GEMM token threshold; large-M work
+retains the ordinary large-GEMM roofline. Precision-incompatible custom
+configurations fall back to separate kernels.
+
+Numerical precision and CUDA scheduling are independent contracts. Selecting
+the native K3 precision profile alone does not enable fused kernels. On decode,
+`k3_sglang_mxfp4` also models fused route+quant, shared/routed overlap, TP8
+column-sharded latent-up GEMM plus multicast all-gather for `M <= 12`, the
+fused KDA update chain and projection overlap, and MLA output-gate overlap.
+These switches do not alter prefill or unsupported batch/topology shapes.
 
 Kimi K3's 24 MLA layers also enable `mla_use_output_gate` and
 `mla_use_nope`. The analytical MLA path charges the TP-sharded full-rank gate
@@ -776,26 +798,26 @@ layer. PP stage arrival/end events remain unchanged.
 `generic`, which preserves the configured collective model. The opt-in
 `sm100_megamoe_public` profile models the fused MegaMoE
 dispatch → expert GEMMs → combine critical path on a GB200/GB300 NVL72 domain.
-It uses public-prior one-sided A2A startup and effective-bandwidth envelopes,
-charges the receiver-side maximum unique-token load after deduplicating
-multiple expert routes from one token to the same destination lane, and
+It uses linear fits of the public one-sided A2A latency measurements, charges
+the logical unique-token copies after deduplicating multiple expert routes
+from one token to the same destination lane, uses post-quant routed-activation
+bytes for dispatch and BF16 bytes for combine, and
 overlaps communication with the expert kernels. At an aligned DP barrier, each
 active DP batch contributes one source row of destination-EP routed and
-unique-token counts; column sums form the receiver loads used by the group
-dispatch/combine prediction. Idle DP participants contribute no traffic. For
+unique-token counts. Column sums form the receiver expert loads, while the
+maximum logical row sum bounds rank-local dispatch/combine latency. Idle DP
+participants contribute no traffic. For
 DP-attention + EP-expert layouts,
 dispatch/combine are the
 layout transition, so this profile does not add a second DP input/output
 all-reduce. It is a documented prior, not a workload-fitted calibration.
 The profile may also be selected with the `rubin` device preset as an explicit
 forward projection. In that mode arithmetic and HBM work use Rubin roofline
-ceilings, the expert grid uses 224 rather than 160 SMs, A2A payload time scales
-by the public 3.6/1.8 TB/s NVLink ratio, while the per-cluster residual remains
-the GB300-calibrated 0.06325 us. Like fixed A2A startup, the residual represents
-a latency term for which no public GB300-to-Rubin ratio is available; it does
-not scale from peak arithmetic or memory bandwidth. The former 5/3
-throughput-per-SM reduction to 0.03795 us is retained only as an explicit
-optimistic sensitivity through `mega_moe_cluster_task_latency_us`. Rubin
+ceilings, the expert grid uses 224 rather than 160 SMs, and A2A payload time
+scales by the public 3.6/1.8 TB/s NVLink ratio. The precision-correct GB300
+refit selected no extra per-cluster residual; nonzero
+`mega_moe_cluster_task_latency_us` values remain available only as explicit
+sensitivity inputs. Rubin
 counted writes and tile-level dependent triggering may improve overlap, but
 there is no K3 MegaMoE measurement to quantify it, so fixed startup and the
 selected overlap residual also remain the GB300 priors. Block-M, block-N,
@@ -807,32 +829,41 @@ generic kernel profile still uses the Rubin payload bandwidth. The ordinary
 `generic` collective backend ignores this MegaMoE-specific scale.
 
 `execution_model.kernel_profile` is also optional and defaults to `generic`,
-which preserves the portable roofline efficiencies. Two Kimi-K3 profiles for
+which preserves the portable roofline efficiencies. Three Kimi-K3 profiles for
 GB300, or explicit forward projection onto Rubin, make serving-stack
 assumptions explicit instead of silently changing the device ceilings:
 
+- `k3_flashkda_prefill` is an isolated prefill ablation. It keeps portable
+  GEMM/MoE efficiencies but replaces KDA's conservative per-token state
+  traffic with FlashKDA's 16-token K1/K2 pipeline, exact 13,824-byte
+  chunk/head workspace, and public GB200 sequence/head scheduling envelope.
 - `k3_sglang_mxfp4` models the published Blackwell K3 local-kernel path: W4A8
-  SiTU expert kernels, small-M GEMMs, fused routing/finalize work, and reduced
-  launch overhead. Its batch-1 target is the published non-speculative
-  approximately 113 tok/s endpoint.
+  SiTU expert kernels, the topology-specific two/three-way MoE front, fused
+  route+quant, shared/routed overlap, TP8 latent-up GEMM+all-gather, fused KDA
+  decode and auxiliary projection overlap, FlashKDA two-stage prefill, MLA
+  gate/attention overlap,
+  small-M TGV BF16 GEMMs, fused collective finalize work, and reduced launch
+  overhead. Its batch-1 target is the published non-speculative approximately
+  113 tok/s endpoint. This profile is required on every local K3 decode arm;
+  it is not implied by an experiment label or by the precision profile.
 - `k3_deepgemm_megamoe` applies only to the DP-source-composed destination-EP
   group prediction. It applies the public DeepGEMM SM100 block-M selection
   policy to the exact destination-lane expert histogram, charges tensor-core
   work and activation IO for padded M blocks, and adds a grid-size-dependent
-  cluster scheduler/pipeline term. A factorial refit found no independently
-  identifiable final-wave multiplier after the grid coefficient was refit.
-  The latter is the reduced `c*g` term from a RaMP-style wave model after the
-  existing roofline has already charged arithmetic and bulk HBM traffic. Its
-  0.06325 us/routed-two-CTA-cluster coefficient is calibrated on the three
-  LMSYS DP4/EP32 points; the DP2/EP16 points are a topology holdout. The grid
-  term dominates the low-concurrency end of that calibration set and should
-  not be interpreted as a small perturbation there. DP-group
+  optional cluster scheduler/pipeline term. After correcting the router GEMM
+  and dispatch/combine precision paths, a refit on the three LMSYS DP4/EP32
+  points selected `0 us` for that residual; the DP2/EP16 points remain a
+  topology holdout. DP-group
   recomposition includes routed destination-expert work only: router, latent
   projection, replicated shared expert, normalization, and finalize work keep
   each DP source's local token count. The shared-expert overlap component is
   carried from that first source prediction into the group barrier rather
-  than recomputing a full MoE layer per source. It also exposes the complete
-  dispatch/GEMM/combine producer-consumer critical path. The former
+  than recomputing a full MoE layer per source. In the MegaMoE profile, the EP
+  side-stream overlap exposes half of the ideal `min(shared, routed)` credit,
+  matching SGLang's reported 4-5% GB300 output-throughput gain without
+  assuming contention-free streams. It also
+  exposes the complete dispatch/GEMM/combine producer-consumer critical path.
+  The former
   workload-fitted constant expert slowdown is not used; the A2A transport
   envelope remains the separate public NVIDIA prior described above.
 

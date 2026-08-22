@@ -4,6 +4,8 @@ Status: implemented
 
 Date: 2026-08-18
 
+Retuned: 2026-08-22
+
 Applies to: C++ analytical predictor, `device="gb300"`, Kimi K3,
 `kernel_profile="k3_deepgemm_megamoe"`
 
@@ -21,12 +23,13 @@ actual destination-lane expert-token histogram:
    diagnostics, without a separately fitted wave multiplier;
 5. add an empirical cost proportional to cluster-grid size.
 
-The grid coefficient is `0.06325 us` per routed two-CTA cluster task. It
-replaces the constant 1.75 expert/shuffle multiplier; it does not multiply shuffling, routing, or
-the full MoE path. Router, latent projection, shared expert, normalization,
-and finalize work are evaluated once per DP source with that source's local
-token count; only routed destination-expert work is recomposed at the EP
-barrier.
+The precision-correct grid coefficient is `0 us` per routed two-CTA cluster
+task. The former `0.06325 us` fit is superseded: it was obtained while FP32
+router logits incorrectly selected the FP32 CUDA-core ceiling for the BF16
+router GEMM and while one common communication dtype drove both dispatch and
+combine. Router, latent projection, shared expert, normalization, and finalize
+work are evaluated once per DP source with that source's local token count;
+only routed destination-expert work is recomposed at the EP barrier.
 
 This is deliberately a reduced RaMP-style model rather than a complete RaMP
 implementation. Frontier's existing roofline already accounts for kernel
@@ -128,7 +131,7 @@ resource that dominates it:
 | HBM traffic | `22 / 8 = 2.75x` bandwidth | handled once by the ordinary roofline |
 | Wave capacity | `224 / 160 = 1.4x` SMs | set `mega_moe_sm_count=224` |
 | A2A payload | `3.6 / 1.8 = 2x` NVLink bandwidth | double the public effective payload bandwidth |
-| Per-cluster coefficient | no public generational latency ratio | retain the GB300-calibrated `0.06325 us` |
+| Per-cluster coefficient | precision-correct GB300 fit selected zero | retain `0 us`; nonzero values are explicit sensitivities |
 | A2A startup | no public generational latency ratio | retain the GB300 public prior |
 | Communication/compute overlap | producer-consumer dependency | retain the measured wide-EP `1.0` residual; report optimistic overlap only as sensitivity |
 
@@ -138,10 +141,10 @@ inference maximum. Peak NVLink bandwidth scales only the payload term. It does
 not reduce fixed dispatch/combine startup, and it does not change overlap by
 itself. Rubin counted writes and tile-level dependent triggering motivate a
 future sensitivity case but do not provide a numeric K3 MegaMoE overlap value.
-The former throughput-per-SM projection, `0.06325 / (5/3) = 0.03795 us`, is an
-optimistic boundary available through the explicit cluster-task-latency
-override, not the Rubin default. This separation prevents applying the same
-hardware gain twice or silently treating throughput as a latency measurement.
+The former throughput-per-SM projection is superseded. Explicit nonzero
+cluster-task-latency overrides remain available for sensitivity studies, not
+as the Rubin default. This separation prevents applying the same hardware gain
+twice or silently treating throughput as a latency measurement.
 
 The geometry model is enabled only in `predict_moe_group_layer()`, after all
 active DP source rows have been composed into the destination EP lanes. That
@@ -270,14 +273,14 @@ would add complexity without independent evidence.
 The final projection time is:
 
 ```text
-c_grid       = 0.06325 us / routed two-CTA cluster task
+c_grid       = 0 us / routed two-CTA cluster task
 T_projection = T_wave + c_grid * g / 1000   [ms]
 ```
 
-Conceptually this is an empirical per-grid-task scheduler/pipeline term from
-a reduced RaMP-style model. It is additive, not multiplicative. It is the
-dominant expert-kernel term at the low-concurrency end of the calibration set,
-so it must not be described as a small perturbation there. Consequently:
+Conceptually this remains an optional empirical per-grid-task
+scheduler/pipeline term from a reduced RaMP-style model. It is additive, not
+multiplicative. The Day-0 precision refit did not identify a positive residual,
+so the default leaves it disabled. Consequently:
 
 - an empty or small grid does not inherit a blanket 1.75 penalty;
 - a fragmented or larger grid costs more;
@@ -307,7 +310,21 @@ The chosen model is the smallest one that passed both requirements:
    predicted times for a physical reason;
 2. the LMSYS wide-EP curves remain close without a full-path scale factor.
 
-## Calibration and validation
+## Superseded 2026-08-18 calibration
+
+The numbers in this section document the former mixed-precision-invalid fit
+and must not be used as the current calibration. The 2026-08-22 retune uses
+MXFP4/MXFP8 routed experts, BF16 non-expert operators/KV/combine, FP32 KDA
+state and router logits, MXFP8 post-quant dispatch, and the BF16 operand
+ceiling for the router GEMM. It selected `c_grid=0` on DP4/EP32: user MAPE
+0.19%, throughput MAPE 26.28% before the LatentMoE-front fidelity fix. After
+modeling the published fused gate/down GEMM and its small-M TGV geometry, the
+same points are 1.07% and 28.29%. The untouched DP2/EP16 holdout moves from
+8.06%/27.50% to 8.11%/30.07%. The common throughput error is a separate
+prefill-model error and is not identifiable from `c_grid` or the source-local
+front GEMM.
+
+## Historical calibration and validation
 
 The development sequence is important because it exposes what each component
 contributes.
@@ -389,13 +406,13 @@ Neither boundary replaces a Rubin measurement.
 - `generic` and `k3_sglang_mxfp4` profiles keep their previous behavior.
 - The model is opt-in and K3-only. GB300 is the calibrated device; Rubin use
   is an unvalidated projection that maps each term to its dominant resource:
-  arithmetic/HBM use Rubin roofline ceilings, A2A payload uses the 2x per-GPU
-  NVLink ratio, while the latency-like cluster-task coefficient remains the
-  GB300-calibrated `0.06325 us`. Geometry records 224 SMs, but
+  arithmetic/HBM use Rubin roofline ceilings and A2A payload uses the 2x
+  per-GPU NVLink ratio. The default cluster-task residual is zero on both
+  devices. Geometry records 224 SMs, but
   `lambda_wave=0` means that count does not add a separate wave timing
   multiplier. Fixed startup, cluster-task latency, and wide-EP overlap are not
-  scaled without a Rubin K3 measurement. The former `0.03795 us` coefficient
-  is retained only as an explicit optimistic sensitivity.
+  scaled without a Rubin K3 measurement. Nonzero coefficients are explicit
+  sensitivities only.
 - Routed and source-local timing are emitted in one lane pass; enabling the
   breakdown does not double the number of MoE-layer roofline evaluations.
 - The already-predicted shared-expert path is carried per source into the
@@ -435,6 +452,6 @@ The model should be revisited when any of the following becomes available:
    especially A2A startup, achieved bandwidth, overlap, and tile policy.
 
 The preferred next validation is a microbenchmark matrix indexed by
-`(B_M, active experts, [m_e], up/down N, precision)`. At that point the
-`0.06325 us` coefficient can be replaced by hardware-derived coefficients while
-retaining the current histogram-to-grid transformation.
+`(B_M, active experts, [m_e], up/down N, precision)`. At that point the zero
+default can be replaced by hardware-derived coefficients while retaining the
+current histogram-to-grid transformation.

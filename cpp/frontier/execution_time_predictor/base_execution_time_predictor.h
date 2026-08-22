@@ -116,7 +116,8 @@ struct MoEGroupLayerInput {
     // at every destination-group barrier.
     std::vector<double> source_shared_expert_path_ms;
     // One row per active attention-DP source and one column per destination
-    // EP lane. Column sums are the receiver-side loads that bound A2A time.
+    // EP lane. Column sums bound destination expert work; the maximum row sum
+    // bounds the rank-local one-sided A2A logical traffic.
     std::vector<std::vector<std::uint64_t>> source_lane_routed_tokens;
     std::vector<std::vector<std::uint64_t>> source_lane_unique_tokens;
     // Predictors without a token-sensitive group model may retain their
@@ -130,6 +131,10 @@ struct MoEGroupLayerPrediction {
     // The scheduler composes this with the slowest source-local path. Fixed
     // predictors retain their historical full-lane fallback and leave false.
     bool lane_times_are_routed_only = false;
+    // The K3 EP decode graph issues the source-local shared expert beside the
+    // routed destination branch. Zero keeps serial composition; one is the
+    // ideal max(shared, routed) limit; the measured profile lies in between.
+    double source_shared_expert_overlap_fraction = 0.0;
     std::uint64_t critical_lane = 0;
     double critical_lane_time_ms = 0.0;
     bool has_source_aware_ep_communication = false;

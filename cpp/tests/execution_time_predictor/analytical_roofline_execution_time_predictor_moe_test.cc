@@ -269,8 +269,8 @@ void test_sm100_megamoe_public_profile_models_overlap_and_layout_transition() {
             communication, 64, 7168, 512, 4, 1, 32, 4, false, 1.0, 2048,
             "sm100_megamoe_public", &balanced, 0.04, 0.35, 2.0, 1.0);
 
-    require(public_balanced.raw_ep_dispatch_ms > 0.018 &&
-                public_balanced.raw_ep_combine_ms > 0.031,
+    require(public_balanced.raw_ep_dispatch_ms > 0.0175 &&
+                public_balanced.raw_ep_combine_ms > 0.0268,
             "public profile must include measured A2A startup floors");
     require(public_balanced.ep_dispatch_ms + public_balanced.ep_combine_ms <
                 public_balanced.raw_ep_dispatch_ms +
@@ -292,9 +292,8 @@ void test_sm100_megamoe_public_profile_models_overlap_and_layout_transition() {
                      synchronized.raw_ep_dispatch_ms -
                      synchronized.raw_ep_combine_ms) < 1e-12,
             "synchronized MegaMoE must expose the full A2A path");
-    const double ep32_position = 2.0 / 3.0;
-    const double dispatch_startup_ms = (18.0 + 4.0 * ep32_position) / 1000.0;
-    const double combine_startup_ms = (31.0 + 2.0 * ep32_position) / 1000.0;
+    const double dispatch_startup_ms = 17.550 / 1000.0;
+    const double combine_startup_ms = 26.892 / 1000.0;
     require(std::abs(rubin_bandwidth.raw_ep_dispatch_ms - dispatch_startup_ms -
                      0.5 * (public_balanced.raw_ep_dispatch_ms -
                             dispatch_startup_ms)) < 1e-12 &&
@@ -304,6 +303,23 @@ void test_sm100_megamoe_public_profile_models_overlap_and_layout_transition() {
                                 combine_startup_ms)) < 1e-12,
             "Rubin NVLink scaling must halve payload time without scaling "
             "the fixed A2A startup");
+
+    frontier::execution_time_predictor::detail::RoutingAllocation ep8_large{};
+    ep8_large.input_tokens = 2'048;
+    ep8_large.routed_tokens = 2'048 * 8;
+    ep8_large.lane_routed_tokens = std::vector<std::uint64_t>(8, 2'048);
+    ep8_large.lane_unique_tokens = std::vector<std::uint64_t>(8, 2'048);
+    const auto post_quant =
+        frontier::execution_time_predictor::detail::predict_moe_communication(
+            communication, 2'048, 7'168, 2'048 * 8, 1, 1, 8, 1, false,
+            2.0, 7'168, "sm100_megamoe_public", &ep8_large, 0.0, 1.0,
+            1.0, 1.0, 1.03125);
+    require(std::abs(post_quant.raw_ep_dispatch_ms - 0.1722) / 0.1722 <
+                    0.03 &&
+                std::abs(post_quant.raw_ep_combine_ms - 0.3226) / 0.3226 <
+                    0.03,
+            "public profile must reproduce NVIDIA EP8 post-quant MXFP8 "
+            "dispatch and BF16 combine within three percent");
 }
 
 void test_group_moe_communication_aggregates_dp_source_rows() {
@@ -379,7 +395,7 @@ void test_group_moe_communication_aggregates_dp_source_rows() {
     const auto synchronized_group =
         synchronized_predictor.predict_moe_group_layer(make_input(true));
     auto sensitivity_execution = execution;
-    sensitivity_execution.mega_moe_cluster_task_latency_us = 0.0;
+    sensitivity_execution.mega_moe_cluster_task_latency_us = 0.05;
     sensitivity_execution.mega_moe_wave_exposure = 0.0;
     sensitivity_execution.mega_moe_tail_io_fraction = 1.0;
     const frontier::execution_time_predictor::
@@ -394,6 +410,11 @@ void test_group_moe_communication_aggregates_dp_source_rows() {
                 group.lane_times_are_routed_only,
             "analytical DP-group prediction must expose only destination "
             "routed work");
+    require(group.source_shared_expert_overlap_fraction == 0.0 &&
+                synchronized_group.source_shared_expert_overlap_fraction ==
+                    0.5,
+            "only the K3 MegaMoE profile may overlap the source-local shared "
+            "expert with routed destination work");
     for (std::size_t lane = 0;
          lane < group.destination_lane_routed_tokens.size(); ++lane) {
         require(group.destination_lane_routed_tokens.at(lane) ==
@@ -407,9 +428,12 @@ void test_group_moe_communication_aggregates_dp_source_rows() {
                 "column sum");
     }
     require(group.raw_ep_dispatch_ms >= single.raw_ep_dispatch_ms &&
-                group.raw_ep_combine_ms >= single.raw_ep_combine_ms,
-            "adding an active DP source must not reduce receiver-side A2A "
-            "time");
+                group.raw_ep_combine_ms >= single.raw_ep_combine_ms &&
+                group.raw_ep_dispatch_ms < 1.5 * single.raw_ep_dispatch_ms &&
+                group.raw_ep_combine_ms < 1.5 * single.raw_ep_combine_ms,
+            "balanced DP sources execute one-sided A2A concurrently, so the "
+            "maximum rank-local row may grow but source count must not "
+            "multiply logical traffic");
     require(synchronized_group.critical_lane_time_ms >
                     group.critical_lane_time_ms &&
                 synchronized_group.ep_dispatch_ms +
@@ -689,8 +713,7 @@ void test_mega_moe_geometry_uses_exact_expert_histogram() {
                 rubin_mega.mega_moe_a2a_startup_scale == 1.0 &&
                 rubin_mega.mega_moe_tail_io_fraction == 1.0 &&
                 rubin_mega.mega_moe_wave_exposure == 0.0 &&
-                std::abs(rubin_mega.mega_moe_cluster_task_latency_us -
-                         0.06325) < 1e-12 &&
+                rubin_mega.mega_moe_cluster_task_latency_us == 0.0 &&
                 rubin_mega.moe_a2a_overlap_residual == 1.0,
             "Rubin MegaMoE projection must scale SM waves and NVLink payload "
             "without assuming a lower unmeasured cluster-task latency");
@@ -734,11 +757,8 @@ void test_mega_moe_geometry_uses_exact_expert_histogram() {
             mega_fragmented.grouped_gemm_geometry.routed_m_blocks == 6 &&
             mega_aligned.grouped_gemm_geometry.routed_padded_tokens == 80 &&
             mega_fragmented.grouped_gemm_geometry.routed_padded_tokens == 96 &&
-            std::abs(
-                mega_aligned.grouped_gemm_geometry.up_cluster_task_overhead_ms -
-                static_cast<double>(
-                    mega_aligned.grouped_gemm_geometry.up_cluster_tasks) *
-                    0.06325 / 1000.0) < 1e-12,
+            mega_aligned.grouped_gemm_geometry.up_cluster_task_overhead_ms ==
+                0.0,
         "MegaMoE diagnostics must expose block-M padding geometry");
     require(mega_aligned.shuffling_ms == generic_aligned.shuffling_ms,
             "expert GEMM geometry must not scale shuffling work");

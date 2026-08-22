@@ -98,11 +98,13 @@ struct MoEModel {
     std::uint64_t model_num_experts = 0;
     std::uint64_t num_shared_experts = 0;
     std::uint64_t moe_tensor_parallel_size = 1;
+    std::uint64_t expert_parallel_size = 1;
     std::uint64_t routed_expert_hidden_size = 0;
     std::uint64_t attn_res_block_size = 0;
     bool latent_moe_use_norm = false;
     bool gated_mlp = true;
     bool fused_add_norm = false;
+    bool decode_only = false;
 };
 
 struct MoEGroupedGemmGeometry {
@@ -243,6 +245,8 @@ predict_moe_lanes(const DeviceCeilings &device, const AnalyticalConfig &config,
     std::string_view moe_communication_backend = "generic",
     const RoutingAllocation *routing = nullptr,
     double fused_expert_compute_ms = 0.0, double overlap_residual = 0.35,
-    double a2a_bandwidth_scale = 1.0, double a2a_startup_scale = 1.0);
+    double a2a_bandwidth_scale = 1.0, double a2a_startup_scale = 1.0,
+    double dispatch_element_bytes = 0.0,
+    std::uint64_t logical_unique_token_copies = 0);
 
 } // namespace frontier::execution_time_predictor::detail

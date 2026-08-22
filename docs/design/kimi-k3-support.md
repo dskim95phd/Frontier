@@ -200,22 +200,86 @@ not consume these fields. For older/custom latent-MoE configurations that omit
 them, both fields fall back to the routed-expert weight/activation precision,
 preserving the previous simulator behavior.
 
-### 5.1 Router storage and compute are separate
+### 5.1 The Day-0 LatentMoE front is one topology-specific GEMM
+
+The K3 kernel profiles concatenate the BF16 router gate `[7168, 896]` and
+LatentMoE down-projection `[7168, 3584]` weights. On an EP all-to-all path this
+is one `[M, 7168] x [7168, 4480]` front GEMM. On plain TP, the released SGLang
+path also concatenates the TP-local shared-expert gate/up projection, turning
+three memory-bound GEMVs into one launch and removing two duplicate reads of
+`hidden_states`. The merged output is FP32; consumers round the routed-input
+and shared slices as required. The latent up-projection remains a later,
+dependent GEMM.
+
+For `M < small_gemm_token_threshold`, the K3 profiles scale achieved front
+throughput by the exact output-width ratio `4480 / 3584 = 1.25`. This encodes
+the published intent that folding the narrow gate into the wider down
+projection makes the gate nearly free. At and above the threshold, the
+ordinary large-GEMM efficiency applies. Fusion is enabled only when the router
+and latent projection operand precisions match; otherwise the simulator falls
+back to the separate-kernel contract. The portable `generic` profile remains
+unchanged.
+
+A rejected sensitivity applied `ceil(M/BM) * ceil(N/BN) / SMs` as a generic
+occupancy penalty. It raised the 69-point serving user MAPE from 23.27% to
+36.09% when applied broadly and to 30.01% when restricted to the standalone
+router. That proxy is invalid for the Day-0 path because the gate is neither a
+standalone 896-column GEMM nor the generic Triton kernel simulated in the
+FlashGPU-Sim experiment.
+
+### 5.2 Decode schedule is distinct from numerical precision
+
+Selecting native MXFP4/MXFP8 precision does not by itself select the K3 CUDA
+graph. The `generic` kernel profile deliberately retains portable standalone
+kernels. `k3_sglang_mxfp4` enables the released K3 schedules. Most switches
+remain decode-only, while KDA prefill uses FlashKDA's two-stage chunk pipeline:
+
+- plain-TP three-way shared/router/latent front fusion;
+- one-launch route, Top-K, activation quantization, and packed routing, with no
+  later top-k-expanded activation shuffle;
+- full critical-path overlap of plain-TP shared-expert down work with the
+  routed MXFP4 branch; the MegaMoE profile's EP side streams expose half of
+  the ideal overlap credit, reflecting SGLang's measured 4-5% throughput gain
+  rather than assuming contention-free HBM;
+- TP8 column-sharded latent up projection followed by multicast all-gather for
+  `M <= 12`, reading one eighth of the up-projection weights per rank;
+- one fused KDA short-convolution, recurrent-update, and gated-normalization
+  chain, while its auxiliary GEMV chain overlaps the main Q/K/V/gate GEMM for
+  decode batches up to 128;
+- a 16-token FlashKDA prefill K1/K2 pipeline with the public intermediate
+  workspace and sequence/head scheduling envelope; and
+- overlap of the MLA output-gate projection with decode attention for batches
+  up to 128.
+
+Every switch is phase- and topology-gated. Unsupported shapes retain the
+prior schedule. In particular, wide DP/EP uses the two-way front
+and the separate `k3_deepgemm_megamoe` destination-lane model; it does not
+inherit plain-TP shared-expert or TP8 latent-up assumptions.
+
+This separation fixed a calibration error in the LMSYS sweep: all arms had
+the same native K3 checkpoint precision, but the local K3 kernel profile had
+previously been selected only for plot arms carrying an optional `fp4` label.
+Ordinary TP/DCP arms therefore paid generic launch and scheduling costs even
+though their numerical precision was correct.
+
+### 5.3 Router storage and compute are separate
 
 `router_weight_storage` controls resident GPU weight memory and router-weight
 HBM reads. `moe_router_activation` controls input activation storage.
-`router_compute` controls the router GEMM/TopK roofline ceiling and logits
-width.
+`router_compute` controls the router accumulation/logit width and the Top-K
+roofline. The router GEMM ceiling follows its operand precision: BF16
+weights/inputs use BF16 Tensor Cores even though they accumulate and emit FP32.
 
-For the native K3 policy, BF16 weights and BF16 input are consumed by an FP32
-router computation that produces FP32 logits. BF16-to-FP32 conversion is
-assumed fused and free: no separate cast buffer or cast latency is charged.
+For the native K3 policy, a BF16 Tensor Core GEMM consumes BF16 weights and
+inputs, accumulates into FP32, and produces FP32 logits. BF16-to-FP32
+conversion is assumed fused and free: no separate cast buffer or cast latency
+is charged.
 
 The legacy `moe_router_weight` field remains a fallback for both historical
 storage and compute behavior when the canonical fields are absent. A canonical
 `router_weight_storage` override does not suppress K3's FP32 compute default.
 
-### 5.2 Persistent MLA cache layout
+### 5.4 Persistent MLA cache layout
 
 MLA cache storage is component-wise:
 
@@ -413,7 +477,8 @@ The current implementation intentionally does not model:
 - partial snapshot storage, eviction, or transfer;
 - AttnRes latency or weight-memory overhead;
 - router cast buffers or BF16-to-FP32 conversion latency;
-- quantization/dequantization kernel time;
+- standalone quantization/dequantization kernel time outside the K3
+  fused-route work record;
 - precision-conversion cost during PDD transfer;
 - KV-block fragmentation inside an atomic snapshot charge;
 - per-layer congestion changes hidden by `first_layer_scaled` mode.
@@ -421,37 +486,37 @@ The current implementation intentionally does not model:
 These assumptions should be revisited if measured K3 kernels, memory traces,
 or a more detailed recurrent-state recovery policy become available.
 
-### 12.1 Future work: chunked KDA delta-rule execution
+### 12.1 FlashKDA two-stage prefill
 
-`predict_kda_attention_work` charges one full recurrent-state read and write
-per token. That models a strictly sequential scan over the sequence. FlashKDA
-and the comparable open kernels are instead chunked: roughly sixteen tokens are
-processed together against a state held in registers/shared memory, and only
-the per-chunk results are combined sequentially. The state therefore reaches
-HBM once per chunk, not once per token, and the intra-chunk work becomes a
-matmul rather than a stream of rank-one updates.
+The portable `generic` profile deliberately retains its conservative full
+state read/write per token. K3 profiles instead reproduce the released
+FlashKDA structure with `CHUNK=16`:
 
-Measured consequences of the current model, at K3 dimensions on the `rubin`
-preset with TP=4 (`kda_state` FP32):
+1. K1 uses grid `(sequence chunks, local heads)`, performs Q/K normalization,
+   decay and 16x16 inverse construction, and writes 13,824 bytes of workspace
+   per chunk/head (`k_decayed`, `q_decayed`, `k_restored`, `g_total`, inverse,
+   and `Mqk`).
+2. K2 uses grid `(sequences, local heads)`, reads that workspace, scans each
+   sequence's chunks in order, and reads/writes the FP32 boundary recurrent
+   state once per sequence. The state remains on chip during the scan.
 
-| prefill tokens | modeled recurrent | compute part | memory part | chunk-64 reference |
-| --- | --- | --- | --- | --- |
-| 512 | 0.118 ms | 0.0002 ms | 0.113 ms | 0.007 ms |
-| 4,096 | 0.906 ms | 0.0013 ms | 0.901 ms | 0.019 ms |
-| 16,384 | 3.610 ms | 0.0054 ms | 3.604 ms | 0.062 ms |
+The predictor adds separate K1 and K2 rooflines, so the workspace is charged
+once as a K1 write and once as a K2 read. An occupancy envelope is then applied
+as a lower bound because an aggregate roofline cannot represent K2's small
+`N*H` launch grid. Its fixed anchors are the public GB200 FP32-state results at
+8,192 tokens (`H64=0.9247 ms`, `H96=1.0087 ms`). The longest-sequence tail
+exposure, 0.823, is selected from the four public variable-length and 8x1024
+points; their mean absolute percentage error is 2.6%. No LMSYS serving point
+is used for this kernel prior.
 
-The term is memory bound by roughly 675:1, which no chunked kernel exhibits.
-Because the recurrent term then dominates, a KDA layer is modeled at about
-four times the cost of an MLA layer during prefill, and 69 of K3's 93 layers
-are KDA. Whole-model prefill is correspondingly overstated.
+This also prevents incorrect ideal TP scaling: with TP8, K3 has only 12 local
+heads, so K2 launches too few CTAs to use all 160 SMs. The per-layer recurrent
+time therefore remains close to TP1 rather than falling by 8x. Decode is
+unchanged because one decode token already touches the state once.
 
-Implementing this requires a chunk-size model input (16 for FlashKDA, 64-128
-for the FLA-style kernels), per-chunk rather than per-token state traffic, and
-the intra-chunk quadratic FLOP term that the chunked form adds. Decode is
-already correct: one token per request touches the state exactly once.
-
-`cpp/tests/analytical_model/k3_feature_fidelity_test.cc` pins the current
-behavior as a KNOWN DEVIATION so the change is visible when it lands.
+`k3_flashkda_prefill` is an isolated ablation that changes only this KDA
+schedule. `k3_sglang_mxfp4` and `k3_deepgemm_megamoe` combine it with their
+existing K3 local/MegaMoE schedules.
 
 ### 12.2 Future work: DCP during prefill
 
@@ -541,6 +606,10 @@ Changes to this design should preserve tests for:
   AttnRes metadata retained and its modeled cost fixed at zero;
 - Gated MLA cost and NoPE invariants;
 - native mixed-precision defaults and router storage/compute separation;
+- plain-TP versus EP front composition, decode-only route/quant and
+  shared/routed overlap, and the TP8 `M <= 12` latent-up boundary;
+- decode-only KDA chain/projection overlap and MLA output-gate overlap, with
+  prefill and batches above the published limits unchanged;
 - distinct KDA and MLA representative-layer scaling;
 - cold snapshot admission, existing-snapshot reuse, and rollback cleanup;
 - per-session KV-before-snapshot eviction and atomic surplus reclaim;

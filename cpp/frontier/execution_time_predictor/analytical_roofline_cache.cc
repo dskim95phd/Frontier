@@ -313,10 +313,13 @@ AnalyticalRooflineExecutionTimePredictor::shared_routing_for_batch(
         dense_batch.total_tokens, model_.router_topk, model_.total_expert_num,
         parallelism_.moe_expert_parallel_size, routing_, 0,
         static_cast<std::uint64_t>(batch_id.value()));
+    detail::MoEModel moe_model =
+        internal::make_moe_model(model_, parallelism_);
+    moe_model.decode_only = dense_batch.prefill_requests.empty() &&
+                            !dense_batch.decode_requests.empty();
     value->lane_prediction = detail::predict_moe_lanes(
-        device_, analytical_, internal::make_moe_model(model_, parallelism_),
-        value->allocation, model_.router_topk,
-        internal::make_moe_operator_precisions(config_));
+        device_, analytical_, moe_model, value->allocation,
+        model_.router_topk, internal::make_moe_operator_precisions(config_));
     std::lock_guard<std::mutex> lock(timing_cache_mutex_);
     if (cache_generation != timing_cache_generation_) {
         return value;

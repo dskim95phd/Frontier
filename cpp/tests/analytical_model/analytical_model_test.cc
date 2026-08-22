@@ -472,6 +472,15 @@ void test_router_storage_and_compute_precisions_are_independent() {
         analytical::DeviceCeilings::rubin(), analytical::AnalyticalConfig{},
         model, 512, 2, expert_tokens, bf16_storage);
 
+    auto bf16_logits = bf16_storage;
+    bf16_logits.router_compute = analytical::Precision::kBf16;
+    const auto bf16_output = analytical::predict_moe_layer(
+        analytical::DeviceCeilings::rubin(), analytical::AnalyticalConfig{},
+        model, 512, 2, expert_tokens, bf16_logits);
+    expect(bf16.gating_linear_ms >= bf16_output.gating_linear_ms,
+           "FP32 router logits may add output traffic but must retain the "
+           "BF16 operand GEMM ceiling");
+
     auto fp32_storage = bf16_storage;
     fp32_storage.router_weight = analytical::Precision::kFp32;
     const auto fp32 = analytical::predict_moe_layer(
@@ -488,6 +497,144 @@ void test_router_storage_and_compute_precisions_are_independent() {
         analytical::bytes_per_element(analytical::Precision::kFp32), 1);
     expect(output_fp32.hbm_bytes > 0.0,
            "router GEMM must account for FP32 logits writes");
+}
+
+void test_k3_latent_moe_front_is_one_gemm() {
+    analytical::MoEModel model{};
+    model.hidden_size = 7'168;
+    model.intermediate_size = 18'432;
+    model.model_num_experts = 896;
+    model.moe_tensor_parallel_size = 1;
+    model.routed_expert_hidden_size = 3'584;
+    const std::vector<std::uint64_t> expert_tokens(model.model_num_experts, 1);
+
+    analytical::MoEOperatorPrecisions precisions{};
+    precisions.expert = analytical::Precision::kMxFp4;
+    precisions.expert_weight = analytical::Precision::kMxFp4;
+    precisions.expert_activation = analytical::Precision::kMxFp8;
+    precisions.latent_moe_projection_weight = analytical::Precision::kBf16;
+    precisions.latent_moe_projection_activation = analytical::Precision::kBf16;
+    precisions.router_weight = analytical::Precision::kBf16;
+    precisions.router_activation = analytical::Precision::kBf16;
+    precisions.router_compute = analytical::Precision::kFp32;
+
+    analytical::AnalyticalConfig fused =
+        analytical::analytical_config_from_profile("k3_sglang_mxfp4",
+                                                   "gb300");
+    analytical::AnalyticalConfig separate = fused;
+    separate.fuse_latent_moe_front = false;
+    const auto fused_front = analytical::predict_moe_layer(
+        analytical::DeviceCeilings::gb300(), fused, model, 64, 16,
+        expert_tokens, precisions);
+    const auto separate_front = analytical::predict_moe_layer(
+        analytical::DeviceCeilings::gb300(), separate, model, 64, 16,
+        expert_tokens, precisions);
+
+    expect(fused_front.gating_linear_ms > separate_front.gating_linear_ms,
+           "fused-front bucket must include router and latent down work");
+    expect(fused_front.latent_projection_ms <
+               separate_front.latent_projection_ms,
+           "fused latent bucket must retain only the up projection");
+    expect(fused_front.gating_linear_ms + fused_front.latent_projection_ms <
+               separate_front.gating_linear_ms +
+                   separate_front.latent_projection_ms,
+           "one fused-front GEMM must save the duplicate input read");
+    expect_approximately_equal(
+        fused_front.gating_routing_topk_ms,
+        separate_front.gating_routing_topk_ms,
+        "front fusion must not change router top-k work");
+    expect_approximately_equal(
+        fused_front.grouped_up_projection_ms,
+        separate_front.grouped_up_projection_ms,
+        "front fusion must not change grouped expert up work");
+    expect_approximately_equal(
+        fused_front.grouped_down_projection_ms,
+        separate_front.grouped_down_projection_ms,
+        "front fusion must not change grouped expert down work");
+
+    analytical::AnalyticalConfig slow_tgv = fused;
+    slow_tgv.latent_moe_front = analytical::Efficiency{0.10, 0.10, 0.375};
+    const auto slow_small_front = analytical::predict_moe_layer(
+        analytical::DeviceCeilings::gb300(), slow_tgv, model, 64, 16,
+        expert_tokens, precisions);
+    expect(slow_small_front.gating_linear_ms > fused_front.gating_linear_ms,
+           "small-M fused front must use its TGV-specific efficiency");
+    const auto fused_large = analytical::predict_moe_layer(
+        analytical::DeviceCeilings::gb300(), fused, model, 128, 16,
+        expert_tokens, precisions);
+    const auto slow_tgv_large = analytical::predict_moe_layer(
+        analytical::DeviceCeilings::gb300(), slow_tgv, model, 128, 16,
+        expert_tokens, precisions);
+    expect_approximately_equal(
+        fused_large.gating_linear_ms, slow_tgv_large.gating_linear_ms,
+        "large-M fused front must retain the ordinary large-GEMM efficiency");
+
+    // The released plain-TP decode graph applies several additional
+    // schedules around this two-way front: shared gate/up is the third GEMM
+    // output, route+quant is one launch, shared down overlaps routed experts,
+    // and TP8 uses the column-sharded latent-up GEMM+all-gather for M <= 12.
+    analytical::MoEModel tp8 = model;
+    tp8.intermediate_size = 3'072;
+    tp8.num_shared_experts = 2;
+    tp8.moe_tensor_parallel_size = 8;
+    tp8.expert_parallel_size = 1;
+    tp8.latent_moe_use_norm = true;
+    tp8.decode_only = true;
+    analytical::MoEOperatorPrecisions k3_precisions = precisions;
+    k3_precisions.shared_expert = analytical::Precision::kBf16;
+    k3_precisions.shared_expert_weight = analytical::Precision::kBf16;
+    k3_precisions.shared_expert_activation = analytical::Precision::kBf16;
+    k3_precisions.dense = analytical::Precision::kBf16;
+    k3_precisions.dense_weight = analytical::Precision::kBf16;
+    k3_precisions.dense_activation = analytical::Precision::kBf16;
+    std::vector<std::uint64_t> one_token_routing(tp8.model_num_experts, 0);
+    std::fill_n(one_token_routing.begin(), 16, 1);
+
+    analytical::AnalyticalConfig k3_decode = fused;
+    analytical::AnalyticalConfig serial_decode = k3_decode;
+    serial_decode.fuse_shared_expert_moe_front = false;
+    serial_decode.fuse_route_quant = false;
+    serial_decode.overlap_shared_routed_moe = false;
+    serial_decode.use_tp8_latent_up_gemm_allgather = false;
+    const auto scheduled = analytical::predict_moe_layer(
+        analytical::DeviceCeilings::gb300(), k3_decode, tp8, 1, 16,
+        one_token_routing, k3_precisions);
+    const auto serial = analytical::predict_moe_layer(
+        analytical::DeviceCeilings::gb300(), serial_decode, tp8, 1, 16,
+        one_token_routing, k3_precisions);
+    expect(scheduled.total_ms() < serial.total_ms(),
+           "K3 plain-TP decode schedules must shorten the MoE critical path");
+    expect(scheduled.shuffling_ms == 0.0 && serial.shuffling_ms > 0.0,
+           "fused route+quant must remove the standalone shuffle launch");
+    expect(scheduled.latent_projection_ms < serial.latent_projection_ms,
+           "TP8 small-M latent up must use the sharded GEMM+all-gather path");
+
+    analytical::MoEModel prefill_tp8 = tp8;
+    prefill_tp8.decode_only = false;
+    const auto prefill_scheduled = analytical::predict_moe_layer(
+        analytical::DeviceCeilings::gb300(), k3_decode, prefill_tp8, 1, 16,
+        one_token_routing, k3_precisions);
+    const auto prefill_serial = analytical::predict_moe_layer(
+        analytical::DeviceCeilings::gb300(), serial_decode, prefill_tp8, 1,
+        16, one_token_routing, k3_precisions);
+    expect_approximately_equal(
+        prefill_scheduled.total_ms(), prefill_serial.total_ms(),
+        "decode-only K3 MoE schedules must not alter prefill");
+
+    std::vector<std::uint64_t> thirteen_token_routing(tp8.model_num_experts,
+                                                       0);
+    std::fill_n(thirteen_token_routing.begin(), 16, 13);
+    analytical::AnalyticalConfig no_small_gather = k3_decode;
+    no_small_gather.use_tp8_latent_up_gemm_allgather = false;
+    const auto m13 = analytical::predict_moe_layer(
+        analytical::DeviceCeilings::gb300(), k3_decode, tp8, 13, 16,
+        thirteen_token_routing, k3_precisions);
+    const auto m13_without_gather = analytical::predict_moe_layer(
+        analytical::DeviceCeilings::gb300(), no_small_gather, tp8, 13, 16,
+        thirteen_token_routing, k3_precisions);
+    expect_approximately_equal(
+        m13.latent_projection_ms, m13_without_gather.latent_projection_ms,
+        "TP8 latent GEMM+all-gather must stop above the published M=12 limit");
 }
 
 void test_mla_uses_latent_cache_context_costs() {
@@ -759,6 +906,33 @@ void test_mla_output_gate_and_nope_costs() {
            "Gated MLA must add full-rank gate projection and fusion work");
     expect(gated.total_ms() > k2_explicit_defaults.total_ms(),
            "Gated MLA total time must include gate work");
+
+    analytical::AnalyticalConfig overlapped =
+        analytical::analytical_config_from_profile("k3_sglang_mxfp4",
+                                                   "gb300");
+    analytical::AnalyticalConfig serial_gate = overlapped;
+    serial_gate.overlap_mla_output_gate = false;
+    const auto overlapped_gate = analytical::predict_dense_layer(
+        analytical::DeviceCeilings::gb300(), overlapped, model, batch,
+        analytical::Precision::kBf16);
+    const auto serial_gate_times = analytical::predict_dense_layer(
+        analytical::DeviceCeilings::gb300(), serial_gate, model, batch,
+        analytical::Precision::kBf16);
+    expect(overlapped_gate.total_ms() < serial_gate_times.total_ms(),
+           "K3 decode must overlap the MLA output-gate GEMM with attention");
+
+    analytical::DenseBatch large_decode = batch;
+    large_decode.total_tokens = 129;
+    large_decode.decode_requests = {{129, 2'048}};
+    const auto large_overlapped = analytical::predict_dense_layer(
+        analytical::DeviceCeilings::gb300(), overlapped, model, large_decode,
+        analytical::Precision::kBf16);
+    const auto large_serial = analytical::predict_dense_layer(
+        analytical::DeviceCeilings::gb300(), serial_gate, model, large_decode,
+        analytical::Precision::kBf16);
+    expect_approximately_equal(
+        large_overlapped.total_ms(), large_serial.total_ms(),
+        "MLA gate overlap must stop above the published batch-128 limit");
 
     model.mla_use_output_gate = false;
     model.mla_use_nope = true;
@@ -1995,6 +2169,37 @@ void test_kda_roofline_components_and_fixed_context_cost() {
         short_times.decode_attention_ms, long_times.decode_attention_ms,
         "KDA decode recurrent cost must not grow with past context");
 
+    analytical::AnalyticalConfig fused_decode =
+        analytical::analytical_config_from_profile("k3_sglang_mxfp4",
+                                                   "gb300");
+    analytical::AnalyticalConfig serial_decode = fused_decode;
+    serial_decode.fuse_kda_decode_chain = false;
+    serial_decode.overlap_kda_aux_projections = false;
+    const auto fused_kda = analytical::predict_dense_layer(
+        analytical::DeviceCeilings::gb300(), fused_decode, kda, short_decode,
+        analytical::Precision::kBf16);
+    const auto serial_kda = analytical::predict_dense_layer(
+        analytical::DeviceCeilings::gb300(), serial_decode, kda, short_decode,
+        analytical::Precision::kBf16);
+    expect(fused_kda.total_ms() < serial_kda.total_ms(),
+           "K3 must overlap auxiliary KDA projections and fuse the decode "
+           "conv/recurrent/gated-norm chain");
+    expect(fused_kda.kda_short_conv_ms == 0.0 &&
+               fused_kda.kda_gate_norm_ms == 0.0 &&
+               serial_kda.kda_short_conv_ms > 0.0 &&
+               serial_kda.kda_gate_norm_ms > 0.0,
+           "fused KDA decode must expose one recurrent critical-path bucket");
+
+    const auto fused_prefill = analytical::predict_dense_layer(
+        analytical::DeviceCeilings::gb300(), fused_decode, kda, prefill,
+        analytical::Precision::kBf16);
+    const auto serial_prefill = analytical::predict_dense_layer(
+        analytical::DeviceCeilings::gb300(), serial_decode, kda, prefill,
+        analytical::Precision::kBf16);
+    expect_approximately_equal(
+        fused_prefill.total_ms(), serial_prefill.total_ms(),
+        "decode-only KDA schedules must not alter prefill");
+
     auto tp8_kda = kda;
     tp8_kda.tensor_parallel_size = 8;
     const auto tp8_times = analytical::predict_dense_layer(
@@ -2060,6 +2265,9 @@ int main() {
     failures += frontier::test::run(
         "router storage and compute precisions are independent",
         test_router_storage_and_compute_precisions_are_independent);
+    failures += frontier::test::run(
+        "K3 LatentMoE front is one GEMM",
+        test_k3_latent_moe_front_is_one_gemm);
     failures += frontier::test::run("MLA uses latent-cache context costs",
                                     test_mla_uses_latent_cache_context_costs);
     failures += frontier::test::run("MLA KV layout splits latent and RoPE",

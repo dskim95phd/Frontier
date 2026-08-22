@@ -148,6 +148,9 @@ void BaseClusterScheduler::continue_moe_stage(
             std::size_t source_local_breakdown_sources = 0;
             std::vector<double> maximum_source_local_by_lane(
                 aggregate_lane_times_ms.size(), 0.0);
+            std::vector<double> maximum_source_nonshared_by_lane(
+                aggregate_lane_times_ms.size(), 0.0);
+            double maximum_source_shared_expert_ms = 0.0;
             const auto add_checked = [](std::uint64_t &target,
                                         std::uint64_t value) {
                 if (value >
@@ -194,6 +197,9 @@ void BaseClusterScheduler::continue_moe_stage(
                 group_input.source_input_tokens.push_back(routing.input_tokens);
                 group_input.source_shared_expert_path_ms.push_back(
                     routing.shared_expert_path_ms);
+                maximum_source_shared_expert_ms =
+                    std::max(maximum_source_shared_expert_ms,
+                             routing.shared_expert_path_ms);
                 for (std::size_t expert = 0;
                      expert < routing.global_expert_tokens.size(); ++expert) {
                     add_checked(group_input.global_expert_tokens.at(expert),
@@ -214,9 +220,19 @@ void BaseClusterScheduler::continue_moe_stage(
                     }
                     for (std::size_t lane = 0;
                          lane < aggregate_lane_times_ms.size(); ++lane) {
+                        if (routing.source_local_lane_times_ms.at(lane) <
+                            routing.shared_expert_path_ms) {
+                            throw std::logic_error(
+                                "MoE source-local path is shorter than its "
+                                "shared-expert component");
+                        }
                         maximum_source_local_by_lane.at(lane) = std::max(
                             maximum_source_local_by_lane.at(lane),
                             routing.source_local_lane_times_ms.at(lane));
+                        maximum_source_nonshared_by_lane.at(lane) = std::max(
+                            maximum_source_nonshared_by_lane.at(lane),
+                            routing.source_local_lane_times_ms.at(lane) -
+                                routing.shared_expert_path_ms);
                     }
                     ++source_local_breakdown_sources;
                 }
@@ -275,11 +291,29 @@ void BaseClusterScheduler::continue_moe_stage(
                 }
                 for (std::size_t lane = 0;
                      lane < aggregate_lane_times_ms.size(); ++lane) {
-                    // Preserve lane pairing before the final max reduction.
-                    // max_l(R_l + max_s NR_s,l) is tighter than the former
-                    // max_l(R_l) + max_s,l(NR_s,l) upper bound.
-                    aggregate_lane_times_ms.at(lane) +=
-                        maximum_source_local_by_lane.at(lane);
+                    if (group_prediction
+                            .source_shared_expert_overlap_fraction > 0.0) {
+                        // SGLang EP single-batch overlap joins the shared
+                        // branch immediately before the tail add. Its two
+                        // streams share HBM, so the measured profile exposes
+                        // only a fraction of the ideal overlap credit.
+                        const double overlap_credit_ms =
+                            group_prediction
+                                .source_shared_expert_overlap_fraction *
+                            std::min(aggregate_lane_times_ms.at(lane),
+                                     maximum_source_shared_expert_ms);
+                        aggregate_lane_times_ms.at(lane) =
+                            aggregate_lane_times_ms.at(lane) +
+                            maximum_source_shared_expert_ms -
+                            overlap_credit_ms +
+                            maximum_source_nonshared_by_lane.at(lane);
+                    } else {
+                        // Preserve lane pairing before the final max
+                        // reduction. max_l(R_l + max_s NR_s,l) is tighter
+                        // than max_l(R_l) + max_s,l(NR_s,l).
+                        aggregate_lane_times_ms.at(lane) +=
+                            maximum_source_local_by_lane.at(lane);
+                    }
                 }
             }
             if (group_prediction.has_source_aware_ep_communication) {

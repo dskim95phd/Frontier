@@ -13,6 +13,12 @@ namespace frontier::execution_time_predictor {
 MoEGroupLayerPrediction
 AnalyticalRooflineExecutionTimePredictor::predict_moe_group_layer(
     const MoEGroupLayerInput &input) const {
+    if (!std::isfinite(analytical_.ep_shared_routed_overlap_fraction) ||
+        analytical_.ep_shared_routed_overlap_fraction < 0.0 ||
+        analytical_.ep_shared_routed_overlap_fraction > 1.0) {
+        throw ExecutionTimePredictorError(
+            "EP shared/routed overlap fraction must be in [0, 1]");
+    }
     if (!input.layer_id.valid() || input.input_tokens == 0 ||
         input.global_expert_tokens.size() != model_.total_expert_num ||
         input.fallback_lane_times_ms.size() !=
@@ -130,6 +136,10 @@ AnalyticalRooflineExecutionTimePredictor::predict_moe_group_layer(
     MoEGroupLayerPrediction result{};
     result.lane_times_ms = prediction.lane_times_ms;
     result.lane_times_are_routed_only = true;
+    result.source_shared_expert_overlap_fraction =
+        analytical_.overlap_shared_routed_moe
+            ? analytical_.ep_shared_routed_overlap_fraction
+            : 0.0;
     result.critical_lane = prediction.critical_lane;
     result.critical_lane_time_ms = prediction.critical_lane_time_ms;
     const detail::MoEGroupedGemmGeometry &geometry =
@@ -171,8 +181,29 @@ AnalyticalRooflineExecutionTimePredictor::predict_moe_group_layer(
         }
         // Preserve the historical overlap window's shared-expert component,
         // but evaluate it per source instead of on the DP-summed token count.
+        const double overlap_credit_ms =
+            result.source_shared_expert_overlap_fraction *
+            std::min(prediction.critical_lane_time_ms,
+                     maximum_shared_expert_ms);
         const double fused_expert_compute_ms =
-            prediction.critical_lane_time_ms + maximum_shared_expert_ms;
+            prediction.critical_lane_time_ms + maximum_shared_expert_ms -
+            overlap_credit_ms;
+        std::uint64_t maximum_source_unique_token_copies = 0;
+        for (const auto &source_row : input.source_lane_unique_tokens) {
+            std::uint64_t source_unique_token_copies = 0;
+            for (const std::uint64_t tokens : source_row) {
+                if (tokens > std::numeric_limits<std::uint64_t>::max() -
+                                 source_unique_token_copies) {
+                    throw ExecutionTimePredictorError(
+                        "analytical group MoE source logical traffic "
+                        "overflows");
+                }
+                source_unique_token_copies += tokens;
+            }
+            maximum_source_unique_token_copies =
+                std::max(maximum_source_unique_token_copies,
+                         source_unique_token_copies);
+        }
         const detail::Precision communication_precision =
             detail::precision_from_string(config_.communication_precision());
         const detail::MoECommunicationTime communication =
@@ -187,7 +218,10 @@ AnalyticalRooflineExecutionTimePredictor::predict_moe_group_layer(
                 config_.moe_communication_backend, &allocation,
                 fused_expert_compute_ms, analytical_.moe_a2a_overlap_residual,
                 analytical_.mega_moe_a2a_bandwidth_scale,
-                analytical_.mega_moe_a2a_startup_scale);
+                analytical_.mega_moe_a2a_startup_scale,
+                detail::bytes_per_element(detail::precision_from_string(
+                    config_.routed_expert_activation_precision())),
+                maximum_source_unique_token_copies);
         result.has_source_aware_ep_communication = true;
         result.raw_ep_dispatch_ms = communication.raw_ep_dispatch_ms;
         result.raw_ep_combine_ms = communication.raw_ep_combine_ms;

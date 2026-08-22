@@ -79,6 +79,9 @@ struct SequenceAttentionWork {
     KernelWork kv_cache_save{0.0, 0.0};
     KernelWork prefill_attention{0.0, 0.0};
     KernelWork decode_attention{0.0, 0.0};
+    // Decode-side GEMM issued on an alternate stream and joined before the
+    // post-attention projection (K3 MLA output gate).
+    double decode_side_projection_ms = 0.0;
 };
 
 AttentionKind attention_kind(const DenseModel &model) {
@@ -271,6 +274,30 @@ KernelWork dense_gemm_work(const DenseLayerContext &context, std::uint64_t m,
                      context.dense_element_bytes, multiplier);
 }
 
+double predict_attention_gemm_ms(const DenseLayerContext &context,
+                                 std::uint64_t m, std::uint64_t k,
+                                 std::uint64_t n,
+                                 std::uint64_t output_matrices = 1) {
+    if (m == 0) {
+        return 0.0;
+    }
+    return predict_attention_work_ms(
+        context, attention_gemm_work(context, m, k, n, output_matrices),
+        gemm_efficiency_for(context, m));
+}
+
+double predict_dense_gemm_ms(const DenseLayerContext &context,
+                             std::uint64_t m, std::uint64_t k,
+                             std::uint64_t n,
+                             std::uint64_t output_matrices = 1) {
+    if (m == 0) {
+        return 0.0;
+    }
+    return predict_dense_work_ms(
+        context, dense_gemm_work(context, m, k, n, output_matrices),
+        gemm_efficiency_for(context, m));
+}
+
 KernelWork per_head_gemm_work(const DenseLayerContext &context,
                               std::uint64_t rows, std::uint64_t k,
                               std::uint64_t n) {
@@ -359,25 +386,16 @@ predict_mla_attention_work(const DenseLayerContext &context) {
     SequenceAttentionWork work{};
 
     if (model.q_lora_rank == 0) {
-        work.pre_projection_ms = predict_attention_work_ms(
-            context,
-            attention_gemm_work(context, context.batch.total_tokens,
-                                model.hidden_size,
-                                context.local_query_heads * model.qk_head_dim),
-            gemm_efficiency_for(context, context.batch.total_tokens));
+        work.pre_projection_ms = predict_attention_gemm_ms(
+            context, context.batch.total_tokens, model.hidden_size,
+            context.local_query_heads * model.qk_head_dim);
     } else {
         work.pre_projection_ms =
-            predict_attention_work_ms(
-                context,
-                attention_gemm_work(context, context.batch.total_tokens,
-                                    model.hidden_size, model.q_lora_rank),
-                gemm_efficiency_for(context, context.batch.total_tokens)) +
-            predict_attention_work_ms(
-                context,
-                attention_gemm_work(
-                    context, context.batch.total_tokens, model.q_lora_rank,
-                    context.local_query_heads * model.qk_head_dim),
-                gemm_efficiency_for(context, context.batch.total_tokens));
+            predict_attention_gemm_ms(context, context.batch.total_tokens,
+                                      model.hidden_size, model.q_lora_rank) +
+            predict_attention_gemm_ms(
+                context, context.batch.total_tokens, model.q_lora_rank,
+                context.local_query_heads * model.qk_head_dim);
         work.inter_norm_ms += predict_attention_work_ms(
             context,
             streaming_work(tokens * static_cast<double>(model.q_lora_rank),
@@ -387,11 +405,9 @@ predict_mla_attention_work(const DenseLayerContext &context) {
                            context.attention_element_bytes),
             context.config.streaming);
     }
-    work.pre_projection_ms += predict_attention_work_ms(
-        context,
-        attention_gemm_work(context, context.batch.total_tokens,
-                            model.hidden_size, latent_and_rope_dim),
-        gemm_efficiency_for(context, context.batch.total_tokens));
+    work.pre_projection_ms += predict_attention_gemm_ms(
+        context, context.batch.total_tokens, model.hidden_size,
+        latent_and_rope_dim);
     work.inter_norm_ms += predict_attention_work_ms(
         context,
         streaming_work(tokens * static_cast<double>(model.kv_lora_rank),
@@ -407,23 +423,17 @@ predict_mla_attention_work(const DenseLayerContext &context) {
         per_head_gemm_work(context, context.decode_tokens,
                            model.qk_nope_head_dim, model.kv_lora_rank),
         gemm_efficiency_for(context, context.decode_tokens));
-    work.post_projection_ms += predict_attention_work_ms(
-        context,
-        attention_gemm_work(context, context.prefill_tokens,
-                            context.local_query_heads * model.v_head_dim,
-                            model.hidden_size),
-        gemm_efficiency_for(context, context.prefill_tokens));
+    work.post_projection_ms += predict_attention_gemm_ms(
+        context, context.prefill_tokens,
+        context.local_query_heads * model.v_head_dim, model.hidden_size);
     work.post_projection_ms += predict_attention_work_ms(
         context,
         per_head_gemm_work(context, context.decode_tokens, model.kv_lora_rank,
                            model.v_head_dim),
         gemm_efficiency_for(context, context.decode_tokens));
-    work.post_projection_ms += predict_attention_work_ms(
-        context,
-        attention_gemm_work(context, context.decode_tokens,
-                            context.local_query_heads * model.v_head_dim,
-                            model.hidden_size),
-        gemm_efficiency_for(context, context.decode_tokens));
+    work.post_projection_ms += predict_attention_gemm_ms(
+        context, context.decode_tokens,
+        context.local_query_heads * model.v_head_dim, model.hidden_size);
 
     if (model.mla_use_output_gate) {
         // Kimi K3 computes a full-rank sigmoid gate from the layer input,
@@ -434,11 +444,17 @@ predict_mla_attention_work(const DenseLayerContext &context) {
         // and attention output and writes the gated output once.
         const std::uint64_t gate_dim =
             context.local_query_heads * model.v_head_dim;
-        work.post_projection_ms += predict_attention_work_ms(
-            context,
-            attention_gemm_work(context, context.batch.total_tokens,
-                                model.hidden_size, gate_dim),
-            gemm_efficiency_for(context, context.batch.total_tokens));
+        const bool overlap_decode_gate =
+            context.config.overlap_mla_output_gate &&
+            context.prefill_tokens == 0 && context.decode_tokens > 0 &&
+            context.decode_tokens <= 128;
+        const double gate_projection_ms = predict_attention_gemm_ms(
+            context, context.batch.total_tokens, model.hidden_size, gate_dim);
+        if (overlap_decode_gate) {
+            work.decode_side_projection_ms = gate_projection_ms;
+        } else {
+            work.post_projection_ms += gate_projection_ms;
+        }
         const double gate_elements = tokens * static_cast<double>(gate_dim);
         work.post_projection_ms += predict_attention_work_ms(
             context,
@@ -507,11 +523,9 @@ predict_mfa_attention_work(const DenseLayerContext &context) {
     const std::uint64_t replicated_qkv_dim =
         model.share_q_dim + 2 * context.local_kv_heads * model.head_dim;
     SequenceAttentionWork work{};
-    work.pre_projection_ms = predict_attention_work_ms(
-        context,
-        attention_gemm_work(context, context.batch.total_tokens,
-                            model.hidden_size, replicated_qkv_dim),
-        gemm_efficiency_for(context, context.batch.total_tokens));
+    work.pre_projection_ms = predict_attention_gemm_ms(
+        context, context.batch.total_tokens, model.hidden_size,
+        replicated_qkv_dim);
     work.inter_norm_ms = predict_attention_work_ms(
         context,
         streaming_work(tokens * static_cast<double>(model.share_q_dim),
@@ -519,18 +533,12 @@ predict_mfa_attention_work(const DenseLayerContext &context) {
                        5.0 * tokens * static_cast<double>(model.share_q_dim),
                        context.attention_element_bytes),
         context.config.streaming);
-    work.wq_projection_ms = predict_attention_work_ms(
-        context,
-        attention_gemm_work(context, context.batch.total_tokens,
-                            model.share_q_dim,
-                            context.local_query_heads * model.head_dim),
-        gemm_efficiency_for(context, context.batch.total_tokens));
-    work.post_projection_ms = predict_attention_work_ms(
-        context,
-        attention_gemm_work(context, context.batch.total_tokens,
-                            context.local_query_heads * model.head_dim,
-                            model.hidden_size),
-        gemm_efficiency_for(context, context.batch.total_tokens));
+    work.wq_projection_ms = predict_attention_gemm_ms(
+        context, context.batch.total_tokens, model.share_q_dim,
+        context.local_query_heads * model.head_dim);
+    work.post_projection_ms = predict_attention_gemm_ms(
+        context, context.batch.total_tokens,
+        context.local_query_heads * model.head_dim, model.hidden_size);
     work.rope_elements = tokens * (query_heads + kv_heads) * head_dim;
     const double kv_elements = tokens * 2.0 * kv_heads * head_dim;
     work.kv_cache_save = KernelWork{
@@ -560,19 +568,13 @@ predict_mha_attention_work(const DenseLayerContext &context) {
         (context.local_query_heads + 2 * context.local_kv_heads) *
         model.head_dim;
     SequenceAttentionWork work{};
-    work.pre_projection_ms = predict_attention_work_ms(
-        context,
-        attention_gemm_work(context, context.batch.total_tokens,
-                            model.hidden_size, local_qkv_dim),
-        gemm_efficiency_for(context, context.batch.total_tokens));
-    work.post_projection_ms = predict_attention_work_ms(
-        context,
-        attention_gemm_work(
-            context, context.batch.total_tokens,
-            std::max<std::uint64_t>(1, model.hidden_size /
-                                           model.tensor_parallel_size),
-            model.hidden_size),
-        gemm_efficiency_for(context, context.batch.total_tokens));
+    work.pre_projection_ms = predict_attention_gemm_ms(
+        context, context.batch.total_tokens, model.hidden_size, local_qkv_dim);
+    work.post_projection_ms = predict_attention_gemm_ms(
+        context, context.batch.total_tokens,
+        std::max<std::uint64_t>(1,
+                                model.hidden_size / model.tensor_parallel_size),
+        model.hidden_size);
     work.rope_elements = tokens * (query_heads + kv_heads) * head_dim;
     const double kv_elements = tokens * 2.0 * kv_heads * head_dim;
     work.kv_cache_save = KernelWork{
@@ -601,10 +603,12 @@ predict_mha_attention_work(const DenseLayerContext &context) {
 DenseLayerTimes predict_kda_attention_times(const DenseLayerContext &context) {
     struct KdaAttentionWork {
         KernelWork projection{0.0, 0.0};
-        KernelWork short_conv{0.0, 0.0};
+        KernelWork short_conv_prefill{0.0, 0.0};
+        KernelWork short_conv_decode{0.0, 0.0};
         KernelWork recurrent_prefill{0.0, 0.0};
         KernelWork recurrent_decode{0.0, 0.0};
-        KernelWork gate_norm{0.0, 0.0};
+        KernelWork gate_norm_prefill{0.0, 0.0};
+        KernelWork gate_norm_decode{0.0, 0.0};
     };
     const DenseModel &model = context.model;
     if (!model.use_kda) {
@@ -625,7 +629,6 @@ DenseLayerTimes predict_kda_attention_times(const DenseLayerContext &context) {
     }
     const std::uint64_t tokens = context.batch.total_tokens;
     const std::uint64_t conv_kernel = model.kda_short_conv_kernel_size;
-    const double token_count = static_cast<double>(tokens);
     const double qk_channels = static_cast<double>(local_qk_channels);
     const double v_channels = static_cast<double>(local_v_channels);
     const double conv_channels = static_cast<double>(std::max(
@@ -662,37 +665,59 @@ DenseLayerTimes predict_kda_attention_times(const DenseLayerContext &context) {
     const KernelWork beta = gemm_work(tokens, model.hidden_size, local_v_heads,
                                       context.attention_weight_element_bytes,
                                       context.attention_element_bytes, 1);
-    work.projection = add_kernel_work(
-        add_kernel_work(add_kernel_work(qk, v), add_kernel_work(f_a, f_b)),
-        add_kernel_work(full_rank_gate, beta));
+    const bool overlap_aux_projections =
+        context.config.overlap_kda_aux_projections &&
+        context.prefill_tokens == 0 && context.decode_tokens > 0 &&
+        context.decode_tokens <= 128;
+    double aux_projection_ms = 0.0;
+    if (overlap_aux_projections) {
+        // K3's main stream runs one [q|k|v|g] GEMM. A side stream runs the
+        // merged [f_a|beta] GEMV followed by f_b; it joins before recurrence.
+        // The two branches read hidden_states independently but overlap.
+        work.projection = gemm_work(
+            tokens, model.hidden_size, local_qk_channels,
+            context.attention_weight_element_bytes,
+            context.attention_element_bytes, 4);
+        const KernelWork fa_beta = gemm_work(
+            tokens, model.hidden_size,
+            model.kda_head_dim + local_v_heads,
+            context.attention_weight_element_bytes,
+            context.attention_element_bytes, 1);
+        aux_projection_ms =
+            predict_attention_work_ms(
+                context, fa_beta,
+                gemm_efficiency_for(context, context.batch.total_tokens)) +
+            predict_attention_work_ms(
+                context, f_b,
+                gemm_efficiency_for(context, context.batch.total_tokens));
+    } else {
+        work.projection = add_kernel_work(
+            add_kernel_work(add_kernel_work(qk, v), add_kernel_work(f_a, f_b)),
+            add_kernel_work(full_rank_gate, beta));
+    }
 
     // Each of Q/K/V is passed through a depthwise short convolution.  The
     // history window is fixed, so this cost is linear in tokens and does not
     // depend on request past_context.  HBM traffic accounts for a window read
     // and one output write for each channel.
-    const double conv_history_elements =
-        token_count * conv_channels * static_cast<double>(conv_kernel);
-    const double conv_output_elements = token_count * conv_channels;
-    const KernelWork short_conv{
-        2.0 * conv_history_elements,
-        conv_history_elements * context.kda_state_element_bytes +
-            conv_output_elements * context.attention_element_bytes,
+    const auto short_conv_work = [&](std::uint64_t count) {
+        const double rows = static_cast<double>(count);
+        const double history =
+            rows * conv_channels * static_cast<double>(conv_kernel);
+        const double output = rows * conv_channels;
+        return KernelWork{
+            2.0 * history,
+            history * context.kda_state_element_bytes +
+                output * context.attention_element_bytes,
+        };
     };
-    work.short_conv = short_conv;
+    work.short_conv_prefill = short_conv_work(context.prefill_tokens);
+    work.short_conv_decode = short_conv_work(context.decode_tokens);
 
-    // The delta-rule update performs a query/state product and a key/value
-    // outer-product update for each head.  The fixed recurrent state is
-    // touched once per token in this conservative roofline model.  It keeps
-    // decode work O(1) in context length while retaining the quadratic head
-    // dimension dependence of the state matrix.
-    //
-    // FUTURE WORK (docs/design/kimi-k3-support.md 12.1): this models a strictly
-    // sequential scan.  FlashKDA-style kernels process a chunk of tokens
-    // against a state held in registers and only combine chunk results
-    // sequentially, so the state reaches HBM once per chunk.  Per-token traffic
-    // makes prefill memory bound by roughly 675:1 and overstates a KDA layer by
-    // about an order of magnitude; decode, which touches the state once per
-    // request either way, is unaffected.
+    // The portable recurrence keeps the historical conservative contract:
+    // one full state read/write per token. The released K3 profile replaces
+    // prefill below with FlashKDA's two-stage chunk pipeline. Decode still
+    // touches one state per request and therefore uses this work record.
     const auto recurrent_work =
         [&](const std::vector<AttentionRequestSlice> &requests) {
             const double request_tokens =
@@ -711,42 +736,155 @@ DenseLayerTimes predict_kda_attention_times(const DenseLayerContext &context) {
     work.recurrent_prefill = recurrent_work(context.batch.prefill_requests);
     work.recurrent_decode = recurrent_work(context.batch.decode_requests);
 
+    const auto flashkda_prefill_ms = [&]() {
+        if (!context.config.use_flashkda_prefill_two_stage ||
+            context.batch.prefill_requests.empty()) {
+            return predict_attention_work_ms(
+                context, work.recurrent_prefill,
+                context.config.prefill_attention);
+        }
+
+        const std::uint64_t chunk = context.config.flashkda_chunk_tokens;
+        const std::uint64_t sm_count = context.config.flashkda_sm_count;
+        if (chunk == 0 || sm_count == 0) {
+            throw AnalyticalModelError(
+                "FlashKDA chunk size and SM count must be positive");
+        }
+        std::uint64_t total_chunks = 0;
+        std::uint64_t longest_chunks = 0;
+        for (const AttentionRequestSlice &request :
+             context.batch.prefill_requests) {
+            const std::uint64_t chunks =
+                dense_ceil_div(request.query_tokens, chunk);
+            total_chunks += chunks;
+            longest_chunks = std::max(longest_chunks, chunks);
+        }
+
+        const double heads = v_heads;
+        const double chunks = static_cast<double>(total_chunks);
+        const double token_count = static_cast<double>(context.prefill_tokens);
+        const double workspace =
+            chunks * heads * static_cast<double>(
+                                  context.config
+                                      .flashkda_workspace_bytes_per_chunk_head);
+        const double state_elements_per_sequence =
+            heads * key_dim * value_dim;
+        const double sequences =
+            static_cast<double>(context.batch.prefill_requests.size());
+
+        // K1 grid: (sequence chunks, heads). It normalizes Q/K, constructs
+        // the 16x16 decay/Mqk terms and inverse, then writes the exact public
+        // FlashKDA workspace: 3x4096 + 3x512 = 13,824 B per chunk/head.
+        const KernelWork kernel1{
+            4.0 * token_count * heads * key_dim * value_dim,
+            token_count * (2.0 * qk_channels + heads) *
+                    context.attention_element_bytes +
+                workspace,
+        };
+        // K2 grid: (sequences, heads). It reads the workspace, scans chunks
+        // in order, contracts V/output and reads/writes the FP32 boundary
+        // state once per sequence rather than once per token.
+        const KernelWork kernel2{
+            4.0 * token_count * heads * key_dim * value_dim,
+            workspace +
+                token_count * (2.0 * v_channels + heads) *
+                    context.attention_element_bytes +
+                2.0 * sequences * state_elements_per_sequence *
+                    context.kda_state_element_bytes,
+        };
+        const double roofline_ms =
+            predict_attention_work_ms(context, kernel1,
+                                      context.config.prefill_attention) +
+            predict_attention_work_ms(context, kernel2,
+                                      context.config.prefill_attention);
+
+        // Aggregate roofline misses K2's small N*H grid and sequential chunk
+        // tail. Anchor that scheduling envelope to FlashKDA's public GB200
+        // 8192-token FP32-state measurements (H64=0.9247 ms,
+        // H96=1.0087 ms). GB300 has the same 160-SM topology and HBM class;
+        // the roofline above remains the physical lower bound.
+        const double single_sequence_8192_ms =
+            0.9247 + (heads - 64.0) * ((1.0087 - 0.9247) / 32.0);
+        const double sequence_head_ctas = sequences * heads;
+        const double effective_chunks =
+            sequence_head_ctas <= static_cast<double>(sm_count)
+                ? static_cast<double>(longest_chunks)
+                : chunks * heads / static_cast<double>(sm_count) +
+                      context.config.flashkda_serial_tail_exposure *
+                          static_cast<double>(longest_chunks);
+        const double scheduling_ms =
+            std::max(0.0, single_sequence_8192_ms) * effective_chunks /
+            (8192.0 / static_cast<double>(chunk));
+        return std::max(roofline_ms, scheduling_ms);
+    };
+
     // Fused RMSNorm + sigmoid gate: one read/write pass over the projected
     // output with a small constant amount of scalar work per element.
-    work.gate_norm = streaming_work(
-        token_count * v_channels, token_count * v_channels,
-        8.0 * token_count * v_channels, context.attention_element_bytes);
+    const auto gate_norm_work = [&](std::uint64_t count) {
+        const double rows = static_cast<double>(count);
+        return streaming_work(rows * v_channels, rows * v_channels,
+                              8.0 * rows * v_channels,
+                              context.attention_element_bytes);
+    };
+    work.gate_norm_prefill = gate_norm_work(context.prefill_tokens);
+    work.gate_norm_decode = gate_norm_work(context.decode_tokens);
 
     DenseLayerTimes times{};
     // Keep the historical attention buckets populated while exposing the KDA
     // sub-components for diagnostics and focused tests.
-    times.kda_projection_ms = predict_attention_work_ms(
+    // The Day-0 path merges skinny Q/K/V/gate projections and overlaps the
+    // dependent GEMV chain. A standalone tile-grid prior would double-count
+    // the small-M loss already represented by this fused aggregate profile.
+    const double main_projection_ms = predict_attention_work_ms(
         context, work.projection,
         gemm_efficiency_for(context, context.batch.total_tokens));
-    times.kda_short_conv_ms = predict_attention_work_ms(
-        context, work.short_conv, context.config.streaming);
+    times.kda_projection_ms =
+        overlap_aux_projections
+            ? std::max(main_projection_ms, aux_projection_ms)
+            : main_projection_ms;
+    const double prefill_short_conv_ms = predict_attention_work_ms(
+        context, work.short_conv_prefill, context.config.streaming);
+    const double decode_short_conv_ms = predict_attention_work_ms(
+        context, work.short_conv_decode, context.config.streaming);
+    const double prefill_recurrent_ms = flashkda_prefill_ms();
+    const double decode_recurrent_ms = predict_attention_work_ms(
+        context, work.recurrent_decode, context.config.decode_attention);
+    const double prefill_gate_norm_ms = predict_attention_work_ms(
+        context, work.gate_norm_prefill, context.config.streaming);
+    const double decode_gate_norm_ms = predict_attention_work_ms(
+        context, work.gate_norm_decode, context.config.streaming);
+    const bool fuse_decode_chain = context.config.fuse_kda_decode_chain &&
+                                   context.prefill_tokens == 0 &&
+                                   context.decode_tokens > 0;
+    double fused_decode_ms = 0.0;
+    if (fuse_decode_chain) {
+        const KernelWork fused_decode_work = add_kernel_work(
+            add_kernel_work(work.short_conv_decode, work.recurrent_decode),
+            work.gate_norm_decode);
+        fused_decode_ms = predict_attention_work_ms(
+            context, fused_decode_work, context.config.decode_attention);
+    }
+    times.kda_short_conv_ms =
+        prefill_short_conv_ms +
+        (fuse_decode_chain ? 0.0 : decode_short_conv_ms);
     times.kda_recurrent_ms =
-        predict_attention_work_ms(context, work.recurrent_prefill,
-                                  context.config.prefill_attention) +
-        predict_attention_work_ms(context, work.recurrent_decode,
-                                  context.config.decode_attention);
-    times.kda_gate_norm_ms = predict_attention_work_ms(
-        context, work.gate_norm, context.config.streaming);
+        prefill_recurrent_ms +
+        (fuse_decode_chain ? fused_decode_ms : decode_recurrent_ms);
+    times.kda_gate_norm_ms =
+        prefill_gate_norm_ms +
+        (fuse_decode_chain ? 0.0 : decode_gate_norm_ms);
     times.attention_pre_projection_ms =
         times.kda_projection_ms + times.kda_short_conv_ms;
-    times.attention_post_projection_ms = predict_attention_work_ms(
-        context,
-        attention_gemm_work(context, context.batch.total_tokens,
-                            dense_ceil_div(context.model.kda_num_v_heads,
-                                           context.model.tensor_parallel_size) *
-                                context.model.kda_value_head_dim,
-                            context.model.hidden_size),
-        gemm_efficiency_for(context, context.batch.total_tokens));
+    times.attention_post_projection_ms = predict_attention_gemm_ms(
+        context, context.batch.total_tokens,
+        dense_ceil_div(context.model.kda_num_v_heads,
+                       context.model.tensor_parallel_size) *
+            context.model.kda_value_head_dim,
+        context.model.hidden_size);
     times.attention_inter_norm_ms = times.kda_gate_norm_ms;
-    times.prefill_attention_ms = predict_attention_work_ms(
-        context, work.recurrent_prefill, context.config.prefill_attention);
-    times.decode_attention_ms = predict_attention_work_ms(
-        context, work.recurrent_decode, context.config.decode_attention);
+    times.prefill_attention_ms = prefill_recurrent_ms;
+    times.decode_attention_ms =
+        fuse_decode_chain ? fused_decode_ms : decode_recurrent_ms;
     // KDA does not use RoPE or a sequence-growing KV cache.
     times.rope_ms = 0.0;
     times.kv_cache_save_ms = 0.0;
@@ -783,6 +921,11 @@ predict_sequence_attention_times(const DenseLayerContext &context,
         context, work.prefill_attention, context.config.prefill_attention);
     times.decode_attention_ms = predict_attention_work_ms(
         context, work.decode_attention, context.config.decode_attention);
+    if (work.decode_side_projection_ms > 0.0) {
+        times.decode_attention_ms =
+            std::max(times.decode_attention_ms,
+                     work.decode_side_projection_ms);
+    }
     return times;
 }
 
@@ -811,14 +954,9 @@ void populate_dense_mlp_and_norm_times(const DenseLayerContext &context,
     const double activation_elements = tokens * intermediate;
     const std::uint64_t gated_multiplier = context.model.gated_mlp ? 2 : 1;
     const double norm_factor = context.model.fused_add_norm ? 3.0 : 2.0;
-    const Efficiency &gemm_efficiency =
-        gemm_efficiency_for(context, context.batch.total_tokens);
-    times.mlp_up_projection_ms = predict_dense_work_ms(
-        context,
-        dense_gemm_work(context, context.batch.total_tokens,
-                        context.model.hidden_size, context.local_intermediate,
-                        gated_multiplier),
-        gemm_efficiency);
+    times.mlp_up_projection_ms = predict_dense_gemm_ms(
+        context, context.batch.total_tokens, context.model.hidden_size,
+        context.local_intermediate, gated_multiplier);
     times.mlp_activation_ms = predict_dense_work_ms(
         context,
         streaming_work(activation_elements *
@@ -826,11 +964,9 @@ void populate_dense_mlp_and_norm_times(const DenseLayerContext &context,
                        activation_elements, 8.0 * activation_elements,
                        context.dense_element_bytes),
         context.config.streaming);
-    times.mlp_down_projection_ms = predict_dense_work_ms(
-        context,
-        dense_gemm_work(context, context.batch.total_tokens,
-                        context.local_intermediate, context.model.hidden_size),
-        gemm_efficiency);
+    times.mlp_down_projection_ms = predict_dense_gemm_ms(
+        context, context.batch.total_tokens, context.local_intermediate,
+        context.model.hidden_size);
     times.mlp_norm_ms = predict_dense_work_ms(
         context,
         streaming_work(tokens * hidden * (norm_factor - 1.0), tokens * hidden,

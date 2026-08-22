@@ -301,11 +301,13 @@ ExecutionModelConfig parse_execution_model(const Json &root,
                 "'detailed', 'first_layer_scaled', or 'stage_group_scaled'");
         }
         if (analytical.kernel_profile != "generic" &&
+            analytical.kernel_profile != "k3_flashkda_prefill" &&
             analytical.kernel_profile != "k3_sglang_mxfp4" &&
             analytical.kernel_profile != "k3_deepgemm_megamoe") {
             throw ConfigError(
                 "config.execution_model.kernel_profile must be 'generic', "
-                "'k3_sglang_mxfp4', or 'k3_deepgemm_megamoe'");
+                "'k3_flashkda_prefill', 'k3_sglang_mxfp4', or "
+                "'k3_deepgemm_megamoe'");
         }
         if (analytical.kernel_profile != "generic" &&
             ((analytical.device != "gb300" && analytical.device != "rubin") ||

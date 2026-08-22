@@ -19,6 +19,7 @@ detail::MoEModel make_moe_model(const config::ModelConfig &model,
     result.model_num_experts = model.num_experts;
     result.num_shared_experts = model.num_shared_experts;
     result.moe_tensor_parallel_size = parallelism.moe_tensor_parallel_size;
+    result.expert_parallel_size = parallelism.moe_expert_parallel_size;
     result.routed_expert_hidden_size = model.routed_expert_hidden_size;
     result.latent_moe_use_norm = model.latent_moe_use_norm;
     result.attn_res_block_size = model.attn_res_block_size;
@@ -260,7 +261,9 @@ moe_stage_communication(const MoEStageContext &context,
         context.config.moe_communication_backend, &allocation,
         fused_expert_compute_ms, context.analytical.moe_a2a_overlap_residual,
         context.analytical.mega_moe_a2a_bandwidth_scale,
-        context.analytical.mega_moe_a2a_startup_scale);
+        context.analytical.mega_moe_a2a_startup_scale,
+        detail::bytes_per_element(detail::precision_from_string(
+            context.config.routed_expert_activation_precision())));
 }
 
 void reset_moe_compute(entities::ExecutionTime &execution_time) noexcept {
@@ -333,7 +336,9 @@ predict_selected_moe_layer_execution(const MoEStageContext &context,
     reset_moe_compute(result.execution_time);
     reset_moe_communication(result.execution_time);
 
-    const detail::MoEModel moe_model = make_moe_model(model, parallelism);
+    detail::MoEModel moe_model = make_moe_model(model, parallelism);
+    moe_model.decode_only = context.dense_batch.prefill_requests.empty() &&
+                            !context.dense_batch.decode_requests.empty();
     const detail::MoEOperatorPrecisions moe_precisions =
         make_moe_operator_precisions(context.config);
     double pending_dense_compute_ms = 0.0;
@@ -415,7 +420,9 @@ MoEStagePrediction predict_moe_stage_execution(const MoEStageContext &context) {
     result.execution_time = context.base_execution_time;
     reset_moe_compute(result.execution_time);
     reset_moe_communication(result.execution_time);
-    const detail::MoEModel moe_model = make_moe_model(model, parallelism);
+    detail::MoEModel moe_model = make_moe_model(model, parallelism);
+    moe_model.decode_only = context.dense_batch.prefill_requests.empty() &&
+                            !context.dense_batch.decode_requests.empty();
     const detail::MoEOperatorPrecisions moe_precisions =
         make_moe_operator_precisions(config);
     double pending_pre_moe_compute_ms = 0.0;

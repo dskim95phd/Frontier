@@ -3,7 +3,7 @@
 // These tests do not re-derive the roofline arithmetic; they pin the
 // qualitative behavior a reader would expect from a real serving system, so a
 // future change that silently inverts one of these relationships fails here.
-// Two checks deliberately record a KNOWN DEVIATION from real hardware; they are
+// Checks that deliberately record a KNOWN DEVIATION from real hardware are
 // marked as such and must be flipped, not deleted, when the model is corrected.
 
 #include "frontier/config/config.h"
@@ -82,6 +82,19 @@ analytical::DenseLayerTimes predict_layer(const analytical::DenseModel &model,
         model, batch, analytical::Precision::kFp8);
 }
 
+analytical::DenseLayerTimes predict_layer(
+    const analytical::DenseModel &model, const analytical::DenseBatch &batch,
+    const analytical::AnalyticalConfig &config) {
+    analytical::DenseOperatorPrecisions precisions{};
+    precisions.attention = analytical::Precision::kBf16;
+    precisions.dense = analytical::Precision::kBf16;
+    precisions.kv_cache = analytical::Precision::kBf16;
+    precisions.kda_state = analytical::Precision::kFp32;
+    return analytical::predict_dense_layer(
+        analytical::DeviceCeilings::gb300(), config, model, batch,
+        precisions);
+}
+
 analytical::DenseBatch decode_batch(std::uint64_t requests,
                                     std::uint64_t context) {
     analytical::DenseBatch value{};
@@ -131,33 +144,43 @@ void test_kda_decode_is_context_free_and_mla_is_not() {
            "at 512K context KDA must be far cheaper than MLA");
 }
 
-// KNOWN DEVIATION, tracked in docs/design/kimi-k3-support.md section 12.1.
-// The delta-rule update is charged one full recurrent-state read and write per
-// token, which models a strictly sequential scan.  FlashKDA-style kernels
-// process a chunk of tokens against a state held in registers and combine only
-// the chunk results sequentially, so prefill state traffic here is roughly two
-// orders of magnitude too high.  Flip this test when the model gains chunking.
-void test_kda_prefill_recurrent_traffic_is_per_token() {
+void test_kda_prefill_flashkda_two_stage_profile() {
     const auto config =
         frontier::config::load_model_config("moonshotai/Kimi-K3");
-    auto kda = k3_dense_model(config, 4);
+    auto kda = k3_dense_model(config, 1);
     kda.use_mla = false;
     kda.use_kda = true;
 
-    const auto small = predict_layer(kda, prefill_batch(512, 0));
-    const auto large = predict_layer(kda, prefill_batch(4'096, 0));
-    const double growth =
-        large.prefill_attention_ms / small.prefill_attention_ms;
-    expect(growth > 7.0 && growth < 8.1,
-           "KDA prefill recurrent cost currently scales linearly with tokens");
+    const auto portable = predict_layer(kda, prefill_batch(8'192, 0),
+                                        analytical::AnalyticalConfig{});
+    auto flash_config = analytical::analytical_config_from_profile(
+        "k3_sglang_mxfp4", "gb300");
+    const auto flash = predict_layer(kda, prefill_batch(8'192, 0),
+                                     flash_config);
+    expect(flash.prefill_attention_ms > 0.95 &&
+               flash.prefill_attention_ms < 1.07,
+           "TP1 FlashKDA must match the public H96 8K scheduling anchor");
+    expect(flash.prefill_attention_ms < 0.07 *
+                                            portable.prefill_attention_ms,
+           "FlashKDA must remove the portable per-token state traffic");
 
-    auto mla = k3_dense_model(config, 4);
-    mla.use_mla = true;
-    const auto mla_prefill = predict_layer(mla, prefill_batch(4'096, 0));
-    // A K3 linear-attention layer should be the cheap one during prefill.  It
-    // is not, because of the per-token state traffic above.
-    expect(large.total_ms() > 3.0 * mla_prefill.total_ms(),
-           "KNOWN DEVIATION: KDA prefill is modeled far above MLA prefill");
+    auto tp8 = k3_dense_model(config, 8);
+    tp8.use_mla = false;
+    tp8.use_kda = true;
+    const auto tp8_flash =
+        predict_layer(tp8, prefill_batch(8'192, 0), flash_config);
+    expect(tp8_flash.prefill_attention_ms >
+               0.70 * flash.prefill_attention_ms,
+           "K2's small head grid must prevent ideal TP8 recurrence scaling");
+
+    analytical::DenseBatch eight_sequences{};
+    eight_sequences.total_tokens = 8'192;
+    eight_sequences.prefill_requests.assign(
+        8, analytical::AttentionRequestSlice{1'024, 0});
+    const auto batched_flash = predict_layer(kda, eight_sequences, flash_config);
+    expect(batched_flash.prefill_attention_ms > 0.67 &&
+               batched_flash.prefill_attention_ms < 0.74,
+           "FlashKDA head/chunk waves must match the public 8x1024 anchor");
 }
 
 // DCP is deliberately decode-only: a context-parallel prefill would pay an
@@ -537,8 +560,8 @@ int main() {
         frontier::test::run("kda_decode_is_context_free",
                             test_kda_decode_is_context_free_and_mla_is_not);
     failures +=
-        frontier::test::run("kda_prefill_recurrent_traffic_per_token",
-                            test_kda_prefill_recurrent_traffic_is_per_token);
+        frontier::test::run("kda_prefill_flashkda_two_stage",
+                            test_kda_prefill_flashkda_two_stage_profile);
     failures +=
         frontier::test::run("mla_dcp_prefill_versus_decode",
                             test_mla_dcp_shards_decode_but_not_cached_prefill);

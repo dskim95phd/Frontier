@@ -169,7 +169,17 @@ double predict_shared_expert_work_ms(const MoELayerContext &context,
                       context.config.kernel_launch_latency_us);
 }
 
-double predict_router_work_ms(const MoELayerContext &context,
+double predict_router_gemm_ms(const MoELayerContext &context,
+                              const KernelWork &work,
+                              const Efficiency &efficiency) {
+    // FP32 router logits describe accumulation/output width, not an FP32
+    // CUDA-core GEMM. BF16 inputs and weights execute on the BF16 tensor-core
+    // roofline while still writing FP32 logits.
+    return predict_ms(context.device, context.router_weight_precision, work,
+                      efficiency, context.config.kernel_launch_latency_us);
+}
+
+double predict_router_topk_ms(const MoELayerContext &context,
                               const KernelWork &work,
                               const Efficiency &efficiency) {
     return predict_ms(context.device, context.router_compute_precision, work,
@@ -434,6 +444,13 @@ const Efficiency &router_gemm_efficiency(const MoELayerContext &context) {
                : context.config.large_gemm;
 }
 
+const Efficiency &
+latent_moe_front_efficiency(const MoELayerContext &context) {
+    return context.input_tokens < context.config.small_gemm_token_threshold
+               ? context.config.latent_moe_front
+               : context.config.large_gemm;
+}
+
 } // namespace
 
 double MoELayerTime::total_ms() const noexcept {
@@ -472,23 +489,94 @@ predict_moe_layer(const DeviceCeilings &device, const AnalyticalConfig &config,
         context.model.routed_expert_hidden_size == 0
             ? context.model.hidden_size
             : context.model.routed_expert_hidden_size;
+    const bool fuse_latent_moe_front =
+        context.config.fuse_latent_moe_front &&
+        context.model.routed_expert_hidden_size != 0 &&
+        context.router_weight_precision ==
+            context.latent_moe_projection_weight_precision &&
+        context.router_element_bytes ==
+            context.latent_moe_projection_element_bytes;
+    const bool plain_tp_decode = context.model.decode_only &&
+                                 context.model.expert_parallel_size == 1 &&
+                                 context.model.moe_tensor_parallel_size > 1;
+    const bool fuse_shared_expert_front =
+        fuse_latent_moe_front && plain_tp_decode &&
+        context.config.fuse_shared_expert_moe_front &&
+        context.model.num_shared_experts > 0 &&
+        context.shared_expert_weight_precision ==
+            context.router_weight_precision &&
+        context.shared_expert_element_bytes == context.router_element_bytes;
 
     MoELayerTime result{};
-    result.gating_linear_ms = predict_router_work_ms(
-        context,
-        gemm_work(context.input_tokens, context.model.hidden_size,
-                  context.model.model_num_experts,
-                  context.router_weight_element_bytes,
-                  context.router_element_bytes,
-                  bytes_per_element(context.router_compute_precision), 1),
-        router_gemm_efficiency(context));
-    result.gating_routing_topk_ms = predict_router_work_ms(
-        context,
-        streaming_work(tokens * experts,
-                       tokens * static_cast<double>(context.router_topk),
-                       4.0 * tokens * experts,
-                       bytes_per_element(context.router_compute_precision)),
-        context.config.routing);
+    const KernelWork router_work = gemm_work(
+        context.input_tokens, context.model.hidden_size,
+        context.model.model_num_experts, context.router_weight_element_bytes,
+        context.router_element_bytes,
+        bytes_per_element(context.router_compute_precision), 1);
+    if (fuse_latent_moe_front) {
+        // SGLang concatenates the 896-column gate and 3584-column LatentMoE
+        // down-projection weights. Both slices emit FP32 from one BF16 GEMM;
+        // the routed slice is rounded to BF16 by its consumer. Combining the
+        // two logical work records must remove the duplicate hidden-state
+        // read that a pair of standalone GEMMs would incur.
+        const KernelWork latent_down_work = gemm_work(
+            context.input_tokens, context.model.hidden_size,
+            latent_hidden_size,
+            context.latent_moe_projection_weight_element_bytes,
+            context.latent_moe_projection_element_bytes,
+            bytes_per_element(context.router_compute_precision), 1);
+        KernelWork fused_front_work =
+            combined_kernel_work(router_work, latent_down_work);
+        fused_front_work.hbm_bytes -=
+            tokens * hidden * context.router_element_bytes;
+        if (fuse_shared_expert_front) {
+            // Plain TP K3 merges the TP-local shared gate/up slice as the
+            // third output of [shared gate_up | router | latent down].  The
+            // multiplier represents the two shared experts and SiTU's gated
+            // pair while retaining a single hidden-state read.
+            const KernelWork shared_front_work = gemm_work(
+                context.input_tokens, context.model.hidden_size,
+                context.local_intermediate,
+                context.shared_expert_weight_element_bytes,
+                context.shared_expert_element_bytes,
+                bytes_per_element(context.router_compute_precision),
+                context.model.num_shared_experts *
+                    (context.model.gated_mlp ? 2 : 1));
+            fused_front_work =
+                combined_kernel_work(fused_front_work, shared_front_work);
+            fused_front_work.hbm_bytes -=
+                tokens * hidden * context.router_element_bytes;
+        }
+        result.gating_linear_ms = predict_router_gemm_ms(
+            context, fused_front_work,
+            latent_moe_front_efficiency(context));
+    } else {
+        result.gating_linear_ms = predict_router_gemm_ms(
+            context, router_work, router_gemm_efficiency(context));
+    }
+    KernelWork routing_work = streaming_work(
+        tokens * experts,
+        tokens * static_cast<double>(context.router_topk),
+        4.0 * tokens * experts,
+        bytes_per_element(context.router_compute_precision));
+    const bool fuse_route_quant =
+        context.model.decode_only && context.config.fuse_route_quant &&
+        context.model.routed_expert_hidden_size != 0;
+    if (fuse_route_quant) {
+        // SGLang's K3 route_quant_fused launch runs the radix-routing CTAs and
+        // one MXFP8 quant CTA per source token together. The packed expert ids
+        // are tiny; include the activation and scale traffic without creating
+        // the old second launch or top-k-expanded activation copies.
+        const double latent = static_cast<double>(latent_hidden_size);
+        routing_work.hbm_bytes +=
+            tokens * latent *
+                (context.latent_moe_projection_element_bytes +
+                 context.expert_element_bytes) +
+            tokens * std::ceil(latent / 32.0) * 4.0;
+        routing_work.flops += 4.0 * tokens * latent;
+    }
+    result.gating_routing_topk_ms = predict_router_topk_ms(
+        context, routing_work, context.config.routing);
     const bool shared_uses_routed_kernel =
         context.shared_expert_weight_precision ==
             context.expert_weight_precision &&
@@ -527,7 +615,7 @@ predict_moe_layer(const DeviceCeilings &device, const AnalyticalConfig &config,
                   mega_moe.shared_down_cluster_tasks)
             : predict_shared_expert_work_ms(context, expert_work.shared_down,
                                             context.config.moe);
-    if (shared_uses_routed_kernel) {
+    if (shared_uses_routed_kernel && !fuse_shared_expert_front) {
         KernelWork combined_up = expert_work.routed_up;
         KernelWork combined_down = expert_work.routed_down;
         add_kernel_work(combined_up, expert_work.shared_up);
@@ -552,30 +640,88 @@ predict_moe_layer(const DeviceCeilings &device, const AnalyticalConfig &config,
         }
     } else {
         result.grouped_up_projection_ms =
-            routed_up_projection_ms + shared_up_projection_ms;
+            routed_up_projection_ms +
+            (fuse_shared_expert_front ? 0.0 : shared_up_projection_ms);
         result.grouped_down_projection_ms =
             routed_down_projection_ms + shared_down_projection_ms;
     }
     result.grouped_gemm_geometry = mega_moe.geometry;
-    result.shuffling_ms = predict_expert_work_ms(
-        context,
-        streaming_work(routed * static_cast<double>(latent_hidden_size),
-                       routed * static_cast<double>(latent_hidden_size), 0.0,
-                       context.expert_element_bytes),
-        context.config.streaming);
+    result.shuffling_ms =
+        fuse_route_quant
+            ? 0.0
+            : predict_expert_work_ms(
+                  context,
+                  streaming_work(
+                      routed * static_cast<double>(latent_hidden_size),
+                      routed * static_cast<double>(latent_hidden_size), 0.0,
+                      context.expert_element_bytes),
+                  context.config.streaming);
+    if (fuse_shared_expert_front &&
+        context.config.overlap_shared_routed_moe) {
+        // After the merged front, the BF16 shared down GEMM runs on the side
+        // stream while routed MXFP4 experts run on the main stream. Charge the
+        // producer/consumer critical path rather than adding both branches.
+        const double routed_path = routed_up_projection_ms +
+                                   routed_down_projection_ms +
+                                   result.shuffling_ms;
+        const double critical_path =
+            std::max(routed_path, shared_down_projection_ms);
+        result.grouped_up_projection_ms = routed_up_projection_ms;
+        result.grouped_down_projection_ms = std::max(
+            0.0, critical_path - routed_up_projection_ms -
+                     result.shuffling_ms);
+    }
     if (context.model.routed_expert_hidden_size != 0) {
-        const KernelWork latent_projection = combined_kernel_work(
-            gemm_work(context.input_tokens, context.model.hidden_size,
-                      latent_hidden_size,
-                      context.latent_moe_projection_weight_element_bytes,
-                      context.latent_moe_projection_element_bytes, 1),
-            gemm_work(context.input_tokens, latent_hidden_size,
-                      context.model.hidden_size,
-                      context.latent_moe_projection_weight_element_bytes,
-                      context.latent_moe_projection_element_bytes, 1));
-        result.latent_projection_ms = predict_latent_moe_projection_work_ms(
-            context, latent_projection, router_gemm_efficiency(context));
-        if (context.model.latent_moe_use_norm) {
+        KernelWork latent_projection = gemm_work(
+            context.input_tokens, latent_hidden_size, context.model.hidden_size,
+            context.latent_moe_projection_weight_element_bytes,
+            context.latent_moe_projection_element_bytes, 1);
+        if (!fuse_latent_moe_front) {
+            latent_projection = combined_kernel_work(
+                gemm_work(
+                    context.input_tokens, context.model.hidden_size,
+                    latent_hidden_size,
+                    context.latent_moe_projection_weight_element_bytes,
+                    context.latent_moe_projection_element_bytes, 1),
+                latent_projection);
+        }
+        const bool use_gemm_allgather =
+            plain_tp_decode &&
+            context.config.use_tp8_latent_up_gemm_allgather &&
+            context.model.moe_tensor_parallel_size == 8 &&
+            context.input_tokens <=
+                context.config.tp8_latent_up_gemm_allgather_max_tokens;
+        if (use_gemm_allgather) {
+            // TP8 K3 reads one eighth of the replicated up-projection weight
+            // per rank, multicasts the local columns, and folds add3 into the
+            // consumer. The producer and consumer are separate PDL launches.
+            const std::uint64_t local_hidden =
+                ceil_div(context.model.hidden_size,
+                         context.model.moe_tensor_parallel_size);
+            const KernelWork local_projection = gemm_work(
+                context.input_tokens, latent_hidden_size, local_hidden,
+                context.latent_moe_projection_weight_element_bytes,
+                context.latent_moe_projection_element_bytes, 1);
+            const double local_ms = predict_latent_moe_projection_work_ms(
+                context, local_projection, router_gemm_efficiency(context));
+            const double gathered_bytes =
+                tokens * hidden *
+                context.latent_moe_projection_element_bytes;
+            const double gather_ms =
+                context.config.kernel_launch_latency_us / 1000.0 +
+                gathered_bytes /
+                    (context.config
+                         .tp8_latent_up_gemm_allgather_bandwidth_tbps *
+                     1e12) *
+                    1e3;
+            result.latent_projection_ms = local_ms + gather_ms;
+        } else {
+            result.latent_projection_ms =
+                predict_latent_moe_projection_work_ms(
+                    context, latent_projection,
+                    router_gemm_efficiency(context));
+        }
+        if (context.model.latent_moe_use_norm && !use_gemm_allgather) {
             result.latent_norm_ms = predict_dense_work_ms(
                 context,
                 streaming_work(tokens * static_cast<double>(latent_hidden_size),
@@ -594,7 +740,8 @@ predict_moe_layer(const DeviceCeilings &device, const AnalyticalConfig &config,
     result.routed_path_ms = routed_up_projection_ms +
                             routed_down_projection_ms + result.shuffling_ms;
     result.shared_expert_path_ms =
-        shared_up_projection_ms + shared_down_projection_ms;
+        (fuse_shared_expert_front ? 0.0 : shared_up_projection_ms) +
+        shared_down_projection_ms;
     result.source_local_ms =
         result.gating_linear_ms + result.gating_routing_topk_ms +
         result.shared_expert_path_ms + result.post_attention_norm_ms +

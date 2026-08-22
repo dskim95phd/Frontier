@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <cmath>
-#include <limits>
 #include <optional>
 #include <string>
 #include <utility>
@@ -20,6 +19,10 @@ AnalyticalConfig analytical_config_from_profile(std::string_view profile,
         // Keep portable kernel efficiencies. Device resource scaling below
         // remains independent because the separately selected MegaMoE
         // communication backend may be used with this kernel profile.
+    } else if (profile == "k3_flashkda_prefill") {
+        // Isolated ablation: retain portable GEMM/MoE assumptions and change
+        // only KDA prefill to the released two-kernel FlashKDA schedule.
+        result.use_flashkda_prefill_two_stage = true;
     } else if (profile == "k3_sglang_mxfp4") {
         // Blackwell K3 local-MoE profile: official W4A8 SiTU cubins, fused
         // routing/finalize, small-M GEMMs, and lower launch count.  Keep the
@@ -27,10 +30,24 @@ AnalyticalConfig analytical_config_from_profile(std::string_view profile,
         // differ from the portable generic path.
         result.large_gemm = Efficiency{0.70, 0.80, 0.075};
         result.small_gemm = Efficiency{0.315, 0.69, 0.375};
+        // Concatenating the 896-wide gate to the 3584-wide latent down
+        // projection increases N by 4480/3584. Scale achieved throughput by
+        // the same geometry ratio so the gate slice is nearly free, matching
+        // the published kernel intent without fitting a latency constant.
+        result.latent_moe_front = Efficiency{0.39375, 0.8625, 0.375};
         result.streaming = Efficiency{0.26, 0.825, 0.0};
         result.moe = Efficiency{0.525, 0.75, 0.225};
         result.routing = Efficiency{0.195, 0.625, 0.625};
         result.kernel_launch_latency_us = 3.75;
+        result.fuse_latent_moe_front = true;
+        result.fuse_shared_expert_moe_front = true;
+        result.fuse_route_quant = true;
+        result.overlap_shared_routed_moe = true;
+        result.use_tp8_latent_up_gemm_allgather = true;
+        result.fuse_kda_decode_chain = true;
+        result.overlap_kda_aux_projections = true;
+        result.use_flashkda_prefill_two_stage = true;
+        result.overlap_mla_output_gate = true;
     } else if (profile == "k3_deepgemm_megamoe") {
         // Large DP-attention + EP K3 deployments use a synchronized
         // MegaMoE/DeepGEMM critical path.  Public communication measurements
@@ -39,19 +56,24 @@ AnalyticalConfig analytical_config_from_profile(std::string_view profile,
         // SM100 block-M policy and exact destination-lane histogram instead
         // of a workload-fitted constant slowdown.
         result.mega_moe_geometry_enabled = true;
-        // RaMP's public H200 wave staircase implies about 0.1--0.2 us per
-        // CTA over this grid range. MegaMoE uses two-CTA clusters and GB300
-        // has higher compute/HBM ceilings, so retain only a conservative
-        // residual after the ordinary roofline contribution. The coefficient
-        // is calibrated on the three LMSYS DP4/EP32 points; DP2/EP16 is kept
-        // as a topology holdout rather than participating in the fit.
-        // A 2x2 factorial refit of tail IO and wave exposure found that the
-        // former wave term was degenerate with this coefficient. Full padded
-        // activation IO plus no separate wave multiplier preserves the DP4
-        // calibration while reducing the DP2 topology holdout error.
+        result.fuse_latent_moe_front = true;
+        result.fuse_route_quant = true;
+        result.overlap_shared_routed_moe = true;
+        result.ep_shared_routed_overlap_fraction = 0.5;
+        result.fuse_kda_decode_chain = true;
+        result.overlap_kda_aux_projections = true;
+        result.use_flashkda_prefill_two_stage = true;
+        result.overlap_mla_output_gate = true;
+        result.latent_moe_front = Efficiency{0.3125, 0.75, 0.50};
+        // Full padded activation IO is retained, but no additional wave or
+        // per-cluster residual is charged. The old 0.06325 us coefficient was
+        // fitted while router FP32 logits incorrectly forced the router GEMM
+        // onto the FP32 CUDA-core ceiling and while dispatch/combine shared
+        // one dtype. A precision-correct refit selected the zero boundary on
+        // the three LMSYS DP4/EP32 points; DP2/EP16 remained the holdout.
         result.mega_moe_tail_io_fraction = 1.0;
         result.mega_moe_wave_exposure = 0.0;
-        result.mega_moe_cluster_task_latency_us = 0.06325;
+        result.mega_moe_cluster_task_latency_us = 0.0;
         // The measured wide-EP path includes a synchronized dispatch-tail /
         // combine-head barrier. Rubin exposes mechanisms that may improve
         // this dependency, but no K3 MegaMoE measurement quantifies the

@@ -65,6 +65,7 @@ struct RooflineResult {
 struct AnalyticalConfig {
     Efficiency large_gemm{0.65, 0.75, 0.10};
     Efficiency small_gemm{0.25, 0.60, 0.50};
+    Efficiency latent_moe_front{0.25, 0.60, 0.50};
     Efficiency prefill_attention{0.55, 0.65, 0.20};
     Efficiency decode_attention{0.20, 0.60, 0.50};
     Efficiency streaming{0.20, 0.75, 0.0};
@@ -72,6 +73,40 @@ struct AnalyticalConfig {
     Efficiency routing{0.15, 0.55, 0.75};
     double kernel_launch_latency_us = 5.0;
     std::uint64_t small_gemm_token_threshold = 128;
+    // K3's Day-0 path concatenates the BF16 router gate and LatentMoE down
+    // projection weights. They share one input read and one GEMM launch.
+    // Portable profiles retain the historical separate-kernel contract.
+    bool fuse_latent_moe_front = false;
+    // K3 decode-only kernel graph switches. These are kept separate from the
+    // hardware ceilings and from numerical precision: an MXFP4 checkpoint may
+    // still be executed by a portable fallback kernel, while the SGLang Day-0
+    // path uses these fused schedules on SM100.
+    bool fuse_shared_expert_moe_front = false;
+    bool fuse_route_quant = false;
+    bool overlap_shared_routed_moe = false;
+    // EP side streams contend for HBM and achieve only partial overlap. The
+    // current SGLang GB300 measurement reports a 4-5% end-to-end gain rather
+    // than the full max(shared, routed) ideal.
+    double ep_shared_routed_overlap_fraction = 0.0;
+    bool use_tp8_latent_up_gemm_allgather = false;
+    bool fuse_kda_decode_chain = false;
+    bool overlap_kda_aux_projections = false;
+    // FlashKDA prefill is a two-kernel pipeline. K1 is parallel over
+    // sequence chunks and materializes a compact per-chunk workspace; K2 is
+    // parallel over sequence/head and carries the recurrent state through the
+    // chunk scan. The portable profile retains the conservative per-token
+    // state-traffic roofline.
+    bool use_flashkda_prefill_two_stage = false;
+    std::uint64_t flashkda_chunk_tokens = 16;
+    std::uint64_t flashkda_sm_count = 160;
+    std::uint64_t flashkda_workspace_bytes_per_chunk_head = 13'824;
+    // Fitted only to the four public GB200 variable-length/batched scheduling
+    // points after fixing the single-sequence H64/H96 anchors. It represents
+    // the exposed longest-sequence tail after the head/chunk waves.
+    double flashkda_serial_tail_exposure = 0.823;
+    bool overlap_mla_output_gate = false;
+    std::uint64_t tp8_latent_up_gemm_allgather_max_tokens = 12;
+    double tp8_latent_up_gemm_allgather_bandwidth_tbps = 1.8;
     // The public SM100 MegaMoE profile converts the destination lane's exact
     // per-expert token histogram into padded M blocks and two-CTA cluster
     // waves. Portable profiles leave this disabled and retain the historical
