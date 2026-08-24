@@ -1704,7 +1704,6 @@ void test_k3_kernel_profile_contract() {
     analytical.kernel_profile = "k3_deepgemm_megamoe";
     analytical.mega_moe_tail_io_fraction = 0.25;
     analytical.mega_moe_wave_exposure = 0.75;
-    analytical.mega_moe_cluster_task_latency_us = 0.068;
     frontier::config::apply_model_native_precision_defaults(
         analytical, config.cluster().model);
     const std::string serialized = serialize_simulation_config_json(config);
@@ -1718,10 +1717,6 @@ void test_k3_kernel_profile_contract() {
                parsed.cluster()
                        .execution_model.analytical.mega_moe_wave_exposure ==
                    std::optional<double>{0.75} &&
-               parsed.cluster()
-                       .execution_model.analytical
-                       .mega_moe_cluster_task_latency_us ==
-                   std::optional<double>{0.068} &&
                parsed.cluster().model.model_type == "kimi_k3",
            "K3 kernel profiles and sensitivity overrides must round-trip");
 

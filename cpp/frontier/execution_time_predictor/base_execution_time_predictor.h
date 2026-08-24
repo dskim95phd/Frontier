@@ -25,8 +25,6 @@ struct MoEGroupedGemmGeometryDiagnostic {
     std::uint64_t down_cluster_tasks = 0;
     double up_wave_utilization = 1.0;
     double down_wave_utilization = 1.0;
-    double up_cluster_task_overhead_ms = 0.0;
-    double down_cluster_task_overhead_ms = 0.0;
 };
 
 struct MoERoutingDiagnostic {

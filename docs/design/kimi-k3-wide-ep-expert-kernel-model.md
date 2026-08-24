@@ -263,24 +263,23 @@ T_wave = T_launch + (T_roofline - T_launch) * phi
        = T_roofline
 ```
 
-When `c_grid` was independently refit, all four `(rho_tail, lambda_wave)`
-corners fit the DP4 calibration equally well. The former wave staircase was
-therefore not separately identifiable from the grid coefficient. Keeping it
-would add complexity without independent evidence.
+When an additive per-grid-task residual was independently refit, all four
+`(rho_tail, lambda_wave)` corners selected statistically equivalent fits and
+the precision-correct model selected the zero boundary. The term was therefore
+not identifiable and has been removed rather than retained as a dormant knob.
 
-### 5. Grid-size residual
+### 5. No fitted grid-size residual
 
-The final projection time is:
+The final projection time is simply:
 
 ```text
-c_grid       = 0 us / routed two-CTA cluster task
-T_projection = T_wave + c_grid * g / 1000   [ms]
+T_projection = T_wave
 ```
 
-Conceptually this remains an optional empirical per-grid-task
-scheduler/pipeline term from a reduced RaMP-style model. It is additive, not
-multiplicative. The Day-0 precision refit did not identify a positive residual,
-so the default leaves it disabled. Consequently:
+The earlier empirical scheduler/pipeline coefficient was fitted while router
+and communication precisions were wrong. The corrected fit did not identify a
+positive value, so both the coefficient and its configuration/diagnostic fields
+were deleted. Consequently:
 
 - an empty or small grid does not inherit a blanket 1.75 penalty;
 - a fragmented or larger grid costs more;
@@ -316,12 +315,12 @@ The numbers in this section document the former mixed-precision-invalid fit
 and must not be used as the current calibration. The 2026-08-22 retune uses
 MXFP4/MXFP8 routed experts, BF16 non-expert operators/KV/combine, FP32 KDA
 state and router logits, MXFP8 post-quant dispatch, and the BF16 operand
-ceiling for the router GEMM. It selected `c_grid=0` on DP4/EP32: user MAPE
+ceiling for the router GEMM. It selected no additive grid residual on DP4/EP32: user MAPE
 0.19%, throughput MAPE 26.28% before the LatentMoE-front fidelity fix. After
 modeling the published fused gate/down GEMM and its small-M TGV geometry, the
 same points are 1.07% and 28.29%. The untouched DP2/EP16 holdout moves from
 8.06%/27.50% to 8.11%/30.07%. The common throughput error is a separate
-prefill-model error and is not identifiable from `c_grid` or the source-local
+prefill-model error and is not identifiable from expert-grid timing or the source-local
 front GEMM.
 
 ## Historical calibration and validation
@@ -338,8 +337,9 @@ contributes.
 The tile-only failure is evidence that padded FLOPs and final-wave occupancy
 were not enough: the aggregate roofline still lacked a grid-size cost.
 
-`c_grid` was selected using only the three LMSYS DP4/EP32 measurements. The
-two DP2/EP16 measurements were kept out as a topology holdout:
+The former additive grid coefficient was selected using only the three LMSYS
+DP4/EP32 measurements. The two DP2/EP16 measurements were kept out as a
+topology holdout:
 
 | Wide-EP arm | Role | User MAPE | Throughput MAPE |
 | --- | --- | ---: | ---: |
@@ -361,29 +361,19 @@ Absolute log distance and MAPE are therefore the more informative metrics for
 this change; Pearson correlation mainly confirms that the overall topology
 ordering was preserved.
 
-The three model coefficients are exposed as optional analytical execution
-configuration fields so sensitivity runs do not require recompilation:
+The two retained physical sensitivity coefficients are exposed as optional
+analytical execution configuration fields:
 
 ```text
 mega_moe_tail_io_fraction
 mega_moe_wave_exposure
-mega_moe_cluster_task_latency_us
 ```
 
 They are accepted only with `kernel_profile="k3_deepgemm_megamoe"`.
-Using the same steady-state central-turn metric as the main report, `c_grid`
-was independently refit on DP4 for every factorial corner:
-
-| rho_tail | lambda_wave | fitted c_grid (us) | DP4 MAPE | DP2 holdout MAPE |
-| ---: | ---: | ---: | ---: | ---: |
-| 0 | 1 | 0.05860 | 0.26% | 2.32% |
-| 1 | 1 | 0.05775 | 0.25% | 1.94% |
-| 0 | 0 | 0.06400 | 0.23% | 0.63% |
-| **1** | **0** | **0.06325** | **0.23%** | **0.31%** |
-
-All four DP4 errors are effectively equivalent. This confirms that the former
-one-at-a-time table conflated the three coefficients. The DP2 holdout selects
-`rho_tail=1, lambda_wave=0`; only `c_grid` remains fitted.
+The former three-factor fit is retained only as historical evidence that the
+additive coefficient was confounded: all four tail/wave corners produced
+effectively equivalent DP4 errors. With corrected precision the optimum moved
+to zero, leaving `rho_tail=1, lambda_wave=0` and no fitted latency constant.
 
 The generated comparison artifact is:
 
@@ -392,8 +382,8 @@ The generated comparison artifact is:
 Under the former throughput-per-SM Rubin sensitivity, the four equally
 calibrated GB300 corners remain close: their per-user decode spread is about
 0.8% for DP4 and 2.3% for DP2 at c=256/c=1024. Those results now define an
-optimistic boundary rather than the default projection. Keeping `c_grid` at
-the GB300 value reduces the wide-EP Rubin median per-user decode speed by
+optimistic boundary rather than the default projection. Applying the former
+GB300 fitted residual reduced the wide-EP Rubin median per-user decode speed by
 8.0% relative to that boundary; the reduction is about 10--11% for DP4 and
 14% for DP2 at c=256/c=1024. The conservative full-sweep artifact is:
 

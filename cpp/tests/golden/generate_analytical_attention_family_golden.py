@@ -1,4 +1,8 @@
-"""Generate Python/C++ analytical MLA and MFA attention parity data."""
+"""Generate legacy Python MLA and MFA attention reference data.
+
+The active C++ fixture includes the shape-aware Tensor Core GEMM curve and is
+maintained as a C++ numeric contract.
+"""
 
 from __future__ import annotations
 

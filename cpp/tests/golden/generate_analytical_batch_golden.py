@@ -1,4 +1,8 @@
-"""Generate analytical batch fixtures from production Python models."""
+"""Generate legacy analytical batch values from production Python models.
+
+The active C++ batch fixture includes the shape-aware Tensor Core GEMM curve
+and is maintained as a C++ numeric contract.
+"""
 
 from __future__ import annotations
 

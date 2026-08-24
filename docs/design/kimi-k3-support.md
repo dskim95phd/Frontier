@@ -211,21 +211,31 @@ three memory-bound GEMVs into one launch and removing two duplicate reads of
 and shared slices as required. The latent up-projection remains a later,
 dependent GEMM.
 
-For `M < small_gemm_token_threshold`, the K3 profiles scale achieved front
-throughput by the exact output-width ratio `4480 / 3584 = 1.25`. This encodes
-the published intent that folding the narrow gate into the wider down
-projection makes the gate nearly free. At and above the threshold, the
-ordinary large-GEMM efficiency applies. Fusion is enabled only when the router
-and latent projection operand precisions match; otherwise the simulator falls
-back to the separate-kernel contract. The portable `generic` profile remains
-unchanged.
+GEMM efficiency has no global token-count branch. SM100 CUTLASS kernels expose
+64-row MMA tiles while DeepGEMM chooses block-M 32, 64, or 128 from the problem
+shape. The predictor therefore interpolates continuously between a GEMV-like
+floor and a saturated GEMM ceiling. Its progress combines useful M-row fill,
+the N-direction CTA grid relative to the device SM count, and K-loop pipeline
+depth. The fused front retains its measured floor, including the exact output
+width ratio `4480 / 3584 = 1.25`, but its influence decays continuously as the
+problem saturates. Fusion is enabled only when the router and latent projection
+operand precisions match; otherwise the simulator falls back to the
+separate-kernel contract.
 
-A rejected sensitivity applied `ceil(M/BM) * ceil(N/BN) / SMs` as a generic
-occupancy penalty. It raised the 69-point serving user MAPE from 23.27% to
-36.09% when applied broadly and to 30.01% when restricted to the standalone
-router. That proxy is invalid for the Day-0 path because the gate is neither a
-standalone 896-column GEMM nor the generic Triton kernel simulated in the
-FlashGPU-Sim experiment.
+A standalone `ceil(M/BM) * ceil(N/BN) / SMs` multiplier remains rejected. It
+double-counts arithmetic-intensity and tile-fill losses already present in the
+roofline and cannot represent shape-dependent block selection or K-pipeline
+fill. The new bounded curve uses grid exposure only as a small modifier of the
+empirical floor-to-ceiling envelope.
+
+Geometry references:
+
+- NVIDIA CUTLASS SM100 functionality and valid MMA tile shapes:
+  <https://github.com/NVIDIA/cutlass/blob/main/media/docs/cpp/blackwell_functionality.md>
+- DeepGEMM SM100 block-shape selection heuristic:
+  <https://github.com/deepseek-ai/DeepGEMM/blob/main/csrc/jit_kernels/heuristics/sm100.hpp>
+- NVIDIA's tile- and wave-quantization explanation:
+  <https://docs.nvidia.com/deeplearning/performance/dl-performance-matrix-multiplication/index.html>
 
 ### 5.2 Decode schedule is distinct from numerical precision
 

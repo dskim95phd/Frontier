@@ -70,9 +70,8 @@ double predict_output_projection_ms(
     const KernelWork work = gemm_work(
         tokens, hidden_size, local_vocab, bytes_per_element(weight_precision),
         bytes_per_element(activation_precision), 1);
-    const Efficiency &efficiency = tokens < config.small_gemm_token_threshold
-                                       ? config.small_gemm
-                                       : config.large_gemm;
+    const Efficiency efficiency = gemm_efficiency_for_shape(
+        config.gemm, tokens, hidden_size, local_vocab);
     return predict_ms(device, weight_precision, work, efficiency,
                       config.kernel_launch_latency_us);
 }

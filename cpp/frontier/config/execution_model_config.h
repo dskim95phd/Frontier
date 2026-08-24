@@ -181,7 +181,6 @@ struct AnalyticalExecutionModelConfig {
     // valid only with k3_deepgemm_megamoe; absent values use profile priors.
     std::optional<double> mega_moe_tail_io_fraction;
     std::optional<double> mega_moe_wave_exposure;
-    std::optional<double> mega_moe_cluster_task_latency_us;
     std::uint64_t tensor_parallel_size = 8;
     double network_bandwidth_gbps = 400.0;
     double network_latency_us = 1.0;
@@ -194,7 +193,6 @@ struct AnalyticalExecutionModelConfig {
                    lhs.operator_precisions, lhs.kernel_profile,
                    lhs.moe_layer_event_mode, lhs.moe_communication_backend,
                    lhs.mega_moe_tail_io_fraction, lhs.mega_moe_wave_exposure,
-                   lhs.mega_moe_cluster_task_latency_us,
                    lhs.tensor_parallel_size, lhs.network_bandwidth_gbps,
                    lhs.network_latency_us, lhs.intra_node_bandwidth_gbps) ==
                std::tie(rhs.device, rhs.device_overrides, rhs.precision,
@@ -202,7 +200,6 @@ struct AnalyticalExecutionModelConfig {
                         rhs.moe_layer_event_mode, rhs.moe_communication_backend,
                         rhs.mega_moe_tail_io_fraction,
                         rhs.mega_moe_wave_exposure,
-                        rhs.mega_moe_cluster_task_latency_us,
                         rhs.tensor_parallel_size, rhs.network_bandwidth_gbps,
                         rhs.network_latency_us, rhs.intra_node_bandwidth_gbps);
     }

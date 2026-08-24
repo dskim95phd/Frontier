@@ -64,10 +64,6 @@ AnalyticalRooflineExecutionTimePredictor::
     if (config_.mega_moe_wave_exposure.has_value()) {
         analytical_.mega_moe_wave_exposure = *config_.mega_moe_wave_exposure;
     }
-    if (config_.mega_moe_cluster_task_latency_us.has_value()) {
-        analytical_.mega_moe_cluster_task_latency_us =
-            *config_.mega_moe_cluster_task_latency_us;
-    }
     config::apply_model_native_precision_defaults(config_, model_);
     if (parallelism_.tensor_parallel_size == 0) {
         parallelism_.tensor_parallel_size = config_.tensor_parallel_size;

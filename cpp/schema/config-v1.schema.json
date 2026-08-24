@@ -261,8 +261,7 @@
         "moe_layer_event_mode": { "enum": ["detailed", "first_layer_scaled", "stage_group_scaled"] },
         "moe_communication_backend": { "enum": ["generic", "sm100_megamoe_public"] },
         "mega_moe_tail_io_fraction": { "$ref": "#/$defs/fraction" },
-        "mega_moe_wave_exposure": { "$ref": "#/$defs/fraction" },
-        "mega_moe_cluster_task_latency_us": { "$ref": "#/$defs/nonnegativeNumber" }
+        "mega_moe_wave_exposure": { "$ref": "#/$defs/fraction" }
       },
       "additionalProperties": false,
       "allOf": [

@@ -811,9 +811,8 @@ The profile may also be selected with the `rubin` device preset as an explicit
 forward projection. In that mode arithmetic and HBM work use Rubin roofline
 ceilings, the expert grid uses 224 rather than 160 SMs, and A2A payload time
 scales by the public 3.6/1.8 TB/s NVLink ratio. The precision-correct GB300
-refit selected no extra per-cluster residual; nonzero
-`mega_moe_cluster_task_latency_us` values remain available only as explicit
-sensitivity inputs. Rubin
+refit selected no extra per-cluster residual, so the unidentifiable fitted
+grid-latency term was removed from the model and configuration surface. Rubin
 counted writes and tile-level dependent triggering may improve overlap, but
 there is no K3 MegaMoE measurement to quantify it, so fixed startup and the
 selected overlap residual also remain the GB300 priors. Block-M, block-N,
@@ -845,11 +844,9 @@ assumptions explicit instead of silently changing the device ceilings:
 - `k3_deepgemm_megamoe` applies only to the DP-source-composed destination-EP
   group prediction. It applies the public DeepGEMM SM100 block-M selection
   policy to the exact destination-lane expert histogram, charges tensor-core
-  work and activation IO for padded M blocks, and adds a grid-size-dependent
-  optional cluster scheduler/pipeline term. After correcting the router GEMM
-  and dispatch/combine precision paths, a refit on the three LMSYS DP4/EP32
-  points selected `0 us` for that residual; the DP2/EP16 points remain a
-  topology holdout. DP-group
+  work and activation IO for padded M blocks. After correcting the router GEMM
+  and dispatch/combine precision paths, no independent grid-latency term was
+  identifiable; the DP2/EP16 points remain a topology holdout. DP-group
   recomposition includes routed destination-expert work only: router, latent
   projection, replicated shared expert, normalization, and finalize work keep
   each DP source's local token count. The shared-expert overlap component is
@@ -864,9 +861,9 @@ assumptions explicit instead of silently changing the device ceilings:
   envelope remains the separate public NVIDIA prior described above.
 
   For controlled sensitivity or hardware refitting, this profile alone also
-  accepts optional `mega_moe_tail_io_fraction`, `mega_moe_wave_exposure`, and
-  `mega_moe_cluster_task_latency_us` overrides. Omitting them selects the
-  documented device-profile priors.
+  accepts optional `mega_moe_tail_io_fraction` and
+  `mega_moe_wave_exposure` overrides. Omitting them selects the documented
+  device-profile priors.
 
 Both profiles require `device="gb300"` or `device="rubin"` and a Kimi K3 model
 asset. They are opt-in so existing analytical configs and numeric baselines

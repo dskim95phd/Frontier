@@ -2,9 +2,9 @@
   "mfa_prefill_32_past_256": {
     "attention_inter_norm_ms": 0.005015887515151515,
     "attention_norm_ms": 0.005083409454545455,
-    "attention_post_projection_ms": 0.010442641671757576,
-    "attention_pre_projection_ms": 0.008414683772121212,
-    "attention_wq_projection_ms": 0.006569225759030303,
+    "attention_post_projection_ms": 0.0095810641923747414,
+    "attention_pre_projection_ms": 0.0078905840147677642,
+    "attention_wq_projection_ms": 0.0063270163511015632,
     "decode_attention_ms": 0.0,
     "kv_cache_save_ms": 0.005003971878787879,
     "prefill_attention_ms": 0.005076397560839161,

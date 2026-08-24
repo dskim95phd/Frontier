@@ -2,10 +2,10 @@
   "cases": [
     {
       "expected": {
-        "batch_duration_ms": 1.8640443114668657,
+        "batch_duration_ms": 1.880278340430142,
         "decode_request_count": 0,
-        "dense_layer_compute_ms": 0.05421248695556177,
-        "dense_layer_total_ms": 0.05825138473333955,
+        "dense_layer_compute_ms": 0.054719800360664192,
+        "dense_layer_total_ms": 0.058758698138441971,
         "num_layers": 32,
         "prefill_request_count": 1,
         "total_tokens": 128,
@@ -68,10 +68,10 @@
     },
     {
       "expected": {
-        "batch_duration_ms": 2.053674425826959,
+        "batch_duration_ms": 2.0008354122931626,
         "decode_request_count": 1,
-        "dense_layer_compute_ms": 0.06114194802931469,
-        "dense_layer_total_ms": 0.06417732580709247,
+        "dense_layer_compute_ms": 0.059490728856383582,
+        "dense_layer_total_ms": 0.06252610663416136,
         "num_layers": 32,
         "prefill_request_count": 1,
         "total_tokens": 65,

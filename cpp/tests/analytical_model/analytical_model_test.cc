@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <limits>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -57,9 +58,11 @@ bool approximately_equal(double actual, double expected,
 void expect_approximately_equal(double actual, double expected,
                                 std::string_view field) {
     if (!approximately_equal(actual, expected)) {
-        throw std::runtime_error(std::string{field} +
-                                 " mismatch: actual=" + std::to_string(actual) +
-                                 ", expected=" + std::to_string(expected));
+        std::ostringstream message;
+        message.precision(17);
+        message << field << " mismatch: actual=" << actual
+                << ", expected=" << expected;
+        throw std::runtime_error(message.str());
     }
 }
 
@@ -212,7 +215,9 @@ void check_attention_fields(const analytical::DenseLayerTimes &actual,
     }
 }
 
-void test_dense_layer_matches_python_golden() {
+void test_dense_layer_matches_cpp_golden() {
+    // The C++ shape-aware GEMM curve intentionally moved ahead of the legacy
+    // Python two-bucket predictor. This fixture pins the active C++ contract.
     const Json golden = load_golden();
     const analytical::DeviceCeilings device =
         analytical::DeviceCeilings::rubin();
@@ -499,6 +504,49 @@ void test_router_storage_and_compute_precisions_are_independent() {
            "router GEMM must account for FP32 logits writes");
 }
 
+void test_gemm_efficiency_is_shape_continuous() {
+    const auto config = analytical::analytical_config_from_profile(
+        "k3_sglang_mxfp4", "gb300");
+    const auto efficiency = [&](std::uint64_t m, std::uint64_t k,
+                                std::uint64_t n) {
+        return analytical::gemm_efficiency_for_shape(config.gemm, m, k, n);
+    };
+    const auto m1 = efficiency(1, 7'168, 7'168);
+    const auto m32 = efficiency(32, 7'168, 7'168);
+    const auto m64 = efficiency(64, 7'168, 7'168);
+    const auto m127 = efficiency(127, 7'168, 7'168);
+    const auto m128 = efficiency(128, 7'168, 7'168);
+    const auto m256 = efficiency(256, 7'168, 7'168);
+    expect(m1.compute == config.gemm.floor.compute &&
+               m1.memory == config.gemm.floor.memory &&
+               m1.overlap_penalty == config.gemm.floor.overlap_penalty,
+           "M=1 must retain the measured GEMV-like efficiency floor");
+    expect(m1.compute < m32.compute && m32.compute < m64.compute &&
+               m64.compute < m127.compute && m127.compute < m128.compute &&
+               m128.compute < m256.compute,
+           "Tensor Core GEMM compute efficiency must increase smoothly with M");
+    expect(m1.memory < m32.memory && m32.memory < m64.memory &&
+               m64.memory < m127.memory && m127.memory < m128.memory &&
+               m128.memory < m256.memory,
+           "Tensor Core GEMM memory efficiency must increase smoothly with M");
+    expect(m1.overlap_penalty > m32.overlap_penalty &&
+               m32.overlap_penalty > m64.overlap_penalty &&
+               m64.overlap_penalty > m127.overlap_penalty &&
+               m127.overlap_penalty > m128.overlap_penalty &&
+               m128.overlap_penalty > m256.overlap_penalty,
+           "roofline overlap penalty must decay smoothly with GEMM size");
+    expect(std::abs(m128.compute - m127.compute) < 0.002,
+           "M=128 must not introduce the former efficiency discontinuity");
+
+    const auto narrow_n = efficiency(64, 7'168, 512);
+    const auto wide_n = efficiency(64, 7'168, 28'672);
+    const auto shallow_k = efficiency(64, 128, 7'168);
+    expect(narrow_n.compute < wide_n.compute,
+           "a narrow N grid must expose less of the GPU than a full CTA wave");
+    expect(shallow_k.compute < m64.compute,
+           "a shallow K loop must expose Tensor Core pipeline fill");
+}
+
 void test_k3_latent_moe_front_is_one_gemm() {
     analytical::MoEModel model{};
     model.hidden_size = 7'168;
@@ -553,21 +601,24 @@ void test_k3_latent_moe_front_is_one_gemm() {
         "front fusion must not change grouped expert down work");
 
     analytical::AnalyticalConfig slow_tgv = fused;
-    slow_tgv.latent_moe_front = analytical::Efficiency{0.10, 0.10, 0.375};
+    slow_tgv.latent_moe_front_floor =
+        analytical::Efficiency{0.10, 0.10, 0.375};
     const auto slow_small_front = analytical::predict_moe_layer(
         analytical::DeviceCeilings::gb300(), slow_tgv, model, 64, 16,
         expert_tokens, precisions);
     expect(slow_small_front.gating_linear_ms > fused_front.gating_linear_ms,
            "small-M fused front must use its TGV-specific efficiency");
     const auto fused_large = analytical::predict_moe_layer(
-        analytical::DeviceCeilings::gb300(), fused, model, 128, 16,
+        analytical::DeviceCeilings::gb300(), fused, model, 512, 16,
         expert_tokens, precisions);
     const auto slow_tgv_large = analytical::predict_moe_layer(
-        analytical::DeviceCeilings::gb300(), slow_tgv, model, 128, 16,
+        analytical::DeviceCeilings::gb300(), slow_tgv, model, 512, 16,
         expert_tokens, precisions);
-    expect_approximately_equal(
-        fused_large.gating_linear_ms, slow_tgv_large.gating_linear_ms,
-        "large-M fused front must retain the ordinary large-GEMM efficiency");
+    expect(slow_tgv_large.gating_linear_ms > fused_large.gating_linear_ms &&
+               slow_tgv_large.gating_linear_ms - fused_large.gating_linear_ms <
+                   slow_small_front.gating_linear_ms -
+                       fused_front.gating_linear_ms,
+           "the fused-front floor influence must decay smoothly with M");
 
     // The released plain-TP decode graph applies several additional
     // schedules around this two-way front: shared gate/up is the third GEMM
@@ -996,7 +1047,8 @@ double diagnostic_value(const predictor::ExecutionTimePrediction &prediction,
     return iterator->second;
 }
 
-void test_batch_model_matches_python_golden() {
+void test_batch_model_matches_cpp_golden() {
+    // Stage totals include the C++-only shape-aware GEMM curve.
     const Json golden = load_batch_golden();
     expect(golden.at("schema_version").get<int>() == 1,
            "analytical batch golden schema must be version 1");
@@ -2249,8 +2301,8 @@ int main() {
                                     test_roofline_matches_python_golden);
     failures += frontier::test::run("device presets and overrides",
                                     test_device_presets_and_overrides);
-    failures += frontier::test::run("dense layer matches Python golden",
-                                    test_dense_layer_matches_python_golden);
+    failures += frontier::test::run("dense layer matches C++ golden",
+                                    test_dense_layer_matches_cpp_golden);
     failures += frontier::test::run("long-context decode cost increases",
                                     test_long_context_decode_cost_increases);
     failures +=
@@ -2266,6 +2318,9 @@ int main() {
         "router storage and compute precisions are independent",
         test_router_storage_and_compute_precisions_are_independent);
     failures += frontier::test::run(
+        "GEMM efficiency is continuous and shape-aware",
+        test_gemm_efficiency_is_shape_continuous);
+    failures += frontier::test::run(
         "K3 LatentMoE front is one GEMM",
         test_k3_latent_moe_front_is_one_gemm);
     failures += frontier::test::run("MLA uses latent-cache context costs",
@@ -2278,8 +2333,8 @@ int main() {
                                     test_mla_output_gate_and_nope_costs);
     failures += frontier::test::run("MFA models shared-Q projection path",
                                     test_mfa_models_shared_q_projection_path);
-    failures += frontier::test::run("batch model matches Python golden",
-                                    test_batch_model_matches_python_golden);
+    failures += frontier::test::run("batch model matches C++ golden",
+                                    test_batch_model_matches_cpp_golden);
     failures += frontier::test::run("communication matches Python golden",
                                     test_communication_matches_python_golden);
     failures += frontier::test::run("KV transfer matches Python golden",

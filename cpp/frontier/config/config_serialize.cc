@@ -232,10 +232,6 @@ OrderedJson serialize_execution_model(const ExecutionModelConfig &execution) {
         result["mega_moe_wave_exposure"] =
             *execution.analytical.mega_moe_wave_exposure;
     }
-    if (execution.analytical.mega_moe_cluster_task_latency_us.has_value()) {
-        result["mega_moe_cluster_task_latency_us"] =
-            *execution.analytical.mega_moe_cluster_task_latency_us;
-    }
     return result;
 }
 

@@ -225,8 +225,7 @@ ExecutionModelConfig parse_execution_model(const Json &root,
                      {"operator_precisions", "device_overrides",
                       "kernel_profile", "moe_layer_event_mode",
                       "moe_communication_backend", "mega_moe_tail_io_fraction",
-                      "mega_moe_wave_exposure",
-                      "mega_moe_cluster_task_latency_us"},
+                      "mega_moe_wave_exposure"},
                      "config.execution_model");
         AnalyticalExecutionModelConfig analytical = [&]() {
             AnalyticalExecutionModelConfig value{};
@@ -260,11 +259,6 @@ ExecutionModelConfig parse_execution_model(const Json &root,
                 value.mega_moe_wave_exposure =
                     require_finite_number(execution, "mega_moe_wave_exposure",
                                           "config.execution_model");
-            }
-            if (execution.contains("mega_moe_cluster_task_latency_us")) {
-                value.mega_moe_cluster_task_latency_us = require_finite_number(
-                    execution, "mega_moe_cluster_task_latency_us",
-                    "config.execution_model");
             }
             value.tensor_parallel_size = parallelism.tensor_parallel_size;
             value.network_bandwidth_gbps = require_finite_number(
@@ -318,8 +312,7 @@ ExecutionModelConfig parse_execution_model(const Json &root,
         }
         const bool has_mega_moe_override =
             analytical.mega_moe_tail_io_fraction.has_value() ||
-            analytical.mega_moe_wave_exposure.has_value() ||
-            analytical.mega_moe_cluster_task_latency_us.has_value();
+            analytical.mega_moe_wave_exposure.has_value();
         if (has_mega_moe_override &&
             analytical.kernel_profile != "k3_deepgemm_megamoe") {
             throw ConfigError("MegaMoE timing overrides require "
@@ -329,12 +322,9 @@ ExecutionModelConfig parse_execution_model(const Json &root,
             return !value.has_value() || (*value >= 0.0 && *value <= 1.0);
         };
         if (!valid_fraction(analytical.mega_moe_tail_io_fraction) ||
-            !valid_fraction(analytical.mega_moe_wave_exposure) ||
-            (analytical.mega_moe_cluster_task_latency_us.has_value() &&
-             *analytical.mega_moe_cluster_task_latency_us < 0.0)) {
+            !valid_fraction(analytical.mega_moe_wave_exposure)) {
             throw ConfigError(
-                "MegaMoE tail IO/wave overrides must be in [0, 1] and "
-                "cluster-task latency must be non-negative");
+                "MegaMoE tail IO/wave overrides must be in [0, 1]");
         }
         if (analytical.moe_communication_backend != "generic" &&
             analytical.moe_communication_backend != "sm100_megamoe_public") {

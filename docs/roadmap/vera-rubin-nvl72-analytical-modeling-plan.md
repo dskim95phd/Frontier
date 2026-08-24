@@ -353,8 +353,7 @@ The MVP avoids one global efficiency constant. It defines a small set of
 configurable operator classes:
 
 ```text
-large_gemm
-small_gemm
+gemm_shape_curve
 prefill_attention
 decode_attention
 streaming_memory

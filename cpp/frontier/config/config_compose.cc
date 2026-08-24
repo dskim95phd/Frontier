@@ -330,7 +330,7 @@ Json compose_analytical_execution(
         {"precision_profile", "precision", "operator_precisions",
          "kernel_profile", "moe_layer_event_mode",
          "moe_communication_backend", "mega_moe_tail_io_fraction",
-         "mega_moe_wave_exposure", "mega_moe_cluster_task_latency_us"},
+         "mega_moe_wave_exposure"},
         context);
 
     Json result{{"type", "analytical"}};

@@ -463,14 +463,10 @@ OrderedJson serialize_moe_routing(const MoERoutingMetricsRecord &routing) {
     const bool invalid_geometry =
         !std::isfinite(geometry.up_wave_utilization) ||
         !std::isfinite(geometry.down_wave_utilization) ||
-        !std::isfinite(geometry.up_cluster_task_overhead_ms) ||
-        !std::isfinite(geometry.down_cluster_task_overhead_ms) ||
         geometry.up_wave_utilization <= 0.0 ||
         geometry.up_wave_utilization > 1.0 ||
         geometry.down_wave_utilization <= 0.0 ||
         geometry.down_wave_utilization > 1.0 ||
-        geometry.up_cluster_task_overhead_ms < 0.0 ||
-        geometry.down_cluster_task_overhead_ms < 0.0 ||
         (geometry.enabled &&
          (geometry.block_m == 0 || geometry.routed_m_blocks == 0 ||
           geometry.up_cluster_tasks == 0 || geometry.down_cluster_tasks == 0));
@@ -577,10 +573,6 @@ OrderedJson serialize_moe_routing(const MoERoutingMetricsRecord &routing) {
              {"down_cluster_tasks", geometry.down_cluster_tasks},
              {"up_wave_utilization", geometry.up_wave_utilization},
              {"down_wave_utilization", geometry.down_wave_utilization},
-             {"up_cluster_task_overhead_ms",
-              geometry.up_cluster_task_overhead_ms},
-             {"down_cluster_task_overhead_ms",
-              geometry.down_cluster_task_overhead_ms},
          })},
     });
     if (routing.sync_group_id.valid()) {

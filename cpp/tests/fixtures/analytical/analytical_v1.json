@@ -20,14 +20,14 @@
     {
       "expected": {
         "attention_norm_ms": 0.005190650181818182,
-        "attention_post_projection_ms": 0.00534634294183683,
-        "attention_pre_projection_ms": 0.005911928704298369,
+        "attention_post_projection_ms": 0.0053909917204691335,
+        "attention_pre_projection_ms": 0.0060396516560670757,
         "decode_attention_ms": 0.0,
         "kv_cache_save_ms": 0.0050317750303030305,
         "mlp_activation_ms": 0.005064046545454545,
-        "mlp_down_projection_ms": 0.005823555928913753,
+        "mlp_down_projection_ms": 0.0059245694362408171,
         "mlp_norm_ms": 0.005190650181818182,
-        "mlp_up_projection_ms": 0.006583561797221445,
+        "mlp_up_projection_ms": 0.0067931304481182011,
         "prefill_attention_ms": 0.005038200613594406,
         "residual_add_ms": 0.0,
         "rope_ms": 0.0050317750303030305

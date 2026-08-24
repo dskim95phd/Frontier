@@ -301,12 +301,9 @@ void validate_mega_moe_geometry_config(const AnalyticalConfig &config) {
         config.mega_moe_tail_io_fraction > 1.0 ||
         !std::isfinite(config.mega_moe_wave_exposure) ||
         config.mega_moe_wave_exposure < 0.0 ||
-        config.mega_moe_wave_exposure > 1.0 ||
-        !std::isfinite(config.mega_moe_cluster_task_latency_us) ||
-        config.mega_moe_cluster_task_latency_us < 0.0) {
+        config.mega_moe_wave_exposure > 1.0) {
         throw AnalyticalModelError(
-            "MegaMoE tail IO/wave exposure must be in [0, 1] and cluster "
-            "task latency must be finite and non-negative");
+            "MegaMoE tail IO/wave exposure must be in [0, 1]");
     }
 }
 
@@ -392,12 +389,6 @@ MegaMoeGeometryWork build_mega_moe_geometry_work(
         context.config, result.geometry.up_cluster_tasks);
     result.geometry.down_wave_utilization = mega_moe_wave_utilization(
         context.config, result.geometry.down_cluster_tasks);
-    result.geometry.up_cluster_task_overhead_ms =
-        static_cast<double>(result.geometry.up_cluster_tasks) *
-        context.config.mega_moe_cluster_task_latency_us / 1000.0;
-    result.geometry.down_cluster_task_overhead_ms =
-        static_cast<double>(result.geometry.down_cluster_tasks) *
-        context.config.mega_moe_cluster_task_latency_us / 1000.0;
     return result;
 }
 
@@ -433,22 +424,22 @@ double predict_mega_moe_work_ms(const MoELayerContext &context,
         1.0 + context.config.mega_moe_wave_exposure * (1.0 / utilization - 1.0);
     return roofline.launch_time_ms +
            (roofline.predicted_time_ms - roofline.launch_time_ms) *
-               wave_factor +
-           static_cast<double>(cluster_tasks) *
-               context.config.mega_moe_cluster_task_latency_us / 1000.0;
+               wave_factor;
 }
 
-const Efficiency &router_gemm_efficiency(const MoELayerContext &context) {
-    return context.input_tokens < context.config.small_gemm_token_threshold
-               ? context.config.small_gemm
-               : context.config.large_gemm;
+Efficiency router_gemm_efficiency(const MoELayerContext &context,
+                                  std::uint64_t k, std::uint64_t n,
+                                  std::uint64_t independent_matrices = 1) {
+    return gemm_efficiency_for_shape(context.config.gemm,
+                                     context.input_tokens, k, n,
+                                     independent_matrices);
 }
 
-const Efficiency &
-latent_moe_front_efficiency(const MoELayerContext &context) {
-    return context.input_tokens < context.config.small_gemm_token_threshold
-               ? context.config.latent_moe_front
-               : context.config.large_gemm;
+Efficiency latent_moe_front_efficiency(const MoELayerContext &context,
+                                       std::uint64_t n) {
+    return gemm_efficiency_for_shape(
+        context.config.gemm, context.input_tokens, context.model.hidden_size,
+        n, 1, &context.config.latent_moe_front_floor);
 }
 
 } // namespace
@@ -547,12 +538,21 @@ predict_moe_layer(const DeviceCeilings &device, const AnalyticalConfig &config,
             fused_front_work.hbm_bytes -=
                 tokens * hidden * context.router_element_bytes;
         }
+        std::uint64_t fused_output_width =
+            context.model.model_num_experts + latent_hidden_size;
+        if (fuse_shared_expert_front) {
+            fused_output_width +=
+                context.local_intermediate * context.model.num_shared_experts *
+                (context.model.gated_mlp ? 2 : 1);
+        }
         result.gating_linear_ms = predict_router_gemm_ms(
             context, fused_front_work,
-            latent_moe_front_efficiency(context));
+            latent_moe_front_efficiency(context, fused_output_width));
     } else {
         result.gating_linear_ms = predict_router_gemm_ms(
-            context, router_work, router_gemm_efficiency(context));
+            context, router_work,
+            router_gemm_efficiency(context, context.model.hidden_size,
+                                   context.model.model_num_experts));
     }
     KernelWork routing_work = streaming_work(
         tokens * experts,
@@ -703,7 +703,9 @@ predict_moe_layer(const DeviceCeilings &device, const AnalyticalConfig &config,
                 context.latent_moe_projection_weight_element_bytes,
                 context.latent_moe_projection_element_bytes, 1);
             const double local_ms = predict_latent_moe_projection_work_ms(
-                context, local_projection, router_gemm_efficiency(context));
+                context, local_projection,
+                router_gemm_efficiency(context, latent_hidden_size,
+                                       local_hidden));
             const double gathered_bytes =
                 tokens * hidden *
                 context.latent_moe_projection_element_bytes;
@@ -719,7 +721,10 @@ predict_moe_layer(const DeviceCeilings &device, const AnalyticalConfig &config,
             result.latent_projection_ms =
                 predict_latent_moe_projection_work_ms(
                     context, latent_projection,
-                    router_gemm_efficiency(context));
+                    router_gemm_efficiency(
+                        context, std::max(latent_hidden_size,
+                                          context.model.hidden_size),
+                        latent_hidden_size + context.model.hidden_size));
         }
         if (context.model.latent_moe_use_norm && !use_gemm_allgather) {
             result.latent_norm_ms = predict_dense_work_ms(

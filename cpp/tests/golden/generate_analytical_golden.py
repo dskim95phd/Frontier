@@ -1,4 +1,8 @@
-"""Generate the Step 1D analytical parity fixture from the Python oracle."""
+"""Generate legacy analytical parity values from the Python oracle.
+
+The active C++ dense fixture includes the shape-aware Tensor Core GEMM curve
+and must not be overwritten from this two-bucket Python model.
+"""
 
 from __future__ import annotations
 

@@ -126,17 +126,12 @@ sum_past_context(const std::vector<AttentionRequestSlice> &requests) {
     return total;
 }
 
-void validate_dense_layer_inputs(const AnalyticalConfig &config,
-                                 const DenseModel &model,
+void validate_dense_layer_inputs(const DenseModel &model,
                                  const DenseBatch &batch) {
     if (model.hidden_size == 0 || model.intermediate_size == 0 ||
         model.num_query_heads == 0 || model.num_kv_heads == 0 ||
         model.head_dim == 0 || model.tensor_parallel_size == 0) {
         throw AnalyticalModelError("dense model dimensions must be positive");
-    }
-    if (config.small_gemm_token_threshold == 0) {
-        throw AnalyticalModelError(
-            "small GEMM token threshold must be positive");
     }
     if (sum_query_tokens(batch.prefill_requests) +
             sum_query_tokens(batch.decode_requests) !=
@@ -237,11 +232,12 @@ make_dense_layer_context(const DeviceCeilings &device,
     };
 }
 
-const Efficiency &gemm_efficiency_for(const DenseLayerContext &context,
-                                      std::uint64_t rows) {
-    return rows < context.config.small_gemm_token_threshold
-               ? context.config.small_gemm
-               : context.config.large_gemm;
+Efficiency gemm_efficiency_for(const DenseLayerContext &context,
+                               std::uint64_t m, std::uint64_t k,
+                               std::uint64_t n,
+                               std::uint64_t independent_matrices = 1) {
+    return gemm_efficiency_for_shape(context.config.gemm, m, k, n,
+                                     independent_matrices);
 }
 
 double predict_attention_work_ms(const DenseLayerContext &context,
@@ -283,7 +279,7 @@ double predict_attention_gemm_ms(const DenseLayerContext &context,
     }
     return predict_attention_work_ms(
         context, attention_gemm_work(context, m, k, n, output_matrices),
-        gemm_efficiency_for(context, m));
+        gemm_efficiency_for(context, m, k, n, output_matrices));
 }
 
 double predict_dense_gemm_ms(const DenseLayerContext &context,
@@ -295,7 +291,7 @@ double predict_dense_gemm_ms(const DenseLayerContext &context,
     }
     return predict_dense_work_ms(
         context, dense_gemm_work(context, m, k, n, output_matrices),
-        gemm_efficiency_for(context, m));
+        gemm_efficiency_for(context, m, k, n, output_matrices));
 }
 
 KernelWork per_head_gemm_work(const DenseLayerContext &context,
@@ -417,12 +413,15 @@ predict_mla_attention_work(const DenseLayerContext &context) {
         context.config.streaming);
     work.pre_projection_ms += predict_attention_work_ms(
         context, mla_unabsorbed_kv_expansion_work(context, expanded_kv_dim),
-        gemm_efficiency_for(context, prefill_visible_tokens));
+        gemm_efficiency_for(context, prefill_visible_tokens,
+                            model.kv_lora_rank, expanded_kv_dim));
     work.pre_projection_ms += predict_attention_work_ms(
         context,
         per_head_gemm_work(context, context.decode_tokens,
                            model.qk_nope_head_dim, model.kv_lora_rank),
-        gemm_efficiency_for(context, context.decode_tokens));
+        gemm_efficiency_for(context, context.decode_tokens,
+                            model.qk_nope_head_dim, model.kv_lora_rank,
+                            context.local_query_heads));
     work.post_projection_ms += predict_attention_gemm_ms(
         context, context.prefill_tokens,
         context.local_query_heads * model.v_head_dim, model.hidden_size);
@@ -430,7 +429,9 @@ predict_mla_attention_work(const DenseLayerContext &context) {
         context,
         per_head_gemm_work(context, context.decode_tokens, model.kv_lora_rank,
                            model.v_head_dim),
-        gemm_efficiency_for(context, context.decode_tokens));
+        gemm_efficiency_for(context, context.decode_tokens,
+                            model.kv_lora_rank, model.v_head_dim,
+                            context.local_query_heads));
     work.post_projection_ms += predict_attention_gemm_ms(
         context, context.decode_tokens,
         context.local_query_heads * model.v_head_dim, model.hidden_size);
@@ -686,10 +687,12 @@ DenseLayerTimes predict_kda_attention_times(const DenseLayerContext &context) {
         aux_projection_ms =
             predict_attention_work_ms(
                 context, fa_beta,
-                gemm_efficiency_for(context, context.batch.total_tokens)) +
+                gemm_efficiency_for(context, tokens, model.hidden_size,
+                                    model.kda_head_dim + local_v_heads)) +
             predict_attention_work_ms(
                 context, f_b,
-                gemm_efficiency_for(context, context.batch.total_tokens));
+                gemm_efficiency_for(context, tokens, model.kda_head_dim,
+                                    local_v_channels));
     } else {
         work.projection = add_kernel_work(
             add_kernel_work(add_kernel_work(qk, v), add_kernel_work(f_a, f_b)),
@@ -837,7 +840,12 @@ DenseLayerTimes predict_kda_attention_times(const DenseLayerContext &context) {
     // the small-M loss already represented by this fused aggregate profile.
     const double main_projection_ms = predict_attention_work_ms(
         context, work.projection,
-        gemm_efficiency_for(context, context.batch.total_tokens));
+        gemm_efficiency_for(
+            context, tokens, model.hidden_size,
+            overlap_aux_projections
+                ? 4 * local_qk_channels
+                : 2 * local_qk_channels + 2 * local_v_channels +
+                      model.kda_head_dim + local_v_heads));
     times.kda_projection_ms =
         overlap_aux_projections
             ? std::max(main_projection_ms, aux_projection_ms)
@@ -993,7 +1001,7 @@ DenseLayerTimes predict_dense_layer(const DeviceCeilings &device,
                                     const DenseModel &model,
                                     const DenseBatch &batch,
                                     const DenseOperatorPrecisions &precisions) {
-    validate_dense_layer_inputs(config, model, batch);
+    validate_dense_layer_inputs(model, batch);
     const DenseLayerContext context =
         make_dense_layer_context(device, config, model, batch, precisions);
     DenseLayerTimes times = predict_attention_times(context);

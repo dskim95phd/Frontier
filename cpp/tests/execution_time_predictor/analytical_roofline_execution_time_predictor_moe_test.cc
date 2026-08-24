@@ -395,9 +395,8 @@ void test_group_moe_communication_aggregates_dp_source_rows() {
     const auto synchronized_group =
         synchronized_predictor.predict_moe_group_layer(make_input(true));
     auto sensitivity_execution = execution;
-    sensitivity_execution.mega_moe_cluster_task_latency_us = 0.05;
-    sensitivity_execution.mega_moe_wave_exposure = 0.0;
-    sensitivity_execution.mega_moe_tail_io_fraction = 1.0;
+    sensitivity_execution.mega_moe_wave_exposure = 1.0;
+    sensitivity_execution.mega_moe_tail_io_fraction = 0.0;
     const frontier::execution_time_predictor::
         AnalyticalRooflineExecutionTimePredictor sensitivity_predictor(
             sensitivity_execution, parallelism, model, routing);
@@ -443,7 +442,7 @@ void test_group_moe_communication_aggregates_dp_source_rows() {
             "costs");
     require(sensitivity_group.critical_lane_time_ms !=
                 synchronized_group.critical_lane_time_ms,
-            "MegaMoE rho_tail/lambda_wave/c_grid config overrides must "
+            "MegaMoE tail-IO/wave config overrides must "
             "change the live routed group prediction");
     require(synchronized_group.grouped_gemm_geometry.enabled &&
                 synchronized_group.grouped_gemm_geometry.block_m > 0 &&
@@ -713,10 +712,9 @@ void test_mega_moe_geometry_uses_exact_expert_histogram() {
                 rubin_mega.mega_moe_a2a_startup_scale == 1.0 &&
                 rubin_mega.mega_moe_tail_io_fraction == 1.0 &&
                 rubin_mega.mega_moe_wave_exposure == 0.0 &&
-                rubin_mega.mega_moe_cluster_task_latency_us == 0.0 &&
                 rubin_mega.moe_a2a_overlap_residual == 1.0,
             "Rubin MegaMoE projection must scale SM waves and NVLink payload "
-            "without assuming a lower unmeasured cluster-task latency");
+            "without adding an unmeasured grid-latency coefficient");
     require(!rubin_generic.mega_moe_geometry_enabled &&
                 rubin_generic.mega_moe_sm_count == 224 &&
                 rubin_generic.mega_moe_a2a_bandwidth_scale == 2.0,
@@ -756,9 +754,7 @@ void test_mega_moe_geometry_uses_exact_expert_histogram() {
             mega_aligned.grouped_gemm_geometry.routed_m_blocks == 5 &&
             mega_fragmented.grouped_gemm_geometry.routed_m_blocks == 6 &&
             mega_aligned.grouped_gemm_geometry.routed_padded_tokens == 80 &&
-            mega_fragmented.grouped_gemm_geometry.routed_padded_tokens == 96 &&
-            mega_aligned.grouped_gemm_geometry.up_cluster_task_overhead_ms ==
-                0.0,
+            mega_fragmented.grouped_gemm_geometry.routed_padded_tokens == 96,
         "MegaMoE diagnostics must expose block-M padding geometry");
     require(mega_aligned.shuffling_ms == generic_aligned.shuffling_ms,
             "expert GEMM geometry must not scale shuffling work");

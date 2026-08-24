@@ -155,8 +155,6 @@ AnalyticalRooflineExecutionTimePredictor::predict_moe_group_layer(
         geometry.down_cluster_tasks,
         geometry.up_wave_utilization,
         geometry.down_wave_utilization,
-        geometry.up_cluster_task_overhead_ms,
-        geometry.down_cluster_task_overhead_ms,
     };
     result.destination_lane_routed_tokens = allocation.lane_routed_tokens;
     result.destination_lane_unique_tokens = allocation.lane_unique_tokens;

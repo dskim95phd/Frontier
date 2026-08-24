@@ -28,13 +28,14 @@ AnalyticalConfig analytical_config_from_profile(std::string_view profile,
         // routing/finalize, small-M GEMMs, and lower launch count.  Keep the
         // ceilings physical; only achieved efficiencies and launch overhead
         // differ from the portable generic path.
-        result.large_gemm = Efficiency{0.70, 0.80, 0.075};
-        result.small_gemm = Efficiency{0.315, 0.69, 0.375};
+        result.gemm.floor = Efficiency{0.315, 0.69, 0.375};
+        result.gemm.ceiling = Efficiency{0.70, 0.80, 0.075};
         // Concatenating the 896-wide gate to the 3584-wide latent down
         // projection increases N by 4480/3584. Scale achieved throughput by
         // the same geometry ratio so the gate slice is nearly free, matching
         // the published kernel intent without fitting a latency constant.
-        result.latent_moe_front = Efficiency{0.39375, 0.8625, 0.375};
+        result.latent_moe_front_floor =
+            Efficiency{0.39375, 0.8625, 0.375};
         result.streaming = Efficiency{0.26, 0.825, 0.0};
         result.moe = Efficiency{0.525, 0.75, 0.225};
         result.routing = Efficiency{0.195, 0.625, 0.625};
@@ -64,7 +65,7 @@ AnalyticalConfig analytical_config_from_profile(std::string_view profile,
         result.overlap_kda_aux_projections = true;
         result.use_flashkda_prefill_two_stage = true;
         result.overlap_mla_output_gate = true;
-        result.latent_moe_front = Efficiency{0.3125, 0.75, 0.50};
+        result.latent_moe_front_floor = Efficiency{0.3125, 0.75, 0.50};
         // Full padded activation IO is retained, but no additional wave or
         // per-cluster residual is charged. The old 0.06325 us coefficient was
         // fitted while router FP32 logits incorrectly forced the router GEMM
@@ -73,7 +74,6 @@ AnalyticalConfig analytical_config_from_profile(std::string_view profile,
         // the three LMSYS DP4/EP32 points; DP2/EP16 remained the holdout.
         result.mega_moe_tail_io_fraction = 1.0;
         result.mega_moe_wave_exposure = 0.0;
-        result.mega_moe_cluster_task_latency_us = 0.0;
         // The measured wide-EP path includes a synchronized dispatch-tail /
         // combine-head barrier. Rubin exposes mechanisms that may improve
         // this dependency, but no K3 MegaMoE measurement quantifies the
@@ -91,12 +91,10 @@ AnalyticalConfig analytical_config_from_profile(std::string_view profile,
         // sm100_megamoe_public communication backend; generic collectives
         // ignore it.
         result.mega_moe_sm_count = 224;
+        result.gemm.sm_count = 224;
         result.mega_moe_a2a_bandwidth_scale = 2.0;
-        // Keep the GB300-calibrated per-cluster residual unchanged. It
-        // represents small-grid scheduling/pipeline latency, not bulk
-        // arithmetic throughput, and no public Rubin measurement provides a
-        // generational latency ratio. The former 5/3 throughput-per-SM scale
-        // remains available as an explicit optimistic config sensitivity.
+        // GEMM and MegaMoE wave exposure both use Rubin's larger SM count.
+        // No fitted per-grid-task latency is carried across generations.
     }
     return result;
 }
@@ -265,6 +263,71 @@ RooflineResult predict_roofline(const DeviceCeilings &device,
         value.bottleneck = bottleneck;
         return value;
     }();
+}
+
+Efficiency gemm_efficiency_for_shape(const GemmEfficiencyCurve &curve,
+                                     std::uint64_t m, std::uint64_t k,
+                                     std::uint64_t n,
+                                     std::uint64_t independent_matrices,
+                                     const Efficiency *floor_override) {
+    validate_efficiency(curve.floor);
+    validate_efficiency(curve.ceiling);
+    const Efficiency &floor =
+        floor_override == nullptr ? curve.floor : *floor_override;
+    validate_efficiency(floor);
+    if (!std::isfinite(curve.m_saturation_rows) ||
+        curve.m_saturation_rows <= 0.0 || curve.tile_m == 0 ||
+        curve.tile_n == 0 || curve.tile_k == 0 || curve.sm_count == 0 ||
+        independent_matrices == 0 ||
+        !std::isfinite(curve.grid_saturation_weight) ||
+        !std::isfinite(curve.k_saturation_weight) ||
+        curve.grid_saturation_weight < 0.0 ||
+        curve.k_saturation_weight < 0.0 ||
+        curve.grid_saturation_weight + curve.k_saturation_weight > 1.0) {
+        throw AnalyticalModelError("invalid GEMM efficiency curve");
+    }
+    if (m == 0 || k == 0 || n == 0) {
+        return floor;
+    }
+
+    // DeepGEMM and CUTLASS select multiple block-M shapes around 32/64/128.
+    // A shifted exponential represents the useful-row fill of those choices
+    // without inventing a discontinuity at any one token count.  M=1 pins the
+    // measured GEMV-like floor; roughly two 64-row SM100 MMA tiles reach 86%
+    // of the M-axis envelope.
+    const double m_progress =
+        1.0 - std::exp(-(static_cast<double>(m) - 1.0) /
+                       curve.m_saturation_rows);
+
+    const auto ceil_div = [](std::uint64_t value, std::uint64_t divisor) {
+        return value / divisor + static_cast<std::uint64_t>(value % divisor != 0);
+    };
+    const long double grid_tiles =
+        static_cast<long double>(ceil_div(m, curve.tile_m)) *
+        static_cast<long double>(ceil_div(n, curve.tile_n)) *
+        static_cast<long double>(independent_matrices);
+    const double grid_progress = std::min(
+        1.0, static_cast<double>(grid_tiles /
+                                 static_cast<long double>(curve.sm_count)));
+    const double k_tiles = static_cast<double>(k) /
+                           static_cast<double>(curve.tile_k);
+    const double k_progress = 1.0 - std::exp(-k_tiles / 4.0);
+    const double base_weight =
+        1.0 - curve.grid_saturation_weight - curve.k_saturation_weight;
+    const double shape_factor = base_weight +
+                                curve.grid_saturation_weight * grid_progress +
+                                curve.k_saturation_weight * k_progress;
+    const double progress = std::clamp(m_progress * shape_factor, 0.0, 1.0);
+
+    const auto interpolate = [progress](double low, double high) {
+        return low + (high - low) * progress;
+    };
+    return Efficiency{
+        interpolate(floor.compute, curve.ceiling.compute),
+        interpolate(floor.memory, curve.ceiling.memory),
+        interpolate(floor.overlap_penalty,
+                    curve.ceiling.overlap_penalty),
+    };
 }
 
 KernelWork gemm_work(std::uint64_t m, std::uint64_t k, std::uint64_t n,

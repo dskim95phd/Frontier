@@ -54,6 +54,22 @@ struct Efficiency {
     double overlap_penalty;
 };
 
+// Smooth achieved-efficiency envelope for Tensor Core GEMMs.  SM100 kernels
+// choose among several MMA/block shapes, so there is no architecture-level
+// token count at which every GEMM changes regime.  The curve instead ramps
+// with M while applying smaller N-grid and K-pipeline saturation factors.
+struct GemmEfficiencyCurve {
+    Efficiency floor{0.25, 0.60, 0.50};
+    Efficiency ceiling{0.65, 0.75, 0.10};
+    double m_saturation_rows = 64.0;
+    std::uint64_t tile_m = 64;
+    std::uint64_t tile_n = 128;
+    std::uint64_t tile_k = 128;
+    std::uint64_t sm_count = 160;
+    double grid_saturation_weight = 0.15;
+    double k_saturation_weight = 0.10;
+};
+
 struct RooflineResult {
     double compute_time_ms;
     double memory_time_ms;
@@ -63,16 +79,14 @@ struct RooflineResult {
 };
 
 struct AnalyticalConfig {
-    Efficiency large_gemm{0.65, 0.75, 0.10};
-    Efficiency small_gemm{0.25, 0.60, 0.50};
-    Efficiency latent_moe_front{0.25, 0.60, 0.50};
+    GemmEfficiencyCurve gemm{};
+    Efficiency latent_moe_front_floor{0.25, 0.60, 0.50};
     Efficiency prefill_attention{0.55, 0.65, 0.20};
     Efficiency decode_attention{0.20, 0.60, 0.50};
     Efficiency streaming{0.20, 0.75, 0.0};
     Efficiency moe{0.45, 0.65, 0.30};
     Efficiency routing{0.15, 0.55, 0.75};
     double kernel_launch_latency_us = 5.0;
-    std::uint64_t small_gemm_token_threshold = 128;
     // K3's Day-0 path concatenates the BF16 router gate and LatentMoE down
     // projection weights. They share one input read and one GEMM launch.
     // Portable profiles retain the historical separate-kernel contract.
@@ -122,10 +136,6 @@ struct AnalyticalConfig {
     // Exposure of a partially occupied final cluster wave. One is the
     // geometry-derived prior; zero disables the wave correction.
     double mega_moe_wave_exposure = 1.0;
-    // Residual scheduler/pipeline cost per two-CTA cluster task. The
-    // roofline already charges arithmetic and bulk HBM traffic; this is the
-    // grid-size-dependent remainder of a RaMP-style wave model.
-    double mega_moe_cluster_task_latency_us = 0.0;
     // Device-generation scaling for the public one-sided A2A prior. Payload
     // bandwidth follows per-GPU NVLink peak; fixed startup remains separate
     // because link bandwidth alone does not establish a latency improvement.
@@ -153,6 +163,10 @@ class AnalyticalModelError : public std::runtime_error {
                                               const KernelWork &work,
                                               const Efficiency &efficiency,
                                               double kernel_launch_latency_us);
+[[nodiscard]] Efficiency gemm_efficiency_for_shape(
+    const GemmEfficiencyCurve &curve, std::uint64_t m, std::uint64_t k,
+    std::uint64_t n, std::uint64_t independent_matrices = 1,
+    const Efficiency *floor_override = nullptr);
 [[nodiscard]] KernelWork gemm_work(std::uint64_t m, std::uint64_t k,
                                    std::uint64_t n, double element_bytes,
                                    std::uint64_t weight_multiplier = 1);
