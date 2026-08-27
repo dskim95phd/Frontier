@@ -5,7 +5,7 @@ The output directory is the source of truth.  Every completed
 ``r*/cpu*gb/r1`` case with both ``summary.json`` and ``requests.csv`` is
 included, even when later split runner invocations replaced ``sweep_plan.json``
 with a smaller plan.  The script is safe to run while a sweep is partial and
-can be rerun after ``run_dense_cpu_capacity_rate_sweep.py --resume``.
+can be rerun after ``run_sweep.py --resume``.
 """
 
 from __future__ import annotations
@@ -20,16 +20,10 @@ from typing import Any, Mapping, Sequence
 
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parents[2]
-K2_EXPERIMENT = HERE.parent / "kimi_k2_cpu_dram"
-if str(K2_EXPERIMENT) not in sys.path:
-    sys.path.insert(0, str(K2_EXPERIMENT))
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
 
-import analyze_r0p4_capacity_sweep_10h as capacity_report  # noqa: E402
-
-
-DEFAULT_OUTPUT_ROOT = (
-    REPO_ROOT / "outputs" / "tracelab_k3_p24_d64_cpu_per_gpu_capacity_10h"
-)
+from lib import capacity_report  # noqa: E402
 
 RATE_DIRECTORY = re.compile(r"^r(?P<integer>\d+)p(?P<fraction>\d+)$")
 CAPACITY_DIRECTORY = re.compile(r"^cpu(?P<capacity>\d+)gb$")
@@ -212,6 +206,12 @@ def _index_html(
             parts.append(f"{int(decode_gpus)} DECODE GPUs")
         topology = ", ".join(parts)
     report_name = model_name + (f" — {topology}" if topology else "")
+    aggregate_note = (
+        "Aggregate CPU capacity is "
+        f"<code>capacity &times; {int(prefill_gpus)}</code>."
+        if prefill_gpus is not None
+        else "Aggregate CPU capacity depends on the PREFILL GPU count in the config."
+    )
     rows = []
     for report in reports:
         capacities = ", ".join(str(value) for value in report["capacities_gb"])
@@ -231,8 +231,8 @@ def _index_html(
 </head><body><h1>{html.escape(report_name)} CPU-per-GPU capacity sweep</h1>
 <p>Discovered {completed} completed points under this output directory. The latest sweep plan contains {latest_planned} points and is informational only. Each link contains every completed capacity found for that session-injection rate, including final-hour measurements and five-minute time series.</p>
 <table><thead><tr><th>session rate</th><th>completed points</th><th>CPU capacity per PREFILL GPU (GB)</th><th>report</th></tr></thead><tbody>{''.join(rows)}</tbody></table>
-<p>Capacity is the configured CPU DRAM slice per PREFILL GPU. Aggregate CPU
-capacity is <code>capacity &times; 24</code>; zero is the CPU-off baseline.</p>
+<p>Capacity is the configured CPU DRAM slice per PREFILL GPU. {aggregate_note}
+Zero is the CPU-off baseline.</p>
 </body></html>"""
 
 
@@ -358,7 +358,7 @@ def generate_reports(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
+    parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--max-final-hour-ttft-p90-ms", type=float, default=5_000.0)
     parser.add_argument("--max-final-hour-queue-count", type=float, default=1_000.0)
     parser.add_argument("--max-final-hour-backlog-requests", type=float, default=1_000.0)

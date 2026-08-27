@@ -1,15 +1,10 @@
 #!/usr/bin/env python3
-"""Run the Kimi K3 P24/D32 CPU-capacity sweep.
+"""Run a TraceLab CPU-DRAM capacity/session-rate sweep for Kimi K2 or K3.
 
-Edit ``SESSION_RATE_CAPACITIES_GB`` and ``MAX_CONCURRENT_SIMULATIONS`` below
-for the server.  Each session-injection rate has its own explicit list of CPU
-DRAM capacities.  The runner generates one deterministic TraceLab workload
-per distinct rate, runs all requested capacity/rate pairs, supports
-``--resume``, and generates one HTML capacity report per completed rate.
-
-Capacity labels are decimal GB of CPU DRAM per PREFILL GPU.  The default
-topology has 24 PREFILL GPU slices, so a 250 GB point resolves to 6 TB of
-aggregate CPU KV capacity.  Point zero is the CPU-off baseline.
+The simulator config selects the model, topology, execution precision, and
+batching policy.  CLI values select the session-rate and per-PREFILL-GPU CPU
+DRAM grids.  The runner generates one deterministic workload per rate, runs
+the Cartesian product, supports resume, and generates the shared HTML report.
 """
 
 from __future__ import annotations
@@ -30,38 +25,22 @@ from typing import Any, Mapping, Sequence
 
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parents[2]
-K2_EXPERIMENT = HERE.parent / "kimi_k2_cpu_dram"
-if str(K2_EXPERIMENT) not in sys.path:
-    sys.path.insert(0, str(K2_EXPERIMENT))
 
-from convert_tracelab_workload import (  # noqa: E402
-    CONVERTER_VERSION,
-    count_eligible_source_sessions,
-)
+try:
+    from .convert_tracelab_workload import (
+        CONVERTER_VERSION,
+        count_eligible_source_sessions,
+    )
+except ImportError:  # Direct script execution.
+    from convert_tracelab_workload import (
+        CONVERTER_VERSION,
+        count_eligible_source_sessions,
+    )
 
 
-# ---------------------------------------------------------------------------
-# Server experiment settings: edit this block before launching the sweep.
-# The default is exactly eight capacity points at one pilot session rate.  Add
-# more entries, or give each rate a different tuple, to select an arbitrary
-# matrix.  For example:
-#
-# SESSION_RATE_CAPACITIES_GB = {
-#     "0.50": (250, 500, 750, 1000),
-#     "0.70": (500, 750, 875, 1000),
-#     "0.90": (875, 1000),
-# }
-#
-# The rate must be calibrated before treating a long K3 run as a capacity-knee
-# result.  ``--session-rate`` remains available as a one-rate override.
-# ---------------------------------------------------------------------------
-PILOT_SESSION_RATE = "0.30"
-SESSION_RATE_CAPACITIES_GB: dict[str, tuple[int, ...]] = {
-    PILOT_SESSION_RATE: (0, 250, 375, 500, 625, 750, 875, 1000),
-}
 RATE_STEP = "0.01"
 MAX_CONCURRENT_SIMULATIONS = 4
-SIMULATION_END_TIME_S = 10 * 60 * 60
+SIMULATION_END_TIME_S = 12 * 60 * 60
 PROGRESS_INTERVAL_S = 60 * 60
 # None means use every eligible source session.  SESSION_REPETITIONS=None
 # selects the minimum number of full epochs that keeps injection active for
@@ -69,11 +48,10 @@ PROGRESS_INTERVAL_S = 60 * 60
 SAMPLE_SESSIONS: int | None = None
 SESSION_REPETITIONS: int | None = None
 SEED = 20260803
+DEFAULT_SESSION_RATES = tuple(f"{value / 100:.2f}" for value in range(5, 51, 5))
+DEFAULT_CAPACITIES_GB = (250, 375, 500, 625, 750, 875, 1000)
 
 
-DEFAULT_CONFIG = (
-    HERE / "configs" / "tracelab_k3_p24_d32_cpu_sweep_benchmark.json"
-)
 DEFAULT_TRACELAB_DB = (
     REPO_ROOT / "outputs" / "datasets" / "tracelab" / "v0.0.2" / "syfi_coding_trace.duckdb"
 )
@@ -84,10 +62,7 @@ DEFAULT_WORKLOAD_ROOT = (
     / "tracelab"
     / "v0.0.2"
     / "frontier"
-    / "all_sessions_continuous_10h"
-)
-DEFAULT_OUTPUT_ROOT = (
-    REPO_ROOT / "outputs" / "tracelab_k3_p24_d32_cpu_per_gpu_capacity_10h"
+    / "kimi_cpu_dram_compaction_v3_12h"
 )
 DECIMAL_GB = 1_000_000_000
 
@@ -160,8 +135,8 @@ def rate_label(rate: Decimal | float | str) -> str:
 def capacity_label(capacity_gb: int) -> str:
     if capacity_gb < 0:
         raise ValueError("capacity must be nonnegative")
-    # Preserve the analyzer's stable directory contract.  In this K3 runner
-    # the numeric value means per-PREFILL-GPU GB; cpu0000gb is the off case.
+    # Preserve the report's stable directory contract.  The numeric value is
+    # always decimal GB per PREFILL GPU; cpu0000gb is the CPU-off case.
     return f"cpu{capacity_gb:04d}gb"
 
 
@@ -234,26 +209,20 @@ def normalize_rate_capacities(
             raise ValueError(f"session rate {rate} contains duplicate CPU capacities")
         normalized[rate] = tuple(sorted(capacities))
     if not normalized:
-        raise ValueError("SESSION_RATE_CAPACITIES_GB must not be empty")
+        raise ValueError("rate/capacity matrix must not be empty")
     return dict(sorted(normalized.items()))
 
 
 def resolve_rate_capacities(
-    session_rate: str | float | Decimal | None,
-    configured: Mapping[
-        str | float | Decimal, Sequence[int]
-    ] = SESSION_RATE_CAPACITIES_GB,
+    session_rates: Sequence[str | float | Decimal],
+    capacities_gb: Sequence[int],
 ) -> dict[Decimal, tuple[int, ...]]:
-    """Use the configured matrix, or apply the legacy one-rate CLI override."""
+    """Build the exact Cartesian product requested on the CLI."""
 
-    normalized = normalize_rate_capacities(configured)
-    if session_rate is None:
-        return normalized
-    override = _decimal(session_rate, name="session rate")
-    all_capacities = tuple(
-        sorted({capacity for capacities in normalized.values() for capacity in capacities})
-    )
-    return {override: all_capacities}
+    capacities = tuple(sorted(capacities_gb))
+    if not capacities:
+        raise ValueError("at least one CPU capacity is required")
+    return normalize_rate_capacities({rate: capacities for rate in session_rates})
 
 
 def build_rate_capacity_matrix(
@@ -319,7 +288,7 @@ def resolve_session_repetitions(
     configured_repetitions: int | None = SESSION_REPETITIONS,
 ) -> int:
     if not cases:
-        raise ValueError("SESSION_RATE_CAPACITIES_GB produced no cases")
+        raise ValueError("rate/capacity matrix produced no cases")
     if source_sessions_per_epoch <= 0:
         raise ValueError("source_sessions_per_epoch must be positive")
     highest_rate = max(case.rate for case in cases)
@@ -345,7 +314,7 @@ def _converter_command(args: argparse.Namespace, rate: Decimal, workload: Path,
                        session_repetitions: int) -> list[str]:
     command = [
         str(args.python),
-        str(K2_EXPERIMENT / "convert_tracelab_workload.py"),
+        str(HERE / "convert_tracelab_workload.py"),
         "--db",
         str(args.tracelab_db),
         "--output",
@@ -687,37 +656,54 @@ def run_case(
     return case.label, returncode == 0
 
 
-def _parse_capacity_filter(text: str) -> set[int]:
+def _parse_capacities(text: str) -> tuple[int, ...]:
     try:
-        values = {int(item.strip()) for item in text.split(",") if item.strip()}
+        raw = [int(item.strip()) for item in text.split(",") if item.strip()]
     except ValueError as error:
         raise argparse.ArgumentTypeError("capacities must be comma-separated integer GB values") from error
-    if not values or any(value < 0 for value in values):
-        raise argparse.ArgumentTypeError("capacities must be nonnegative and non-empty")
-    return values
+    if not raw or any(value < 0 for value in raw) or len(set(raw)) != len(raw):
+        raise argparse.ArgumentTypeError(
+            "capacities must be unique, nonnegative, and non-empty"
+        )
+    return tuple(sorted(raw))
+
+
+def _parse_session_rates(text: str) -> tuple[Decimal, ...]:
+    raw = [item.strip() for item in text.split(",") if item.strip()]
+    if not raw:
+        raise argparse.ArgumentTypeError("session rates must be non-empty")
+    try:
+        values = tuple(_decimal(item, name="session rate") for item in raw)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+    if len(set(values)) != len(values):
+        raise argparse.ArgumentTypeError("session rates must be unique")
+    return tuple(sorted(values))
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, default=_default_binary())
-    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    parser.add_argument(
+        "--config",
+        type=Path,
+        help="simulator JSON config; this alone selects Kimi K2 or K3",
+    )
     parser.add_argument("--tracelab-db", type=Path, default=DEFAULT_TRACELAB_DB)
     parser.add_argument("--workload-root", type=Path, default=DEFAULT_WORKLOAD_ROOT)
-    parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
+    parser.add_argument("--output-root", type=Path)
     parser.add_argument("--python", type=Path, default=Path(sys.executable))
     parser.add_argument(
-        "--session-rate",
-        default=None,
-        help=(
-            "optional source-sessions/second override applied to every declared "
-            "capacity; omit to use SESSION_RATE_CAPACITIES_GB"
-        ),
+        "--session-rates",
+        type=_parse_session_rates,
+        default=_parse_session_rates(",".join(DEFAULT_SESSION_RATES)),
+        help="comma-separated source-session rates (default: 0.05,...,0.50)",
     )
     parser.add_argument(
         "--simulation-hours",
         type=float,
         default=SIMULATION_END_TIME_S / 3600.0,
-        help="simulated horizon in hours (default: 10)",
+        help="simulated horizon in hours (default: 12)",
     )
     parser.add_argument(
         "--jobs",
@@ -727,8 +713,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--capacities-gb",
-        type=_parse_capacity_filter,
-        help="optional subset of the capacities declared at the top of this file",
+        type=_parse_capacities,
+        default=DEFAULT_CAPACITIES_GB,
+        help="comma-separated decimal GB per PREFILL GPU",
     )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
@@ -765,6 +752,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     global SIMULATION_END_TIME_S
     args = build_parser().parse_args(argv)
     _require_expensive_diagnostics_opt_in(args)
+    if args.config is None:
+        raise SystemExit("--config is required")
+    if args.output_root is None:
+        raise SystemExit("--output-root is required")
     if args.jobs <= 0:
         raise SystemExit("--jobs must be positive")
     if not math.isfinite(args.simulation_hours) or args.simulation_hours <= 0:
@@ -778,7 +769,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     if SIMULATION_END_TIME_S <= 0:
         raise SystemExit("--simulation-hours rounds to an empty horizon")
     try:
-        rate_capacities = resolve_rate_capacities(args.session_rate)
+        rate_capacities = resolve_rate_capacities(
+            args.session_rates,
+            args.capacities_gb,
+        )
     except ValueError as error:
         raise SystemExit(str(error)) from error
     full_matrix = build_rate_capacity_matrix(
@@ -787,30 +781,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         output_root=args.output_root.resolve(),
         seed=SEED,
     )
-    if args.capacities_gb is not None:
-        declared_capacities = {
-            capacity
-            for capacities in rate_capacities.values()
-            for capacity in capacities
-        }
-        unknown = sorted(args.capacities_gb - declared_capacities)
-        if unknown:
-            raise SystemExit(
-                f"capacities not declared in SESSION_RATE_CAPACITIES_GB: {unknown}"
-            )
-        rate_capacities = {
-            rate: tuple(
-                capacity
-                for capacity in capacities
-                if capacity in args.capacities_gb
-            )
-            for rate, capacities in rate_capacities.items()
-        }
-        rate_capacities = {
-            rate: capacities
-            for rate, capacities in rate_capacities.items()
-            if capacities
-        }
     cases = build_rate_capacity_matrix(
         rate_capacities,
         workload_root=args.workload_root.resolve(),
@@ -883,7 +853,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 format(rate, "f"): list(capacities)
                 for rate, capacities in rate_capacities.items()
             },
-            "session_rate_override": args.session_rate,
+            "session_rates": [format(rate, "f") for rate in rate_capacities],
             "capacity_mapping": (
                 "capacity point is decimal GB per PREFILL GPU; aggregate static "
                 f"CPU capacity is point * {prefill_gpus} PREFILL GPU slices"
@@ -953,7 +923,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.generate_reports and not args.dry_run:
         try:
-            from generate_dense_cpu_capacity_rate_reports import generate_reports
+            try:
+                from .generate_report import generate_reports
+            except ImportError:  # Direct script execution.
+                from generate_report import generate_reports
 
             result = generate_reports(args.output_root.resolve())
             print(json.dumps(result, indent=2), flush=True)

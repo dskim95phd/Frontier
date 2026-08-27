@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from cpp.experiments.kimi_k2_cpu_dram import analyze_r0p4_capacity_sweep_10h as report
+from cpp.experiments.kimi_cpu_dram.lib import capacity_report as report
 
 
 def test_ttft_chart_caps_y_axis_and_clips_large_values() -> None:

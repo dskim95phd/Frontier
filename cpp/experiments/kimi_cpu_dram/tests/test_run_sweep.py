@@ -5,8 +5,20 @@ from pathlib import Path
 
 import pytest
 
-from cpp.experiments.kimi_k3_cpu_dram import generate_dense_cpu_capacity_rate_reports as reports
-from cpp.experiments.kimi_k3_cpu_dram import run_dense_cpu_capacity_rate_sweep as runner
+from cpp.experiments.kimi_cpu_dram import generate_report as reports
+from cpp.experiments.kimi_cpu_dram import run_sweep as runner
+
+REPO_ROOT = Path(__file__).resolve().parents[4]
+K2_CONFIG = (
+    REPO_ROOT
+    / "cpp/experiments/kimi_k2_cpu_dram/configs/"
+    "tracelab_vera_rubin_p8_d16_prefill_only_cpu_per_gpu.json"
+)
+K3_CONFIG = (
+    REPO_ROOT
+    / "cpp/experiments/kimi_k3_cpu_dram/configs/"
+    "tracelab_k3_p24_d64_prefill_only_batch8192_cpu_per_gpu.json"
+)
 
 
 def test_decimal_matrix_is_inclusive_and_exact(tmp_path: Path) -> None:
@@ -30,21 +42,24 @@ def test_decimal_matrix_is_inclusive_and_exact(tmp_path: Path) -> None:
     assert cases[0].output_dir == tmp_path / "runs" / "r0p30" / "cpu0500gb" / "r1"
 
 
-def test_default_k3_matrix_has_off_plus_seven_per_gpu_capacity_points(
+def test_default_matrix_has_ten_rates_and_seven_per_gpu_capacity_points(
     tmp_path: Path,
 ) -> None:
+    rate_capacities = runner.resolve_rate_capacities(
+        runner.DEFAULT_SESSION_RATES,
+        runner.DEFAULT_CAPACITIES_GB,
+    )
     cases = runner.build_rate_capacity_matrix(
-        runner.SESSION_RATE_CAPACITIES_GB,
+        rate_capacities,
         workload_root=tmp_path / "workloads",
         output_root=tmp_path / "runs",
         seed=7,
     )
 
-    assert [(case.capacity_gb, str(case.rate)) for case in cases] == [
-        (capacity_gb, runner.PILOT_SESSION_RATE)
-        for capacity_gb in (0, 250, 375, 500, 625, 750, 875, 1000)
-    ]
-    assert cases[0].capacity_label == "cpu0000gb"
+    assert len(cases) == 70
+    assert cases[0].rate == runner.Decimal("0.05")
+    assert cases[-1].rate == runner.Decimal("0.50")
+    assert {case.capacity_gb for case in cases} == set(runner.DEFAULT_CAPACITIES_GB)
 
 
 def test_configured_matrix_can_select_capacities_per_session_rate(
@@ -71,35 +86,34 @@ def test_configured_matrix_can_select_capacities_per_session_rate(
     ]
 
 
-def test_session_rate_cli_is_a_uniform_override_for_all_declared_capacities() -> None:
-    args = runner.build_parser().parse_args(["--session-rate", "0.42"])
+def test_session_rate_and_capacity_cli_build_cartesian_product() -> None:
+    args = runner.build_parser().parse_args(
+        ["--session-rates", "0.42,0.50", "--capacities-gb", "250,1000"]
+    )
     rate_capacities = runner.resolve_rate_capacities(
-        args.session_rate,
-        {"0.30": (0, 250, 500), "0.50": (500, 750, 1000)},
+        args.session_rates,
+        args.capacities_gb,
     )
 
     assert rate_capacities == {
-        runner.Decimal("0.42"): (0, 250, 500, 750, 1000)
+        runner.Decimal("0.42"): (250, 1000),
+        runner.Decimal("0.50"): (250, 1000),
     }
 
 
-def test_omitting_session_rate_uses_configured_rate_matrix() -> None:
+def test_omitting_grid_options_uses_documented_defaults() -> None:
     args = runner.build_parser().parse_args([])
 
-    assert args.session_rate is None
-    assert runner.resolve_rate_capacities(
-        args.session_rate,
-        {"0.50": (250, 500), "0.70": (750, 1000)},
-    ) == {
-        runner.Decimal("0.50"): (250, 500),
-        runner.Decimal("0.70"): (750, 1000),
-    }
+    assert args.session_rates[0] == runner.Decimal("0.05")
+    assert args.session_rates[-1] == runner.Decimal("0.50")
+    assert args.capacities_gb == runner.DEFAULT_CAPACITIES_GB
+    assert args.simulation_hours == 12
 
 
 def test_twelve_hour_endpoint_cli_contract() -> None:
     args = runner.build_parser().parse_args(
         [
-            "--session-rate",
+            "--session-rates",
             "0.5",
             "--simulation-hours",
             "12",
@@ -108,9 +122,9 @@ def test_twelve_hour_endpoint_cli_contract() -> None:
         ]
     )
 
-    assert args.session_rate == "0.5"
+    assert args.session_rates == (runner.Decimal("0.5"),)
     assert args.simulation_hours == 12
-    assert args.capacities_gb == {250, 1000}
+    assert args.capacities_gb == (250, 1000)
 
 
 def test_simulator_command_enables_one_minute_wall_progress_by_default(
@@ -216,8 +230,8 @@ def test_all_session_epoch_count_is_derived_from_highest_rate(tmp_path: Path) ->
 
     assert runner.resolve_session_repetitions(
         cases, source_sessions_per_epoch=1000, configured_repetitions=None
-    ) == 18
-    with pytest.raises(ValueError, match="use at least 18"):
+    ) == 22
+    with pytest.raises(ValueError, match="use at least 22"):
         runner.resolve_session_repetitions(
             cases, source_sessions_per_epoch=1000, configured_repetitions=17
         )
@@ -262,15 +276,12 @@ def test_case_start_message_prints_complete_experiment_condition(tmp_path: Path)
 
     assert message == (
         "[running] r0p30/cpu0500gb rate=0.30/s per_prefill_gpu=500GB "
-        "aggregate_cpu=12000GB source_sessions=8041 epochs=3 horizon=10h"
+        "aggregate_cpu=12000GB source_sessions=8041 epochs=3 horizon=12h"
     )
 
 
 def test_k3_config_uses_static_per_gpu_capacity_and_off_baseline() -> None:
-    assert runner.DEFAULT_CONFIG.name == (
-        "tracelab_k3_p24_d32_cpu_sweep_benchmark.json"
-    )
-    template = json.loads(runner.DEFAULT_CONFIG.read_text(encoding="utf-8"))
+    template = json.loads(K3_CONFIG.read_text(encoding="utf-8"))
     cases = runner.build_matrix(
         {0: ("0.30", "0.30"), 250: ("0.30", "0.30")},
         step="0.01",
@@ -292,7 +303,7 @@ def test_k3_config_uses_static_per_gpu_capacity_and_off_baseline() -> None:
     assert runner._topology_gpu_counts(enabled) == (24, 32)
     assert enabled["run_id"] == "kimi-k3-tracelab-p24-d32-r0p30-cpu0250gb"
     prefill_scheduler = enabled["clusters"]["prefill"]["scheduler"]
-    assert prefill_scheduler["max_tokens_in_batch"] == 16_384
+    assert prefill_scheduler["max_tokens_in_batch"] == 8_192
     assert prefill_scheduler["enable_chunked_prefill"] is True
     assert (
         prefill_scheduler["long_prefill_token_threshold"] == 512
@@ -314,8 +325,7 @@ def test_k3_config_uses_static_per_gpu_capacity_and_off_baseline() -> None:
 
 
 def test_generated_run_id_tracks_k2_template_model() -> None:
-    template = json.loads(runner.DEFAULT_CONFIG.read_text(encoding="utf-8"))
-    template["model"] = "moonshotai/Kimi-K2-Instruct"
+    template = json.loads(K2_CONFIG.read_text(encoding="utf-8"))
     case = runner.build_matrix(
         {250: ("0.50", "0.50")},
         step="0.01",
@@ -326,7 +336,7 @@ def test_generated_run_id_tracks_k2_template_model() -> None:
 
     generated = runner.build_config(template, case)
 
-    assert generated["run_id"] == "kimi-k2-tracelab-p24-d32-r0p50-cpu0250gb"
+    assert generated["run_id"] == "kimi-k2-tracelab-p8-d16-r0p50-cpu0250gb"
 
 
 def test_case_progress_message_reports_simulated_hours(tmp_path: Path) -> None:
@@ -342,7 +352,7 @@ def test_case_progress_message_reports_simulated_hours(tmp_path: Path) -> None:
         case,
         simulation_time_s=3 * 3600,
         wall_seconds=42.125,
-    ) == "[progress] r0p45/cpu4000gb simulated=3/10h (30%) wall=42.1s"
+    ) == "[progress] r0p45/cpu4000gb simulated=3/12h (25%) wall=42.1s"
 
 
 def test_report_discovery_includes_only_completed_points(tmp_path: Path) -> None:

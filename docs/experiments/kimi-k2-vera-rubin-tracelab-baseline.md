@@ -1,5 +1,10 @@
 # Kimi K2 / Vera Rubin TraceLab baseline
 
+> Historical record: the exact one-off runner and frozen configuration named
+> below were retired when the Kimi CPU-DRAM experiments were consolidated.
+> New sweeps use `cpp/experiments/kimi_cpu_dram/run_sweep.py`; see its adjacent
+> `README.md`.
+
 This baseline mirrors the latest GB300 TraceLab experiment topology while
 replacing the hardware contract with NVIDIA Vera Rubin.
 

@@ -1,5 +1,10 @@
 # TraceLab cache-aware arrival-rate sweep
 
+> Historical record: the one-off runner, collector, and frozen configuration
+> referenced below were retired when the Kimi CPU-DRAM experiments were
+> consolidated. New sweeps use
+> `cpp/experiments/kimi_cpu_dram/run_sweep.py`; see its adjacent `README.md`.
+
 This experiment finds the sustainable TraceLab source-session arrival rate for
 the cache-aware PREFILL routing policy.  It runs the same seeded 1,000-source-
 session sample twice at six rates from 0.10 down to 0.05 sessions/s, then

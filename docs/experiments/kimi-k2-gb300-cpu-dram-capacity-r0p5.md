@@ -1,5 +1,10 @@
 # Kimi K2 / GB300 CPU DRAM Capacity 실험 — 최신 r0.5 기준
 
+> Historical record: the exact synthetic workload, one-off runner, and base
+> configuration named below were retired when the Kimi CPU-DRAM experiments
+> were consolidated. New sweeps use
+> `cpp/experiments/kimi_cpu_dram/run_sweep.py`; see its adjacent `README.md`.
+
 > 상태: 실행 완료 및 결과 재집계 (2026-08-04)  
 > 기준 seed: `20260803`  
 > 기준 workload: `long_mixed_steady4096_r0p5`  
