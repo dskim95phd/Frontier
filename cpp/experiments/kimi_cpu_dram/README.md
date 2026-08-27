@@ -39,6 +39,7 @@ python cpp/experiments/kimi_cpu_dram/run_sweep.py \
   --capacities-gb 250,500,1000 \
   --simulation-hours 12 \
   --jobs 4 \
+  --report-jobs 4 \
   --regenerate-workloads \
   --resume
 ```
@@ -53,5 +54,12 @@ Reports can be rebuilt independently:
 
 ```bash
 python cpp/experiments/kimi_cpu_dram/generate_report.py \
-  --output-root outputs/my-sweep
+  --output-root outputs/my-sweep \
+  --report-jobs 4
 ```
+
+Report jobs are separate processes, one session-rate report per process. The
+default is up to four processes. Every completed canonical case already under
+the output root is included by default, even if it is absent from the latest
+`sweep_plan.json`. Use `--no-include-existing-results` only when the report
+must be restricted to that latest plan.

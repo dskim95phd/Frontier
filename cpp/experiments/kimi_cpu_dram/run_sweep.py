@@ -17,6 +17,7 @@ from decimal import Decimal, InvalidOperation
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -40,6 +41,7 @@ except ImportError:  # Direct script execution.
 
 RATE_STEP = "0.01"
 MAX_CONCURRENT_SIMULATIONS = 4
+DEFAULT_REPORT_JOBS = min(4, os.cpu_count() or 1)
 SIMULATION_END_TIME_S = 12 * 60 * 60
 PROGRESS_INTERVAL_S = 60 * 60
 # None means use every eligible source session.  SESSION_REPETITIONS=None
@@ -783,6 +785,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--regenerate-workloads", action="store_true")
     parser.add_argument("--generate-reports", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
+        "--report-jobs",
+        type=int,
+        default=DEFAULT_REPORT_JOBS,
+        help=f"parallel report-analysis processes (default: {DEFAULT_REPORT_JOBS})",
+    )
+    parser.add_argument(
+        "--include-existing-results",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="include completed results outside the latest sweep plan (default: true)",
+    )
+    parser.add_argument(
         "--runtime-validation",
         action=argparse.BooleanOptionalAction,
         default=PERFORMANCE_RUNTIME_VALIDATION,
@@ -818,6 +832,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise SystemExit("--output-root is required")
     if args.jobs <= 0:
         raise SystemExit("--jobs must be positive")
+    if args.report_jobs <= 0:
+        raise SystemExit("--report-jobs must be positive")
     if not math.isfinite(args.simulation_hours) or args.simulation_hours <= 0:
         raise SystemExit("--simulation-hours must be finite and positive")
     if (
@@ -920,6 +936,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             "injection_duration_at_max_rate_s": float(injection_duration_s),
             "seed": SEED,
             "jobs": args.jobs,
+            "report_options": {
+                "jobs": args.report_jobs,
+                "include_existing_results": bool(args.include_existing_results),
+            },
             "wall_progress_interval_s": args.wall_progress_interval_s,
             "simulator_options": {
                 "runtime_validation": bool(args.runtime_validation),
@@ -979,7 +999,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             except ImportError:  # Direct script execution.
                 from generate_report import generate_reports
 
-            result = generate_reports(args.output_root.resolve())
+            result = generate_reports(
+                args.output_root.resolve(),
+                report_jobs=args.report_jobs,
+                include_existing_results=args.include_existing_results,
+            )
             print(json.dumps(result, indent=2), flush=True)
         except Exception as error:  # noqa: BLE001 - simulation results remain resumable
             failures.append("report-generation")

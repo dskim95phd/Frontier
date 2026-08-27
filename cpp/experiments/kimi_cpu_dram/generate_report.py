@@ -11,8 +11,12 @@ can be rerun after ``run_sweep.py --resume``.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from contextlib import redirect_stdout
 import html
+import io
 import json
+import os
 from pathlib import Path
 import re
 import sys
@@ -27,6 +31,7 @@ from lib import capacity_report  # noqa: E402
 
 RATE_DIRECTORY = re.compile(r"^r(?P<integer>\d+)p(?P<fraction>\d+)$")
 CAPACITY_DIRECTORY = re.compile(r"^cpu(?P<capacity>\d+)gb$")
+DEFAULT_REPORT_JOBS = min(4, os.cpu_count() or 1)
 
 
 def _json_read(path: Path) -> dict[str, Any]:
@@ -188,6 +193,7 @@ def _index_html(
     latest_planned: int,
     completed: int,
     identity: Mapping[str, Any],
+    include_existing_results: bool = True,
 ) -> str:
     model_name = str(identity.get("model_name") or "LLM")
     prefill_gpus = identity.get("prefill_gpu_count")
@@ -212,6 +218,12 @@ def _index_html(
         if prefill_gpus is not None
         else "Aggregate CPU capacity depends on the PREFILL GPU count in the config."
     )
+    discovery_note = (
+        "Each link contains every completed capacity found for that "
+        "session-injection rate, including results outside the latest sweep plan."
+        if include_existing_results
+        else "Each link is restricted to completed cases in the latest sweep plan."
+    )
     rows = []
     for report in reports:
         capacities = ", ".join(str(value) for value in report["capacities_gb"])
@@ -229,11 +241,56 @@ def _index_html(
 <title>{html.escape(report_name)} CPU-per-GPU capacity sweep</title>
 <style>body{{font:14px/1.5 system-ui,sans-serif;max-width:1200px;margin:auto;padding:28px;color:#172033;background:#f7f8fb}}table{{width:100%;border-collapse:collapse;background:#fff}}th,td{{padding:9px 11px;border:1px solid #d8dde8;text-align:left}}th{{background:#eef2f8}}code{{font-family:ui-monospace,monospace}}</style>
 </head><body><h1>{html.escape(report_name)} CPU-per-GPU capacity sweep</h1>
-<p>Discovered {completed} completed points under this output directory. The latest sweep plan contains {latest_planned} points and is informational only. Each link contains every completed capacity found for that session-injection rate, including final-hour measurements and five-minute time series.</p>
+<p>Discovered {completed} completed points under this output directory. The latest sweep plan contains {latest_planned} points. {discovery_note} Reports include final-hour measurements and five-minute time series.</p>
 <table><thead><tr><th>session rate</th><th>completed points</th><th>CPU capacity per PREFILL GPU (GB)</th><th>report</th></tr></thead><tbody>{''.join(rows)}</tbody></table>
 <p>Capacity is the configured CPU DRAM slice per PREFILL GPU. {aggregate_note}
 Zero is the CPU-off baseline.</p>
 </body></html>"""
+
+
+def _select_completed_cases(
+    output_root: Path,
+    plan: Mapping[str, Any] | None,
+    *,
+    include_existing_results: bool,
+) -> dict[str, list[dict[str, Any]]]:
+    discovered = discover_completed_cases_by_rate(output_root, plan)
+    if include_existing_results:
+        return discovered
+    if plan is None:
+        raise FileNotFoundError(
+            "--no-include-existing-results requires sweep_plan.json"
+        )
+    planned_dirs = set(_plan_cases_by_output_dir(plan))
+    selected: dict[str, list[dict[str, Any]]] = {}
+    for rate_tag, cases in discovered.items():
+        retained = [
+            case
+            for case in cases
+            if Path(str(case["output_dir"])).resolve() in planned_dirs
+        ]
+        if retained:
+            selected[rate_tag] = retained
+    return selected
+
+
+def _run_rate_report_task(task: Mapping[str, Any]) -> dict[str, Any]:
+    """Run one rate report in a worker process without interleaved stdout."""
+
+    captured = io.StringIO()
+    try:
+        with redirect_stdout(captured):
+            status = capacity_report.main(list(task["argv"]))
+    except SystemExit as exc:
+        status = int(exc.code) if isinstance(exc.code, int) else 1
+    if status != 0:
+        detail = captured.getvalue().strip()
+        suffix = f": {detail}" if detail else ""
+        raise RuntimeError(
+            f"report generation failed for {task['rate_label']} with status "
+            f"{status}{suffix}"
+        )
+    return dict(task["report"])
 
 
 def generate_reports(
@@ -242,11 +299,19 @@ def generate_reports(
     max_final_hour_ttft_p90_ms: float = 5_000.0,
     max_final_hour_queue_count: float = 1_000.0,
     max_final_hour_backlog_requests: float = 1_000.0,
+    report_jobs: int = DEFAULT_REPORT_JOBS,
+    include_existing_results: bool = True,
 ) -> dict[str, Any]:
+    if report_jobs <= 0:
+        raise ValueError("report_jobs must be positive")
     output_root = output_root.resolve()
     plan_path = output_root / "sweep_plan.json"
     plan = _json_read(plan_path) if plan_path.is_file() else None
-    grouped = discover_completed_cases_by_rate(output_root, plan)
+    grouped = _select_completed_cases(
+        output_root,
+        plan,
+        include_existing_results=include_existing_results,
+    )
     if not grouped:
         raise FileNotFoundError(
             "no completed r*/cpu*gb/r1 cases with summary.json and requests.csv "
@@ -254,7 +319,7 @@ def generate_reports(
         )
     first_case_dir = Path(str(next(iter(grouped.values()))[0]["output_dir"]))
     report_identity = capacity_report._report_identity(first_case_dir)
-    reports: list[dict[str, Any]] = []
+    tasks: list[dict[str, Any]] = []
     for rate_tag, cases in grouped.items():
         rate = float(cases[0]["rate"])
         rate_root = output_root / rate_tag
@@ -286,8 +351,19 @@ def generate_reports(
         output_csv = rate_root / f"{rate_tag}_capacity_sweep_{horizon_tag}_5min.csv"
         output_json = rate_root / f"{rate_tag}_capacity_sweep_{horizon_tag}.json"
         output_html = rate_root / f"{rate_tag}_capacity_sweep_{horizon_tag}.html"
-        status = capacity_report.main(
-            [
+        report = {
+            "rate": rate,
+            "rate_label": rate_tag,
+            "capacities_gb": capacities,
+            "html": str(output_html.resolve()),
+            "json": str(output_json.resolve()),
+            "csv": str(output_csv.resolve()),
+        }
+        tasks.append(
+            {
+                "rate_label": rate_tag,
+                "report": report,
+                "argv": [
                 "--output-root",
                 str(rate_root),
                 "--simulation-rate",
@@ -313,20 +389,31 @@ def generate_reports(
                 str(output_json),
                 "--output-html",
                 str(output_html),
-            ]
-        )
-        if status != 0:
-            raise RuntimeError(f"report generation failed for {rate_tag} with status {status}")
-        reports.append(
-            {
-                "rate": rate,
-                "rate_label": rate_tag,
-                "capacities_gb": capacities,
-                "html": str(output_html.resolve()),
-                "json": str(output_json.resolve()),
-                "csv": str(output_csv.resolve()),
+                ],
             }
         )
+
+    reports: list[dict[str, Any]] = []
+    worker_count = min(report_jobs, len(tasks))
+    if worker_count == 1:
+        for task in tasks:
+            print(f"[report] analyzing {task['rate_label']}", flush=True)
+            reports.append(_run_rate_report_task(task))
+    else:
+        print(
+            f"[report] analyzing {len(tasks)} rates with {worker_count} processes",
+            flush=True,
+        )
+        with ProcessPoolExecutor(max_workers=worker_count) as executor:
+            pending = {
+                executor.submit(_run_rate_report_task, task): task["rate_label"]
+                for task in tasks
+            }
+            for future in as_completed(pending):
+                rate_label = pending[future]
+                reports.append(future.result())
+                print(f"[report] completed {rate_label}", flush=True)
+    reports.sort(key=lambda report: float(report["rate"]))
     completed = sum(len(cases) for cases in grouped.values())
     latest_planned = len((plan or {}).get("cases", []))
     index_path = output_root / "index.html"
@@ -337,12 +424,19 @@ def generate_reports(
             latest_planned,
             completed,
             report_identity,
+            include_existing_results,
         ),
         encoding="utf-8",
     )
     summary = {
         "schema_version": 1,
-        "discovery": "completed r*/cpu*gb/r1 directories under output_root",
+        "discovery": (
+            "all completed r*/cpu*gb/r1 directories under output_root"
+            if include_existing_results
+            else "completed cases from the latest sweep_plan.json only"
+        ),
+        "include_existing_results": include_existing_results,
+        "report_jobs": worker_count,
         "sweep_plan": str(plan_path) if plan_path.is_file() else None,
         "planned_cases": latest_planned,
         "completed_cases": completed,
@@ -359,6 +453,21 @@ def generate_reports(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-root", type=Path, required=True)
+    parser.add_argument(
+        "--report-jobs",
+        type=int,
+        default=DEFAULT_REPORT_JOBS,
+        help=f"parallel rate-analysis processes (default: {DEFAULT_REPORT_JOBS})",
+    )
+    parser.add_argument(
+        "--include-existing-results",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "include every completed case under output-root, including cases "
+            "outside the latest sweep plan (default: true)"
+        ),
+    )
     parser.add_argument("--max-final-hour-ttft-p90-ms", type=float, default=5_000.0)
     parser.add_argument("--max-final-hour-queue-count", type=float, default=1_000.0)
     parser.add_argument("--max-final-hour-backlog-requests", type=float, default=1_000.0)
@@ -367,6 +476,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.report_jobs <= 0:
+        raise SystemExit("--report-jobs must be positive")
     for name in (
         "max_final_hour_ttft_p90_ms",
         "max_final_hour_queue_count",
@@ -381,6 +492,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 max_final_hour_ttft_p90_ms=args.max_final_hour_ttft_p90_ms,
                 max_final_hour_queue_count=args.max_final_hour_queue_count,
                 max_final_hour_backlog_requests=args.max_final_hour_backlog_requests,
+                report_jobs=args.report_jobs,
+                include_existing_results=args.include_existing_results,
             ),
             indent=2,
         )

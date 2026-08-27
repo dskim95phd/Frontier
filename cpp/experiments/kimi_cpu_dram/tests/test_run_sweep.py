@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ProcessPoolExecutor
 import json
 from pathlib import Path
 
@@ -121,6 +122,8 @@ def test_omitting_grid_options_uses_documented_defaults() -> None:
         runner.DEFAULT_CAPACITIES_GB
     )
     assert args.simulation_hours == 12
+    assert args.report_jobs == runner.DEFAULT_REPORT_JOBS
+    assert args.include_existing_results is True
 
 
 def test_capacity_only_cli_uses_each_capacity_configured_rates() -> None:
@@ -528,7 +531,7 @@ def test_report_generation_discovers_split_runs_beyond_latest_plan(
 
     monkeypatch.setattr(reports.capacity_report, "main", fake_capacity_report)
 
-    result = reports.generate_reports(output_root)
+    result = reports.generate_reports(output_root, report_jobs=1)
 
     assert len(calls) == 1
     assert calls[0][calls[0].index("--capacities") + 1] == "500,1000"
@@ -536,11 +539,52 @@ def test_report_generation_discovers_split_runs_beyond_latest_plan(
     assert "--include-final-hour-details" in calls[0]
     assert result["planned_cases"] == 1
     assert result["completed_cases"] == 2
+    assert result["include_existing_results"] is True
     assert result["rate_reports"][0]["capacities_gb"] == [500, 1000]
     assert first.is_dir()
     index = (output_root / "index.html").read_text(encoding="utf-8")
     assert "Discovered 2 completed points" in index
     assert "500, 1000" in index
+
+    calls.clear()
+    restricted = reports.generate_reports(
+        output_root,
+        report_jobs=1,
+        include_existing_results=False,
+    )
+
+    assert len(calls) == 1
+    assert calls[0][calls[0].index("--capacities") + 1] == "1000"
+    assert restricted["planned_cases"] == 1
+    assert restricted["completed_cases"] == 1
+    assert restricted["include_existing_results"] is False
+
+
+def test_report_cli_includes_existing_results_and_parallelizes_by_default() -> None:
+    args = reports.build_parser().parse_args(["--output-root", "reports"])
+
+    assert args.include_existing_results is True
+    assert args.report_jobs == reports.DEFAULT_REPORT_JOBS
+
+
+def test_rate_report_worker_can_run_in_a_separate_process(tmp_path: Path) -> None:
+    task = {
+        "rate_label": "r0p10",
+        "report": {"rate": 0.1},
+        "argv": [
+            "--output-root",
+            str(tmp_path / "missing"),
+            "--simulation-rate",
+            "0.1",
+            "--capacities",
+            "250",
+        ],
+    }
+
+    with ProcessPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(reports._run_rate_report_task, task)
+        with pytest.raises(RuntimeError, match="r0p10"):
+            future.result(timeout=30)
 
 
 def test_report_directory_discovery_does_not_require_sweep_plan(
