@@ -313,6 +313,22 @@ def test_k3_config_uses_static_per_gpu_capacity_and_off_baseline() -> None:
     )
 
 
+def test_generated_run_id_tracks_k2_template_model() -> None:
+    template = json.loads(runner.DEFAULT_CONFIG.read_text(encoding="utf-8"))
+    template["model"] = "moonshotai/Kimi-K2-Instruct"
+    case = runner.build_matrix(
+        {250: ("0.50", "0.50")},
+        step="0.01",
+        workload_root=Path("workloads"),
+        output_root=Path("runs"),
+        seed=7,
+    )[0]
+
+    generated = runner.build_config(template, case)
+
+    assert generated["run_id"] == "kimi-k2-tracelab-p24-d32-r0p50-cpu0250gb"
+
+
 def test_case_progress_message_reports_simulated_hours(tmp_path: Path) -> None:
     case = runner.build_matrix(
         {4000: ("0.45", "0.45")},

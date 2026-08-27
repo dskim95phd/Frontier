@@ -463,9 +463,21 @@ def _topology_gpu_counts(config: Mapping[str, Any]) -> tuple[int, int]:
     )
 
 
+def _model_experiment_slug(config: Mapping[str, Any]) -> str:
+    """Return the stable Kimi model label used in generated metadata."""
+
+    model = str(config.get("model", "")).lower()
+    if "kimi-k2" in model:
+        return "kimi-k2"
+    if "kimi-k3" in model:
+        return "kimi-k3"
+    raise ValueError(f"unsupported model for Kimi CPU-capacity sweep: {model!r}")
+
+
 def build_config(template: Mapping[str, Any], case: MatrixCase) -> dict[str, Any]:
     config = copy.deepcopy(dict(template))
     prefill_gpus, decode_gpus = _topology_gpu_counts(config)
+    model_slug = _model_experiment_slug(config)
     cpu = config.setdefault("cpu_kv_cache", {})
     if not isinstance(cpu, dict):
         raise ValueError("cpu_kv_cache must be a JSON object")
@@ -476,7 +488,7 @@ def build_config(template: Mapping[str, Any], case: MatrixCase) -> dict[str, Any
     # value makes the input self-describing to readers outside the simulator.
     cpu["capacity_bytes"] = case.capacity_gb * DECIMAL_GB * prefill_gpus
     config["run_id"] = (
-        f"kimi-k3-tracelab-p{prefill_gpus}-d{decode_gpus}-"
+        f"{model_slug}-tracelab-p{prefill_gpus}-d{decode_gpus}-"
         f"{case.rate_label}-{case.capacity_label}"
     )
     return config
@@ -854,6 +866,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     template = _json_read(args.config)
     prefill_gpus, decode_gpus = _topology_gpu_counts(template)
+    model_slug = _model_experiment_slug(template)
     if not args.dry_run:
         workload_hashes: dict[str, str] = {}
         for case in cases:
@@ -862,7 +875,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         plan = {
             "schema_version": 2,
             "study": (
-                f"kimi_k3_p{prefill_gpus}_d{decode_gpus}_"
+                f"{model_slug.replace('-', '_')}_p{prefill_gpus}_d{decode_gpus}_"
                 "cpu_per_gpu_capacity_session_rate"
             ),
             "git_revision": _git_revision(),
