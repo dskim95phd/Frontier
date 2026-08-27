@@ -25,6 +25,7 @@ import json
 import math
 import re
 import statistics
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -144,6 +145,58 @@ def _parse_capacities(raw: str) -> list[int]:
     if not values:
         raise ValueError("at least one capacity is required")
     return sorted(values)
+
+
+def _report_identity(case_dir: Path) -> dict[str, Any]:
+    """Derive a human-readable model and topology label from normalized config."""
+
+    config_path = case_dir / "config.normalized.json"
+    if not config_path.is_file():
+        return {
+            "model_name": "LLM",
+            "prefill_gpu_count": None,
+            "decode_gpu_count": None,
+            "prefill_only": False,
+        }
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    clusters = config.get("clusters", {})
+
+    def gpu_count(cluster: Any) -> int | None:
+        if not isinstance(cluster, Mapping):
+            return None
+        parallelism = cluster.get("parallelism", {})
+        if not isinstance(parallelism, Mapping):
+            return None
+        return math.prod(
+            int(parallelism.get(key, 1))
+            for key in (
+                "num_replicas",
+                "tensor_parallel_size",
+                "pipeline_parallel_size",
+                "data_parallel_size",
+            )
+        )
+
+    prefill = clusters.get("prefill", {}) if isinstance(clusters, Mapping) else {}
+    decode = clusters.get("decode", {}) if isinstance(clusters, Mapping) else {}
+    raw_model_name = (
+        str(prefill.get("model_name", "LLM"))
+        if isinstance(prefill, Mapping)
+        else "LLM"
+    )
+    kimi_match = re.search(r"Kimi[-_ ]?(K\d+)", raw_model_name, re.IGNORECASE)
+    model_name = (
+        f"Kimi {kimi_match.group(1).upper()}"
+        if kimi_match is not None
+        else raw_model_name.rsplit("/", 1)[-1]
+    )
+    return {
+        "model_name": model_name,
+        "model_asset_name": raw_model_name,
+        "prefill_gpu_count": gpu_count(prefill),
+        "decode_gpu_count": gpu_count(decode),
+        "prefill_only": isinstance(config.get("prefill_only"), Mapping),
+    }
 
 
 def _discover_capacities(root: Path, requested: Sequence[int]) -> list[int]:
@@ -496,6 +549,189 @@ def _window_statistics(
     }
 
 
+def _integrate_step_series(
+    events: Sequence[tuple[float, float]], start_s: float, end_s: float
+) -> tuple[float, float]:
+    """Return the time-weighted mean and maximum of a delta event series."""
+
+    if end_s <= start_s:
+        raise ValueError("working-set window must have positive duration")
+    ordered = sorted(events)
+    current = 0.0
+    position = 0
+    while position < len(ordered) and ordered[position][0] <= start_s:
+        current += ordered[position][1]
+        position += 1
+
+    previous = start_s
+    area = 0.0
+    maximum = current
+    while position < len(ordered) and ordered[position][0] < end_s:
+        event_time = ordered[position][0]
+        area += current * (event_time - previous)
+        while position < len(ordered) and ordered[position][0] == event_time:
+            current += ordered[position][1]
+            position += 1
+        previous = event_time
+        maximum = max(maximum, current)
+    area += current * (end_s - previous)
+    return area / (end_s - start_s), maximum
+
+
+def _hot_session_hbm_statistics(
+    case_dir: Path,
+    summary: Mapping[str, Any],
+    *,
+    horizon_s: float,
+    prefill_lanes: int,
+) -> dict[str, Any]:
+    """Measure KV needed by sessions that still have a future request.
+
+    The metric is an oracle capacity demand, not observed cache residency.  A
+    session enters or updates the working set when PREFILL completes and is
+    removed when its final planned request completes PREFILL.  KDA snapshots
+    share the same accounting pool and are included when configured.
+    """
+
+    config_path = case_dir / "config.normalized.json"
+    workload_path = case_dir / "workload.normalized.csv"
+    requests_path = case_dir / "requests.csv"
+    for path in (config_path, workload_path, requests_path):
+        if not path.is_file():
+            raise FileNotFoundError(f"hot-session HBM source is missing: {path}")
+
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    prefill = config["clusters"]["prefill"]
+    parallelism = prefill["parallelism"]
+    configured_gpus = (
+        int(parallelism.get("num_replicas", 1))
+        * int(parallelism.get("tensor_parallel_size", 1))
+        * int(parallelism.get("pipeline_parallel_size", 1))
+        * int(parallelism.get("data_parallel_size", 1))
+    )
+    gpu_count = configured_gpus if configured_gpus > 0 else prefill_lanes
+    if gpu_count <= 0:
+        raise ValueError("PREFILL GPU count must be positive")
+
+    gpu_memory = prefill["gpu_memory"]
+    hbm_bytes_per_gpu = int(gpu_memory["capacity_bytes_per_gpu"])
+    kv_budget_bytes_per_gpu = int(gpu_memory["kv_cache_budget_bytes_per_gpu"])
+    model_weight_bytes_per_gpu = int(gpu_memory["model_weight_bytes_per_gpu"])
+    reserve_bytes_per_gpu = int(
+        hbm_bytes_per_gpu * float(gpu_memory.get("runtime_reserve_fraction", 0.0))
+        + int(gpu_memory.get("runtime_reserve_bytes", 0))
+    )
+
+    cpu_cache = summary["cpu_kv_cache"]
+    ordinary_block_bytes = int(cpu_cache["bytes_per_block"])
+    snapshot_bytes_per_session = int(
+        cpu_cache.get("kda_snapshot_bytes_per_session", 0)
+    )
+    planned_turns: Counter[int] = Counter()
+    with workload_path.open(newline="", encoding="utf-8") as stream:
+        for row in csv.DictReader(stream):
+            planned_turns[int(row["session_id"])] += 1
+
+    completed: defaultdict[int, list[tuple[float, int]]] = defaultdict(list)
+    with requests_path.open(newline="", encoding="utf-8") as stream:
+        for row in csv.DictReader(stream):
+            completion_s = _finite_float(row.get("prefill_completed_at_s"))
+            prompt_tokens = _finite_int(row.get("num_prefill_tokens"))
+            session_id = _finite_int(row.get("session_id"))
+            if completion_s is None or prompt_tokens is None or session_id is None:
+                continue
+            completed[session_id].append((completion_s, prompt_tokens))
+
+    total_events: list[tuple[float, float]] = []
+    ordinary_events: list[tuple[float, float]] = []
+    snapshot_events: list[tuple[float, float]] = []
+    session_events: list[tuple[float, float]] = []
+    for session_id, turns in completed.items():
+        planned_count = planned_turns.get(session_id)
+        if not planned_count:
+            continue
+        old_ordinary = 0
+        old_snapshot = 0
+        active = False
+        for completed_index, (completion_s, prompt_tokens) in enumerate(
+            sorted(turns), start=1
+        ):
+            has_future_turn = completed_index < planned_count
+            new_ordinary = (
+                math.ceil(prompt_tokens / 16) * ordinary_block_bytes
+                if has_future_turn
+                else 0
+            )
+            new_snapshot = snapshot_bytes_per_session if has_future_turn else 0
+            total_events.append(
+                (
+                    completion_s,
+                    float(new_ordinary + new_snapshot - old_ordinary - old_snapshot),
+                )
+            )
+            ordinary_events.append(
+                (completion_s, float(new_ordinary - old_ordinary))
+            )
+            snapshot_events.append(
+                (completion_s, float(new_snapshot - old_snapshot))
+            )
+            if has_future_turn != active:
+                session_events.append((completion_s, 1.0 if has_future_turn else -1.0))
+            old_ordinary = new_ordinary
+            old_snapshot = new_snapshot
+            active = has_future_turn
+
+    start_s = max(0.0, horizon_s - 3600.0)
+    average_bytes, maximum_bytes = _integrate_step_series(
+        total_events, start_s, horizon_s
+    )
+    average_ordinary, _ = _integrate_step_series(
+        ordinary_events, start_s, horizon_s
+    )
+    average_snapshot, _ = _integrate_step_series(
+        snapshot_events, start_s, horizon_s
+    )
+    average_sessions, maximum_sessions = _integrate_step_series(
+        session_events, start_s, horizon_s
+    )
+    kv_budget_total = gpu_count * kv_budget_bytes_per_gpu
+    hbm_total = gpu_count * hbm_bytes_per_gpu
+    fixed_hbm_total = gpu_count * (model_weight_bytes_per_gpu + reserve_bytes_per_gpu)
+    return {
+        "available": True,
+        "definition": "KV of sessions with at least one future turn; terminal state removed at PREFILL completion",
+        "scope": "post-hoc oracle capacity demand, not observed physical residency",
+        "window_start_s": start_s,
+        "window_end_s": horizon_s,
+        "prefill_gpu_count": gpu_count,
+        "average_hot_sessions": average_sessions,
+        "maximum_hot_sessions": maximum_sessions,
+        "average_ordinary_kv_gb_per_gpu": average_ordinary / gpu_count / 1e9,
+        "average_kda_snapshot_gb_per_gpu": average_snapshot / gpu_count / 1e9,
+        "average_hot_kv_gb_per_gpu": average_bytes / gpu_count / 1e9,
+        "maximum_hot_kv_gb_per_gpu": maximum_bytes / gpu_count / 1e9,
+        "kv_budget_gb_per_gpu": kv_budget_bytes_per_gpu / 1e9,
+        "average_hot_kv_pct_of_budget": 100.0 * average_bytes / kv_budget_total,
+        "maximum_hot_kv_pct_of_budget": 100.0 * maximum_bytes / kv_budget_total,
+        "average_total_hbm_demand_gb_per_gpu": (
+            fixed_hbm_total + average_bytes
+        )
+        / gpu_count
+        / 1e9,
+        "maximum_total_hbm_demand_gb_per_gpu": (
+            fixed_hbm_total + maximum_bytes
+        )
+        / gpu_count
+        / 1e9,
+        "average_total_hbm_demand_pct": 100.0
+        * (fixed_hbm_total + average_bytes)
+        / hbm_total,
+        "maximum_total_hbm_demand_pct": 100.0
+        * (fixed_hbm_total + maximum_bytes)
+        / hbm_total,
+    }
+
+
 def _primary_metrics_complete(stability: Mapping[str, Any], expected_bins: int) -> bool:
     """Require backlog and TTFT observations before recommending a capacity."""
 
@@ -603,6 +839,18 @@ def _analyze_capacity_case(
     final_hour["statistics"] = _window_statistics(
         rows, 1.0, prefill_lanes=prefill_lanes
     )
+    try:
+        hot_session_hbm = _hot_session_hbm_statistics(
+            case_dir,
+            summary,
+            horizon_s=horizon,
+            prefill_lanes=prefill_lanes,
+        )
+    except (FileNotFoundError, KeyError, TypeError, ValueError) as exc:
+        hot_session_hbm = {
+            "available": False,
+            "reason": str(exc),
+        }
     last_two_hours["qos"] = _window_qos(rows, DEFAULT_TREND_WINDOW_HOURS)
     final_qos = final_hour["qos"]
     final_qos["thresholds"] = {
@@ -658,6 +906,7 @@ def _analyze_capacity_case(
         ),
         "missing_metrics": missing_metrics,
         "overall": overall,
+        "hot_session_hbm": hot_session_hbm,
         "stability": {"final_hour": final_hour, "last_2_hours": last_two_hours},
         "bins": rows,
     }
@@ -1038,6 +1287,27 @@ def _html_report(document: Mapping[str, Any]) -> str:
     cases = list(document.get("cases", []))
     thresholds = document.get("heuristic_thresholds", {})
     recommendations = document.get("recommendations", {})
+    identity = document.get("report_identity", {})
+    if not isinstance(identity, Mapping):
+        identity = {}
+    model_name = str(identity.get("model_name") or "LLM")
+    prefill_gpu_count = _finite_int(identity.get("prefill_gpu_count"))
+    decode_gpu_count = _finite_int(identity.get("decode_gpu_count"))
+    prefill_only = bool(identity.get("prefill_only"))
+    if prefill_only:
+        topology_label = (
+            f"PREFILL-only, {prefill_gpu_count} PREFILL GPUs"
+            if prefill_gpu_count is not None
+            else "PREFILL-only"
+        )
+    else:
+        topology_parts = []
+        if prefill_gpu_count is not None:
+            topology_parts.append(f"{prefill_gpu_count} PREFILL GPUs")
+        if decode_gpu_count is not None:
+            topology_parts.append(f"{decode_gpu_count} DECODE GPUs")
+        topology_label = ", ".join(topology_parts)
+    report_name = model_name + (f" — {topology_label}" if topology_label else "")
     rows: list[str] = []
     for case in cases:
         final = case.get("stability", {}).get("final_hour", {})
@@ -1124,6 +1394,66 @@ def _html_report(document: Mapping[str, Any]) -> str:
             "<th>CPU transfer</th><th>final 1h class</th>"
             f"</tr></thead><tbody>{''.join(detail_rows)}</tbody></table></div>"
         )
+    hot_session_rows: list[str] = []
+    unavailable_hot_session_cases: list[str] = []
+    for case in cases:
+        metric = case.get("hot_session_hbm", {})
+        if not isinstance(metric, Mapping) or not metric.get("available"):
+            unavailable_hot_session_cases.append(str(case.get("capacity_label")))
+            continue
+        start_s = _finite_float(metric.get("window_start_s"))
+        end_s = _finite_float(metric.get("window_end_s"))
+        window = (
+            f"{start_s / 3600.0:.2f}–{end_s / 3600.0:.2f} h"
+            if start_s is not None and end_s is not None
+            else "—"
+        )
+        hot_session_rows.append(
+            "<tr>"
+            f"<td>{html.escape(str(case.get('capacity_label')))}</td>"
+            f"<td>{window}</td>"
+            f"<td>{_fmt(metric.get('average_hot_sessions'))}</td>"
+            f"<td>{_fmt(metric.get('maximum_hot_sessions'))}</td>"
+            f"<td>{_fmt(metric.get('average_ordinary_kv_gb_per_gpu'))} GB</td>"
+            f"<td>{_fmt(metric.get('average_kda_snapshot_gb_per_gpu'))} GB</td>"
+            f"<td>{_fmt(metric.get('average_hot_kv_gb_per_gpu'))} GB</td>"
+            f"<td>{_fmt(metric.get('maximum_hot_kv_gb_per_gpu'))} GB</td>"
+            f"<td>{_fmt(metric.get('kv_budget_gb_per_gpu'))} GB</td>"
+            f"<td>{_fmt(metric.get('average_hot_kv_pct_of_budget'))}%</td>"
+            f"<td>{_fmt(metric.get('maximum_hot_kv_pct_of_budget'))}%</td>"
+            f"<td>{_fmt(metric.get('average_total_hbm_demand_gb_per_gpu'))} GB "
+            f"({_fmt(metric.get('average_total_hbm_demand_pct'))}%)</td>"
+            f"<td>{_fmt(metric.get('maximum_total_hbm_demand_gb_per_gpu'))} GB "
+            f"({_fmt(metric.get('maximum_total_hbm_demand_pct'))}%)</td>"
+            "</tr>"
+        )
+    hot_session_hbm_details = ""
+    if hot_session_rows:
+        unavailable_note = (
+            "<p class='muted'>Unavailable cases: "
+            + html.escape(", ".join(unavailable_hot_session_cases))
+            + ".</p>"
+            if unavailable_hot_session_cases
+            else ""
+        )
+        hot_session_hbm_details = (
+            "<h2>Final-hour hot-session HBM working set</h2>"
+            "<p class='muted'>A hot session has at least one future request. "
+            "Its KV is removed at terminal-request PREFILL completion. KDA "
+            "snapshot bytes are included. Values are post-hoc capacity demand, "
+            "not observed physical residency; values above 100% mean the full "
+            "hot working set cannot fit in the configured KV HBM budget.</p>"
+            "<div class='table-wrap'><table><thead><tr>"
+            "<th>capacity / PREFILL GPU</th><th>window</th>"
+            "<th>hot sessions avg</th><th>hot sessions max</th>"
+            "<th>ordinary KV avg/GPU</th><th>KDA snapshot avg/GPU</th>"
+            "<th>hot KV avg/GPU</th><th>hot KV max/GPU</th>"
+            "<th>KV HBM budget/GPU</th><th>avg / budget</th>"
+            "<th>max / budget</th><th>total HBM avg/GPU</th>"
+            "<th>total HBM max/GPU</th>"
+            f"</tr></thead><tbody>{''.join(hot_session_rows)}</tbody></table></div>"
+            + unavailable_note
+        )
     context_chart = _stacked_context_chart(
         document.get("arrival_context_distribution_4tb")
     )
@@ -1178,7 +1508,7 @@ def _html_report(document: Mapping[str, Any]) -> str:
     )
     return f"""<!doctype html>
 <html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
-<title>{rate_tag} Kimi K3 P24/D64 CPU-DRAM capacity sweep</title>
+<title>{rate_tag} {html.escape(report_name)} CPU-DRAM capacity sweep</title>
 <style>
 :root {{ color-scheme:light dark; --bg:#f7f8fb; --panel:#fff; --fg:#172033; --muted:#5b6475; --border:#d8dde8; --grid:#e7eaf0; }}
 @media (prefers-color-scheme:dark) {{ :root {{ --bg:#0f1219; --panel:#171b24; --fg:#edf1f7; --muted:#a6afbf; --border:#31394a; --grid:#252c39; }} }}
@@ -1189,13 +1519,14 @@ h1 {{ margin:0 0 6px; }} h2 {{ margin:28px 0 12px; }} h3 {{ margin:0 0 8px; font
 details {{ margin-top:14px; }} summary {{ cursor:pointer; font-weight:600; }} .notes {{ padding:14px 16px; background:var(--panel); border-left:4px solid #2563eb; border-radius:4px; }} code {{ font-family:ui-monospace,Consolas,monospace; }}
 @media (max-width:900px) {{ main{{padding:16px}} .charts{{grid-template-columns:1fr}} }}
 </style></head><body><main>
-<h1>{rate_tag} Kimi K3 P24/D64 CPU-per-PREFILL-GPU capacity sweep</h1>
+<h1>{rate_tag} {html.escape(report_name)} CPU-per-PREFILL-GPU capacity sweep</h1>
 <p class='muted'>Five-minute source-derived metrics; simulation rate {simulation_rate:g} sessions/s. Output root: <code>{html.escape(str(document.get('output_root')))}</code></p>
 <div class='notes'><strong>Recommendations</strong><p>Minimum clearly stable: <code>{_fmt(recommendations.get('minimum_clearly_stable_capacity_gb'))} GB</code>. Minimum operationally acceptable: <code>{_fmt(recommendations.get('minimum_operationally_acceptable_capacity_gb'))} GB</code>.</p>
 <p><code>underloaded-stable</code> is below the {thresholds.get('busy_saturation_pct')}% time-weighted PREFILL busy line with non-material reconstructed-backlog and TTFT trends. <code>saturated-stable</code> is at/over that line but remains flat on those primary signals. <code>overloaded</code> requires a material backlog or TTFT trend. Queue and active-session trends are secondary/right-censored diagnostics and cannot trigger overload alone. Stability requires exact 12-bin final-hour and 24-bin final-2-hour windows plus observed backlog and TTFT.</p>
 <p>Backlog growth thresholds: both {thresholds.get('backlog_relative_growth')} of window arrivals and {thresholds.get('backlog_growth_rate_per_s')} requests/s, with at least {thresholds.get('positive_bin_fraction')} positive steps. TTFT trend thresholds: {thresholds.get('ttft_slope_ms_per_hour')} ms/hour and {thresholds.get('ttft_relative_growth')} relative growth. Operational QoS gates are final-hour max source-bin TTFT p90 ≤ {thresholds.get('max_final_hour_ttft_p90_ms')} ms, max time-weighted waiting queue ≤ {thresholds.get('max_final_hour_waiting_queue_count')}, and max cumulative backlog ≤ {thresholds.get('max_final_hour_cumulative_backlog_requests')}. CPU bandwidth is arrival-binned restore+offload. Waiting context is sum(context&nbsp;×&nbsp;queue-duration)/sum(queue-duration), not aggregate context load.</p>{missing_html}</div>
 <h2>Capacity summary</h2><div class='table-wrap'><table><thead><tr><th>capacity</th><th>final 1h class</th><th>last 2h class</th><th>final busy</th><th>backlog Δ</th><th>TTFT slope</th><th>TTFT mean</th><th>TPOT mean</th><th>combined hit</th><th>final backlog</th></tr></thead><tbody>{''.join(rows)}</tbody></table></div>
 {final_hour_details}
+{hot_session_hbm_details}
 <h2>Five-minute comparison</h2><div class='charts'>{charts}</div>
 <h2>Raw five-minute tables</h2>{''.join(details)}
 <p class='muted'>Generated by <code>analyze_r0p4_capacity_sweep_10h.py</code>. JSON and CSV beside this report contain complete machine-readable output.</p>
@@ -1345,7 +1676,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     nominal_horizon_s = max(float(case.get("horizon_s", 0) or 0) for case in cases)
     document: dict[str, Any] = {
         "schema_version": 1,
-        "analysis": f"{_rate_tag(args.simulation_rate)}_k3_p24_d64_cpu_capacity_sweep",
+        "analysis": f"{_rate_tag(args.simulation_rate)}_cpu_capacity_sweep",
+        "report_identity": _report_identity(Path(cases[0]["run_dir"])),
         "output_root": str(root),
         "workload_dir": str(workload_dir),
         "workload_path": str(workload_path),

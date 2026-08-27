@@ -193,7 +193,25 @@ def _index_html(
     reports: Sequence[Mapping[str, Any]],
     latest_planned: int,
     completed: int,
+    identity: Mapping[str, Any],
 ) -> str:
+    model_name = str(identity.get("model_name") or "LLM")
+    prefill_gpus = identity.get("prefill_gpu_count")
+    decode_gpus = identity.get("decode_gpu_count")
+    if bool(identity.get("prefill_only")):
+        topology = (
+            f"PREFILL-only, {int(prefill_gpus)} PREFILL GPUs"
+            if prefill_gpus is not None
+            else "PREFILL-only"
+        )
+    else:
+        parts = []
+        if prefill_gpus is not None:
+            parts.append(f"{int(prefill_gpus)} PREFILL GPUs")
+        if decode_gpus is not None:
+            parts.append(f"{int(decode_gpus)} DECODE GPUs")
+        topology = ", ".join(parts)
+    report_name = model_name + (f" — {topology}" if topology else "")
     rows = []
     for report in reports:
         capacities = ", ".join(str(value) for value in report["capacities_gb"])
@@ -208,9 +226,9 @@ def _index_html(
         )
     return f"""<!doctype html>
 <html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
-<title>Kimi K3 CPU-per-GPU capacity sweep</title>
+<title>{html.escape(report_name)} CPU-per-GPU capacity sweep</title>
 <style>body{{font:14px/1.5 system-ui,sans-serif;max-width:1200px;margin:auto;padding:28px;color:#172033;background:#f7f8fb}}table{{width:100%;border-collapse:collapse;background:#fff}}th,td{{padding:9px 11px;border:1px solid #d8dde8;text-align:left}}th{{background:#eef2f8}}code{{font-family:ui-monospace,monospace}}</style>
-</head><body><h1>Kimi K3 CPU-per-GPU capacity sweep</h1>
+</head><body><h1>{html.escape(report_name)} CPU-per-GPU capacity sweep</h1>
 <p>Discovered {completed} completed points under this output directory. The latest sweep plan contains {latest_planned} points and is informational only. Each link contains every completed capacity found for that session-injection rate, including final-hour measurements and five-minute time series.</p>
 <table><thead><tr><th>session rate</th><th>completed points</th><th>CPU capacity per PREFILL GPU (GB)</th><th>report</th></tr></thead><tbody>{''.join(rows)}</tbody></table>
 <p>Capacity is the configured CPU DRAM slice per PREFILL GPU. Aggregate CPU
@@ -234,6 +252,8 @@ def generate_reports(
             "no completed r*/cpu*gb/r1 cases with summary.json and requests.csv "
             f"under {output_root}"
         )
+    first_case_dir = Path(str(next(iter(grouped.values()))[0]["output_dir"]))
+    report_identity = capacity_report._report_identity(first_case_dir)
     reports: list[dict[str, Any]] = []
     for rate_tag, cases in grouped.items():
         rate = float(cases[0]["rate"])
@@ -311,7 +331,13 @@ def generate_reports(
     latest_planned = len((plan or {}).get("cases", []))
     index_path = output_root / "index.html"
     index_path.write_text(
-        _index_html(output_root, reports, latest_planned, completed),
+        _index_html(
+            output_root,
+            reports,
+            latest_planned,
+            completed,
+            report_identity,
+        ),
         encoding="utf-8",
     )
     summary = {
@@ -320,6 +346,7 @@ def generate_reports(
         "sweep_plan": str(plan_path) if plan_path.is_file() else None,
         "planned_cases": latest_planned,
         "completed_cases": completed,
+        "report_identity": report_identity,
         "rate_reports": reports,
         "index_html": str(index_path),
     }

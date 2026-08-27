@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import re
+from pathlib import Path
 
 import pytest
 
@@ -172,16 +174,140 @@ def test_final_hour_statistics_use_source_counts_and_exact_window() -> None:
     assert stats["cpu_transfer_gbps"] == 1.5
 
 
+def test_hot_session_hbm_statistics_exclude_terminal_sessions_and_include_snapshot(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "config.normalized.json").write_text(
+        json.dumps(
+            {
+                "clusters": {
+                    "prefill": {
+                        "parallelism": {
+                            "num_replicas": 1,
+                            "tensor_parallel_size": 1,
+                            "pipeline_parallel_size": 2,
+                            "data_parallel_size": 1,
+                        },
+                        "gpu_memory": {
+                            "capacity_bytes_per_gpu": 10_000_000_000,
+                            "kv_cache_budget_bytes_per_gpu": 2_000_000_000,
+                            "model_weight_bytes_per_gpu": 1_000_000_000,
+                            "runtime_reserve_fraction": 0.1,
+                            "runtime_reserve_bytes": 0,
+                        },
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "workload.normalized.csv").write_text(
+        "session_id,session_turn_index\n0,0\n0,1\n1,0\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "requests.csv").write_text(
+        "session_id,num_prefill_tokens,prefill_completed_at_s\n"
+        "0,32,3000\n1,999,4000\n0,48,6000\n",
+        encoding="utf-8",
+    )
+    summary = {
+        "cpu_kv_cache": {
+            "bytes_per_block": 1_000_000_000,
+            "kda_snapshot_bytes_per_session": 500_000_000,
+        }
+    }
+
+    metric = report._hot_session_hbm_statistics(
+        tmp_path, summary, horizon_s=7_200.0, prefill_lanes=2
+    )
+
+    assert metric["average_hot_sessions"] == pytest.approx(2 / 3)
+    assert metric["maximum_hot_sessions"] == 1
+    assert metric["average_ordinary_kv_gb_per_gpu"] == pytest.approx(2 / 3)
+    assert metric["average_kda_snapshot_gb_per_gpu"] == pytest.approx(1 / 6)
+    assert metric["average_hot_kv_gb_per_gpu"] == pytest.approx(5 / 6)
+    assert metric["maximum_hot_kv_gb_per_gpu"] == pytest.approx(1.25)
+    assert metric["average_hot_kv_pct_of_budget"] == pytest.approx(100 * 5 / 12)
+    assert metric["maximum_hot_kv_pct_of_budget"] == pytest.approx(62.5)
+    assert metric["average_total_hbm_demand_gb_per_gpu"] == pytest.approx(17 / 6)
+
+
+def test_report_identity_uses_model_and_hides_decode_for_prefill_only(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "config.normalized.json").write_text(
+        json.dumps(
+            {
+                "clusters": {
+                    "prefill": {
+                        "model_name": "moonshotai/Kimi-K2-Instruct",
+                        "parallelism": {
+                            "num_replicas": 1,
+                            "tensor_parallel_size": 1,
+                            "pipeline_parallel_size": 1,
+                            "data_parallel_size": 8,
+                        },
+                    },
+                    "decode": {
+                        "parallelism": {
+                            "num_replicas": 1,
+                            "tensor_parallel_size": 4,
+                            "pipeline_parallel_size": 1,
+                            "data_parallel_size": 4,
+                        }
+                    },
+                },
+                "prefill_only": {"decode_tokens_per_second": 50.0},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    identity = report._report_identity(tmp_path)
+
+    assert identity == {
+        "model_name": "Kimi K2",
+        "model_asset_name": "moonshotai/Kimi-K2-Instruct",
+        "prefill_gpu_count": 8,
+        "decode_gpu_count": 16,
+        "prefill_only": True,
+    }
+
+
 def test_html_can_render_final_hour_detailed_statistics() -> None:
     rendered = report._html_report(
         {
             "simulation_rate_per_s": 0.5,
+            "report_identity": {
+                "model_name": "Kimi K2",
+                "prefill_gpu_count": 8,
+                "decode_gpu_count": 16,
+                "prefill_only": True,
+            },
             "report_options": {"include_final_hour_details": True},
             "cases": [
                 {
                     "capacity_label": "cpu0500gb",
                     "overall": {},
                     "bins": [],
+                    "hot_session_hbm": {
+                        "available": True,
+                        "window_start_s": 32_400.0,
+                        "window_end_s": 36_000.0,
+                        "average_hot_sessions": 900.0,
+                        "maximum_hot_sessions": 950.0,
+                        "average_ordinary_kv_gb_per_gpu": 85.0,
+                        "average_kda_snapshot_gb_per_gpu": 9.0,
+                        "average_hot_kv_gb_per_gpu": 94.0,
+                        "maximum_hot_kv_gb_per_gpu": 98.0,
+                        "kv_budget_gb_per_gpu": 192.0,
+                        "average_hot_kv_pct_of_budget": 49.0,
+                        "maximum_hot_kv_pct_of_budget": 51.0,
+                        "average_total_hbm_demand_gb_per_gpu": 191.0,
+                        "average_total_hbm_demand_pct": 66.0,
+                        "maximum_total_hbm_demand_gb_per_gpu": 194.0,
+                        "maximum_total_hbm_demand_pct": 67.0,
+                    },
                     "stability": {
                         "final_hour": {
                             "classification": "underloaded-stable",
@@ -210,3 +336,8 @@ def test_html_can_render_final_hour_detailed_statistics() -> None:
     assert "completed req/s/GPU" in rendered
     assert "TTFT p90 max" in rendered
     assert "underloaded-stable" in rendered
+    assert "Final-hour hot-session HBM working set" in rendered
+    assert "KDA snapshot avg/GPU" in rendered
+    assert "94.00 GB" in rendered
+    assert "Kimi K2 — PREFILL-only, 8 PREFILL GPUs" in rendered
+    assert "16 DECODE GPUs" not in rendered
