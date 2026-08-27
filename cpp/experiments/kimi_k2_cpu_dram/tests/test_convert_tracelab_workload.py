@@ -56,8 +56,9 @@ def _make_trace_db(path: Path) -> None:
             # This row has a negative timing gap but a positive logical ISL;
             # it remains in the session with think_time clamped to zero.
             (3, 3, "codex", "project_a", "session_a", 2, "model_a", 150, 15, 2, "file_a:turn_x:2"),
-            # Context reduction starts a new numeric simulator session.
-            (4, 4, "codex", "project_a", "session_a", 3, "model_a", 120, 1, 3, "file_a:turn_x:3"),
+            # An 80% context reduction is accepted as compaction and starts a
+            # new numeric simulator session.
+            (4, 4, "codex", "project_a", "session_a", 3, "model_a", 30, 1, 3, "file_a:turn_x:3"),
             # The first index break truncates this row and all later rows.
             (5, 5, "codex", "project_a", "session_a", 5, "model_a", 140, 20, 4, "file_a:turn_x:5"),
             (6, 6, "codex", "project_a", "session_a", 6, "model_a", 160, 20, 4, "file_a:turn_x:6"),
@@ -130,11 +131,11 @@ def test_gap_clamp_context_split_and_index_truncation(tmp_path: Path) -> None:
     assert rows[2]["num_prefill_tokens"] == "10"  # 150 - 135 - 5
     assert rows[2]["session_id"] == "0"
     assert rows[2]["session_turn_index"] == "2"
-    # Context reduction still starts a new simulator session, but its root is
+    # The 80% context reduction starts a new simulator session, but its root is
     # anchored at the original shuffled root plus the observed source-relative
     # elapsed time (10 seconds here), not reset to t=0.
     assert rows[3]["session_start_at"] == "10.000000000000"
-    assert rows[3]["num_prefill_tokens"] == "120"
+    assert rows[3]["num_prefill_tokens"] == "30"
     assert rows[3]["session_id"] == "1"
     assert rows[4]["session_start_at"] == "1.000000000000"
     assert rows[4]["session_id"] == "2"  # Claude source session.
@@ -156,7 +157,48 @@ def test_gap_clamp_context_split_and_index_truncation(tmp_path: Path) -> None:
     assert summary["distributions"]["think_time_seconds_successors"]["p50"] == 1.5
     written = json.loads(metadata.read_text(encoding="utf-8"))
     assert written["token_assumptions"]["successor_isl"].startswith("current input_tokens_total")
+    assert written["token_assumptions"]["minimum_compaction_reduction_fraction"] == 0.75
     assert written["arrival_assumptions"]["root_arrival_distribution"].startswith("deterministic stratified")
+
+
+def test_compaction_reduction_boundary_is_inclusive() -> None:
+    assert converter._is_accepted_compaction(100, 25)
+    assert not converter._is_accepted_compaction(100, 26)
+
+
+@pytest.mark.parametrize("candidate_input", [120, 151])
+def test_insufficient_compaction_truncates_source_tail(
+    tmp_path: Path, candidate_input: int
+) -> None:
+    db = tmp_path / "trace.duckdb"
+    output = tmp_path / "workload.csv"
+    _make_trace_db(db)
+    con = duckdb.connect(str(db))
+    try:
+        # Both candidates have a nonpositive logical delta.  120 is only a 20%
+        # reduction; 151 did not reduce total input at all and is nonpositive
+        # only because the preceding output is included in the delta.
+        con.execute(
+            "UPDATE rounds SET input_tokens_total = ? WHERE round_pk = 4",
+            [candidate_input],
+        )
+    finally:
+        con.close()
+
+    summary = converter.convert_database(
+        db,
+        output,
+        session_arrival_rate=1.0,
+    )
+    rows = _read_rows(output)
+
+    assert len(rows) == 4
+    assert {row["num_prefill_tokens"] for row in rows} == {"100", "25", "10", "50"}
+    assert summary["split_reasons"]["logical_delta_nonpositive"] == 0
+    assert summary["policy_counts"]["insufficient_compaction_truncations"] == 1
+    assert summary["policy_counts"]["rows_discarded_after_insufficient_compaction"] == 3
+    assert summary["counts"]["rows_discarded_after_insufficient_compaction"] == 3
+    assert summary["policy_counts"]["index_break_truncations"] == 0
 
 
 def test_filters_and_sampling_are_deterministic(tmp_path: Path) -> None:

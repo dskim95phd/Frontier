@@ -93,9 +93,13 @@ The default mapping is:
   cache-accounting field `newly_append_tokens`.
 
 TraceLab context-max and tokenizer metadata are intentionally ignored.  When a
-context reduction/compaction makes that ISL nonpositive or timing is missing,
-the current row begins a new numeric simulator session and its full observed
-input becomes the new root ISL.  A negative timestamp gap is clamped to
+nonpositive logical ISL coincides with a reduction of at least 75% in total
+input tokens, the row is treated as a compaction: it begins a new numeric
+simulator session and its full observed input becomes the new root ISL.  If the
+logical ISL is nonpositive but the total-input reduction is smaller than 75%,
+the candidate row and all later rows in that source session are discarded
+because the discontinuity is not large enough to accept as compaction.  Missing
+timing starts a new simulator session.  A negative timestamp gap is clamped to
 `think_time=0` while retaining the session.  At the first non-adjacent
 `round_index`, that row and all later rows in the source session are discarded:
 the missing requests make their compute time and context evolution
