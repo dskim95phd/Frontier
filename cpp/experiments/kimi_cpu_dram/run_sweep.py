@@ -2,9 +2,9 @@
 """Run a TraceLab CPU-DRAM capacity/session-rate sweep for Kimi K2 or K3.
 
 The simulator config selects the model, topology, execution precision, and
-batching policy.  CLI values select the session-rate and per-PREFILL-GPU CPU
-DRAM grids.  The runner generates one deterministic workload per rate, runs
-the Cartesian product, supports resume, and generates the shared HTML report.
+batching policy. The settings block near the top maps each per-PREFILL-GPU CPU
+DRAM capacity to the exact session rates to run. CLI grid options can override
+that mapping. The runner supports resume and generates the shared HTML report.
 """
 
 from __future__ import annotations
@@ -50,6 +50,24 @@ SESSION_REPETITIONS: int | None = None
 SEED = 20260803
 DEFAULT_SESSION_RATES = tuple(f"{value / 100:.2f}" for value in range(5, 51, 5))
 DEFAULT_CAPACITIES_GB = (250, 375, 500, 625, 750, 875, 1000)
+
+# ---------------------------------------------------------------------------
+# Server sweep settings. Edit only this mapping to give each CPU capacity its
+# own session-injection rates. Values are decimal GB per PREFILL GPU.
+#
+# Example:
+#   250: ("0.05", "0.10", "0.15"),
+#   500: ("0.15", "0.20", "0.25"),
+# ---------------------------------------------------------------------------
+SESSION_RATES_BY_CAPACITY_GB: dict[int, tuple[str, ...]] = {
+    250: DEFAULT_SESSION_RATES,
+    375: DEFAULT_SESSION_RATES,
+    500: DEFAULT_SESSION_RATES,
+    625: DEFAULT_SESSION_RATES,
+    750: DEFAULT_SESSION_RATES,
+    875: DEFAULT_SESSION_RATES,
+    1000: DEFAULT_SESSION_RATES,
+}
 
 
 DEFAULT_TRACELAB_DB = (
@@ -214,15 +232,53 @@ def normalize_rate_capacities(
 
 
 def resolve_rate_capacities(
-    session_rates: Sequence[str | float | Decimal],
-    capacities_gb: Sequence[int],
+    session_rates: Sequence[str | float | Decimal] | None,
+    capacities_gb: Sequence[int] | None,
+    configured: Mapping[int, Sequence[str | float | Decimal]] = (
+        SESSION_RATES_BY_CAPACITY_GB
+    ),
 ) -> dict[Decimal, tuple[int, ...]]:
-    """Build the exact Cartesian product requested on the CLI."""
+    """Resolve the script mapping, optionally overridden by CLI grid values."""
 
-    capacities = tuple(sorted(capacities_gb))
-    if not capacities:
-        raise ValueError("at least one CPU capacity is required")
-    return normalize_rate_capacities({rate: capacities for rate in session_rates})
+    normalized_config: dict[int, tuple[Decimal, ...]] = {}
+    for capacity, raw_rates in configured.items():
+        if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity < 0:
+            raise ValueError(
+                "configured CPU capacities must be nonnegative integer GB values"
+            )
+        rates = tuple(_decimal(rate, name="session rate") for rate in raw_rates)
+        if not rates:
+            raise ValueError(f"CPU capacity {capacity} has no session rates")
+        if len(set(rates)) != len(rates):
+            raise ValueError(f"CPU capacity {capacity} contains duplicate session rates")
+        normalized_config[capacity] = tuple(sorted(rates))
+    if not normalized_config:
+        raise ValueError("SESSION_RATES_BY_CAPACITY_GB must not be empty")
+
+    if capacities_gb is None:
+        capacities = tuple(sorted(normalized_config))
+    else:
+        capacities = tuple(sorted(capacities_gb))
+        if not capacities:
+            raise ValueError("at least one CPU capacity is required")
+
+    if session_rates is not None:
+        # An explicit rate list is a Cartesian override. Explicit capacities
+        # may include values not present in the script mapping.
+        return normalize_rate_capacities({rate: capacities for rate in session_rates})
+
+    unknown = [capacity for capacity in capacities if capacity not in normalized_config]
+    if unknown:
+        raise ValueError(
+            "capacities missing from SESSION_RATES_BY_CAPACITY_GB: "
+            f"{unknown}; also pass --session-rates to override the mapping"
+        )
+
+    by_rate: dict[Decimal, list[int]] = {}
+    for capacity in capacities:
+        for rate in normalized_config[capacity]:
+            by_rate.setdefault(rate, []).append(capacity)
+    return normalize_rate_capacities(by_rate)
 
 
 def build_rate_capacity_matrix(
@@ -696,8 +752,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--session-rates",
         type=_parse_session_rates,
-        default=_parse_session_rates(",".join(DEFAULT_SESSION_RATES)),
-        help="comma-separated source-session rates (default: 0.05,...,0.50)",
+        help=(
+            "optional comma-separated Cartesian override; omit to use "
+            "SESSION_RATES_BY_CAPACITY_GB"
+        ),
     )
     parser.add_argument(
         "--simulation-hours",
@@ -714,8 +772,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--capacities-gb",
         type=_parse_capacities,
-        default=DEFAULT_CAPACITIES_GB,
-        help="comma-separated decimal GB per PREFILL GPU",
+        help=(
+            "optional capacity subset in decimal GB per PREFILL GPU; with "
+            "--session-rates, selects a Cartesian override"
+        ),
     )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
@@ -775,12 +835,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     except ValueError as error:
         raise SystemExit(str(error)) from error
-    full_matrix = build_rate_capacity_matrix(
-        rate_capacities,
-        workload_root=args.workload_root.resolve(),
-        output_root=args.output_root.resolve(),
-        seed=SEED,
-    )
     cases = build_rate_capacity_matrix(
         rate_capacities,
         workload_root=args.workload_root.resolve(),
@@ -802,13 +856,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         else min(SAMPLE_SESSIONS, eligible_source_sessions)
     )
     session_repetitions = resolve_session_repetitions(
-        full_matrix,
+        cases,
         source_sessions_per_epoch=source_sessions_per_epoch,
     )
-    # Size every workload against the full declared grid, even when one server
-    # invocation uses --capacities-gb.  This keeps shared rate CSVs identical
-    # across split/resumed batches.
-    highest_rate = max(case.rate for case in full_matrix)
+    highest_rate = max(case.rate for case in cases)
     injection_duration_s = (
         Decimal(source_sessions_per_epoch * session_repetitions) / highest_rate
     )

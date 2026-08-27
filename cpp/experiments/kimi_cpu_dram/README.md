@@ -14,9 +14,21 @@ Kimi K3. Model-specific directories contain simulator configs only.
   `index.html`. Private `lib/` modules contain report calculations and are not
   separate experiment entry points.
 
-The default grid is 0.05 through 0.50 source sessions/s in 0.05 increments,
-250/375/500/625/750/875/1000 decimal GB per PREFILL GPU, and a 12-hour
-simulation. Override it without editing code:
+The `SESSION_RATES_BY_CAPACITY_GB` mapping near the top of `run_sweep.py` is
+the server experiment matrix. Each CPU capacity can have a different tuple of
+session rates. The checked-in matrix uses 0.05 through 0.50 sessions/s for
+each of 250/375/500/625/750/875/1000 decimal GB per PREFILL GPU. For example:
+
+```python
+SESSION_RATES_BY_CAPACITY_GB = {
+    250: ("0.05", "0.10", "0.15"),
+    500: ("0.15", "0.20", "0.25"),
+    1000: ("0.25", "0.30", "0.35"),
+}
+```
+
+The default simulation horizon is 12 hours. CLI values can override the
+script mapping without editing it:
 
 ```bash
 python cpp/experiments/kimi_cpu_dram/run_sweep.py \

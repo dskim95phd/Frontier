@@ -46,8 +46,8 @@ def test_default_matrix_has_ten_rates_and_seven_per_gpu_capacity_points(
     tmp_path: Path,
 ) -> None:
     rate_capacities = runner.resolve_rate_capacities(
-        runner.DEFAULT_SESSION_RATES,
-        runner.DEFAULT_CAPACITIES_GB,
+        None,
+        None,
     )
     cases = runner.build_rate_capacity_matrix(
         rate_capacities,
@@ -65,12 +65,17 @@ def test_default_matrix_has_ten_rates_and_seven_per_gpu_capacity_points(
 def test_configured_matrix_can_select_capacities_per_session_rate(
     tmp_path: Path,
 ) -> None:
-    cases = runner.build_rate_capacity_matrix(
+    rate_capacities = runner.resolve_rate_capacities(
+        None,
+        None,
         {
-            "0.50": (250, 500, 1000),
-            "0.70": (500, 1000),
-            "0.90": (1000,),
+            250: ("0.50",),
+            500: ("0.50", "0.70"),
+            1000: ("0.50", "0.70", "0.90"),
         },
+    )
+    cases = runner.build_rate_capacity_matrix(
+        rate_capacities,
         workload_root=tmp_path / "workloads",
         output_root=tmp_path / "runs",
         seed=7,
@@ -104,10 +109,37 @@ def test_session_rate_and_capacity_cli_build_cartesian_product() -> None:
 def test_omitting_grid_options_uses_documented_defaults() -> None:
     args = runner.build_parser().parse_args([])
 
-    assert args.session_rates[0] == runner.Decimal("0.05")
-    assert args.session_rates[-1] == runner.Decimal("0.50")
-    assert args.capacities_gb == runner.DEFAULT_CAPACITIES_GB
+    assert args.session_rates is None
+    assert args.capacities_gb is None
+    rate_capacities = runner.resolve_rate_capacities(
+        args.session_rates, args.capacities_gb
+    )
+    assert tuple(rate_capacities) == tuple(
+        runner.Decimal(rate) for rate in runner.DEFAULT_SESSION_RATES
+    )
+    assert set(rate_capacities[runner.Decimal("0.05")]) == set(
+        runner.DEFAULT_CAPACITIES_GB
+    )
     assert args.simulation_hours == 12
+
+
+def test_capacity_only_cli_uses_each_capacity_configured_rates() -> None:
+    rate_capacities = runner.resolve_rate_capacities(
+        None,
+        (250, 1000),
+        {
+            250: ("0.05", "0.10"),
+            500: ("0.15",),
+            1000: ("0.20", "0.25"),
+        },
+    )
+
+    assert rate_capacities == {
+        runner.Decimal("0.05"): (250,),
+        runner.Decimal("0.10"): (250,),
+        runner.Decimal("0.20"): (1000,),
+        runner.Decimal("0.25"): (1000,),
+    }
 
 
 def test_twelve_hour_endpoint_cli_contract() -> None:
