@@ -61,7 +61,8 @@
       },
       "execution_model": {
         "type": "analytical",
-        "precision_profile": "kimi-k3-native",
+        "precision_profile": "kimi-k3-w4a8",
+        "kernel_profile": "k3_flashkda_prefill",
         "moe_layer_event_mode": "stage_group_scaled"
       },
       "moe_routing": {
@@ -96,7 +97,7 @@
       },
       "execution_model": {
         "type": "analytical",
-        "precision_profile": "kimi-k3-native",
+        "precision_profile": "kimi-k3-w4a8",
         "moe_layer_event_mode": "stage_group_scaled"
       },
       "moe_routing": {

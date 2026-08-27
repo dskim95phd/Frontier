@@ -359,6 +359,59 @@ def test_k3_config_uses_static_per_gpu_capacity_and_off_baseline() -> None:
     )
 
 
+def test_k3_config_matches_k2_precision_and_enables_prefill_flashkda() -> None:
+    k3 = json.loads(K3_CONFIG.read_text(encoding="utf-8"))
+    profile = json.loads(
+        (
+            REPO_ROOT
+            / "data/config/precision_profiles/kimi-k3-w4a8.json"
+        ).read_text(encoding="utf-8")
+    )
+
+    k3_prefill = k3["clusters"]["prefill"]["execution_model"]
+    k3_decode = k3["clusters"]["decode"]["execution_model"]
+    expected = {
+        "attention": "fp8",
+        "dense": "fp8",
+        "moe_expert": "fp8",
+        "moe_router": "fp8",
+        "kv_cache": "fp8",
+        "communication": "fp8",
+        "attention_weight": "fp8",
+        "attention_activation": "fp8",
+        "dense_weight": "fp8",
+        "dense_activation": "fp8",
+        "moe_expert_weight": "fp4",
+        "moe_expert_activation": "fp8",
+        "moe_router_weight": "fp8",
+        "moe_router_activation": "fp8",
+        "router_weight_storage": "fp8",
+        "lm_head": "fp8",
+        "lm_head_weight": "fp8",
+        "lm_head_activation": "fp8",
+        "routed_expert_weight": "fp4",
+        "routed_expert_activation": "fp8",
+        "latent_moe_projection_weight": "fp4",
+        "latent_moe_projection_activation": "fp8",
+        "shared_expert_weight": "fp4",
+        "shared_expert_activation": "fp8",
+        "dense_mlp_weight": "fp8",
+        "dense_mlp_activation": "fp8",
+        "router_compute": "fp8",
+        "kda_snapshot": "fp8",
+    }
+
+    assert profile["name"] == "kimi-k3-w4a8"
+    assert profile["precision"] == "fp8"
+    assert profile["operator_precisions"] == expected
+    assert k3_prefill["precision_profile"] == profile["name"]
+    assert k3_decode["precision_profile"] == profile["name"]
+    assert "operator_precisions" not in k3_prefill
+    assert "operator_precisions" not in k3_decode
+    assert k3_prefill["kernel_profile"] == "k3_flashkda_prefill"
+    assert "kernel_profile" not in k3_decode
+
+
 def test_generated_run_id_tracks_k2_template_model() -> None:
     template = json.loads(K2_CONFIG.read_text(encoding="utf-8"))
     case = runner.build_matrix(

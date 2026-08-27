@@ -79,6 +79,8 @@ if(NOT EXISTS
    "${FRONTIER_INSTALL_DIR}/share/frontier/clusters/gb300-1gpu.json" OR
    NOT EXISTS "${FRONTIER_INSTALL_DIR}/share/frontier/links/ib-200g.json" OR
    NOT EXISTS
-   "${FRONTIER_INSTALL_DIR}/share/frontier/precision_profiles/kimi-k3-native.json")
+   "${FRONTIER_INSTALL_DIR}/share/frontier/precision_profiles/kimi-k3-native.json" OR
+   NOT EXISTS
+   "${FRONTIER_INSTALL_DIR}/share/frontier/precision_profiles/kimi-k3-w4a8.json")
   message(FATAL_ERROR "installed Frontier modular config assets are missing")
 endif()
