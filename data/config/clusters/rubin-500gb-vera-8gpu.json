@@ -1,0 +1,15 @@
+{
+  "asset_schema_version": 1,
+  "name": "rubin-500gb-vera-8gpu",
+  "gpu": {"profile": "rubin-500gb", "count": 8},
+  "gpu_memory": {
+    "runtime_reserve_fraction": 0.1,
+    "runtime_reserve_bytes": 0,
+    "weight_overhead_fraction": 0.0
+  },
+  "network": {
+    "network_bandwidth_gbps": 28800.0,
+    "network_latency_us": 1.0,
+    "intra_node_bandwidth_gbps": 28800.0
+  }
+}

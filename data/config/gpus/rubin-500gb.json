@@ -1,0 +1,17 @@
+{
+  "asset_schema_version": 1,
+  "name": "rubin-500gb",
+  "memory": {
+    "capacity_bytes_per_gpu": 500000000000
+  },
+  "analytical": {
+    "device": "rubin",
+    "device_overrides": {
+      "hbm_bandwidth_tbps": 22.0,
+      "fp32_tflops": 130.0,
+      "fp16_tflops": 4000.0,
+      "fp8_tflops": 17500.0,
+      "fp4_tflops": 35000.0
+    }
+  }
+}
