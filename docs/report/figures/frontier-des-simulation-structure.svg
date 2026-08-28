@@ -1,0 +1,156 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1050" viewBox="0 0 1600 1050" role="img" aria-labelledby="title desc">
+  <title id="title">Frontier 이산 사건 시뮬레이션 구조</title>
+  <desc id="desc">워크로드와 시스템 구성이 Future Event Queue에 입력되고, 가장 이른 사건 시점으로 이동해 시스템 상태를 갱신한 뒤 후속 사건을 다시 큐에 삽입하는 Frontier의 이산 사건 시뮬레이션 흐름과 고정 시간 간격 방식과의 차이를 보여준다.</desc>
+
+  <defs>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M 0 0 L 12 6 L 0 12 z" fill="#3f4a54"/>
+    </marker>
+    <marker id="arrow-blue" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M 0 0 L 12 6 L 0 12 z" fill="#126b87"/>
+    </marker>
+    <filter id="soft-shadow" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="3" stdDeviation="5" flood-color="#18222b" flood-opacity="0.10"/>
+    </filter>
+    <style>
+      .title { font: 700 34px "Noto Sans KR", "Malgun Gothic", sans-serif; fill: #17212a; }
+      .section-title { font: 700 24px "Noto Sans KR", "Malgun Gothic", sans-serif; fill: #17212a; }
+      .box-title { font: 700 23px "Noto Sans KR", "Malgun Gothic", sans-serif; fill: #17212a; }
+      .body { font: 500 18px "Noto Sans KR", "Malgun Gothic", sans-serif; fill: #27333d; }
+      .small { font: 500 16px "Noto Sans KR", "Malgun Gothic", sans-serif; fill: #56636e; }
+      .step { font: 700 17px "Noto Sans KR", "Malgun Gothic", sans-serif; fill: #ffffff; text-anchor: middle; dominant-baseline: middle; }
+      .timeline-label { font: 700 20px "Noto Sans KR", "Malgun Gothic", sans-serif; fill: #27333d; }
+      .time { font: 700 16px "Noto Sans KR", "Malgun Gothic", sans-serif; fill: #27333d; text-anchor: middle; }
+      .event { font: 500 15px "Noto Sans KR", "Malgun Gothic", sans-serif; fill: #56636e; text-anchor: middle; }
+      .flow { fill: none; stroke: #3f4a54; stroke-width: 3; marker-end: url(#arrow); }
+      .flow-blue { fill: none; stroke: #126b87; stroke-width: 3.5; marker-end: url(#arrow-blue); }
+      .divider { stroke: #c9d2d8; stroke-width: 1.5; }
+    </style>
+  </defs>
+
+  <rect width="1600" height="1050" fill="#ffffff"/>
+  <text x="50" y="58" class="title">Frontier 이산 사건 시뮬레이션 구조</text>
+  <text x="50" y="91" class="small">사건이 발생하는 시점으로 시간을 이동하며 요청·메모리·장비 상태를 갱신</text>
+
+  <!-- Main simulation flow -->
+  <g filter="url(#soft-shadow)">
+    <rect x="40" y="130" width="235" height="315" rx="16" fill="#eef4f7" stroke="#71808b" stroke-width="2"/>
+    <rect x="335" y="130" width="280" height="315" rx="16" fill="#e9f4f8" stroke="#126b87" stroke-width="2.5"/>
+    <rect x="675" y="130" width="260" height="315" rx="16" fill="#fff2e8" stroke="#d96d25" stroke-width="2.5"/>
+    <rect x="995" y="130" width="280" height="315" rx="16" fill="#edf7f2" stroke="#2d7a5b" stroke-width="2.5"/>
+    <rect x="1335" y="130" width="225" height="315" rx="16" fill="#f1eef9" stroke="#6a59a5" stroke-width="2.5"/>
+  </g>
+
+  <!-- Input -->
+  <text x="157.5" y="174" class="box-title" text-anchor="middle">입력</text>
+  <line x1="62" y1="194" x2="253" y2="194" class="divider"/>
+  <text x="75" y="233" class="body">워크로드 trace</text>
+  <text x="75" y="273" class="body">모델 구조</text>
+  <text x="75" y="313" class="body">GPU·메모리·네트워크</text>
+  <text x="75" y="353" class="body">서빙·병렬화 구성</text>
+  <text x="75" y="404" class="small">초기 요청 도착 사건 생성</text>
+
+  <!-- Future event queue -->
+  <text x="475" y="171" class="box-title" text-anchor="middle">Future Event Queue</text>
+  <text x="475" y="198" class="small" text-anchor="middle">발생 시각 기준 우선순위 큐</text>
+  <line x1="357" y1="218" x2="593" y2="218" class="divider"/>
+  <rect x="365" y="238" width="220" height="39" rx="7" fill="#ffffff" stroke="#91a9b4"/>
+  <text x="380" y="264" class="body">1.2 s</text>
+  <text x="465" y="264" class="body">요청 도착</text>
+  <rect x="365" y="286" width="220" height="39" rx="7" fill="#ffffff" stroke="#91a9b4"/>
+  <text x="380" y="312" class="body">1.8 s</text>
+  <text x="465" y="312" class="body">배치 완료</text>
+  <rect x="365" y="334" width="220" height="39" rx="7" fill="#ffffff" stroke="#91a9b4"/>
+  <text x="380" y="360" class="body">2.1 s</text>
+  <text x="465" y="360" class="body">KV 전송 완료</text>
+  <rect x="365" y="382" width="220" height="39" rx="7" fill="#ffffff" stroke="#91a9b4"/>
+  <text x="380" y="408" class="body">2.4 s</text>
+  <text x="465" y="408" class="body">요청 완료</text>
+
+  <!-- Event processing -->
+  <text x="805" y="174" class="box-title" text-anchor="middle">다음 사건 처리</text>
+  <line x1="697" y1="194" x2="913" y2="194" class="divider"/>
+  <circle cx="714" cy="243" r="18" fill="#d96d25"/>
+  <text x="714" y="244" class="step">1</text>
+  <text x="744" y="249" class="body">가장 이른 사건 선택</text>
+  <circle cx="714" cy="306" r="18" fill="#d96d25"/>
+  <text x="714" y="307" class="step">2</text>
+  <text x="744" y="299" class="body">시뮬레이션 시간을</text>
+  <text x="744" y="327" class="body">사건 시점으로 이동</text>
+  <circle cx="714" cy="383" r="18" fill="#d96d25"/>
+  <text x="714" y="384" class="step">3</text>
+  <text x="744" y="389" class="body">사건 handler 실행</text>
+
+  <!-- State -->
+  <text x="1135" y="174" class="box-title" text-anchor="middle">시스템 상태 갱신</text>
+  <line x1="1017" y1="194" x2="1253" y2="194" class="divider"/>
+  <text x="1033" y="237" class="body">요청·배치 대기열</text>
+  <text x="1033" y="278" class="body">GPU별 자원 점유</text>
+  <text x="1033" y="319" class="body">KV 캐시 생성·재사용·축출</text>
+  <text x="1033" y="360" class="body">데이터 전송 및 장비 상태</text>
+  <rect x="1025" y="390" width="220" height="34" rx="17" fill="#d8eee4"/>
+  <text x="1135" y="413" class="small" text-anchor="middle">변화에 따라 후속 사건 예약</text>
+
+  <!-- Output -->
+  <text x="1447.5" y="174" class="box-title" text-anchor="middle">출력 지표</text>
+  <line x1="1357" y1="194" x2="1538" y2="194" class="divider"/>
+  <text x="1371" y="235" class="body">TTFT · TPOT</text>
+  <text x="1371" y="277" class="body">요청 처리량</text>
+  <text x="1371" y="319" class="body">메모리 점유</text>
+  <text x="1371" y="361" class="body">캐시 재사용·축출</text>
+  <text x="1371" y="403" class="body">자원 사용률</text>
+
+  <!-- Main arrows -->
+  <path d="M 275 287 H 323" class="flow"/>
+  <path d="M 615 287 H 663" class="flow"/>
+  <path d="M 935 287 H 983" class="flow"/>
+  <path d="M 1275 287 H 1323" class="flow"/>
+
+  <!-- Event feedback loop -->
+  <path d="M 1135 445 V 526 H 475 V 457" class="flow-blue"/>
+  <rect x="688" y="494" width="294" height="44" rx="22" fill="#ffffff" stroke="#126b87" stroke-width="2"/>
+  <text x="835" y="523" class="body" text-anchor="middle">후속 사건 생성 및 큐 삽입</text>
+
+  <!-- Timeline comparison -->
+  <rect x="40" y="590" width="1520" height="410" rx="18" fill="#f8fafb" stroke="#b9c3ca" stroke-width="2"/>
+  <text x="72" y="634" class="section-title">시간 진행 방식 비교</text>
+  <text x="72" y="663" class="small">Frontier는 고정 간격마다 전체 시스템을 계산하지 않고 상태가 변하는 시점만 처리한다.</text>
+  <line x1="72" y1="684" x2="1528" y2="684" class="divider"/>
+
+  <!-- Fixed timestep lane -->
+  <text x="78" y="747" class="timeline-label">고정 시간 간격</text>
+  <text x="78" y="775" class="small">모든 Δt마다 상태 계산</text>
+  <line x1="320" y1="750" x2="1490" y2="750" stroke="#8c979f" stroke-width="3" marker-end="url(#arrow)"/>
+  <g fill="#ffffff" stroke="#7f8a93" stroke-width="2.5">
+    <circle cx="350" cy="750" r="11"/><circle cx="555" cy="750" r="11"/><circle cx="760" cy="750" r="11"/>
+    <circle cx="965" cy="750" r="11"/><circle cx="1170" cy="750" r="11"/><circle cx="1375" cy="750" r="11"/>
+  </g>
+  <text x="350" y="722" class="time">t=0</text>
+  <text x="555" y="722" class="time">t+Δt</text>
+  <text x="760" y="722" class="time">t+2Δt</text>
+  <text x="965" y="722" class="time">t+3Δt</text>
+  <text x="1170" y="722" class="time">t+4Δt</text>
+  <text x="1375" y="722" class="time">t+5Δt</text>
+  <text x="862" y="794" class="small" text-anchor="middle">상태 변화가 없는 시점도 반복 계산</text>
+
+  <!-- DES lane -->
+  <text x="78" y="892" class="timeline-label" fill="#126b87">Frontier DES</text>
+  <text x="78" y="920" class="small">사건 발생 시점만 처리</text>
+  <line x1="320" y1="890" x2="1490" y2="890" stroke="#126b87" stroke-width="4" marker-end="url(#arrow-blue)"/>
+  <g fill="#ffffff" stroke="#126b87" stroke-width="4">
+    <circle cx="350" cy="890" r="12"/><circle cx="760" cy="890" r="12"/>
+    <circle cx="1040" cy="890" r="12"/><circle cx="1405" cy="890" r="12"/>
+  </g>
+  <text x="350" y="853" class="time">t=0</text>
+  <text x="760" y="853" class="time">t=1.2 s</text>
+  <text x="1040" y="853" class="time">t=1.8 s</text>
+  <text x="1405" y="853" class="time">t=2.4 s</text>
+  <text x="350" y="932" class="event">시작</text>
+  <text x="760" y="932" class="event">요청 도착</text>
+  <text x="1040" y="932" class="event">배치 완료</text>
+  <text x="1405" y="932" class="event">요청 완료</text>
+  <text x="555" y="878" class="small" text-anchor="middle">사건 없는 시간 건너뜀</text>
+  <text x="1222" y="878" class="small" text-anchor="middle">사건 없는 시간 건너뜀</text>
+  <rect x="680" y="957" width="510" height="28" rx="14" fill="#e3f2f6"/>
+  <text x="935" y="977" class="small" text-anchor="middle">요청 수와 GPU 규모가 커져도 사건 단위로 동일한 방식 적용</text>
+</svg>

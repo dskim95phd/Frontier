@@ -1,10 +1,10 @@
 {
   "asset_schema_version": 1,
-  "name": "kimi-k3-lmsys-day0",
-  "precision": "bf16",
+  "name": "kimi-k2-k3-native",
+  "precision": "fp8",
   "operator_precisions": {
     "attention": "bf16",
-    "attention_core": "bf16",
+    "attention_core": "fp8",
     "dense": "bf16",
     "routed_expert_weight": "mxfp4",
     "routed_expert_activation": "mxfp8",
@@ -16,8 +16,7 @@
     "moe_router_activation": "bf16",
     "router_compute": "fp32",
     "lm_head": "bf16",
-    "kv_cache": "bf16",
-    "communication": "bf16",
-    "kda_snapshot": "fp32"
+    "kv_cache": "fp8",
+    "kda_snapshot": "bf16"
   }
 }

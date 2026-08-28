@@ -297,7 +297,11 @@ MLA cache storage is component-wise:
 - the decoupled RoPE component remains BF16.
 
 Scale metadata is included for MXFP storage. Quantization/dequantization time
-is not modeled.
+for persistent-cache movement is not modeled. The sequence-attention model is
+separate: `attention_core` selects the QK/PV Tensor Core dtype, and a differing
+attention activation dtype adds Q/K/V conversion traffic. K3 native uses
+BF16 projections, an FP8 MLA core, and FP8 latent KV; KDA remains on the BF16
+attention path with FP32 accumulation/state rules described below.
 
 ## 6. KDA snapshot representation
 

@@ -129,6 +129,7 @@ detail::DenseOperatorPrecisions make_dense_operator_precisions(
         detail::precision_from_string(config.dense_mlp_weight_precision()),
         detail::precision_from_string(config.dense_mlp_activation_precision()),
         detail::precision_from_string(config.kda_snapshot_precision()),
+        detail::precision_from_string(config.attention_core_precision()),
     };
 }
 
@@ -183,6 +184,7 @@ void validate_predictor_configuration(
     const std::pair<std::string_view, std::string_view> precisions[] = {
         {"default", config.precision},
         {"attention", config.attention_precision()},
+        {"attention_core", config.attention_core_precision()},
         {"dense", config.dense_precision()},
         {"moe_expert", config.moe_expert_precision()},
         {"moe_router", config.moe_router_precision()},

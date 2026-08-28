@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "run_id": "kimi-k3-tracelab-p24-d64-prefill-only-batch8192-cpu-per-gpu",
+  "run_id": "kimi-k2-tracelab-vera-rubin-pp8-d16-prefill-only-batch8192-cpu-per-gpu",
   "simulation_mode": "online",
   "system_architecture": "pd-disaggregation",
   "prefill_only": {
@@ -12,9 +12,9 @@
   },
   "cpu_kv_cache": {
     "enabled": true,
-    "capacity_bytes": 6000000000000,
+    "capacity_bytes": 8000000000000,
     "static_slice_per_gpu": true,
-    "capacity_bytes_per_gpu": 250000000000,
+    "capacity_bytes_per_gpu": 1000000000000,
     "dram_bandwidth_gbps_per_gpu": 4800.0,
     "c2c_bandwidth_gbps_per_gpu": 7200.0,
     "write_bandwidth_gbps": 9600.0,
@@ -33,15 +33,15 @@
     "balance_abs_threshold": 8,
     "balance_rel_threshold": 1.5
   },
-  "model": "moonshotai/Kimi-K3",
+  "model": "moonshotai/Kimi-K2-Instruct",
   "clusters": {
     "prefill": {
-      "profile": "rubin-vera-24gpu",
+      "profile": "rubin-vera-8gpu",
       "parallelism": {
         "num_replicas": 1,
         "tensor_parallel_size": 1,
         "decode_context_parallel_size": 1,
-        "pipeline_parallel_size": 24,
+        "pipeline_parallel_size": 8,
         "data_parallel_size": 1,
         "moe_tensor_parallel_size": 1,
         "moe_expert_parallel_size": 1,
@@ -61,27 +61,29 @@
       },
       "execution_model": {
         "type": "analytical",
-        "precision_profile": "kimi-k3-native",
-        "kernel_profile": "k3_flashkda_prefill",
+        "precision_profile": "kimi-k2-w4a8",
         "moe_layer_event_mode": "stage_group_scaled"
       },
       "moe_routing": {
         "mode": "simulation",
         "distribution": "balanced",
         "seed": 42
-      }
+      },
+      "total_expert_num": 384,
+      "router_topk": 8,
+      "first_k_dense_replace": 1,
+      "num_shared_experts": 1
     },
     "decode": {
-      "profile": "rubin-vera-32gpu",
+      "profile": "rubin-vera-16gpu",
       "parallelism": {
         "num_replicas": 1,
         "tensor_parallel_size": 4,
         "decode_context_parallel_size": 4,
         "pipeline_parallel_size": 1,
-        "data_parallel_size": 8,
+        "data_parallel_size": 4,
         "moe_tensor_parallel_size": 1,
-        "moe_expert_parallel_size": 32,
-        "pipeline_exclusive": false
+        "moe_expert_parallel_size": 16
       },
       "scheduler": {
         "type": "vllm_v1",
@@ -97,14 +99,18 @@
       },
       "execution_model": {
         "type": "analytical",
-        "precision_profile": "kimi-k3-native",
-        "moe_layer_event_mode": "stage_group_scaled"
+        "precision_profile": "kimi-k2-w4a8",
+        "moe_layer_event_mode": "first_layer_scaled"
       },
       "moe_routing": {
         "mode": "simulation",
         "distribution": "balanced",
         "seed": 42
-      }
+      },
+      "total_expert_num": 384,
+      "router_topk": 8,
+      "first_k_dense_replace": 1,
+      "num_shared_experts": 1
     }
   },
   "kv_cache_transfer": {

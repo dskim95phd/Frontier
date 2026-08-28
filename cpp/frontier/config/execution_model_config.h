@@ -37,6 +37,10 @@ struct FixedExecutionModelConfig {
 struct OperatorPrecisionConfig {
     // Empty fields inherit AnalyticalExecutionModelConfig::precision.
     std::string attention;
+    // Sequence-attention QK/PV compute precision. Empty values inherit the
+    // attention family while projections, normalization, and KDA continue to
+    // use the regular attention precision fields.
+    std::string attention_core;
     std::string dense;
     std::string moe_expert;
     std::string moe_router;
@@ -74,7 +78,8 @@ struct OperatorPrecisionConfig {
     std::string kda_snapshot;
 
     [[nodiscard]] bool empty() const noexcept {
-        return attention.empty() && dense.empty() && moe_expert.empty() &&
+        return attention.empty() && attention_core.empty() && dense.empty() &&
+               moe_expert.empty() &&
                moe_router.empty() && kv_cache.empty() &&
                communication.empty() && attention_weight.empty() &&
                attention_activation.empty() && dense_weight.empty() &&
@@ -94,7 +99,8 @@ struct OperatorPrecisionConfig {
 
     friend bool operator==(const OperatorPrecisionConfig &lhs,
                            const OperatorPrecisionConfig &rhs) {
-        return std::tie(lhs.attention, lhs.dense, lhs.moe_expert,
+        return std::tie(lhs.attention, lhs.attention_core, lhs.dense,
+                        lhs.moe_expert,
                         lhs.moe_router, lhs.kv_cache, lhs.communication,
                         lhs.attention_weight, lhs.attention_activation,
                         lhs.dense_weight, lhs.dense_activation,
@@ -108,7 +114,8 @@ struct OperatorPrecisionConfig {
                         lhs.shared_expert_weight, lhs.shared_expert_activation,
                         lhs.dense_mlp_weight, lhs.dense_mlp_activation,
                         lhs.router_compute, lhs.kda_snapshot) ==
-               std::tie(rhs.attention, rhs.dense, rhs.moe_expert,
+               std::tie(rhs.attention, rhs.attention_core, rhs.dense,
+                        rhs.moe_expert,
                         rhs.moe_router, rhs.kv_cache, rhs.communication,
                         rhs.attention_weight, rhs.attention_activation,
                         rhs.dense_weight, rhs.dense_activation,
@@ -208,6 +215,12 @@ struct AnalyticalExecutionModelConfig {
         return operator_precisions.attention.empty()
                    ? precision
                    : operator_precisions.attention;
+    }
+    [[nodiscard]] const std::string &
+    attention_core_precision() const noexcept {
+        return operator_precisions.attention_core.empty()
+                   ? attention_precision()
+                   : operator_precisions.attention_core;
     }
     [[nodiscard]] const std::string &dense_precision() const noexcept {
         return operator_precisions.dense.empty() ? precision

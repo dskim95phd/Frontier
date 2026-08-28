@@ -303,7 +303,8 @@ Json parse_precision_profile(const AssetDocument &document,
     const Json &operators = document.json.at("operator_precisions");
     require_keys(
         operators, {},
-        {"attention", "dense", "moe_expert", "moe_router", "kv_cache",
+        {"attention", "attention_core", "dense", "moe_expert",
+         "moe_router", "kv_cache",
          "communication", "attention_weight", "attention_activation",
          "dense_weight", "dense_activation", "moe_expert_weight",
          "moe_expert_activation", "moe_router_weight",

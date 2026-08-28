@@ -293,6 +293,7 @@
       "type": "object",
       "properties": {
         "attention": { "$ref": "#/$defs/precision" },
+        "attention_core": { "$ref": "#/$defs/precision" },
         "dense": { "$ref": "#/$defs/precision" },
         "moe_expert": { "$ref": "#/$defs/precision" },
         "moe_router": { "$ref": "#/$defs/precision" },

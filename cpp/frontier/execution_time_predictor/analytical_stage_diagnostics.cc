@@ -102,6 +102,9 @@ build_stage_diagnostics(const StageDiagnosticsInput &input) {
         {"dense_layer_compute_ms", input.first_layer_compute_ms},
         {"attention_weight_element_bytes",
          bytes_per_element(*input.precisions.attention_weight)},
+        {"attention_core_element_bytes",
+         bytes_per_element(input.precisions.attention_core.value_or(
+             input.precisions.attention))},
         {"attention_activation_element_bytes",
          bytes_per_element(*input.precisions.attention_activation)},
         {"dense_weight_element_bytes",

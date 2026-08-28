@@ -106,8 +106,18 @@ struct DenseOperatorPrecisions {
     std::optional<Precision> dense_weight;
     std::optional<Precision> dense_activation;
     Precision kda_state = Precision::kFp32;
+    // QK/PV sequence-attention compute. When omitted, inherit `attention`.
+    // KDA is deliberately excluded because it is a recurrent BF16/FP32 path.
+    std::optional<Precision> attention_core;
 };
 
+[[nodiscard]] KernelWork
+attention_context_work(const std::vector<AttentionRequestSlice> &requests,
+                       std::uint64_t local_query_heads,
+                       std::uint64_t local_kv_heads, std::uint64_t head_dim,
+                       double core_element_bytes,
+                       double activation_element_bytes,
+                       double kv_cache_element_bytes);
 [[nodiscard]] KernelWork
 attention_context_work(const std::vector<AttentionRequestSlice> &requests,
                        std::uint64_t local_query_heads,
@@ -123,7 +133,19 @@ attention_context_work(const std::vector<AttentionRequestSlice> &requests,
     const std::vector<AttentionRequestSlice> &requests,
     std::uint64_t local_query_heads, std::uint64_t qk_nope_head_dim,
     std::uint64_t qk_rope_head_dim, std::uint64_t v_head_dim,
+    double core_element_bytes, double activation_element_bytes,
+    double rope_cache_element_bytes);
+[[nodiscard]] KernelWork mla_unabsorbed_attention_work(
+    const std::vector<AttentionRequestSlice> &requests,
+    std::uint64_t local_query_heads, std::uint64_t qk_nope_head_dim,
+    std::uint64_t qk_rope_head_dim, std::uint64_t v_head_dim,
     double activation_element_bytes, double rope_cache_element_bytes);
+[[nodiscard]] KernelWork mla_absorbed_attention_work(
+    const std::vector<AttentionRequestSlice> &requests,
+    std::uint64_t local_query_heads, std::uint64_t kv_lora_rank,
+    std::uint64_t qk_rope_head_dim, double core_element_bytes,
+    double activation_element_bytes, double latent_cache_element_bytes,
+    double rope_cache_element_bytes);
 [[nodiscard]] KernelWork mla_absorbed_attention_work(
     const std::vector<AttentionRequestSlice> &requests,
     std::uint64_t local_query_heads, std::uint64_t kv_lora_rank,

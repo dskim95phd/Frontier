@@ -577,6 +577,7 @@ An analytical cluster replaces its fixed execution model with:
   "moe_layer_event_mode": "detailed",
   "operator_precisions": {
     "attention": "fp8",
+    "attention_core": "fp8",
     "dense": "fp8",
     "moe_expert": "fp8",
     "moe_expert_weight": "fp4",
@@ -627,11 +628,22 @@ Each compute family (`attention`, `dense`, `moe_expert`, `moe_router`, and
 `lm_head`) can be split further with `_weight` and `_activation` suffixes.
 The unsuffixed value remains the fallback for both, so the example above
 models W4A8 experts while retaining the compact syntax elsewhere.
+`attention_core` is narrower: it controls only sequence-attention QK/PV
+compute and its Q/K/V operands. Projections, RoPE, normalization, and KDA use
+the regular attention weight/activation precision. When the core dtype differs
+from the activation dtype, the analytical model charges the Q/K/V conversion
+traffic; `kv_cache` continues to control persistent cache storage.
 
 Kimi K3 analytical configs may select the bundled `kimi-k3-native` precision
 profile. The model-aware resolver also installs the same defaults for older
 standalone configs when neither the new field nor its legacy family fallback
-is explicitly set:
+is explicitly set. Its BF16 attention projections feed an FP8 MLA QK/PV core,
+matching the TensorRT-LLM FP8-KV FMHA path, while KDA remains BF16:
+
+For controlled K2-versus-K3 comparisons, `kimi-k2-k3-native` applies the
+same precision map to Kimi K2. This is an experimental comparison profile,
+not K2's native checkpoint format: the public K2 checkpoint is block-FP8.
+K2 ignores the K3-only latent-MoE and KDA snapshot fields in this profile.
 
 The bundled `kimi-k3-lmsys-day0` profile reproduces the 2026 LMSYS serving
 experiment instead: BF16 MLA KV, BF16 hidden-state collectives and combine,
@@ -644,6 +656,8 @@ The complete K3 design decision record is
 
 ```json
 {
+  "attention": "bf16",
+  "attention_core": "fp8",
   "routed_expert_weight": "mxfp4",
   "routed_expert_activation": "mxfp8",
   "latent_moe_projection_weight": "bf16",

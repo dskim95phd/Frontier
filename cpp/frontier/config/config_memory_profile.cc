@@ -423,6 +423,12 @@ void apply_model_native_precision_defaults(
     if (operators.kv_cache.empty()) {
         operators.kv_cache = "fp8";
     }
+    if (operators.attention_core.empty() &&
+        (operators.kv_cache == "fp8" || operators.kv_cache == "mxfp8")) {
+        // TRT-LLM's Hopper/Blackwell FP8-KV FMHA path quantizes Q/K/V and
+        // executes QK/PV on FP8 Tensor Cores. Projections and KDA remain BF16.
+        operators.attention_core = "fp8";
+    }
     if (operators.kda_snapshot.empty()) {
         operators.kda_snapshot = "bf16";
     }

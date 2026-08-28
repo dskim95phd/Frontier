@@ -81,6 +81,8 @@ if(NOT EXISTS
    NOT EXISTS
    "${FRONTIER_INSTALL_DIR}/share/frontier/precision_profiles/kimi-k3-native.json" OR
    NOT EXISTS
+   "${FRONTIER_INSTALL_DIR}/share/frontier/precision_profiles/kimi-k2-k3-native.json" OR
+   NOT EXISTS
    "${FRONTIER_INSTALL_DIR}/share/frontier/precision_profiles/kimi-k3-w4a8.json")
   message(FATAL_ERROR "installed Frontier modular config assets are missing")
 endif()

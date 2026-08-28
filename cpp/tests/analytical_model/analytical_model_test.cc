@@ -349,6 +349,29 @@ void test_operator_precisions_split_dense_and_kv_costs() {
                                fp16.mlp_up_projection_ms,
                                "dense precision independence");
 
+    auto fp8_attention_core =
+        precisions(analytical::Precision::kFp16,
+                   analytical::Precision::kFp16,
+                   analytical::Precision::kFp8);
+    fp8_attention_core.attention_weight = analytical::Precision::kBf16;
+    fp8_attention_core.attention_activation = analytical::Precision::kBf16;
+    fp8_attention_core.attention_core = analytical::Precision::kFp8;
+    const auto split_attention = predict(fp8_attention_core);
+    auto bf16_attention_core = fp8_attention_core;
+    bf16_attention_core.attention_core = analytical::Precision::kBf16;
+    const auto bf16_core = predict(bf16_attention_core);
+    expect(split_attention.decode_attention_ms < bf16_core.decode_attention_ms,
+           "FP8 attention core must use the FP8 QK/PV ceiling");
+    expect_approximately_equal(split_attention.attention_pre_projection_ms,
+                               bf16_core.attention_pre_projection_ms,
+                               "attention core must not change QKV projection");
+    expect_approximately_equal(split_attention.attention_post_projection_ms,
+                               bf16_core.attention_post_projection_ms,
+                               "attention core must not change output projection");
+    expect_approximately_equal(split_attention.attention_norm_ms,
+                               bf16_core.attention_norm_ms,
+                               "attention core must not change normalization");
+
     const auto fp4_dense = predict(precisions(analytical::Precision::kFp16,
                                               analytical::Precision::kFp4,
                                               analytical::Precision::kFp16));
@@ -742,18 +765,17 @@ void test_mla_uses_latent_cache_context_costs() {
         analytical::DenseBatch batch{};
         batch.total_tokens = 1;
         batch.prefill_requests = {{1, past_context}};
+        analytical::DenseOperatorPrecisions precisions{};
+        precisions.attention = analytical::Precision::kFp8;
+        precisions.dense = analytical::Precision::kBf16;
+        precisions.kv_cache = analytical::Precision::kFp8;
+        precisions.attention_weight = analytical::Precision::kFp8;
+        precisions.attention_activation = analytical::Precision::kBf16;
+        precisions.dense_weight = analytical::Precision::kFp8;
+        precisions.dense_activation = analytical::Precision::kBf16;
         return analytical::predict_dense_layer(
             analytical::DeviceCeilings::rubin(), analytical::AnalyticalConfig{},
-            model, batch,
-            analytical::DenseOperatorPrecisions{
-                analytical::Precision::kFp8,
-                analytical::Precision::kBf16,
-                analytical::Precision::kFp8,
-                analytical::Precision::kFp8,
-                analytical::Precision::kBf16,
-                analytical::Precision::kFp8,
-                analytical::Precision::kBf16,
-            });
+            model, batch, precisions);
     };
     const auto short_prefill = predict_prefill(0);
     const auto long_prefill = predict_prefill(8'192);
@@ -2205,6 +2227,23 @@ void test_kda_roofline_components_and_fixed_context_cost() {
                prefill_times.kv_cache_save_ms == 0.0,
            "KDA roofline must expose projection, short-conv, and recurrent "
            "work while deliberately omitting AttnRes and sequence KV writes");
+
+    analytical::DenseOperatorPrecisions split_precisions{};
+    split_precisions.attention = analytical::Precision::kBf16;
+    split_precisions.dense = analytical::Precision::kBf16;
+    split_precisions.kv_cache = analytical::Precision::kFp8;
+    split_precisions.kda_state = analytical::Precision::kFp32;
+    split_precisions.attention_core = analytical::Precision::kFp8;
+    const auto split_prefill = analytical::predict_dense_layer(
+        analytical::DeviceCeilings::rubin(), analytical::AnalyticalConfig{},
+        kda, prefill, split_precisions);
+    split_precisions.attention_core = analytical::Precision::kBf16;
+    const auto bf16_core_prefill = analytical::predict_dense_layer(
+        analytical::DeviceCeilings::rubin(), analytical::AnalyticalConfig{},
+        kda, prefill, split_precisions);
+    expect_approximately_equal(
+        split_prefill.total_ms(), bf16_core_prefill.total_ms(),
+        "KDA must ignore sequence attention core precision");
 
     analytical::DenseBatch short_decode{};
     short_decode.total_tokens = 1;

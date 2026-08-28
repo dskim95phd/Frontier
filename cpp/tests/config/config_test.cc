@@ -310,6 +310,7 @@ void test_operator_precision_contract_round_trip() {
     auto config = load("analytical_parallel_colocation.json");
     auto &analytical = config.cluster().execution_model.analytical;
     analytical.operator_precisions.attention = "fp8";
+    analytical.operator_precisions.attention_core = "mxfp8";
     analytical.operator_precisions.dense = "fp8";
     analytical.operator_precisions.moe_expert = "fp4";
     analytical.operator_precisions.moe_router = "fp8";
@@ -337,6 +338,7 @@ void test_operator_precision_contract_round_trip() {
     const auto parsed = parse_simulation_config_json(serialized);
     const auto &resolved = parsed.cluster().execution_model.analytical;
     expect(parsed == config && resolved.attention_precision() == "fp8" &&
+               resolved.attention_core_precision() == "mxfp8" &&
                resolved.dense_precision() == "fp8" &&
                resolved.moe_expert_precision() == "fp4" &&
                resolved.moe_router_precision() == "fp8" &&
@@ -1217,6 +1219,7 @@ void test_kimi_k3_nested_model_asset_and_aliases() {
     const auto &precision =
         native.cluster().execution_model.analytical.operator_precisions;
     expect(precision.routed_expert_weight == "mxfp4" &&
+               precision.attention_core == "fp8" &&
                precision.routed_expert_activation == "mxfp8" &&
                precision.latent_moe_projection_weight == "bf16" &&
                precision.latent_moe_projection_activation == "bf16" &&
@@ -1236,6 +1239,7 @@ void test_kimi_k3_nested_model_asset_and_aliases() {
     auto &overridden_execution =
         overridden.cluster().execution_model.analytical;
     overridden_execution.operator_precisions.routed_expert_weight = "int4";
+    overridden_execution.operator_precisions.attention_core = "bf16";
     overridden_execution.operator_precisions.latent_moe_projection_weight =
         "fp8";
     overridden_execution.operator_precisions.shared_expert_weight = "mxfp4";
@@ -1246,6 +1250,7 @@ void test_kimi_k3_nested_model_asset_and_aliases() {
         overridden_execution, overridden.cluster().model);
     expect(
         overridden_execution.routed_expert_weight_precision() == "int4" &&
+            overridden_execution.attention_core_precision() == "bf16" &&
             overridden_execution.latent_moe_projection_weight_precision() ==
                 "fp8" &&
             overridden_execution.shared_expert_weight_precision() == "mxfp4" &&

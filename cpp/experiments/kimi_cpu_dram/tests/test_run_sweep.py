@@ -359,49 +359,36 @@ def test_k3_config_uses_static_per_gpu_capacity_and_off_baseline() -> None:
     )
 
 
-def test_k3_config_matches_k2_precision_and_enables_prefill_flashkda() -> None:
+def test_k3_config_uses_native_precision_and_enables_prefill_flashkda() -> None:
     k3 = json.loads(K3_CONFIG.read_text(encoding="utf-8"))
     profile = json.loads(
         (
             REPO_ROOT
-            / "data/config/precision_profiles/kimi-k3-w4a8.json"
+            / "data/config/precision_profiles/kimi-k3-native.json"
         ).read_text(encoding="utf-8")
     )
 
     k3_prefill = k3["clusters"]["prefill"]["execution_model"]
     k3_decode = k3["clusters"]["decode"]["execution_model"]
     expected = {
-        "attention": "fp8",
-        "dense": "fp8",
-        "moe_expert": "fp8",
-        "moe_router": "fp8",
+        "attention": "bf16",
+        "attention_core": "fp8",
+        "dense": "bf16",
         "kv_cache": "fp8",
-        "communication": "fp8",
-        "attention_weight": "fp8",
-        "attention_activation": "fp8",
-        "dense_weight": "fp8",
-        "dense_activation": "fp8",
-        "moe_expert_weight": "fp4",
-        "moe_expert_activation": "fp8",
-        "moe_router_weight": "fp8",
-        "moe_router_activation": "fp8",
-        "router_weight_storage": "fp8",
-        "lm_head": "fp8",
-        "lm_head_weight": "fp8",
-        "lm_head_activation": "fp8",
-        "routed_expert_weight": "fp4",
-        "routed_expert_activation": "fp8",
-        "latent_moe_projection_weight": "fp4",
-        "latent_moe_projection_activation": "fp8",
-        "shared_expert_weight": "fp4",
-        "shared_expert_activation": "fp8",
-        "dense_mlp_weight": "fp8",
-        "dense_mlp_activation": "fp8",
-        "router_compute": "fp8",
-        "kda_snapshot": "fp8",
+        "routed_expert_weight": "mxfp4",
+        "routed_expert_activation": "mxfp8",
+        "latent_moe_projection_weight": "bf16",
+        "latent_moe_projection_activation": "bf16",
+        "shared_expert_weight": "bf16",
+        "shared_expert_activation": "bf16",
+        "router_weight_storage": "bf16",
+        "moe_router_activation": "bf16",
+        "router_compute": "fp32",
+        "lm_head": "bf16",
+        "kda_snapshot": "bf16",
     }
 
-    assert profile["name"] == "kimi-k3-w4a8"
+    assert profile["name"] == "kimi-k3-native"
     assert profile["precision"] == "fp8"
     assert profile["operator_precisions"] == expected
     assert k3_prefill["precision_profile"] == profile["name"]

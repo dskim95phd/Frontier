@@ -4,6 +4,7 @@
   "precision": "fp8",
   "operator_precisions": {
     "attention": "bf16",
+    "attention_core": "fp8",
     "dense": "bf16",
     "routed_expert_weight": "mxfp4",
     "routed_expert_activation": "mxfp8",

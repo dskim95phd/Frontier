@@ -9,10 +9,11 @@ Use
 [`configs/tracelab_k3_p24_d64_prefill_only_batch8192_cpu_per_gpu.json`](configs/tracelab_k3_p24_d64_prefill_only_batch8192_cpu_per_gpu.json)
 with the shared runner. It keeps chunked PREFILL enabled with a 512-token
 threshold and an 8,192-token PREFILL batch budget. Both clusters reference the
-`kimi-k3-w4a8` precision profile, which matches the K2 experiment's effective
-policy: FP8 by default, FP4 expert weights, and FP8 KV/KDA state. The PREFILL
-cluster additionally enables the isolated `k3_flashkda_prefill` kernel
-profile; no broader SGLang efficiency assumptions are included.
+`kimi-k3-native` precision profile: BF16 attention projections with an FP8
+QK/PV core, MXFP4/MXFP8 routed experts, BF16 latent-MoE projections and shared
+experts, an FP8 KV cache, and BF16 KDA snapshots. The PREFILL cluster
+additionally enables the isolated `k3_flashkda_prefill` kernel profile; no
+broader SGLang efficiency assumptions are included.
 
 ```bash
 python cpp/experiments/kimi_cpu_dram/run_sweep.py \

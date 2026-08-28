@@ -103,6 +103,7 @@ OperatorPrecisionConfig parse_operator_precisions(const Json &execution) {
         "config.execution_model.operator_precisions";
     require_keys(operators, {},
                  {"attention",
+                  "attention_core",
                   "dense",
                   "moe_expert",
                   "moe_router",
@@ -144,6 +145,7 @@ OperatorPrecisionConfig parse_operator_precisions(const Json &execution) {
         }
     };
     parse_optional("attention", result.attention);
+    parse_optional("attention_core", result.attention_core);
     parse_optional("dense", result.dense);
     parse_optional("moe_expert", result.moe_expert);
     parse_optional("moe_router", result.moe_router);

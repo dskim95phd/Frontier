@@ -9,8 +9,8 @@ file(
   "${FRONTIER_SOURCE_DIR}/experiments/kimi_k3_cpu_dram/configs/*.json"
 )
 list(LENGTH kimi_configs config_count)
-if(NOT config_count EQUAL 4)
-  message(FATAL_ERROR "expected 4 maintained Kimi configs, found ${config_count}")
+if(NOT config_count EQUAL 11)
+  message(FATAL_ERROR "expected 11 maintained Kimi configs, found ${config_count}")
 endif()
 
 foreach(config IN LISTS kimi_configs)

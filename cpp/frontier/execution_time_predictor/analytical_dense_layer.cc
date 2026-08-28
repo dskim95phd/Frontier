@@ -52,8 +52,10 @@ struct DenseLayerContext {
     const DenseModel &model;
     const DenseBatch &batch;
     Precision attention_weight_precision;
+    Precision attention_core_precision;
     Precision dense_weight_precision;
     double attention_weight_element_bytes;
+    double attention_core_element_bytes;
     double attention_element_bytes;
     double dense_weight_element_bytes;
     double dense_element_bytes;
@@ -206,6 +208,8 @@ make_dense_layer_context(const DeviceCeilings &device,
         precisions.attention_weight.value_or(precisions.attention);
     const Precision attention_activation_precision =
         precisions.attention_activation.value_or(precisions.attention);
+    const Precision attention_core_precision =
+        precisions.attention_core.value_or(precisions.attention);
     const Precision dense_weight_precision =
         precisions.dense_weight.value_or(precisions.dense);
     const Precision dense_activation_precision =
@@ -216,8 +220,10 @@ make_dense_layer_context(const DeviceCeilings &device,
         model,
         batch,
         attention_weight_precision,
+        attention_core_precision,
         dense_weight_precision,
         bytes_per_element(attention_weight_precision),
+        bytes_per_element(attention_core_precision),
         bytes_per_element(attention_activation_precision),
         bytes_per_element(dense_weight_precision),
         bytes_per_element(dense_activation_precision),
@@ -245,6 +251,14 @@ double predict_attention_work_ms(const DenseLayerContext &context,
                                  const Efficiency &efficiency) {
     return predict_dense_kernel_ms(
         context.device, context.attention_weight_precision, work, efficiency,
+        context.config.kernel_launch_latency_us);
+}
+
+double predict_attention_core_work_ms(const DenseLayerContext &context,
+                                      const KernelWork &work,
+                                      const Efficiency &efficiency) {
+    return predict_dense_kernel_ms(
+        context.device, context.attention_core_precision, work, efficiency,
         context.config.kernel_launch_latency_us);
 }
 
@@ -495,6 +509,7 @@ predict_mla_attention_work(const DenseLayerContext &context) {
     work.prefill_attention = mla_unabsorbed_attention_work(
         context.batch.prefill_requests, context.local_query_heads,
         model.qk_nope_head_dim, model.qk_rope_head_dim, model.v_head_dim,
+        context.attention_core_element_bytes,
         context.attention_element_bytes, kMlaRopeCacheElementBytes);
     std::vector<AttentionRequestSlice> dcp_decode_requests =
         context.batch.decode_requests;
@@ -509,6 +524,7 @@ predict_mla_attention_work(const DenseLayerContext &context) {
         dcp_decode_requests,
         context.local_query_heads * context.model.decode_context_parallel_size,
         model.kv_lora_rank, model.qk_rope_head_dim,
+        context.attention_core_element_bytes,
         context.attention_element_bytes, context.kv_cache_element_bytes,
         kMlaRopeCacheElementBytes);
     return work;
@@ -549,11 +565,13 @@ predict_mfa_attention_work(const DenseLayerContext &context) {
     };
     work.prefill_attention = attention_context_work(
         context.batch.prefill_requests, context.local_query_heads,
-        context.local_kv_heads, model.head_dim, context.attention_element_bytes,
+        context.local_kv_heads, model.head_dim,
+        context.attention_core_element_bytes, context.attention_element_bytes,
         context.kv_cache_element_bytes);
     work.decode_attention = attention_context_work(
         context.batch.decode_requests, context.local_query_heads,
-        context.local_kv_heads, model.head_dim, context.attention_element_bytes,
+        context.local_kv_heads, model.head_dim,
+        context.attention_core_element_bytes, context.attention_element_bytes,
         context.kv_cache_element_bytes);
     return work;
 }
@@ -585,11 +603,13 @@ predict_mha_attention_work(const DenseLayerContext &context) {
     };
     work.prefill_attention = attention_context_work(
         context.batch.prefill_requests, context.local_query_heads,
-        context.local_kv_heads, model.head_dim, context.attention_element_bytes,
+        context.local_kv_heads, model.head_dim,
+        context.attention_core_element_bytes, context.attention_element_bytes,
         context.kv_cache_element_bytes);
     work.decode_attention = attention_context_work(
         context.batch.decode_requests, context.local_query_heads,
-        context.local_kv_heads, model.head_dim, context.attention_element_bytes,
+        context.local_kv_heads, model.head_dim,
+        context.attention_core_element_bytes, context.attention_element_bytes,
         context.kv_cache_element_bytes);
     return work;
 }
@@ -925,9 +945,9 @@ predict_sequence_attention_times(const DenseLayerContext &context,
         context.config.streaming);
     times.attention_inter_norm_ms = work.inter_norm_ms;
     times.attention_wq_projection_ms = work.wq_projection_ms;
-    times.prefill_attention_ms = predict_attention_work_ms(
+    times.prefill_attention_ms = predict_attention_core_work_ms(
         context, work.prefill_attention, context.config.prefill_attention);
-    times.decode_attention_ms = predict_attention_work_ms(
+    times.decode_attention_ms = predict_attention_core_work_ms(
         context, work.decode_attention, context.config.decode_attention);
     if (work.decode_side_projection_ms > 0.0) {
         times.decode_attention_ms =

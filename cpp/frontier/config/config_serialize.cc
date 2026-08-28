@@ -190,6 +190,7 @@ OrderedJson serialize_execution_model(const ExecutionModelConfig &execution) {
             }
         };
         add("attention", operators.attention);
+        add("attention_core", operators.attention_core);
         add("dense", operators.dense);
         add("moe_expert", operators.moe_expert);
         add("moe_router", operators.moe_router);
